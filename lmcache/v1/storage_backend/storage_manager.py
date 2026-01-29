@@ -248,6 +248,14 @@ class StorageManager:
         self.non_allocator_backends = self.get_non_allocator_backends()
 
         self.enable_pd = config.enable_pd
+        self.pd_retrieve_locations = None
+        self.pd_store_location = None
+
+        if self.enable_pd:
+            if config.pd_retrieve_locations:
+                self.pd_retrieve_locations = config.pd_retrieve_locations
+            if config.pd_store_location:
+                self.pd_store_location = config.pd_store_location
 
         self.allocator_backend = None
         if metadata.role != "scheduler":
@@ -389,6 +397,9 @@ class StorageManager:
         storage manager) or has been stored (handled by storage backend).
         """
         # The dictionary from backend cname to objects and keys
+        if location is None:
+            location = self.pd_store_location
+
         obj_dict: dict[
             str,
             tuple[Sequence[CacheEngineKey], list[MemoryObj]],
@@ -436,7 +447,9 @@ class StorageManager:
         """
 
         # Search all backends for blocking get
-        for backend_name, backend in self.get_active_storage_backends(location):
+        for backend_name, backend in self.get_active_storage_backends(
+            location, self.pd_retrieve_locations
+        ):
             # TODO(Jiayi): need to make sure all memory_objs returned
             # are allocated by the allocator backend.
             memory_obj = backend.get_blocking(key)
@@ -463,7 +476,9 @@ class StorageManager:
         # TODO (Jiayi): incorporate prefetching here
 
         # Search all backends for non-blocking get
-        for backend_name, backend in self.get_active_storage_backends(location):
+        for backend_name, backend in self.get_active_storage_backends(
+            location, self.pd_retrieve_locations
+        ):
             # NOTE(Jiayi): bypass the allocator for now
             task = backend.get_non_blocking(key)
             if task:
@@ -480,7 +495,9 @@ class StorageManager:
         Blocking function to get the memory objects from the storages.
         """
         # TODO (ApostaC): remove the nested optional here
-        for backend_name, storage_backend in self.get_active_storage_backends(location):
+        for backend_name, storage_backend in self.get_active_storage_backends(
+            location, self.pd_retrieve_locations
+        ):
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
                 # Align with single-key `get()` logic:
@@ -682,6 +699,9 @@ class StorageManager:
         tier_expected_chunks = []
         # we also keep track of the keys for each tier and each chunk
         loading_task_keys: list[list[CacheEngineKey]] = []
+        if search_range is None:
+            search_range = self.pd_retrieve_locations
+
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
         ):
@@ -894,6 +914,8 @@ class StorageManager:
 
         return: True if the key exists in the specified storage backends.
         """
+        if search_range is None:
+            search_range = self.pd_retrieve_locations
 
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
@@ -929,6 +951,10 @@ class StorageManager:
         total_keys = len(keys)
         total_hit_chunks = 0
         block_mapping = {}
+
+        if search_range is None:
+            search_range = self.pd_retrieve_locations
+
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
         ):
@@ -1002,6 +1028,9 @@ class StorageManager:
         """
 
         num_removed = 0
+        if locations is None:
+            locations = self.pd_retrieve_locations
+
         for backend_name, backend in self.storage_backends.items():
             # TODO(Jiayi): need to handle remove in non-cpu backends
             if locations is None or backend_name in locations:
@@ -1029,6 +1058,9 @@ class StorageManager:
         storage backends.
         """
         num_removed = 0
+        if locations is None:
+            locations = self.pd_retrieve_locations
+
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
                 num_removed += backend.batched_remove(keys)
