@@ -255,6 +255,13 @@ class StorageManager:
         self.non_allocator_backends = self.get_non_allocator_backends()
 
         self.enable_pd = config.enable_pd
+        self.pd_retrieve_locations = None
+        self.pd_store_location = None
+
+        if self.enable_pd:
+            # these para are only effective under PD
+            self.pd_retrieve_locations = config.pd_retrieve_locations
+            self.pd_store_location = config.pd_store_location
 
         self.allocator_backend = None
         if metadata.role != "scheduler":
