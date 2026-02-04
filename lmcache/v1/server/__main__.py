@@ -48,7 +48,7 @@ class LMCacheServer:
                 if not header:
                     break
                 meta = ClientMetaMessage.deserialize(header)
-                logger.debug(f"Received command: {meta.command}")
+                logger.error(f"Received command: {meta.command}")
                 match meta.command:
                     case ClientCommand.PUT:
                         t0 = time.perf_counter()
@@ -99,7 +99,13 @@ class LMCacheServer:
                             if self.data_store.contains(meta.key)
                             else ServerReturnCode.FAIL
                         )
-                        logger.debug(f"Key exists: {code}")
+                        if code == ServerReturnCode.SUCCESS:
+                            logger.error(" the key exists ")
+                        else:
+                            logger.error(" the key is missing ")
+                            logger.error(" ----------------- dump keys  ---------------------------------")
+                            self.data_store.list_keys()
+                            logger.error(" --------------------------------------------------------------")
                         client_socket.sendall(
                             ServerMetaMessage(
                                 code,
@@ -119,7 +125,7 @@ class LMCacheServer:
                                 torch.Size((0, 0, 0, 0)),
                             ).serialize()
                         )
-                        logger.debug("Health check successful")
+                        logger.error("Health check successful")
 
                     # TODO(Jiayi): Implement List
                     # case ClientCommand.LIST:

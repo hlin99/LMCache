@@ -26,6 +26,7 @@ class LMSLocalBackend(LMSBackendInterface):
 
     # TODO
     def list_keys(self) -> List[CacheEngineKey]:
+        logger.error(" list_keys +++ key=%s", list(self.dict.keys()))
         with self.lock:
             return list(self.dict.keys())
 
@@ -33,6 +34,7 @@ class LMSLocalBackend(LMSBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> bool:
+        logger.error(" contains +++ key=%s", key)
         with self.lock:
             return key in self.dict
 
@@ -41,6 +43,7 @@ class LMSLocalBackend(LMSBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> None:
+        logger.error(" remove +++ key=%s", key)
         with self.lock:
             self.dict.pop(key)
 
@@ -49,6 +52,11 @@ class LMSLocalBackend(LMSBackendInterface):
         client_meta: ClientMetaMessage,
         kv_chunk_bytes: bytearray,
     ) -> None:
+        key_obj = client_meta.key
+        hash_str = format(key_obj.chunk_hash, 'x') # key_obj.chunk_hash.hex()
+        hash_int = int(hash_str, 16)
+
+        logger.error(f"DEBUG: Putting key to LMSLocalBackend. Hash: {hash_int}")
         with self.lock:
             self.dict[client_meta.key] = LMSMemoryObj(
                 kv_chunk_bytes,
@@ -63,6 +71,7 @@ class LMSLocalBackend(LMSBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> Optional[LMSMemoryObj]:
+        logger.error(" get +++ key=%s", key)
         with self.lock:
             return self.dict.get(key, None)
 
