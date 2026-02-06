@@ -81,8 +81,15 @@ class SafeLocalCPUBackend(LocalCPUBackend):
     A safe stub for LocalCPUBackend that can be used when local_cpu_backend is None.
     """
 
-    def __init__(self, config: LMCacheEngineConfig):
-        pass
+    def __init__(
+        self, config: LMCacheEngineConfig, metadata: Optional[LMCacheMetadata]
+    ):
+        """A safe stub for LocalCPUBackend.
+        Carries config and metadata so Connector initialization can rely on
+        non-null backend attributes.
+        """
+        self.config = config
+        self.metadata = metadata
 
     def allocate(self, *args, **kwargs):
         raise RuntimeError(
@@ -122,7 +129,7 @@ class ConnectorContext:
         self.local_cpu_backend: LocalCPUBackend = (
             local_cpu_backend
             if local_cpu_backend is not None
-            else SafeLocalCPUBackend(config)
+            else SafeLocalCPUBackend(config, metadata)
         )
         self.config = config
         self.metadata = metadata
