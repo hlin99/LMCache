@@ -462,7 +462,13 @@ class LMCacheEngine:
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
                 num_tokens = end - start
-                kv_shapes = self.metadata.get_shapes(num_tokens)
+
+                # required for VLLMPagedMemHPUConnectorV2
+                if hasattr(torch, "hpu") and torch.hpu.is_available():
+                    kv_shapes = self.gpu_connector.get_shape(num_tokens)
+                else:
+                    kv_shapes = self.metadata.get_shapes(num_tokens)
+
                 kv_dtypes = self.metadata.get_dtypes()
 
                 # TODO (Jiayi): should be batched in the future
@@ -1713,11 +1719,18 @@ class LMCacheEngine:
                 # Create tensor and receive data
                 metadata = MemoryObjMetadata.from_dict(metadata_dict)
                 local_rank = self.metadata.worker_id % torch.cuda.device_count()
-                raw_tensor = torch.empty(
-                    torch.Size([metadata.get_size()]),
-                    dtype=torch.uint8,
-                    device=f"cuda:{local_rank}",
-                )
+                if hasattr(torch, "hpu") and torch.hpu.is_available():
+                    raw_tensor = torch.empty(
+                        self.gpu_connector.get_shape(end-start),
+                        dtype=torch.uint8,
+                        device=f"hpu:{local_rank}",
+                    )
+                else:
+                    raw_tensor = torch.empty(
+                        torch.Size([metadata.get_size()]),
+                        dtype=torch.uint8,
+                        device=f"cuda:{local_rank}",
+                    )
                 self.broadcast_fn(raw_tensor, self.metadata.first_rank)
 
                 # Create temporary memory object (key not needed for other ranks)
