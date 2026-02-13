@@ -520,9 +520,11 @@ class LayerCacheEngineKey(CacheEngineKey):
         return False
 
     def to_string(self):
+        chunk_hash_dec = int(self.chunk_hash_hex, 16)
+
         s = (
             f"{self.model_name}@{self.world_size}"
-            f"@{self.worker_id}@{self.chunk_hash_hex}@{self._dtype_str}@{self.layer_id}"
+            f"@{self.worker_id}@{chunk_hash_dec}@{self._dtype_str}@{self.layer_id}"
         )
         if self.tags is not None and len(self.tags) != 0:
             tags = [f"{k}%{v}" for k, v in self.tags]
@@ -563,7 +565,7 @@ class LayerCacheEngineKey(CacheEngineKey):
             model_name=parts[0],
             world_size=int(parts[1]),
             worker_id=int(parts[2]),
-            chunk_hash=int(parts[3], 16),
+            chunk_hash=int(parts[3]),
             dtype=STR_DTYPE_TO_TORCH_DTYPE[parts[4]],
             request_configs=request_configs,
             layer_id=int(parts[5]),
