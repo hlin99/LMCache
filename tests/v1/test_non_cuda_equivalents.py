@@ -107,10 +107,6 @@ def scenario_rotary_embedding_k_fused():
     ops, scene_info = get_test_context()
     is_cuda_backend = scene_info.startswith("cuda_ops")
 
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
     # 1. Setup Dimensions
     num_tokens = 128
     num_kv_heads = 32
@@ -118,33 +114,39 @@ def scenario_rotary_embedding_k_fused():
     max_position = 2048
     rotary_dim = head_size
 
-    # 2. Generate Inputs
-    old_positions = torch.randint(0, 1000, (num_tokens,), dtype=torch.long)
-    new_positions = old_positions + 1
+    for is_neox in [True, False]:
+        neox_tag = "neox" if is_neox else "non_neox"
 
-    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32)
-    cos_sin_cache = torch.randn(max_position, rotary_dim, dtype=torch.float32)
-    is_neox = True
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
 
-    if is_cuda_backend:
-        target_dev = f"cuda:{torch.cuda.current_device()}"
-        old_positions = old_positions.to(target_dev)
-        new_positions = new_positions.to(target_dev)
-        key = key.to(target_dev)
-        cos_sin_cache = cos_sin_cache.to(target_dev)
+        # 2. Generate Inputs
+        old_positions = torch.randint(0, 1000, (num_tokens,), dtype=torch.long)
+        new_positions = old_positions + 1
 
-    # 3. Execute (in-place update on key)
-    ops.rotary_embedding_k_fused(
-        old_positions,
-        new_positions,
-        key,
-        head_size,
-        cos_sin_cache,
-        is_neox,
-    )
+        key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32)
+        cos_sin_cache = torch.randn(max_position, rotary_dim, dtype=torch.float32)
 
-    # 4. Save
-    save_result("rotary_embedding_k_fused", key.cpu())
+        if is_cuda_backend:
+            target_dev = f"cuda:{torch.cuda.current_device()}"
+            old_positions = old_positions.to(target_dev)
+            new_positions = new_positions.to(target_dev)
+            key = key.to(target_dev)
+            cos_sin_cache = cos_sin_cache.to(target_dev)
+
+        # 3. Execute (in-place update on key)
+        ops.rotary_embedding_k_fused(
+            old_positions,
+            new_positions,
+            key,
+            head_size,
+            cos_sin_cache,
+            is_neox,
+        )
+
+        # 4. Save
+        save_result(f"rotary_embedding_k_fused_{neox_tag}", key.cpu())
 
 
 def scenario_lmcache_memcpy_async():
@@ -1123,6 +1125,82 @@ def scenario_multi_layer_kv_transfer():
             key_value.cpu(),
         )
 
+    # --- MLA Mode Tests ---
+    for direction in [True, False]:
+        dir_tag = "paged2lmc_mla" if direction else "lmc2paged_mla"
+
+        # 1. LMCache Tensor (only K part used in MLA)
+        lmc_shape = (2, num_layers, num_tokens, head_size)
+        key_value = torch.zeros(
+            lmc_shape,
+            dtype=dtype,
+            device=device,
+        )
+        if not direction:  # LMC → Paged
+            for ly in range(num_layers):
+                for t in range(num_tokens):
+                    val = (
+                        ly * 1000 + t * 10 + torch.arange(head_size, device=device)
+                    ).to(dtype)
+                    key_value[0, ly, t] = val
+
+        # 2. Paged Buffers
+        page_buffers = []
+        for ly in range(num_layers):
+            pb = torch.zeros(
+                (2, page_buffer_size, head_size),
+                dtype=dtype,
+                device=device,
+            )
+            if direction:  # Paged → LMC
+                for s in range(page_buffer_size):
+                    val = (
+                        ly * 2000
+                        + s * 10
+                        + torch.arange(
+                            head_size,
+                            device=device,
+                        )
+                    ).to(dtype)
+                    pb[0, s] = val
+            page_buffers.append(pb)
+
+        # 3. Pointer Tensor
+        key_value_ptrs = torch.tensor(
+            [pb.data_ptr() for pb in page_buffers],
+            dtype=torch.int64,
+            device=device,
+        )
+
+        # 4. Execute
+        ops.multi_layer_kv_transfer(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device(device),
+            page_buffer_size,
+            direction,
+            True,  # use_mla
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        # 5. Verify (only K part for MLA)
+        for t_id in range(num_tokens):
+            s_idx = slot_mapping[t_id].item()
+            for ly in range(num_layers):
+                torch.testing.assert_close(
+                    key_value[0, ly, t_id],
+                    page_buffers[ly][0, s_idx],
+                    msg=(f"K mismatch: {dir_tag}, layer={ly}, token={t_id}"),
+                )
+
+        # 6. Save
+        save_result(
+            f"multi_layer_kv_transfer_{dir_tag}",
+            key_value.cpu(),
+        )
+
 
 def scenario_multi_layer_kv_transfer_unilateral():
     ops, scene_info = get_test_context()
@@ -1237,6 +1315,98 @@ def scenario_multi_layer_kv_transfer_unilateral():
                             f"token={t_id}, slot={s_idx}"
                         ),
                     )
+
+        # 5. Save
+        save_result(
+            f"multi_layer_kv_transfer_unilateral_{dir_tag}",
+            lmc_tensor.cpu(),
+        )
+
+    # --- MLA Mode Tests ---
+    for direction in [True, False]:
+        dir_tag = "p2l_mla" if direction else "l2p_mla"
+
+        # LMC Layout: [2, num_layers, num_tokens, head_size]
+        lmc_shape = (2, num_layers, num_tokens, head_size)
+        lmc_tensor = torch.zeros(
+            lmc_shape,
+            dtype=dtype,
+            device=device,
+        )
+
+        if not direction:  # LMC → Paged (only K part for MLA)
+            for ly in range(num_layers):
+                for t in range(num_tokens):
+                    val = (
+                        ly * 1000
+                        + t * 10
+                        + torch.arange(
+                            head_size,
+                            device=device,
+                        )
+                    ).to(dtype)
+                    lmc_tensor[0, ly, t] = val
+
+        # 1. Paged Buffers (only K buffers populated for MLA)
+        buffers = {}
+        for kv in range(2):
+            for ly in range(num_layers):
+                pb = torch.zeros(
+                    (page_buffer_size, head_size),
+                    dtype=dtype,
+                    device=device,
+                )
+                if direction and kv == 0:  # Paged → LMC, only K
+                    val = (
+                        ly * 2000
+                        + torch.arange(
+                            head_size,
+                            device=device,
+                        )
+                    ).to(dtype)
+                    for s in range(page_buffer_size):
+                        pb[s] = val + (s * 10)
+                buffers[(kv, ly)] = pb
+
+        # 2. Grouped Pointer Tensor
+        ptr_list = []
+        for ly in range(num_layers):
+            ptr_list.append(buffers[(0, ly)].data_ptr())
+        for ly in range(num_layers):
+            ptr_list.append(buffers[(1, ly)].data_ptr())
+
+        key_value_ptrs = torch.tensor(
+            ptr_list,
+            dtype=torch.int64,
+            device=device,
+        ).contiguous()
+
+        # 3. Execute
+        ops.multi_layer_kv_transfer_unilateral(
+            lmc_tensor,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device(device),
+            page_buffer_size,
+            direction,
+            True,  # use_mla
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        # 4. Verify (only K part for MLA)
+        for t_id in range(num_tokens):
+            s_idx = slot_mapping[t_id].item()
+            for ly in range(num_layers):
+                torch.testing.assert_close(
+                    lmc_tensor[0, ly, t_id],
+                    buffers[(0, ly)][s_idx],
+                    msg=(
+                        f"K mismatch: {dir_tag}, "
+                        f"layer={ly}, "
+                        f"token={t_id}, slot={s_idx}"
+                    ),
+                )
 
         # 5. Save
         save_result(
