@@ -712,7 +712,13 @@ def _update_config_from_env(self):
             env_config[deprecated_name] = env_value
 
     # Resolve aliases and handle deprecated configurations
-    resolved_config = _resolve_config_aliases(env_config, "environment variables")
+    resolved_config = _resolve_config_aliases(
+        env_config,
+        "environment variables",
+        _CONFIG_DEFINITIONS,
+        _CONFIG_ALIASES,
+        _DEPRECATED_CONFIGS,
+    )
 
     # Update config object with environment values
     for name, config in _CONFIG_DEFINITIONS.items():
@@ -745,6 +751,7 @@ LMCacheEngineConfig = create_config_class(
         "get_lmcache_worker_ids": _get_lmcache_worker_ids,
         "get_lookup_server_worker_ids": _get_lookup_server_worker_ids,
         "from_legacy": classmethod(_from_legacy),
+        "update_config_from_env": _update_config_from_env,
     },
 )
 
