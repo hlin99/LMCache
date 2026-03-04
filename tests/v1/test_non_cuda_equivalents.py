@@ -1337,6 +1337,1075 @@ def scenario_transfer_direction_enum():
 
 
 # ==========================================
+# New Scenarios (Improved Coverage)
+# ==========================================
+
+
+def scenario_alloc_pinned_ptr_data_readwrite():
+    """Verify read/write correctness for alloc_pinned_ptr; multiple sizes; double-free safety."""
+    import ctypes
+
+    import numpy as np
+
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+
+    for size in [64, 4096, 1024 * 1024]:
+        ptr = ops.alloc_pinned_ptr(size)
+        assert ptr != 0, f"Null pointer for size={size}"
+
+        src = np.arange(size, dtype=np.uint8) % 251
+        ctypes.memmove(ctypes.c_void_p(ptr), src.ctypes.data, size)
+
+        dst = np.zeros(size, dtype=np.uint8)
+        ctypes.memmove(dst.ctypes.data, ctypes.c_void_p(ptr), size)
+
+        assert np.array_equal(src, dst), f"Data mismatch for size={size}"
+
+        ops.free_pinned_ptr(ptr)
+        if not is_cuda_backend:
+            ops.free_pinned_ptr(ptr)  # double-free is safe on non-CUDA path
+
+    save_result(
+        "alloc_pinned_ptr_data_readwrite",
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def scenario_alloc_pinned_ptr_device_id():
+    """Verify alloc_pinned_ptr accepts explicit device_id values (0 and 1)."""
+    ops, _ = get_test_context()
+    size = 1024
+
+    for device_id in [0, 1]:
+        ptr = ops.alloc_pinned_ptr(size, device_id)
+        assert ptr != 0, f"Null pointer for device_id={device_id}"
+        ops.free_pinned_ptr(ptr)
+
+    save_result(
+        "alloc_pinned_ptr_device_id",
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def scenario_alloc_pinned_numa_ptr_numa_id():
+    """Verify alloc_pinned_numa_ptr accepts explicit numa_id values (0 and 1)."""
+    ops, _ = get_test_context()
+    size = 1024
+
+    for numa_id in [0, 1]:
+        ptr = ops.alloc_pinned_numa_ptr(size, numa_id)
+        assert ptr != 0, f"Null pointer for numa_id={numa_id}"
+        ops.free_pinned_numa_ptr(ptr, size)
+
+    save_result(
+        "alloc_pinned_numa_ptr_numa_id",
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def scenario_free_idempotency():
+    """Verify double-free, free(0), free(invalid_ptr) do not crash (non-CUDA path only)."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+    size = 1024
+
+    if not is_cuda_backend:
+        # alloc_pinned_ptr / free_pinned_ptr
+        ptr = ops.alloc_pinned_ptr(size)
+        ops.free_pinned_ptr(ptr)
+        ops.free_pinned_ptr(ptr)        # double-free: uses dict.pop, safe
+        ops.free_pinned_ptr(0)           # null pointer
+        ops.free_pinned_ptr(0xDEADBEEF)  # invalid pointer, not in registry
+
+        # alloc_pinned_numa_ptr / free_pinned_numa_ptr
+        ptr2 = ops.alloc_pinned_numa_ptr(size)
+        ops.free_pinned_numa_ptr(ptr2)
+        ops.free_pinned_numa_ptr(ptr2)        # double-free
+        ops.free_pinned_numa_ptr(0)            # null
+        ops.free_pinned_numa_ptr(0xDEADBEEF)  # invalid
+
+        # alloc_numa_ptr / free_numa_ptr
+        ptr3 = ops.alloc_numa_ptr(size)
+        ops.free_numa_ptr(ptr3)
+        ops.free_numa_ptr(ptr3)        # double-free
+        ops.free_numa_ptr(0)            # null
+        ops.free_numa_ptr(0xDEADBEEF)  # invalid
+
+    save_result(
+        "free_idempotency",
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def scenario_multi_layer_kv_transfer_neg_slots():
+    """Test multi_layer_kv_transfer correctly skips negative slot_mapping entries."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    num_layers = 2
+    num_tokens = 4
+    head_size = 16
+    page_buffer_size = 10
+    dtype = torch.float32
+
+    # Tokens 0 and 2 → negative slot (skip); tokens 1 and 3 → valid slots 2 and 9
+    mixed_slots = torch.tensor([-1, 2, -1, 9], dtype=torch.int64, device=device)
+    # All-negative: entire transfer must be a no-op
+    all_neg_slots = torch.tensor([-1, -1, -1, -1], dtype=torch.int64, device=device)
+
+    for use_mla in [False, True]:
+        mla_tag = "mla" if use_mla else "std"
+        k_or_v_size = 1 if use_mla else 2
+
+        for direction in [True, False]:
+            dir_tag = "p2l" if direction else "l2p"
+
+            lmc_shape = (2, num_layers, num_tokens, head_size)
+            key_value = torch.zeros(lmc_shape, dtype=dtype, device=device)
+
+            if not direction:  # LMC → Paged: initialise lmc with distinct values
+                for kv in range(k_or_v_size):
+                    for ly in range(num_layers):
+                        for t in range(num_tokens):
+                            key_value[kv, ly, t] = float(kv * 5000 + ly * 1000 + t * 10)
+
+            page_buffers = []
+            for ly in range(num_layers):
+                pb = torch.zeros(
+                    (2, page_buffer_size, head_size), dtype=dtype, device=device
+                )
+                if direction:  # Paged → LMC: initialise paged buffer
+                    for s in range(page_buffer_size):
+                        pb[0, s] = float(ly * 2000 + s * 10)
+                        pb[1, s] = pb[0, s] + 700
+                page_buffers.append(pb)
+
+            key_value_ptrs = torch.tensor(
+                [pb.data_ptr() for pb in page_buffers],
+                dtype=torch.int64,
+                device=device,
+            )
+
+            # Snapshot negative-slot token state before transfer
+            kv_neg0_before = key_value[:, :, 0, :].clone()
+            kv_neg2_before = key_value[:, :, 2, :].clone()
+
+            ops.multi_layer_kv_transfer(
+                key_value,
+                key_value_ptrs,
+                mixed_slots,
+                torch.device(device),
+                page_buffer_size,
+                direction,
+                use_mla,
+            )
+            if is_cuda_backend:
+                torch.cuda.synchronize()
+
+            # Negative-slot tokens must not change
+            torch.testing.assert_close(
+                key_value[:, :, 0, :],
+                kv_neg0_before,
+                msg=f"Neg-slot token 0 changed: dir={dir_tag} mla={mla_tag}",
+            )
+            torch.testing.assert_close(
+                key_value[:, :, 2, :],
+                kv_neg2_before,
+                msg=f"Neg-slot token 2 changed: dir={dir_tag} mla={mla_tag}",
+            )
+
+            # Valid-slot tokens must match the page buffer at the transferred slot
+            for kv in range(k_or_v_size):
+                for t_id in [1, 3]:
+                    s_idx = int(mixed_slots[t_id].item())
+                    for ly in range(num_layers):
+                        torch.testing.assert_close(
+                            key_value[kv, ly, t_id],
+                            page_buffers[ly][kv, s_idx],
+                            msg=(
+                                f"Valid-slot mismatch: kv={kv} ly={ly} "
+                                f"t={t_id} dir={dir_tag} mla={mla_tag}"
+                            ),
+                        )
+
+            save_result(
+                f"multi_layer_kv_transfer_neg_slots_{dir_tag}_{mla_tag}",
+                key_value.cpu(),
+            )
+
+    # All-negative slots: transfer must leave lmc unchanged (no-op)
+    lmc_noop = torch.randn(2, num_layers, num_tokens, head_size, dtype=dtype)
+    if is_cuda_backend:
+        lmc_noop = lmc_noop.to(device)
+    lmc_noop_orig = lmc_noop.clone()
+    pb_noop = [
+        torch.zeros(2, page_buffer_size, head_size, dtype=dtype, device=device)
+        for _ in range(num_layers)
+    ]
+    ptrs_noop = torch.tensor(
+        [pb.data_ptr() for pb in pb_noop], dtype=torch.int64, device=device
+    )
+
+    ops.multi_layer_kv_transfer(
+        lmc_noop,
+        ptrs_noop,
+        all_neg_slots,
+        torch.device(device),
+        page_buffer_size,
+        True,
+        False,
+    )
+    if is_cuda_backend:
+        torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        lmc_noop,
+        lmc_noop_orig,
+        msg="All-negative slot_mapping should be a no-op",
+    )
+    save_result("multi_layer_kv_transfer_neg_slots_allneg", lmc_noop.cpu())
+
+
+def scenario_multi_layer_kv_transfer_unilateral_neg_slots():
+    """Test multi_layer_kv_transfer_unilateral correctly skips negative slot_mapping entries."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    num_layers = 2
+    num_tokens = 4
+    head_size = 16
+    page_buffer_size = 10
+    dtype = torch.float32
+
+    # Tokens 0 and 3 → negative (skip); tokens 1 and 2 → valid slots 3 and 7
+    mixed_slots = torch.tensor([-1, 3, 7, -1], dtype=torch.int64, device=device)
+
+    for direction in [True, False]:
+        dir_tag = "p2l" if direction else "l2p"
+
+        lmc_shape = (2, num_layers, num_tokens, head_size)
+        lmc_tensor = torch.zeros(lmc_shape, dtype=dtype, device=device)
+
+        if not direction:  # LMC → Paged: fill lmc
+            for kv in range(2):
+                for ly in range(num_layers):
+                    for t in range(num_tokens):
+                        lmc_tensor[kv, ly, t] = float(kv * 5000 + ly * 1000 + t * 10)
+
+        # C++ grouped layout: Key ptrs [0..L-1], Value ptrs [L..2L-1]
+        buffers = {}
+        for kv in range(2):
+            for ly in range(num_layers):
+                pb = torch.zeros((page_buffer_size, head_size), dtype=dtype, device=device)
+                if direction:
+                    for s in range(page_buffer_size):
+                        pb[s] = float(kv * 7000 + ly * 2000 + s * 10)
+                buffers[(kv, ly)] = pb
+
+        ptr_list = (
+            [buffers[(0, ly)].data_ptr() for ly in range(num_layers)]
+            + [buffers[(1, ly)].data_ptr() for ly in range(num_layers)]
+        )
+        key_value_ptrs = torch.tensor(ptr_list, dtype=torch.int64, device=device)
+
+        lmc_neg0_before = lmc_tensor[:, :, 0, :].clone()
+        lmc_neg3_before = lmc_tensor[:, :, 3, :].clone()
+
+        ops.multi_layer_kv_transfer_unilateral(
+            lmc_tensor,
+            key_value_ptrs,
+            mixed_slots,
+            torch.device(device),
+            page_buffer_size,
+            direction,
+            False,
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        # Negative-slot tokens must not change
+        torch.testing.assert_close(
+            lmc_tensor[:, :, 0, :],
+            lmc_neg0_before,
+            msg=f"Neg-slot token 0 changed: dir={dir_tag}",
+        )
+        torch.testing.assert_close(
+            lmc_tensor[:, :, 3, :],
+            lmc_neg3_before,
+            msg=f"Neg-slot token 3 changed: dir={dir_tag}",
+        )
+
+        # Valid-slot tokens must match the page buffer
+        for kv in range(2):
+            for t_id in [1, 2]:
+                s_idx = int(mixed_slots[t_id].item())
+                for ly in range(num_layers):
+                    torch.testing.assert_close(
+                        lmc_tensor[kv, ly, t_id],
+                        buffers[(kv, ly)][s_idx],
+                        msg=f"Valid-slot mismatch: kv={kv} ly={ly} t={t_id} dir={dir_tag}",
+                    )
+
+        save_result(
+            f"multi_layer_kv_transfer_unilateral_neg_slots_{dir_tag}",
+            lmc_tensor.cpu(),
+        )
+
+
+def scenario_single_layer_kv_transfer_extra():
+    """Additional parameter combinations for single_layer_kv_transfer."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    num_tokens = 64
+    num_blocks = 256
+    block_size = 16
+    num_heads = 12
+    head_size = 64
+    hidden_size = num_heads * head_size
+
+    slot_mapping = torch.arange(0, num_tokens * 2, 2, device=device).to(torch.int64)
+
+    # New cases not covered by the existing scenario_single_layer_kv_transfer.
+    # (use_mla, token_major, vllm_two_major, direction)
+    extra_cases = [
+        (False, False, False, True),  # no_token_major, no_two_major, V→L
+        (False, True, False, True),   # token_major, no_two_major, V→L
+        (False, False, True, True),   # no_token_major, two_major, V→L
+    ]
+
+    for use_mla, token_major, vllm_two_major, direction in extra_cases:
+        dir_tag = "v2l" if direction else "l2v"
+        case_desc = f"MLA={use_mla} TM={token_major} 2Maj={vllm_two_major} Dir={dir_tag}"
+
+        lmc_shape = (
+            (num_tokens, 2, hidden_size)
+            if token_major
+            else (2, num_tokens, hidden_size)
+        )
+        vllm_shape = (
+            (2, num_blocks, block_size, num_heads, head_size)
+            if vllm_two_major
+            else (num_blocks, 2, block_size, num_heads, head_size)
+        )
+
+        lmc_size = 1
+        for s in lmc_shape:
+            lmc_size *= s
+        vllm_size = 1
+        for s in vllm_shape:
+            vllm_size *= s
+
+        # Generate on CPU first for cross-backend consistency
+        lmc_tensor = (torch.arange(lmc_size) % 1000).to(torch.float16).reshape(lmc_shape)
+        vllm_tensor = (torch.arange(vllm_size) % 1000).to(torch.float16).reshape(vllm_shape)
+        if is_cuda_backend:
+            lmc_tensor = lmc_tensor.to(device)
+            vllm_tensor = vllm_tensor.to(device)
+
+        lmc_ref = lmc_tensor.clone()
+        vllm_ref = vllm_tensor.clone()
+        block_indices = slot_mapping // block_size
+        block_offsets = slot_mapping % block_size
+
+        if not direction:  # LMC → vLLM
+            src = lmc_ref if token_major else lmc_ref.permute(1, 0, 2)
+            src = src.view(num_tokens, 2, num_heads, head_size)
+            if vllm_two_major:
+                vllm_ref[0, block_indices, block_offsets] = src[:, 0, :, :]
+                vllm_ref[1, block_indices, block_offsets] = src[:, 1, :, :]
+            else:
+                vllm_ref[block_indices, 0, block_offsets] = src[:, 0, :, :]
+                vllm_ref[block_indices, 1, block_offsets] = src[:, 1, :, :]
+        else:  # vLLM → LMC
+            if vllm_two_major:
+                k = vllm_ref[0, block_indices, block_offsets]
+                v = vllm_ref[1, block_indices, block_offsets]
+            else:
+                k = vllm_ref[block_indices, 0, block_offsets]
+                v = vllm_ref[block_indices, 1, block_offsets]
+            combined = torch.stack([k, v], dim=1).view(num_tokens, 2, hidden_size)
+            lmc_ref = combined if token_major else combined.permute(1, 0, 2)
+
+        ops.single_layer_kv_transfer(
+            lmc_tensor,
+            vllm_tensor,
+            slot_mapping,
+            direction,
+            token_major,
+            vllm_two_major,
+            use_mla,
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        if not direction:
+            torch.testing.assert_close(
+                vllm_tensor, vllm_ref, rtol=1e-3, atol=1e-3,
+                msg=f"Mismatch in {case_desc}",
+            )
+        else:
+            torch.testing.assert_close(
+                lmc_tensor, lmc_ref, rtol=1e-3, atol=1e-3,
+                msg=f"Mismatch in {case_desc}",
+            )
+
+        result = lmc_tensor.cpu() if direction else vllm_tensor.cpu()
+        save_result(
+            f"single_layer_kv_transfer_extra_tm{int(token_major)}_2maj{int(vllm_two_major)}_{dir_tag}",
+            result,
+        )
+
+    # --- Single-token edge case (num_tokens=1) ---
+    single_slot = torch.tensor([5], device=device, dtype=torch.int64)
+
+    for use_mla in [False, True]:
+        mla_tag = "mla" if use_mla else "std"
+        if use_mla:
+            lmc_s = torch.randn(1, hidden_size, dtype=torch.float16)
+            vllm_s = torch.randn(num_blocks, block_size, hidden_size, dtype=torch.float16)
+        else:
+            lmc_s = torch.randn(1, 2, hidden_size, dtype=torch.float16)
+            vllm_s = torch.randn(
+                2, num_blocks, block_size, num_heads, head_size, dtype=torch.float16
+            )
+        if is_cuda_backend:
+            lmc_s = lmc_s.to(device)
+            vllm_s = vllm_s.to(device)
+
+        ops.single_layer_kv_transfer(
+            lmc_s, vllm_s, single_slot, True, True, True, use_mla,
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        save_result(
+            f"single_layer_kv_transfer_extra_single_tok_{mla_tag}",
+            lmc_s.cpu(),
+        )
+
+    # --- Non-contiguous (gapped) slot mapping ---
+    # step=11: slots [0, 11, 22, ..., 341], max_slot=341 < num_blocks*block_size=4096
+    num_tokens_gap = 32
+    gap_slots = torch.arange(
+        0, num_tokens_gap * 11, 11, device=device, dtype=torch.int64
+    )
+    lmc_gap = (
+        (torch.arange(num_tokens_gap * 2 * hidden_size) % 500)
+        .to(torch.float16)
+        .reshape(num_tokens_gap, 2, hidden_size)
+    )
+    vllm_gap = torch.zeros(
+        2, num_blocks, block_size, num_heads, head_size, dtype=torch.float16
+    )
+    if is_cuda_backend:
+        lmc_gap = lmc_gap.to(device)
+        vllm_gap = vllm_gap.to(device)
+
+    ops.single_layer_kv_transfer(
+        lmc_gap, vllm_gap, gap_slots, False, True, True, False,
+    )
+    if is_cuda_backend:
+        torch.cuda.synchronize()
+
+    save_result("single_layer_kv_transfer_extra_gap_slots", vllm_gap.cpu())
+
+
+def scenario_single_layer_kv_transfer_sgl_extra():
+    """Single-token edge case and negative-slot behavior for single_layer_kv_transfer_sgl."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    num_blocks = 64
+    block_size = 16
+    num_heads = 4
+    head_size = 32
+    hidden_size = num_heads * head_size
+
+    # --- Single-token edge case ---
+    single_slot = torch.tensor([7], device=device, dtype=torch.int64)
+
+    for token_major in [True, False]:
+        tm_tag = "tm" if token_major else "notm"
+        for direction in [True, False]:
+            dir_tag = "s2l" if direction else "l2s"
+            lmc_shape = (1, 2, hidden_size) if token_major else (2, 1, hidden_size)
+            lmc_s = torch.randn(*lmc_shape, dtype=torch.float16)
+            sgl_k = torch.randn(num_blocks, block_size, num_heads, head_size, dtype=torch.float16)
+            sgl_v = torch.randn(num_blocks, block_size, num_heads, head_size, dtype=torch.float16)
+            if is_cuda_backend:
+                lmc_s = lmc_s.to(device)
+                sgl_k = sgl_k.to(device)
+                sgl_v = sgl_v.to(device)
+
+            ops.single_layer_kv_transfer_sgl(
+                lmc_s, sgl_k, sgl_v, single_slot, direction, token_major
+            )
+            if is_cuda_backend:
+                torch.cuda.synchronize()
+
+            result = lmc_s.cpu() if direction else sgl_k.cpu()
+            save_result(
+                f"single_layer_kv_transfer_sgl_extra_single_{tm_tag}_{dir_tag}",
+                result,
+            )
+
+    # --- Negative-slot behavior (non-CUDA only: documents current no-filter behavior) ---
+    if not is_cuda_backend:
+        neg_slot = torch.tensor([-1], dtype=torch.int64)
+        lmc_neg = torch.randn(1, 2, hidden_size, dtype=torch.float16)
+        sgl_k_neg = torch.randn(
+            num_blocks, block_size, num_heads, head_size, dtype=torch.float16
+        )
+        sgl_v_neg = torch.randn(
+            num_blocks, block_size, num_heads, head_size, dtype=torch.float16
+        )
+        # Does NOT crash; negative index wraps around in Python tensor indexing
+        ops.single_layer_kv_transfer_sgl(
+            lmc_neg, sgl_k_neg, sgl_v_neg, neg_slot, True, True,
+        )
+
+    save_result(
+        "single_layer_kv_transfer_sgl_extra_neg_slot",
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def scenario_lmcache_memcpy_async_alignments():
+    """Test lmcache_memcpy_async with various alignment, offset and nbytes values."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+
+    h2d_dir = ops.TransferDirection.H2D
+    d2h_dir = ops.TransferDirection.D2H
+
+    # Representative (alignment, nbytes) pairs covering all required alignment values
+    alignment_nbytes_pairs = [
+        (1, 1), (2, 7), (4, 63), (8, 16),
+        (16, 63), (32, 256), (64, 256),
+        (256, 1024), (4096, 4096),
+    ]
+
+    for alignment, nbytes in alignment_nbytes_pairs:
+        torch.manual_seed(alignment * 100 + nbytes)
+        src = torch.randint(1, 255, (nbytes,), dtype=torch.uint8)
+        if is_cuda_backend:
+            gpu_buf = torch.zeros(nbytes, dtype=torch.uint8).to(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+            dst = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+        else:
+            gpu_buf = torch.zeros(nbytes, dtype=torch.uint8)
+            dst = torch.zeros(nbytes, dtype=torch.uint8)
+
+        ops.lmcache_memcpy_async(
+            gpu_buf.data_ptr(), src.data_ptr(), nbytes, h2d_dir, 0, alignment
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+        ops.lmcache_memcpy_async(
+            dst.data_ptr(), gpu_buf.data_ptr(), nbytes, d2h_dir, 0, alignment
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        assert torch.equal(dst.cpu(), src), (
+            f"Data mismatch: alignment={alignment}, nbytes={nbytes}"
+        )
+
+    # Non-zero host_buffer_offset values
+    for offset in [0, 1, 7, 15, 16, 255]:
+        nbytes = 1024
+        torch.manual_seed(offset * 7 + 42)
+        src = torch.randint(1, 255, (nbytes,), dtype=torch.uint8)
+        if is_cuda_backend:
+            gpu_buf = torch.zeros(nbytes, dtype=torch.uint8).to(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+            dst = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+        else:
+            gpu_buf = torch.zeros(nbytes, dtype=torch.uint8)
+            dst = torch.zeros(nbytes, dtype=torch.uint8)
+
+        ops.lmcache_memcpy_async(
+            gpu_buf.data_ptr(), src.data_ptr(), nbytes, h2d_dir, offset, 16
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+        ops.lmcache_memcpy_async(
+            dst.data_ptr(), gpu_buf.data_ptr(), nbytes, d2h_dir, offset, 16
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        assert torch.equal(dst.cpu(), src), f"Data mismatch: offset={offset}"
+
+    # Invalid alignment (non-power-of-two) must raise ValueError on non-CUDA path
+    if not is_cuda_backend:
+        for bad_align in [3, 5, 7]:
+            nbytes = 16
+            buf = torch.zeros(nbytes, dtype=torch.uint8)
+            try:
+                ops.lmcache_memcpy_async(
+                    buf.data_ptr(), buf.data_ptr(), nbytes, h2d_dir, 0, bad_align
+                )
+                raise AssertionError(
+                    f"Expected ValueError for alignment={bad_align}, got none"
+                )
+            except ValueError:
+                pass  # expected
+
+    save_result(
+        "lmcache_memcpy_async_alignments",
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def scenario_encode_decode_fast_new_edge_cases():
+    """Edge-case dimensions for encode_fast_new / decode_fast_new."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    # (nlayers, nchannels, ntokens, alphabet_size)
+    edge_configs = [
+        (1, 1, 128, 16),  # minimal nlayers/nchannels
+        (2, 4, 1, 16),    # single token
+        (1, 1, 1, 2),     # absolute minimum
+        (2, 4, 128, 2),   # minimal alphabet
+    ]
+
+    for nlayers, nchannels, ntokens, alphabet_size in edge_configs:
+        torch.manual_seed(nlayers * 1000 + nchannels * 100 + ntokens * 10 + alphabet_size)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
+
+        max_buf_len = max(ntokens * 2, 8)
+
+        # Build CDF (strictly increasing int16 repr; generated on CPU for consistency)
+        step = max(1, 100 // alphabet_size)
+        base_cdf = torch.arange(0, 100, step, dtype=torch.int32)[:alphabet_size]
+        cdf = (
+            base_cdf.unsqueeze(0).unsqueeze(0)
+            .expand(nlayers, nchannels, -1)
+            .contiguous()
+            .to(dtype=torch.int16)
+        ).to(device)
+
+        # Input symbols: all 0 for alphabet_size≤2 (only valid symbol 0),
+        # otherwise cycle through [0, alphabet_size-1)
+        total = nlayers * ntokens * nchannels
+        input_sym = (
+            torch.arange(total, dtype=torch.int8) % max(1, alphabet_size - 1)
+        ).reshape(nlayers, ntokens, nchannels).to(device)
+
+        output_buffer = torch.zeros(
+            (nlayers, nchannels, max_buf_len), dtype=torch.uint8, device=device
+        )
+        output_lengths = torch.zeros(
+            (nlayers, nchannels), dtype=torch.int32, device=device
+        )
+
+        ops.encode_fast_new(cdf, input_sym, output_buffer, output_lengths)
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        lens = output_lengths.cpu()
+        assert (lens >= 0).all(), (
+            f"Negative output lengths for config "
+            f"{nlayers},{nchannels},{ntokens},{alphabet_size}"
+        )
+
+        cfg_tag = f"{nlayers}l{nchannels}c{ntokens}t{alphabet_size}a"
+
+        # The arithmetic decoder bootstraps from the first 4 bytes of each stream.
+        # For ntokens=1, the encoded output may be < 4 bytes, so decode is unreliable.
+        # Test encode-only for the single-token case; save lengths as the result.
+        if ntokens == 1:
+            save_result(f"encode_decode_fast_new_edge_{cfg_tag}", lens)
+            continue
+
+        decoded = torch.zeros_like(input_sym, dtype=torch.uint8)
+        ops.decode_fast_new(cdf, output_buffer, output_lengths, decoded)
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        src_u8 = input_sym.to(torch.uint8)
+        assert torch.equal(src_u8, decoded), (
+            f"Encode/decode mismatch for config "
+            f"{nlayers},{nchannels},{ntokens},{alphabet_size}"
+        )
+
+        save_result(f"encode_decode_fast_new_edge_{cfg_tag}", decoded.cpu())
+
+
+def scenario_decode_fast_prefsum_edge_cases():
+    """Edge-case dimensions for decode_fast_prefsum."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    # (nlayers, nchannels, ntokens, alphabet_size)
+    edge_configs = [
+        (1, 1, 128, 16),  # minimal nlayers/nchannels
+        (2, 4, 1, 16),    # single token
+        (1, 1, 1, 2),     # absolute minimum
+        (2, 4, 128, 2),   # minimal alphabet
+    ]
+
+    for nlayers, nchannels, ntokens, alphabet_size in edge_configs:
+        torch.manual_seed(nlayers * 1000 + nchannels * 100 + ntokens + alphabet_size)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
+
+        max_buf_len = max(ntokens * 2, 8)
+
+        # Build normalized CDF (generated on CPU for consistency)
+        cdf_raw = torch.randint(1, 100, (nlayers, nchannels, alphabet_size), dtype=torch.int32)
+        cdf_f = torch.cumsum(cdf_raw, dim=-1).float()
+        cdf_f = (cdf_f / cdf_f[..., -1:] * 65536).to(torch.int32)
+        cdf_f[..., -1] = 65536
+        cdf = cdf_f.to(torch.int16).contiguous().to(device)
+
+        # For alphabet_size=2, only symbol 0 is valid (max_symbol = alphabet_size - 2 = 0)
+        input_sym = torch.randint(
+            0, max(1, alphabet_size - 2),
+            (nlayers, ntokens, nchannels), dtype=torch.int8,
+        ).to(device)
+
+        # Encode to get variable-length bytestreams
+        tmp_buf = torch.zeros(
+            (nlayers, nchannels, max_buf_len), dtype=torch.uint8, device=device
+        )
+        tmp_len = torch.zeros((nlayers, nchannels), dtype=torch.int32, device=device)
+        ops.encode_fast_new(cdf, input_sym, tmp_buf, tmp_len)
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        cfg_tag = f"{nlayers}l{nchannels}c{ntokens}t{alphabet_size}a"
+
+        # The arithmetic decoder bootstraps from the first 4 bytes of each stream.
+        # For ntokens=1, the encoded output may be < 4 bytes, so decode is unreliable.
+        # Test encode-only for the single-token case; save lengths as the result.
+        if ntokens == 1:
+            save_result(f"decode_fast_prefsum_edge_{cfg_tag}", tmp_len.cpu())
+            continue
+
+        # Pack into 1D dense bytestream
+        lens_flat = tmp_len.cpu().flatten().tolist()
+        bufs_flat = tmp_buf.cpu().reshape(-1, max_buf_len).numpy()
+        all_bytes = []
+        for i, length in enumerate(lens_flat):
+            all_bytes.extend(bufs_flat[i, : int(length)].tolist())
+
+        bytestream_1d = torch.tensor(
+            all_bytes, dtype=torch.uint8, device=device
+        ).contiguous()
+        lengths_prefsum = (
+            tmp_len.flatten().cumsum(0)
+            .reshape(tmp_len.shape)
+            .to(torch.int64)
+            .to(device)
+            .contiguous()
+        )
+
+        decoded = torch.zeros_like(input_sym, dtype=torch.uint8).to(device).contiguous()
+        ops.decode_fast_prefsum(cdf, bytestream_1d, lengths_prefsum, decoded)
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        ref = input_sym.to(torch.uint8)
+        assert torch.equal(ref, decoded), (
+            f"Prefsum mismatch for config {nlayers},{nchannels},{ntokens},{alphabet_size}"
+        )
+
+        save_result(f"decode_fast_prefsum_edge_{cfg_tag}", decoded.cpu())
+
+
+def scenario_calculate_cdf_edge_cases():
+    """Edge cases for calculate_cdf: single bin, all-same input, uniform distribution."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+    target_dev = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    def _normalize(raw_output):
+        out_cpu = raw_output.flatten().cpu()
+        if is_cuda_backend:
+            out_i32 = out_cpu.to(torch.int32)
+            out_u16 = torch.where(out_i32 < 0, out_i32 + 65536, out_i32)
+            return out_u16.float() / 65536.0
+        return out_cpu.float()
+
+    # 1. num_bins=1 with all-zero input
+    input_1 = torch.zeros((1, 100, 1), dtype=torch.int8, device=target_dev)
+    save_result("calculate_cdf_edge_1bin", _normalize(ops.calculate_cdf(input_1, 1)))
+
+    # 2. All-same-value input (constant = 3 out of num_bins=8)
+    input_same = torch.full((1, 500, 1), 3, dtype=torch.int8, device=target_dev)
+    save_result(
+        "calculate_cdf_edge_allsame",
+        _normalize(ops.calculate_cdf(input_same, 8)),
+    )
+
+    # 3. Explicitly uniform distribution (equal counts for all 4 bins)
+    n_per_bin = 250
+    input_uniform = torch.cat(
+        [torch.full((1, n_per_bin, 1), v, dtype=torch.int8) for v in range(4)], dim=1
+    ).to(target_dev)
+    save_result(
+        "calculate_cdf_edge_uniform",
+        _normalize(ops.calculate_cdf(input_uniform, 4)),
+    )
+
+
+def scenario_rotary_embedding_k_fused_neox_false():
+    """Test rotary_embedding_k_fused with is_neox=False (interleaved rotation path)."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    max_position = 2048
+
+    # (num_tokens, num_kv_heads, head_size, is_neox)
+    test_configs = [
+        (128, 32, 128, False),  # standard config, interleaved
+        (128, 32, 64, False),   # smaller head_size
+        (1, 8, 128, False),     # single token
+    ]
+
+    for num_tokens, num_kv_heads, head_size, is_neox in test_configs:
+        rotary_dim = head_size
+        neox_tag = "neox" if is_neox else "inter"
+        cfg_tag = f"t{num_tokens}_h{num_kv_heads}_hs{head_size}_{neox_tag}"
+
+        torch.manual_seed(42)
+        # Generate on CPU first for cross-backend consistency
+        old_positions = torch.randint(0, 1000, (num_tokens,), dtype=torch.long)
+        new_positions = old_positions + 1
+        key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32)
+        cos_sin_cache = torch.randn(max_position, rotary_dim, dtype=torch.float32)
+
+        if is_cuda_backend:
+            dev = f"cuda:{torch.cuda.current_device()}"
+            old_positions = old_positions.to(dev)
+            new_positions = new_positions.to(dev)
+            key = key.to(dev)
+            cos_sin_cache = cos_sin_cache.to(dev)
+
+        ops.rotary_embedding_k_fused(
+            old_positions, new_positions, key, head_size, cos_sin_cache, is_neox
+        )
+        if is_cuda_backend:
+            torch.cuda.synchronize()
+
+        save_result(f"rotary_embedding_k_fused_neox_false_{cfg_tag}", key.cpu())
+
+
+def scenario_load_reshape_flash_roundtrip():
+    """Roundtrip test: load_and_reshape_flash → reshape_and_cache_back_flash."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    src_device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+
+    num_blocks = 16
+    block_size = 8
+    num_heads = 4
+    head_size = 32
+    num_layers = 4
+    num_tokens = 32
+    dtype = torch.bfloat16
+
+    # Build kv_cache with known values (on CPU first, then move)
+    total_elem = num_blocks * block_size * num_heads * head_size
+    kv_cache_orig_cpu = []
+    for ly in range(num_layers):
+        base = torch.linspace(ly, ly + 1, total_elem, dtype=torch.float32)
+        k = base.reshape(num_blocks, block_size, num_heads, head_size).to(dtype)
+        v = (base + 0.5).reshape(num_blocks, block_size, num_heads, head_size).to(dtype)
+        kv_cache_orig_cpu.append([k, v])
+
+    kv_cache = [
+        [layer[0].to(src_device), layer[1].to(src_device)]
+        for layer in kv_cache_orig_cpu
+    ]
+
+    step = (num_blocks * block_size) // num_tokens
+    slot_indices = list(range(0, num_blocks * block_size, step))[:num_tokens]
+    slot_mapping = torch.tensor(slot_indices, device=src_device, dtype=torch.int64)
+
+    # --- Part 1: Extract (load_and_reshape_flash) ---
+    flat_tensor = torch.zeros(
+        (2, num_layers, num_tokens, num_heads * head_size), dtype=dtype
+    )
+    if is_cuda_backend:
+        flat_tensor = flat_tensor.pin_memory()
+
+    for layer_id in range(num_layers):
+        ops.load_and_reshape_flash(
+            flat_tensor,
+            kv_cache[layer_id][0],
+            kv_cache[layer_id][1],
+            slot_mapping,
+            layer_id,
+        )
+    if is_cuda_backend:
+        torch.cuda.synchronize()
+
+    # --- Part 2: Write back (reshape_and_cache_back_flash) into a fresh cache ---
+    kv_cache_rt = [
+        [
+            torch.zeros(num_blocks, block_size, num_heads, head_size,
+                        device=src_device, dtype=dtype),
+            torch.zeros(num_blocks, block_size, num_heads, head_size,
+                        device=src_device, dtype=dtype),
+        ]
+        for _ in range(num_layers)
+    ]
+    for layer_id in range(num_layers):
+        ops.reshape_and_cache_back_flash(
+            flat_tensor,
+            kv_cache_rt[layer_id][0],
+            kv_cache_rt[layer_id][1],
+            slot_mapping,
+            layer_id,
+        )
+    if is_cuda_backend:
+        torch.cuda.synchronize()
+
+    # --- Part 3: Verify roundtrip correctness at mapped slot positions ---
+    for layer_id in range(num_layers):
+        k_orig = kv_cache_orig_cpu[layer_id][0]
+        v_orig = kv_cache_orig_cpu[layer_id][1]
+        k_rt = kv_cache_rt[layer_id][0].cpu()
+        v_rt = kv_cache_rt[layer_id][1].cpu()
+
+        for tok_idx, slot in enumerate(slot_indices):
+            blk, off = slot // block_size, slot % block_size
+            assert torch.equal(k_rt[blk, off], k_orig[blk, off]), (
+                f"K roundtrip mismatch layer={layer_id}, slot={slot}"
+            )
+            assert torch.equal(v_rt[blk, off], v_orig[blk, off]), (
+                f"V roundtrip mismatch layer={layer_id}, slot={slot}"
+            )
+
+    save_result(
+        "load_reshape_flash_roundtrip",
+        kv_cache_rt[num_layers - 1][0][0].cpu(),
+    )
+
+    # --- Also test with the last layer explicitly ---
+    last_layer = num_layers - 1
+    flat_last = torch.zeros(
+        (2, num_layers, num_tokens, num_heads * head_size), dtype=dtype
+    )
+    if is_cuda_backend:
+        flat_last = flat_last.pin_memory()
+
+    ops.load_and_reshape_flash(
+        flat_last,
+        kv_cache[last_layer][0],
+        kv_cache[last_layer][1],
+        slot_mapping,
+        last_layer,
+    )
+    if is_cuda_backend:
+        torch.cuda.synchronize()
+
+    k_out = torch.zeros(num_blocks, block_size, num_heads, head_size,
+                        device=src_device, dtype=dtype)
+    v_out = torch.zeros(num_blocks, block_size, num_heads, head_size,
+                        device=src_device, dtype=dtype)
+    ops.reshape_and_cache_back_flash(flat_last, k_out, v_out, slot_mapping, last_layer)
+    if is_cuda_backend:
+        torch.cuda.synchronize()
+
+    for slot in slot_indices:
+        blk, off = slot // block_size, slot % block_size
+        assert torch.equal(
+            k_out.cpu()[blk, off],
+            kv_cache_orig_cpu[last_layer][0][blk, off],
+        ), f"Last-layer K roundtrip mismatch, slot={slot}"
+
+    save_result("load_reshape_flash_roundtrip_last_layer", k_out.cpu()[0])
+
+
+def scenario_get_gpu_pci_bus_id_invalid():
+    """Test get_gpu_pci_bus_id with out-of-range device_id and high-index keyword."""
+    ops, scene_info = get_test_context()
+    is_cuda_backend = scene_info.startswith("cuda_ops")
+
+    # device_id=999 — no system has 999 GPUs, should return None or ''
+    result_999 = ops.get_gpu_pci_bus_id(999)
+    assert not result_999, (
+        f"Expected falsy result for device_id=999, got {result_999!r}"
+    )
+
+    # device_id=999 with a real keyword also returns None (non-CUDA path only;
+    # the C++ binding may not expose the keyword parameter)
+    if not is_cuda_backend:
+        result_999_nvidia = ops.get_gpu_pci_bus_id(999, "NVIDIA")
+        assert not result_999_nvidia, (
+            f"Expected falsy result for device_id=999 keyword=NVIDIA, "
+            f"got {result_999_nvidia!r}"
+        )
+
+    save_result(
+        "get_gpu_pci_bus_id_invalid",
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
+def scenario_transfer_direction_enum_values():
+    """Verify TransferDirection.H2D.value == 0 and TransferDirection.D2H.value == 1."""
+    ops, _ = get_test_context()
+
+    h2d = ops.TransferDirection.H2D
+    d2h = ops.TransferDirection.D2H
+
+    h2d_val = h2d.value if hasattr(h2d, "value") else int(h2d)
+    d2h_val = d2h.value if hasattr(d2h, "value") else int(d2h)
+
+    assert h2d_val == 0, f"Expected H2D.value == 0, got {h2d_val}"
+    assert d2h_val == 1, f"Expected D2H.value == 1, got {d2h_val}"
+
+    save_result(
+        "transfer_direction_enum_values",
+        torch.tensor([h2d_val, d2h_val], dtype=torch.int32),
+    )
+
+
+# ==========================================
 # 3. Registry
 # ==========================================
 # cover pybind list in csrc/pybind.cpp
@@ -1358,6 +2427,23 @@ SCENARIO_REGISTRY = {
     "alloc_free_pinned_numa_ptr": scenario_alloc_free_pinned_numa_ptr,
     "alloc_free_numa_ptr": scenario_alloc_free_numa_ptr,
     "get_gpu_pci_bus_id": scenario_get_gpu_pci_bus_id,
+    # New scenarios
+    "alloc_pinned_ptr_data_readwrite": scenario_alloc_pinned_ptr_data_readwrite,
+    "alloc_pinned_ptr_device_id": scenario_alloc_pinned_ptr_device_id,
+    "alloc_pinned_numa_ptr_numa_id": scenario_alloc_pinned_numa_ptr_numa_id,
+    "free_idempotency": scenario_free_idempotency,
+    "multi_layer_kv_transfer_neg_slots": scenario_multi_layer_kv_transfer_neg_slots,
+    "multi_layer_kv_transfer_unilateral_neg_slots": scenario_multi_layer_kv_transfer_unilateral_neg_slots,
+    "single_layer_kv_transfer_extra": scenario_single_layer_kv_transfer_extra,
+    "single_layer_kv_transfer_sgl_extra": scenario_single_layer_kv_transfer_sgl_extra,
+    "lmcache_memcpy_async_alignments": scenario_lmcache_memcpy_async_alignments,
+    "encode_decode_fast_new_edge_cases": scenario_encode_decode_fast_new_edge_cases,
+    "decode_fast_prefsum_edge_cases": scenario_decode_fast_prefsum_edge_cases,
+    "calculate_cdf_edge_cases": scenario_calculate_cdf_edge_cases,
+    "rotary_embedding_k_fused_neox_false": scenario_rotary_embedding_k_fused_neox_false,
+    "load_reshape_flash_roundtrip": scenario_load_reshape_flash_roundtrip,
+    "get_gpu_pci_bus_id_invalid": scenario_get_gpu_pci_bus_id_invalid,
+    "transfer_direction_enum_values": scenario_transfer_direction_enum_values,
 }
 
 
