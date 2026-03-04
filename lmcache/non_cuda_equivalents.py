@@ -507,9 +507,7 @@ def lmcache_memcpy_async(
     try:
         libcudart = ctypes.CDLL("libcudart.so")
     except OSError:
-        # Fallback to libc if CUDA is absolutely not there,
-        # though this will segfault if pointers are GPU pointers
-        libcudart = ctypes.CDLL("libc.so.6")
+        libcudart = None
 
     # 4. Pointer arithmetic and aligned copy loop
     offset = 0
@@ -531,7 +529,7 @@ def lmcache_memcpy_async(
 
         # Use cudaMemcpy if available (supports GPU pointers)
         # Note: We use synchronous cudaMemcpy for the fallback to ensure completion
-        if hasattr(libcudart, "cudaMemcpy"):
+        if libcudart is not None and hasattr(libcudart, "cudaMemcpy"):
             ret = libcudart.cudaMemcpy(
                 ctypes.c_void_p(current_dest),
                 ctypes.c_void_p(current_src),
@@ -539,18 +537,18 @@ def lmcache_memcpy_async(
                 ctypes.c_int(cuda_kind),
             )
             if ret != 0:
-                # If CUDA call fails, we try libc as a last resort
-                libcudart.memmove(
+                # If CUDA call fails, we try ctypes.memmove as a last resort
+                ctypes.memmove(
                     ctypes.c_void_p(current_dest),
                     ctypes.c_void_p(current_src),
-                    ctypes.c_size_t(max_nbytes),
+                    int(max_nbytes),
                 )
         else:
             # Fallback for CPU-only pointers
-            libcudart.memmove(
+            ctypes.memmove(
                 ctypes.c_void_p(current_dest),
                 ctypes.c_void_p(current_src),
-                ctypes.c_size_t(max_nbytes),
+                int(max_nbytes),
             )
 
         offset += max_nbytes
