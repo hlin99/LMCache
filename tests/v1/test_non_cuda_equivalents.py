@@ -1090,14 +1090,16 @@ def scenario_multi_layer_kv_transfer():
         )
 
         # 4. Execute
+        xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
         ops.multi_layer_kv_transfer(
             key_value,
             key_value_ptrs,
             slot_mapping,
             torch.device(device),
             page_buffer_size,
-            direction,
-            False,  # use_mla
+            xfer_dir,
+            ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,  # Default FlashAttention format
+            1,  # block_size
         )
         if is_cuda_backend:
             torch.cuda.synchronize()
@@ -1210,14 +1212,16 @@ def scenario_multi_layer_kv_transfer_unilateral():
         ).contiguous()
 
         # 3. Execute
+        xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
         ops.multi_layer_kv_transfer_unilateral(
             lmc_tensor,
             key_value_ptrs,
             slot_mapping,
             torch.device(device),
             page_buffer_size,
-            direction,
-            False,  # use_mla
+            xfer_dir,
+            ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,  # Default format
+            1,  # block_size
         )
         if is_cuda_backend:
             torch.cuda.synchronize()

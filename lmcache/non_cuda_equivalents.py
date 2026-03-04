@@ -23,6 +23,14 @@ class TransferDirection(Enum):
     D2H = 1
 
 
+class GPUKVFormat(Enum):
+    """GPU KV cache format enum matching different attention implementations."""
+    NL_X_TWO_NB_BS_NH_HS = 0  # FlashAttention: [2, num_blocks, block_size, num_heads, head_size]
+    NL_X_NB_TWO_BS_NH_HS = 1  # FlashInfer: [num_blocks, 2, block_size, num_heads, head_size]
+    NL_X_NB_BS_HS = 2  # vLLM MLA: [num_blocks, block_size, head_size]
+    NL_X_NBBS_ONE_HS = 3  # SGLang MLA: [num_blocks*block_size, 1, head_size]
+
+
 def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     """Non-CUDA equivalent of allocating pinned memory with NUMA awareness.
     Note: NUMA and pinned memory are not supported on non-CUDA."""
@@ -94,14 +102,26 @@ def multi_layer_kv_transfer(
     slot_mapping: torch.Tensor,
     paged_memory_device: torch.device,
     page_buffer_size: int,
-    direction: bool,
-    use_mla: bool,
+    direction: TransferDirection,
+    gpu_kv_format: GPUKVFormat,
+    block_size: int,
 ):
     """
     Python equivalent for multi-layer KV transfer using raw pointers.
     Uses ctypes.memmove for CPU-to-CPU pointer copies to avoid CUDA context errors.
+
+    Args:
+        key_value: LMCache tensor [k_or_v_size, num_layers, num_tokens, head_size]
+        key_value_ptrs: Pointer tensor [num_layers] with raw memory addresses
+        slot_mapping: Token to slot mapping [num_tokens]
+        paged_memory_device: Device where paged memory resides
+        page_buffer_size: Size of each page buffer
+        direction: Transfer direction (H2D = LMC->Paged, D2H = Paged->LMC)
+        gpu_kv_format: Format of the GPU KV cache
+        block_size: Block size for blocked formats
     """
     # 1. Basic Metadata
+    k_or_v_size = key_value.size(0)  # 1 for MLA, 2 for standard
     num_layers = key_value.size(1)
     num_tokens = slot_mapping.size(0)
     hidden_size = key_value.size(3)
@@ -112,48 +132,70 @@ def multi_layer_kv_transfer(
     kv_base_ptr = key_value.data_ptr()
 
     # 3. Convert tensors to numpy/list for fast iteration in Python
-    # key_value_ptrs contains the raw memory addresses for each layer
     ptr_list = key_value_ptrs.cpu().numpy().tolist()
     slots = slot_mapping.cpu().numpy().tolist()
 
-    # MLA has 1 part (KV combined), Standard has 2 parts (K and V)
-    k_or_v_size = 1 if use_mla else 2
+    # Determine if direction is paged->LMC (D2H) or LMC->paged (H2D)
+    is_d2h = (direction == TransferDirection.D2H)
 
     # 4. Memory Transfer Loop
     for layer_id in range(num_layers):
-        # paged_buffer_ptr is the raw address of the page buffer for this layer
         paged_buffer_ptr = int(ptr_list[layer_id])
 
         for k_or_v in range(k_or_v_size):
             # Calculate the flattened offset in the LMC tensor
-            # Layout: [2, num_layers, num_tokens, hidden_size]
+            # Layout: [k_or_v_size, num_layers, num_tokens, hidden_size]
             lmc_layer_kv_offset = (
                 k_or_v * (num_layers * num_tokens * hidden_size)
                 + layer_id * (num_tokens * hidden_size)
             ) * element_size
-
-            # Calculate the flattened offset in the VLLM Paged Buffer
-            # Layout: [2, page_buffer_size, hidden_size]
-            vllm_kv_offset = (k_or_v * (page_buffer_size * hidden_size)) * element_size
 
             for token_id in range(num_tokens):
                 slot_idx = slots[token_id]
                 if slot_idx < 0:
                     continue
 
-                # Calculate final absolute memory addresses
+                # Calculate LMC address
                 lmc_addr = kv_base_ptr + lmc_layer_kv_offset + (token_id * token_bytes)
-                paged_addr = (
-                    paged_buffer_ptr + vllm_kv_offset + (slot_idx * token_bytes)
-                )
+
+                # Calculate paged address based on format
+                if gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+                    # FlashInfer: [num_blocks, 2, block_size, num_heads, head_size]
+                    block_idx = slot_idx // block_size
+                    block_offset = slot_idx % block_size
+                    # Offset: block_idx * (2 * block_size * hidden_size)
+                    #         + k_or_v * (block_size * hidden_size)
+                    #         + block_offset * hidden_size
+                    paged_offset = (
+                        block_idx * (2 * block_size * hidden_size)
+                        + k_or_v * (block_size * hidden_size)
+                        + block_offset * hidden_size
+                    ) * element_size
+                elif gpu_kv_format == GPUKVFormat.NL_X_NB_BS_HS:
+                    # vLLM MLA: [num_blocks, block_size, head_size]
+                    # For MLA, k_or_v_size should be 1
+                    block_idx = slot_idx // block_size
+                    block_offset = slot_idx % block_size
+                    paged_offset = (
+                        block_idx * (block_size * hidden_size)
+                        + block_offset * hidden_size
+                    ) * element_size
+                elif gpu_kv_format == GPUKVFormat.NL_X_NBBS_ONE_HS:
+                    # SGLang MLA: [num_blocks*block_size, 1, head_size]
+                    # Linear indexing
+                    paged_offset = (slot_idx * hidden_size) * element_size
+                else:
+                    # Default FlashAttention: [2, page_buffer_size, hidden_size]
+                    # NL_X_TWO_NB_BS_NH_HS with block_size=1 is equivalent
+                    paged_offset = (k_or_v * (page_buffer_size * hidden_size) + slot_idx * hidden_size) * element_size
+
+                paged_addr = paged_buffer_ptr + paged_offset
 
                 # Determine source and destination based on direction
-                # direction: True (Paged -> LMC), False (LMC -> Paged)
-                dst = lmc_addr if direction else paged_addr
-                src = paged_addr if direction else lmc_addr
+                dst = lmc_addr if is_d2h else paged_addr
+                src = paged_addr if is_d2h else lmc_addr
 
-                # 💡 Use memmove for CPU-to-CPU raw pointer copy
-                # This avoids calling libcudart.so in non-CUDA environments
+                # Use memmove for CPU-to-CPU raw pointer copy
                 ctypes.memmove(
                     ctypes.c_void_p(dst),
                     ctypes.c_void_p(src),
@@ -167,13 +209,25 @@ def multi_layer_kv_transfer_unilateral(
     slot_mapping: torch.Tensor,
     paged_memory_device: torch.device,
     page_buffer_size: int,
-    direction: bool,
-    use_mla: bool,
+    direction: TransferDirection,
+    gpu_kv_format: GPUKVFormat,
+    block_size: int,
 ):
     """
     Python equivalent for unilateral multi-layer KV transfer.
     FIXED: Matches C++ grouped pointer indexing [K_layers...|V_layers...].
+
+    Args:
+        key_value: LMCache tensor [k_or_v_size, num_layers, num_tokens, head_size]
+        key_value_ptrs: Pointer tensor [num_layers*k_or_v_size] - grouped by K then V
+        slot_mapping: Token to slot mapping [num_tokens]
+        paged_memory_device: Device where paged memory resides
+        page_buffer_size: Size of each page buffer
+        direction: Transfer direction (H2D = LMC->Paged, D2H = Paged->LMC)
+        gpu_kv_format: Format of the GPU KV cache
+        block_size: Block size for blocked formats
     """
+    k_or_v_size = key_value.size(0)  # 1 for MLA, 2 for standard
     num_layers = key_value.size(1)
     num_tokens = slot_mapping.size(0)
     hidden_size = key_value.size(3)
@@ -184,7 +238,8 @@ def multi_layer_kv_transfer_unilateral(
     ptr_list = key_value_ptrs.cpu().numpy().tolist()
     slots = slot_mapping.cpu().numpy().tolist()
 
-    k_or_v_size = 1 if use_mla else 2
+    # Determine if direction is paged->LMC (D2H) or LMC->paged (H2D)
+    is_d2h = (direction == TransferDirection.D2H)
 
     for layer_id in range(num_layers):
         for k_or_v in range(k_or_v_size):
@@ -196,7 +251,7 @@ def multi_layer_kv_transfer_unilateral(
             else:
                 paged_buffer_ptr = int(ptr_list[layer_id + num_layers])
 
-            # Calculate LMCache offset: [2, num_layers, num_tokens, hidden_size]
+            # Calculate LMCache offset: [k_or_v_size, num_layers, num_tokens, hidden_size]
             lmc_layer_kv_offset = (
                 k_or_v * (num_layers * num_tokens * hidden_size)
                 + layer_id * (num_tokens * hidden_size)
@@ -211,8 +266,8 @@ def multi_layer_kv_transfer_unilateral(
                 # Unilateral page offset is just (slot_idx * token_bytes)
                 paged_addr = paged_buffer_ptr + (slot_idx * token_bytes)
 
-                dst = lmc_addr if direction else paged_addr
-                src = paged_addr if direction else lmc_addr
+                dst = lmc_addr if is_d2h else paged_addr
+                src = paged_addr if is_d2h else lmc_addr
 
                 ctypes.memmove(
                     ctypes.c_void_p(dst),
