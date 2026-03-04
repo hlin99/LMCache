@@ -720,6 +720,10 @@ def _update_config_from_env(self):
         _DEPRECATED_CONFIGS,
     )
 
+    # Ensure _user_set_keys exists
+    if not hasattr(self, "_user_set_keys"):
+        object.__setattr__(self, "_user_set_keys", set())
+
     # Update config object with environment values
     for name, config in _CONFIG_DEFINITIONS.items():
         if name in resolved_config:
@@ -729,6 +733,8 @@ def _update_config_from_env(self):
                 value = _parse_quoted_string(raw_value)
                 converted_value = config["env_converter"](value)
                 setattr(self, name, converted_value)
+                # Mark as user-set
+                self._user_set_keys.add(name)
             except (ValueError, json.JSONDecodeError) as e:
                 logger.warning(
                     f"Failed to parse {get_env_name(name)}={raw_value!r}: {e}"
