@@ -1653,26 +1653,30 @@ def scenario_free_idempotency():
     is_cuda_backend = scene_info.startswith("cuda_ops")
 
     if not is_cuda_backend:
+        # The non-CUDA allocators use a dict-based registry: free() is a safe
+        # dict.pop() that is idempotent and never dereferences invalid addresses.
+        # Verify double-free, null free, and arbitrary-address free are no-ops.
+
         # alloc_pinned_ptr / free_pinned_ptr
         ptr = ops.alloc_pinned_ptr(4096, 0)
         ops.free_pinned_ptr(ptr)
-        ops.free_pinned_ptr(ptr)  # double-free
-        ops.free_pinned_ptr(0)  # null free
-        ops.free_pinned_ptr(0xDEADBEEF)  # arbitrary address
+        ops.free_pinned_ptr(ptr)  # double-free: second pop is a no-op
+        ops.free_pinned_ptr(0)  # null free: key 0 is not in registry
+        ops.free_pinned_ptr(0xDEADBEEF)  # arbitrary key: safe dict.pop miss
 
         # alloc_pinned_numa_ptr / free_pinned_numa_ptr
         ptr2 = ops.alloc_pinned_numa_ptr(4096, 0)
         ops.free_pinned_numa_ptr(ptr2, 4096)
         ops.free_pinned_numa_ptr(ptr2, 4096)  # double-free
-        ops.free_pinned_numa_ptr(0, 0)
-        ops.free_pinned_numa_ptr(0xDEADBEEF, 4096)
+        ops.free_pinned_numa_ptr(0, 0)  # null free
+        ops.free_pinned_numa_ptr(0xDEADBEEF, 4096)  # arbitrary address
 
         # alloc_numa_ptr / free_numa_ptr
         ptr3 = ops.alloc_numa_ptr(4096, 0)
         ops.free_numa_ptr(ptr3, 4096)
         ops.free_numa_ptr(ptr3, 4096)  # double-free
-        ops.free_numa_ptr(0, 0)
-        ops.free_numa_ptr(0xDEADBEEF, 4096)
+        ops.free_numa_ptr(0, 0)  # null free
+        ops.free_numa_ptr(0xDEADBEEF, 4096)  # arbitrary address
 
     save_result(
         "free_idempotency",
@@ -2082,7 +2086,11 @@ def scenario_single_layer_kv_transfer_sgl_extra():
             )
             save_result(f"single_layer_kv_transfer_sgl_extra_{tag}", result)
 
-    # On non-CUDA path: pass negative slot [-1] — wrap-around behavior, no crash
+    # On non-CUDA path: pass negative slot [-1] — documents wrap-around behavior.
+    # The non-CUDA implementation uses advanced indexing with negative indices;
+    # this is gated to non-CUDA only since the CUDA kernel may behave differently.
+    # No result is saved here because this block is non-CUDA-only; the harness
+    # comparison is handled by the main loop's save_result() calls above.
     if not is_cuda_backend:
         slot_neg = torch.tensor([-1], device=device, dtype=torch.int64)
         lmc_shape = (1, 2, hidden_size)
@@ -2346,50 +2354,42 @@ def scenario_calculate_cdf_edge_cases():
     ops, scene_info = get_test_context()
     is_cuda_backend = scene_info.startswith("cuda_ops")
 
+    def _normalize_cdf(raw_output: torch.Tensor, is_cuda: bool) -> torch.Tensor:
+        """Normalize raw calculate_cdf output to [0, 1] float.
+
+        CUDA returns int16 values using an unsigned 16-bit convention
+        (values > 32767 are stored as negative int16); non-CUDA returns
+        floats already in [0, 1].
+        """
+        out = raw_output.flatten().cpu()
+        if is_cuda:
+            # Reinterpret as uint16: negative int16 values represent [32768, 65535]
+            out_int32 = out.to(torch.int32)
+            out_uint16 = torch.where(out_int32 < 0, out_int32 + 65536, out_int32)
+            return out_uint16.float() / 65536.0
+        return out.float()
+
     # Edge case 1: num_bins=1, all-zero input
     input_1 = torch.zeros((1, 100, 1), dtype=torch.int8)
     if is_cuda_backend:
         input_1 = input_1.to(f"cuda:{torch.cuda.current_device()}")
-    raw_1 = ops.calculate_cdf(input_1, 1)
-    out_1 = raw_1.flatten().cpu()
-    if is_cuda_backend:
-        out_int32 = out_1.to(torch.int32)
-        out_uint16 = torch.where(out_int32 < 0, out_int32 + 65536, out_int32)
-        final_1 = out_uint16.float() / 65536.0
-    else:
-        final_1 = out_1.float()
+    final_1 = _normalize_cdf(ops.calculate_cdf(input_1, 1), is_cuda_backend)
     save_result("calculate_cdf_edge_allzero_bins1", final_1)
 
     # Edge case 2: all-same-value input (constant=3, num_bins=8)
     input_2 = torch.full((1, 1000, 1), 3, dtype=torch.int8)
     if is_cuda_backend:
         input_2 = input_2.to(f"cuda:{torch.cuda.current_device()}")
-    raw_2 = ops.calculate_cdf(input_2, 8)
-    out_2 = raw_2.flatten().cpu()
-    if is_cuda_backend:
-        out_int32 = out_2.to(torch.int32)
-        out_uint16 = torch.where(out_int32 < 0, out_int32 + 65536, out_int32)
-        final_2 = out_uint16.float() / 65536.0
-    else:
-        final_2 = out_2.float()
+    final_2 = _normalize_cdf(ops.calculate_cdf(input_2, 8), is_cuda_backend)
     save_result("calculate_cdf_edge_allsame_bins8", final_2)
 
     # Edge case 3: uniform distribution (equal counts for 4 bins)
     # Create exactly equal counts: 250 each for bins 0..3
-    vals = torch.cat([
-        torch.full((250,), i, dtype=torch.int8) for i in range(4)
-    ])
+    vals = torch.cat([torch.full((250,), i, dtype=torch.int8) for i in range(4)])
     input_3 = vals.reshape(1, 1000, 1)
     if is_cuda_backend:
         input_3 = input_3.to(f"cuda:{torch.cuda.current_device()}")
-    raw_3 = ops.calculate_cdf(input_3, 4)
-    out_3 = raw_3.flatten().cpu()
-    if is_cuda_backend:
-        out_int32 = out_3.to(torch.int32)
-        out_uint16 = torch.where(out_int32 < 0, out_int32 + 65536, out_int32)
-        final_3 = out_uint16.float() / 65536.0
-    else:
-        final_3 = out_3.float()
+    final_3 = _normalize_cdf(ops.calculate_cdf(input_3, 4), is_cuda_backend)
     save_result("calculate_cdf_edge_uniform_bins4", final_3)
 
 
