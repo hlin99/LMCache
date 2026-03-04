@@ -543,14 +543,14 @@ def lmcache_memcpy_async(
                 libcudart.memmove(
                     ctypes.c_void_p(current_dest),
                     ctypes.c_void_p(current_src),
-                    ctypes.c_size_t(max_nbytes),
+                    int(max_nbytes),
                 )
         else:
             # Fallback for CPU-only pointers
             libcudart.memmove(
                 ctypes.c_void_p(current_dest),
                 ctypes.c_void_p(current_src),
-                ctypes.c_size_t(max_nbytes),
+                int(max_nbytes),
             )
 
         offset += max_nbytes
