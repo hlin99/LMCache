@@ -1438,6 +1438,14 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
 class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
     """
     Implements a paged memory allocator.
+
+    This allocator divides a pre-allocated memory buffer into fixed-size pages.
+    Each page stores one complete KV cache block for a sequence, determined by
+    the KV cache shape and dtype.
+
+    The key concept is `align_bytes`, which represents the size of one complete
+    page (i.e., one KV cache block). The buffer is split into pages of this size,
+    and allocations are done at page granularity.
     """
 
     def __init__(
@@ -1447,6 +1455,19 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         dtypes: list[torch.dtype],
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
     ):
+        """
+        Initialize a paged memory allocator.
+
+        Args:
+            tensor: Pre-allocated memory buffer (GPU or CPU)
+            shapes: List of KV cache tensor shapes (typically one shape for K and V)
+            dtypes: List of data types corresponding to each shape
+            fmt: Memory format (e.g., KV_2LTD for 2 layers, token-first, then dimension)
+
+        The allocator calculates `align_bytes` as the total size in bytes of one
+        complete KV cache block based on the provided shapes and dtypes. This determines
+        the page size for all allocations.
+        """
         self.buffer = tensor.view(torch.uint8).flatten()
         self.buffer_size = self.buffer.numel() * self.buffer.element_size()
         self.buffer_ptr = self.buffer.data_ptr()
@@ -1455,7 +1476,10 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         self.dtypes = dtypes
         self.fmt = fmt
 
-        # full chunk size bytes
+        # Calculate page size: total bytes for one complete KV cache block
+        # This is the fundamental unit of allocation in the paged allocator
+        # For example, if shapes = [torch.Size([2, 32, 16, 1024])] and dtypes = [torch.bfloat16],
+        # then align_bytes = 2 * 32 * 16 * 1024 * 2 bytes = 2,097,152 bytes (2 MB per page)
         self.align_bytes = get_size_bytes(shapes, dtypes)
 
         # Adjust buffer_size downward to fit N complete aligned blocks
@@ -2303,6 +2327,15 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
     Paged Memory Allocator for both CPU and GPU memory.
     This is a paged memory allocator for PD and P2P sharing
     when NIXL is enabled as NIXL relies on the paging abstraction.
+
+    This class manages separate allocators for CPU and GPU memory, each using
+    PagedTensorMemoryAllocator internally. The `align_bytes` attribute is exposed
+    from the underlying allocator and represents the size of one KV cache page.
+
+    Access pattern: backend.memory_allocator.gpu_allocator.align_bytes
+    - `backend.memory_allocator` is this PagedCpuGpuMemoryAllocator instance
+    - `gpu_allocator` is the PagedTensorMemoryAllocator for GPU memory
+    - `align_bytes` is the page size in bytes (size of one KV cache block)
     """
 
     def __init__(self):
@@ -2316,6 +2349,18 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         device: str = "cuda",
     ):
+        """
+        Initialize the GPU memory allocator.
+
+        Args:
+            size: Total GPU memory size in bytes
+            shapes: KV cache tensor shapes
+            dtypes: Data types for KV cache tensors
+            fmt: Memory format
+            device: Device name (e.g., "cuda", "cuda:0")
+
+        After initialization, gpu_allocator.align_bytes will contain the page size.
+        """
         self.gpu_buffer = torch.empty(
             size,
             dtype=torch.uint8,
@@ -2327,6 +2372,7 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
             dtypes,
             fmt,
         )
+        # Note: align_bytes is set on the gpu_allocator during its __init__
 
     def init_cpu_memory_allocator(
         self,
@@ -2336,6 +2382,18 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         numa_mapping: Optional[NUMAMapping] = None,
     ):
+        """
+        Initialize the CPU memory allocator.
+
+        Args:
+            size: Total CPU memory size in bytes
+            shapes: KV cache tensor shapes
+            dtypes: Data types for KV cache tensors
+            fmt: Memory format
+            numa_mapping: NUMA node mapping for CPU memory
+
+        After initialization, cpu_allocator.align_bytes will contain the page size.
+        """
         self.cpu_buffer = _allocate_cpu_memory(size, numa_mapping)
         self.cpu_allocator = PagedTensorMemoryAllocator(
             self.cpu_buffer,
@@ -2343,6 +2401,8 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
             dtypes,
             fmt,
         )
+        # Expose align_bytes at the top level for convenience
+        # This is the same value as cpu_allocator.align_bytes
         self.align_bytes = self.cpu_allocator.align_bytes
 
     def allocate(
