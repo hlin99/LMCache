@@ -47,19 +47,19 @@ def test_buffer_size_alignment_cpu():
     metadata = create_test_metadata(kv_shape=(28, 2, 256, 8, 128))
 
     # Calculate expected chunk size:
-    # 28 * 2 * 256 * 8 * 128 * 2 (bfloat16) = 8994816 bytes
-    # This matches the error message from the problem statement
+    # 28 * 2 * 256 * 8 * 128 * 2 (bfloat16) = 29360128 bytes
 
     # Create a config with a buffer size that is NOT a multiple of chunk size
     # This should trigger the alignment logic
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
-        pd_buffer_size=4317511681,  # NOT a multiple of 8994816
+        pd_buffer_size=4317511681,  # NOT a multiple of 29360128
         pd_buffer_device="cpu",
         pd_role="receiver",
         pd_peer_host="localhost",
         pd_peer_init_port=[12345],
         pd_peer_alloc_port=[12346],
+        transfer_channel="mock_memory",
     )
 
     # This should NOT raise an assertion error anymore
@@ -90,8 +90,8 @@ def test_buffer_size_alignment_cpu():
             f"original size {config.pd_buffer_size}"
         )
 
-        # Clean up
-        backend.close()
+        # Signal shutdown without joining blocked threads
+        backend.running = False
 
     except AssertionError as e:
         if "must be a multiple of align bytes" in str(e):
@@ -107,9 +107,9 @@ def test_buffer_size_already_aligned():
     metadata = create_test_metadata(kv_shape=(28, 2, 256, 8, 128))
 
     # Calculate a buffer size that is already a multiple of chunk size
-    # chunk_size = 28 * 2 * 256 * 8 * 128 * 2 = 8994816
-    # Use exactly 480 chunks
-    aligned_buffer_size = 8994816 * 480  # = 4317511680
+    # chunk_size = 28 * 2 * 256 * 8 * 128 * 2 = 29360128
+    # Use exactly 147 chunks
+    aligned_buffer_size = 29360128 * 147  # = 4315938816
 
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
@@ -117,8 +117,9 @@ def test_buffer_size_already_aligned():
         pd_buffer_device="cpu",
         pd_role="receiver",
         pd_peer_host="localhost",
-        pd_peer_init_port=[12345],
-        pd_peer_alloc_port=[12346],
+        pd_peer_init_port=[12347],
+        pd_peer_alloc_port=[12348],
+        transfer_channel="mock_memory",
     )
 
     # This should work without any alignment
@@ -136,8 +137,8 @@ def test_buffer_size_already_aligned():
     # Verify that the size was not changed
     assert actual_buffer_size == aligned_buffer_size
 
-    # Clean up
-    backend.close()
+    # Signal shutdown without joining blocked threads
+    backend.running = False
 
 
 if __name__ == "__main__":
