@@ -11,6 +11,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.pd_backend import PDBackend
@@ -142,8 +143,8 @@ def test_buffer_size_too_small():
     """
     metadata = create_test_metadata(kv_shape=(28, 2, 256, 8, 128))
 
-    # From test: 28 * 2 * 256 * 8 * 128 * 2 (bfloat16) = 29360128 bytes
-    chunk_size = 29360128
+    # Calculate the chunk size from the KV shape and dtype
+    chunk_size = get_size_bytes([torch.Size(metadata.kv_shape)], [metadata.kv_dtype])
 
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
