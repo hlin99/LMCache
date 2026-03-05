@@ -544,6 +544,7 @@ def _validate_config(self):
         assert self.pd_role is not None
         assert self.pd_buffer_size is not None
         assert self.pd_buffer_device is not None
+        assert self.transfer_channel is not None
 
         assert self.remote_url is None, "PD only supports remote_url=None"
         assert self.save_decode_cache is False, (
