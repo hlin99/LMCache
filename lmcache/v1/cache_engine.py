@@ -1099,6 +1099,10 @@ class LMCacheEngine:
                     assert isinstance(key, CacheEngineKey)
 
                     start_time = time.monotonic()
+                    # NOTE: This loop executes once when polling is disabled
+                    # (lookup_poll_key_timeout_ms=0), but may block for up to
+                    # lookup_poll_key_timeout_ms ms when enabled. Enabling
+                    # polling can delay the scheduler on the critical path.
                     while True:
                         # TODO(Jiayi): Optimize by checking
                         # only the existence of the key
@@ -1125,10 +1129,9 @@ class LMCacheEngine:
                                     f"< layers({self.num_layers})"
                                 )
                                 return res
+                            time.sleep(self.lookup_poll_key_intervals_ms / 1000)
                         else:
                             break
-
-                        time.sleep(self.lookup_poll_key_intervals_ms / 1000)
 
                     # Only all layers are hit and hit in one location,
                     # we consider this key as a hit
@@ -1158,6 +1161,10 @@ class LMCacheEngine:
                 if self.lookup_poll_key_timeout_ms > 0:
                     start_time = time.monotonic()
 
+                # NOTE: This loop executes once when polling is disabled
+                # (lookup_poll_key_timeout_ms=0), but may block for up to
+                # lookup_poll_key_timeout_ms ms when enabled. Enabling
+                # polling can delay the scheduler on the critical path.
                 while True:
                     # hit chunks by prefix matching
                     hit_chunks, block_mapping = self.storage_manager.batched_contains(
@@ -1180,10 +1187,9 @@ class LMCacheEngine:
                                 f"Lookup poll timeout after {elapsed_ms:.2f}ms"
                             )
                             break
+                        time.sleep(self.lookup_poll_key_intervals_ms / 1000)
                     else:
                         break
-
-                    time.sleep(self.lookup_poll_key_intervals_ms / 1000)
 
                 for idx, (start, end, key) in enumerate(chunk_info_list):
                     if idx < hit_chunks:

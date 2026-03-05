@@ -72,7 +72,7 @@ Basic cache settings that control the core functionality of LMCache.
      - NUMA-aware memory allocation mode. Values: "auto" (detect from system), "manual" (use extra_config mapping), null (disabled). When enabled, allocates pinned memory on specific NUMA nodes for better GPU-CPU memory bandwidth. Default: null
    * - lookup_poll_key_timeout_ms
      - LMCACHE_LOOKUP_POLL_KEY_TIMEOUT_MS
-     - The maximum time in milliseconds to poll for a cache key to be fully available across all layers during lookup. Set to 0 to disable polling (default).
+     - The maximum time in milliseconds to poll for a cache key to be fully available across all layers during lookup. Set to 0 to disable polling (default). **Warning**: Enabling this (> 0) causes lookup to block the calling thread for up to this duration, which can delay the scheduler on the critical path. Only enable this when working with eventually-consistent remote backends where polling is acceptable.
    * - lookup_poll_key_intervals_ms
      - LMCACHE_LOOKUP_POLL_KEY_INTERVALS_MS
      - The interval in milliseconds between consecutive polls when waiting for a cache key to be fully available across all layers during lookup. Only effective when `lookup_poll_key_timeout_ms` > 0.
