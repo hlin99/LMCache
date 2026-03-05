@@ -142,6 +142,51 @@ def test_tensor_allocator(use_paging):
     allocator.close()
 
 
+def test_paged_allocator_non_divisible_buffer():
+    """Test that PagedTensorMemoryAllocator handles non-divisible buffer sizes correctly."""
+    shape = torch.Size([2, 32, 16, 1024])  # Each page is 2 * 32 * 16 * 1024 * 2 bytes = 2 MB
+    dtype = torch.bfloat16
+    fmt = MemoryFormat.KV_2LTD
+
+    # Third Party
+    from lmcache.integration.vllm.utils import get_size_bytes
+
+    align_bytes = get_size_bytes([shape], [dtype])
+
+    # Create a buffer size that is NOT a multiple of align_bytes
+    # For example, 10.5 pages worth of memory
+    buffer_size = int(align_bytes * 10.5)
+    tensor_buffer = torch.zeros(buffer_size, dtype=torch.uint8, device="cpu")
+
+    # This should NOT raise an error, but should adjust the buffer size downward
+    allocator = PagedTensorMemoryAllocator(tensor_buffer, [shape], [dtype], fmt)
+
+    # Verify that the allocator was created successfully
+    assert allocator is not None
+
+    # The allocator should have adjusted to 10 complete pages (not 10.5)
+    expected_num_pages = 10
+    assert len(allocator.free_blocks) == expected_num_pages
+
+    # Verify we can allocate all 10 pages
+    allocated_objs = []
+    for _ in range(expected_num_pages):
+        obj = allocator.allocate(shape, dtype, fmt)
+        assert obj is not None
+        allocated_objs.append(obj)
+
+    # Verify we cannot allocate more (the partial page should be discarded)
+    obj = allocator.allocate(shape, dtype, fmt)
+    assert obj is None
+
+    # Free all allocated objects
+    for obj in allocated_objs:
+        allocator.free(obj)
+
+    assert allocator.memcheck()
+    allocator.close()
+
+
 @pytest.mark.parametrize(
     "alloc_cls",
     [

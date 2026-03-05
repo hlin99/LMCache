@@ -1458,11 +1458,29 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         # full chunk size bytes
         self.align_bytes = get_size_bytes(shapes, dtypes)
 
-        assert self.buffer_size % self.align_bytes == 0, (
-            f"Buffer size {self.buffer_size} must be a"
-            f" multiple of align bytes {self.align_bytes}"
-            " in paged memory allocator."
-        )
+        # Adjust buffer_size downward to fit N complete aligned blocks
+        # instead of requiring exact divisibility
+        if self.buffer_size % self.align_bytes != 0:
+            num_blocks = self.buffer_size // self.align_bytes
+            adjusted_size = num_blocks * self.align_bytes
+
+            if num_blocks == 0:
+                raise ValueError(
+                    f"Buffer size {self.buffer_size} is smaller than "
+                    f"a single aligned block of size {self.align_bytes}. "
+                    f"Please increase pd_buffer_size to at least {self.align_bytes}."
+                )
+
+            logger.warning(
+                "Buffer size %d is not a multiple of align bytes %d. "
+                "Adjusting buffer size down to %d to allocate %d complete blocks.",
+                self.buffer_size,
+                self.align_bytes,
+                adjusted_size,
+                num_blocks,
+            )
+            self.buffer = self.buffer[:adjusted_size]
+            self.buffer_size = adjusted_size
 
         self.paged_buffers = torch.split(self.buffer, self.align_bytes, dim=0)
 
