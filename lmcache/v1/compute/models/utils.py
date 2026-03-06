@@ -12,13 +12,26 @@ logger = init_logger(__name__)
 
 
 def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
-    model_name = type(vllm_model).__name__
-    if model_name == "LlamaForCausalLM":
-        # First Party
-        from lmcache.v1.compute.models.llama import LMCLlamaModel
+    """Infer the LMC model wrapper from a vLLM model instance.
 
-        return LMCLlamaModel(vllm_model, blender, enable_sparse)
-    elif model_name == "Qwen2ForCausalLM":
+    Maps vLLM model class names to the corresponding LMC model adapter and
+    returns an initialized adapter.
+
+    Args:
+        vllm_model: The vLLM model instance (e.g. ``LlamaForCausalLM``).
+        blender: The ``LMCBlender`` instance passed through to the adapter.
+        enable_sparse (bool): Whether to enable sparse attention. Defaults
+            to ``False``.
+
+    Returns:
+        An initialized :class:`LMCBaseModel` subclass appropriate for the
+        given vLLM model.
+
+    Raises:
+        NotImplementedError: If the vLLM model class is not yet supported.
+    """
+    model_name = type(vllm_model).__name__
+    if model_name in ("LlamaForCausalLM", "Qwen2ForCausalLM", "DeepseekForCausalLM"):
         # First Party
         from lmcache.v1.compute.models.llama import LMCLlamaModel
 
