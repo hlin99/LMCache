@@ -26,33 +26,35 @@ def _build_backend_params() -> list:
 
     if cuda_available:
         try:
-            import lmcache.c_ops as _c_ops
+            import lmcache.c_ops as c_ops_module
 
             params.append(
-                pytest.param(("cuda_ops", _c_ops, True), id="cuda_ops")
+                pytest.param(("cuda_ops", c_ops_module, True), id="cuda_ops")
             )
         except ImportError:
             pass
 
-        import lmcache.non_cuda_equivalents as _non_cuda_ops
+        import lmcache.non_cuda_equivalents as non_cuda_ops_gpu
 
         params.append(
             pytest.param(
-                ("non_cuda_gpu", _non_cuda_ops, False), id="non_cuda_gpu"
+                ("non_cuda_gpu", non_cuda_ops_gpu, False), id="non_cuda_gpu"
             )
         )
 
-    import lmcache.non_cuda_equivalents as _non_cuda_ops_nv
+    import lmcache.non_cuda_equivalents as non_cuda_ops_no_gpu
 
     params.append(
         pytest.param(
-            ("non_cuda_no_gpu", _non_cuda_ops_nv, False), id="non_cuda_no_gpu"
+            ("non_cuda_no_gpu", non_cuda_ops_no_gpu, False), id="non_cuda_no_gpu"
         )
     )
     return params
 
 
 _BACKEND_PARAMS = _build_backend_params()
+# Ordered list of backend IDs corresponding to _BACKEND_PARAMS entries
+_BACKEND_IDS: list[str] = [p.values[0][0] for p in _BACKEND_PARAMS]
 
 # Module-level storage: (scenario_name, backend_id) -> {result_key: tensor}
 _results: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1693,7 +1695,7 @@ def test_compare(name: str) -> None:
     equivalents produce numerically identical results to cuda_ops.
     When only one backend ran (no CUDA), simply verifies results were stored.
     """
-    available = [p.values[0][0] for p in _BACKEND_PARAMS]  # list of backend_ids
+    available = _BACKEND_IDS  # ordered list of backend_ids from _build_backend_params
     backend_results = {
         bid: _results[(name, bid)]
         for bid in available
