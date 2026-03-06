@@ -9,6 +9,7 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Optional
 import ctypes
+import math
 import subprocess
 
 # Third Party
@@ -74,6 +75,28 @@ def _alloc_cpu_ptr(size: int) -> int:
     _tensor_registry[ptr] = tensor
 
     return ptr
+
+
+def _ptr_to_tensor(ptr: int, dtype: torch.dtype, shape: tuple) -> torch.Tensor:
+    """Create a writable tensor view over the CPU memory at *ptr*.
+
+    Uses ctypes to wrap the raw pointer as a byte-level buffer, then
+    ``torch.frombuffer`` to reinterpret it as *dtype* without copying.
+    The returned tensor shares storage with the original allocation so
+    reads and writes go directly to that memory.
+
+    Args:
+        ptr: Raw integer CPU memory address (data_ptr() of a tensor).
+        dtype: Element dtype for the returned tensor view.
+        shape: Desired shape of the returned tensor.
+
+    Returns:
+        A writable PyTorch tensor that aliases the memory at *ptr*.
+    """
+    element_size = torch.empty([], dtype=dtype).element_size()
+    nbytes = math.prod(shape) * element_size
+    buf = (ctypes.c_byte * nbytes).from_address(ptr)
+    return torch.frombuffer(buf, dtype=dtype).reshape(shape)
 
 
 def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
@@ -199,89 +222,86 @@ def multi_layer_kv_transfer(
     )
 
     num_layers = key_value.size(1)
-    num_tokens = slot_mapping.size(0)
     hidden_size = key_value.size(3)
-    element_size = key_value.element_size()
-    token_bytes = hidden_size * element_size
 
     # k_or_v_size: MLA has 1 part (KV fused), standard has 2 (K and V)
     k_or_v_size = 1 if is_mla else 2
 
-    # Base pointer of key_value tensor (contiguous [k_or_v_size, L, T, D])
-    kv_base_ptr = key_value.data_ptr()
+    # Compute valid-token indices once; skip entirely if nothing to transfer
+    valid_mask = slot_mapping >= 0
+    valid_token_ids = valid_mask.nonzero(as_tuple=False).squeeze(1)  # [num_valid]
+    valid_slots = slot_mapping[valid_mask].long()  # [num_valid]
+    if valid_token_ids.numel() == 0:
+        return
 
-    # Raw pointers for each layer's paged buffer
     ptr_list = key_value_ptrs.cpu().numpy().tolist()
-    slots = slot_mapping.cpu().numpy().tolist()
 
-    for token_id in range(num_tokens):
-        slot_idx = slots[token_id]
-        if slot_idx < 0:
-            continue
+    for layer_id in range(num_layers):
+        paged_buffer_ptr = int(ptr_list[layer_id])
 
-        for layer_id in range(num_layers):
-            paged_buffer_ptr = int(ptr_list[layer_id])
+        if gpu_kv_format in (
+            GPUKVFormat.NB_NL_TWO_BS_NH_HS,
+            GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ):
+            # Paged buffer layout: [k_or_v_size, page_buffer_size, hidden_size]
+            paged_buf = _ptr_to_tensor(
+                paged_buffer_ptr,
+                key_value.dtype,
+                (k_or_v_size, page_buffer_size, hidden_size),
+            )
+            # key_value layout: [k_or_v_size, num_layers, num_tokens, hidden_size]
+            kv_layer = key_value[:, layer_id, :, :]  # [k_or_v_size, num_tokens, hs]
+            if direction == TransferDirection.H2D:
+                # LMCache -> PagedBuffer
+                paged_buf[:, valid_slots, :] = kv_layer[:, valid_token_ids, :]
+            else:
+                # PagedBuffer -> LMCache
+                kv_layer[:, valid_token_ids, :] = paged_buf[:, valid_slots, :]
 
-            for k_or_v in range(k_or_v_size):
-                # ── LMCache side offset ──
-                # Mirrors key_value_offset() in mem_kernels.cu L229-L236:
-                #   k_or_v * num_layers * num_tokens * scalars_per_token
-                #   + layer_id * num_tokens * scalars_per_token
-                #   + token_id * scalars_per_token
-                lmc_offset = (
-                    k_or_v * (num_layers * num_tokens * hidden_size)
-                    + layer_id * (num_tokens * hidden_size)
-                    + token_id * hidden_size
-                ) * element_size
-
-                # ── Paged buffer side offset ──
-                # Mirrors page_buffer_offset<format>() in mem_kernels.cu L194-L222
-                if gpu_kv_format in (
-                    GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-                    GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
-                ):
-                    # Layout: [2, page_buffer_size, hidden_size]
-                    paged_offset = (
-                        k_or_v * page_buffer_size * hidden_size + slot_idx * hidden_size
-                    ) * element_size
-
-                elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-                    # Layout: [num_blocks, 2, block_size, hidden_size]
-                    blk_idx = slot_idx // block_size
-                    blk_off = slot_idx % block_size
-                    paged_offset = (
-                        blk_idx * 2 * block_size * hidden_size
-                        + k_or_v * block_size * hidden_size
-                        + blk_off * hidden_size
-                    ) * element_size
-
-                elif gpu_kv_format in (
-                    GPUKVFormat.NL_X_NB_BS_HS,
-                    GPUKVFormat.NL_X_NBBS_ONE_HS,
-                ):
-                    # MLA: [page_buffer_size, hidden_size], no K/V split
-                    paged_offset = slot_idx * hidden_size * element_size
-
-                else:
-                    raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
-
-                # ── Absolute addresses ──
-                lmc_addr = kv_base_ptr + lmc_offset
-                paged_addr = paged_buffer_ptr + paged_offset
-
-                # ── Copy direction ──
-                if direction == TransferDirection.D2H:
-                    # PagedBuffer -> LMCache
-                    dst, src = lmc_addr, paged_addr
-                else:
+        elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+            # Paged buffer layout: [num_blocks, 2, block_size, hidden_size]
+            num_blocks = page_buffer_size // block_size
+            paged_buf = _ptr_to_tensor(
+                paged_buffer_ptr,
+                key_value.dtype,
+                (num_blocks, 2, block_size, hidden_size),
+            )
+            blk_indices = valid_slots // block_size
+            blk_offsets = valid_slots % block_size
+            # key_value layout: [2, num_layers, num_tokens, hidden_size]
+            for kv in range(2):
+                if direction == TransferDirection.H2D:
                     # LMCache -> PagedBuffer
-                    dst, src = paged_addr, lmc_addr
+                    paged_buf[blk_indices, kv, blk_offsets] = (
+                        key_value[kv, layer_id][valid_token_ids]
+                    )
+                else:
+                    # PagedBuffer -> LMCache
+                    key_value[kv, layer_id][valid_token_ids] = (
+                        paged_buf[blk_indices, kv, blk_offsets]
+                    )
 
-                ctypes.memmove(
-                    ctypes.c_void_p(dst),
-                    ctypes.c_void_p(src),
-                    token_bytes,
-                )
+        elif gpu_kv_format in (
+            GPUKVFormat.NL_X_NB_BS_HS,
+            GPUKVFormat.NL_X_NBBS_ONE_HS,
+        ):
+            # MLA: Paged buffer layout: [page_buffer_size, hidden_size]
+            paged_buf = _ptr_to_tensor(
+                paged_buffer_ptr,
+                key_value.dtype,
+                (page_buffer_size, hidden_size),
+            )
+            # key_value layout: [1, num_layers, num_tokens, hidden_size]
+            kv_layer = key_value[0, layer_id, :, :]  # [num_tokens, hidden_size]
+            if direction == TransferDirection.H2D:
+                # LMCache -> PagedBuffer
+                paged_buf[valid_slots] = kv_layer[valid_token_ids]
+            else:
+                # PagedBuffer -> LMCache
+                kv_layer[valid_token_ids] = paged_buf[valid_slots]
+
+        else:
+            raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
 
 
 def multi_layer_kv_transfer_unilateral(
@@ -331,63 +351,35 @@ def multi_layer_kv_transfer_unilateral(
 
     # ── Non-MLA path: unilateral (separate K/V buffers per layer) ──
     num_layers = key_value.size(1)
-    num_tokens = slot_mapping.size(0)
     hidden_size = key_value.size(3)
-    element_size = key_value.element_size()
-    token_bytes = hidden_size * element_size
 
-    kv_base_ptr = key_value.data_ptr()
+    # Compute valid-token indices once; skip entirely if nothing to transfer
+    valid_mask = slot_mapping >= 0
+    valid_token_ids = valid_mask.nonzero(as_tuple=False).squeeze(1)  # [num_valid]
+    valid_slots = slot_mapping[valid_mask].long()  # [num_valid]
+    if valid_token_ids.numel() == 0:
+        return
 
     # ptrs layout: [K_layer0, K_layer1, ..., V_layer0, V_layer1, ...]
     ptr_list = key_value_ptrs.cpu().numpy().tolist()
-    slots = slot_mapping.cpu().numpy().tolist()
 
-    for token_id in range(num_tokens):
-        slot_idx = slots[token_id]
-        if slot_idx < 0:
-            continue
-
-        for layer_id in range(num_layers):
-            for k_or_v in range(2):
-                # ── LMCache side offset ──
-                # key_value layout: [2, num_layers, num_tokens, hidden_size]
-                # Mirrors key_value_offset() in mem_kernels.cu L229-L236
-                lmc_offset = (
-                    k_or_v * (num_layers * num_tokens * hidden_size)
-                    + layer_id * (num_tokens * hidden_size)
-                    + token_id * hidden_size
-                ) * element_size
-
-                # ── Paged buffer side offset ──
-                # ptrs[layer_id]            = K buffer for this layer
-                # ptrs[layer_id + num_layers] = V buffer for this layer
-                # Each buffer: [page_buffer_size, hidden_size]
-                # Mirrors page_buffer_offset_unilateral() in mem_kernels.cu L224-L227:
-                #   slot_idx * scalars_per_token + scalar_offset
-                if k_or_v == 0:
-                    buffer_ptr = int(ptr_list[layer_id])
-                else:
-                    buffer_ptr = int(ptr_list[layer_id + num_layers])
-
-                paged_offset = slot_idx * hidden_size * element_size
-
-                # ── Absolute addresses ──
-                lmc_addr = kv_base_ptr + lmc_offset
-                paged_addr = buffer_ptr + paged_offset
-
-                # ── Copy direction ──
-                if direction == TransferDirection.D2H:
-                    # PagedBuffer -> LMCache
-                    dst, src = lmc_addr, paged_addr
-                else:
-                    # LMCache -> PagedBuffer
-                    dst, src = paged_addr, lmc_addr
-
-                ctypes.memmove(
-                    ctypes.c_void_p(dst),
-                    ctypes.c_void_p(src),
-                    token_bytes,
-                )
+    for layer_id in range(num_layers):
+        for kv in range(2):
+            # ptrs[layer_id]             = K buffer for this layer
+            # ptrs[layer_id + num_layers] = V buffer for this layer
+            # Each buffer layout: [page_buffer_size, hidden_size]
+            buf_ptr = int(ptr_list[layer_id if kv == 0 else layer_id + num_layers])
+            paged_buf = _ptr_to_tensor(
+                buf_ptr,
+                key_value.dtype,
+                (page_buffer_size, hidden_size),
+            )
+            if direction == TransferDirection.H2D:
+                # LMCache -> PagedBuffer
+                paged_buf[valid_slots] = key_value[kv, layer_id][valid_token_ids]
+            else:
+                # PagedBuffer -> LMCache
+                key_value[kv, layer_id][valid_token_ids] = paged_buf[valid_slots]
 
 
 def single_layer_kv_transfer(
@@ -734,18 +726,14 @@ def lmcache_memcpy_async(
                 ctypes.c_int(cuda_kind),
             )
             if ret != 0:
-                # If CUDA call fails, we try ctypes.memmove as a last resort
-                ctypes.memmove(
-                    ctypes.c_void_p(current_dest),
-                    ctypes.c_void_p(current_src),
-                    int(max_nbytes),
+                # If CUDA call fails, fall back to a CPU tensor copy
+                _ptr_to_tensor(current_dest, torch.uint8, (int(max_nbytes),)).copy_(
+                    _ptr_to_tensor(current_src, torch.uint8, (int(max_nbytes),))
                 )
         else:
-            # Fallback for CPU-only pointers
-            ctypes.memmove(
-                ctypes.c_void_p(current_dest),
-                ctypes.c_void_p(current_src),
-                int(max_nbytes),
+            # CPU-only fallback: use tensor operations instead of raw memory move
+            _ptr_to_tensor(current_dest, torch.uint8, (int(max_nbytes),)).copy_(
+                _ptr_to_tensor(current_src, torch.uint8, (int(max_nbytes),))
             )
 
         offset += max_nbytes
