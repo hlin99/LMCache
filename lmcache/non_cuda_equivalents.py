@@ -257,11 +257,11 @@ def multi_layer_kv_transfer(
                 key_value.dtype,
             )
             src = key_value[:, layer_id, valid_tokens]
-            dest = paged[:, valid_slots]
             if direction == TransferDirection.H2D:
-                dest.copy_(src)
+                paged.index_copy_(1, valid_slots, src)
             else:
-                key_value[:, layer_id, valid_tokens] = dest
+                gathered = paged.index_select(1, valid_slots)
+                key_value[:, layer_id, valid_tokens] = gathered
 
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
             num_blocks = max(
