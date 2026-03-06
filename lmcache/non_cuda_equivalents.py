@@ -37,6 +37,21 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
     return _copy_lib
 
 
+def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
+    """Copy raw bytes between pointers using torch tensor semantics."""
+    if num_bytes <= 0:
+        return
+
+    buffer_type = ctypes.c_uint8 * num_bytes
+    dst_tensor = torch.frombuffer(
+        buffer_type.from_address(dst), dtype=torch.uint8
+    )
+    src_tensor = torch.frombuffer(
+        buffer_type.from_address(src), dtype=torch.uint8
+    )
+    dst_tensor.copy_(src_tensor)
+
+
 class TransferDirection(Enum):
     H2D = 0
     D2H = 1
@@ -278,11 +293,7 @@ def multi_layer_kv_transfer(
                     # LMCache -> PagedBuffer
                     dst, src = paged_addr, lmc_addr
 
-                ctypes.memmove(
-                    ctypes.c_void_p(dst),
-                    ctypes.c_void_p(src),
-                    token_bytes,
-                )
+                _copy_bytes_with_tensor(dst, src, token_bytes)
 
 
 def multi_layer_kv_transfer_unilateral(
@@ -384,11 +395,7 @@ def multi_layer_kv_transfer_unilateral(
                     # LMCache -> PagedBuffer
                     dst, src = paged_addr, lmc_addr
 
-                ctypes.memmove(
-                    ctypes.c_void_p(dst),
-                    ctypes.c_void_p(src),
-                    token_bytes,
-                )
+                _copy_bytes_with_tensor(dst, src, token_bytes)
 
 
 def single_layer_kv_transfer(
@@ -734,18 +741,10 @@ def lmcache_memcpy_async(
             )
             if ret != 0:
                 # If CUDA call fails, we try ctypes.memmove as a last resort
-                ctypes.memmove(
-                    ctypes.c_void_p(current_dest),
-                    ctypes.c_void_p(current_src),
-                    int(max_nbytes),
-                )
+                _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
         else:
             # Fallback for CPU-only pointers
-            ctypes.memmove(
-                ctypes.c_void_p(current_dest),
-                ctypes.c_void_p(current_src),
-                int(max_nbytes),
-            )
+            _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
 
         offset += max_nbytes
 
