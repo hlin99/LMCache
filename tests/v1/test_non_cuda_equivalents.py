@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-import unittest.mock
 from typing import Any
+import unittest.mock
 
 # Third Party
 import pytest
 import torch
-
 
 # ==========================================
 # 1. Backend Configuration
@@ -26,18 +25,21 @@ def _build_backend_params() -> list:
 
     if cuda_available:
         try:
+            # First Party
             import lmcache.c_ops as c_ops_module
 
             params.append(pytest.param(("cuda_ops", c_ops_module, True), id="cuda_ops"))
         except ImportError:
             pass
 
+        # First Party
         import lmcache.non_cuda_equivalents as non_cuda_ops_gpu
 
         params.append(
-            pytest.param(("non_cuda_gpu", non_cuda_ops_gpu, False), id="non_cuda_gpu")
+            pytest.param(("non_cuda_gpu", non_cuda_ops_gpu, True), id="non_cuda_gpu")
         )
 
+    # First Party
     import lmcache.non_cuda_equivalents as non_cuda_ops_no_gpu
 
     params.append(
@@ -1813,6 +1815,7 @@ def test_register_ptr_pytorch_path() -> None:
     verifies that modifications happen directly on the registered tensors
     without any CPU copy.
     """
+    # First Party
     import lmcache.non_cuda_equivalents as ops
 
     num_layers = 2
