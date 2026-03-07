@@ -695,7 +695,9 @@ def lmcache_memcpy_async(
     mask = host_buffer_alignments - 1
 
     while offset < nbytes:
-        # Calculate chunks based on alignment (1:1 with C++ logic)
+        # Calculate chunks based on alignment; mirrors
+        # csrc/mem_kernels.cu::lmcache_memcpy_async split loop that honors
+        # cudaHostRegister granularity.
         aligned_area_end = (
             (offset + host_buffer_offset) & ~mask
         ) + host_buffer_alignments
