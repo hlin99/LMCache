@@ -21,6 +21,13 @@ _tensor_registry: dict[int, torch.Tensor] = {}
 _shm_registry: dict[int, shared_memory.SharedMemory] = {}
 _buf_registry: dict[int, ctypes.Array] = {}
 
+# Registry for non-CPU paged buffers: maps data_ptr() -> tensor.
+# Callers on non-CUDA non-CPU devices (MPS, XPU, etc.) should register
+# their paged buffer tensors here via register_ptr() so that
+# _tensor_from_ptr and _write_back_to_ptr can use pure PyTorch operations
+# (tensor.cpu() / tensor.copy_()) without needing CUDA libraries.
+_ptr_to_tensor: dict[int, torch.Tensor] = {}
+
 # Cached copy library for lmcache_memcpy_async (lazy-initialized)
 _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
@@ -35,6 +42,43 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
         except OSError:
             _copy_lib = None
     return _copy_lib
+
+
+def register_ptr(ptr: int, tensor: torch.Tensor) -> None:
+    """Register a paged buffer tensor by its data pointer for pure-PyTorch access.
+
+    On non-CUDA non-CPU devices (MPS, XPU, etc.) where CUDA libraries are
+    unavailable, callers must register their paged buffer tensors before calling
+    ``multi_layer_kv_transfer`` or ``multi_layer_kv_transfer_unilateral``.  Once
+    registered, ``_tensor_from_ptr`` and ``_write_back_to_ptr`` use
+    ``tensor.cpu()`` / ``tensor.copy_()`` instead of ``ctypes`` or ``cudaMemcpy``,
+    so no CUDA library is required.
+
+    The tensor **must be contiguous** (freshly allocated ``torch.zeros`` tensors
+    always satisfy this).
+
+    Args:
+        ptr: The integer data pointer of the tensor (``tensor.data_ptr()``).
+        tensor: The paged buffer tensor to register.  May reside on any device.
+
+    Raises:
+        ValueError: If the tensor is not contiguous.
+    """
+    if not tensor.is_contiguous():
+        raise ValueError(
+            "register_ptr: tensor must be contiguous. "
+            "Call tensor.contiguous() before registering."
+        )
+    _ptr_to_tensor[ptr] = tensor
+
+
+def unregister_ptr(ptr: int) -> None:
+    """Remove a previously registered paged buffer tensor from the PyTorch registry.
+
+    Args:
+        ptr: The integer data pointer that was passed to :func:`register_ptr`.
+    """
+    _ptr_to_tensor.pop(ptr, None)
 
 
 def _ensure_cpu(t: torch.Tensor) -> tuple[torch.Tensor, torch.device]:
@@ -88,12 +132,17 @@ def _tensor_from_ptr(
 ) -> torch.Tensor:
     """Create a CPU tensor from a raw pointer.
 
-    When libcudart is available and the pointer is device memory, copies the
-    data to a new CPU tensor via cudaMemcpy (D2H). For CPU pointers, uses a
-    zero-copy frombuffer view as before.
+    Lookup order:
+    1. ``_ptr_to_tensor`` registry (pure-PyTorch path, any device): if the
+       caller registered the paged buffer via :func:`register_ptr`, uses
+       ``tensor.cpu()`` so no CUDA library is needed.
+    2. CUDA path: when ``libcudart`` is available and the pointer is CUDA device
+       memory, copies via ``cudaMemcpy`` (D2H).
+    3. CPU ctypes path: zero-copy ``frombuffer`` view for CPU pointers.
 
     Args:
-        ptr: Raw integer pointer (CPU or GPU).
+        ptr: Raw integer pointer (CPU, CUDA, MPS, or any other device pointer
+             that was previously registered via :func:`register_ptr`).
         shape: Desired tensor shape.
         dtype: Element dtype.
 
@@ -108,6 +157,16 @@ def _tensor_from_ptr(
     element_size = torch.empty((), dtype=dtype).element_size()
     total_bytes = numel * element_size
 
+    # 1. Pure-PyTorch path: use registered tensor (works on any device)
+    if ptr in _ptr_to_tensor:
+        reg = _ptr_to_tensor[ptr]
+        cpu_reg = reg.cpu().contiguous()
+        if cpu_reg.dtype == dtype:
+            return cpu_reg.view(*shape)
+        # Byte-level reinterpretation (handles uint8 alloc'd buffers etc.)
+        return cpu_reg.view(-1).view(torch.uint8).view(dtype).view(*shape)
+
+    # 2. CUDA path: cudaMemcpy D2H for CUDA device pointers
     libcudart = _get_copy_lib()
     if libcudart is not None:
         mem_type = _get_pointer_mem_type(libcudart, ptr)
@@ -126,7 +185,7 @@ def _tensor_from_ptr(
                 )
             return cpu_tensor.view(*shape)
 
-    # CPU pointer: zero-copy frombuffer view
+    # 3. CPU pointer: zero-copy frombuffer view
     buffer_type = ctypes.c_uint8 * total_bytes
     buf = buffer_type.from_address(ptr)
     return torch.frombuffer(buf, dtype=dtype).view(*shape)
@@ -135,16 +194,36 @@ def _tensor_from_ptr(
 def _write_back_to_ptr(ptr: int, tensor: torch.Tensor) -> None:
     """Write a CPU tensor's data back to the memory at *ptr*.
 
-    When libcudart is available and the pointer is device memory, uses
-    cudaMemcpy (H2D). Otherwise falls back to ctypes.memmove.
+    Lookup order mirrors :func:`_tensor_from_ptr`:
+    1. ``_ptr_to_tensor`` registry (pure-PyTorch path): uses
+       ``tensor.to(device)`` + ``tensor.copy_()``; no CUDA library needed.
+    2. CUDA path: ``cudaMemcpy`` H2D when ``libcudart`` is available and the
+       pointer is CUDA device memory.
+    3. CPU path: ``ctypes.memmove`` for CPU pointers.
 
     Args:
-        ptr: Destination raw integer pointer (CPU or GPU).
+        ptr: Destination raw integer pointer (CPU, CUDA, or registered device).
         tensor: Source CPU tensor. Must be contiguous.
     """
     tensor = tensor.contiguous()
     total_bytes = tensor.numel() * tensor.element_size()
 
+    # 1. Pure-PyTorch path: use registered tensor (works on any device)
+    if ptr in _ptr_to_tensor:
+        reg = _ptr_to_tensor[ptr]
+        tensor_on_dev = tensor.to(reg.device)
+        if reg.dtype == tensor.dtype and reg.shape == tensor.shape:
+            reg.copy_(tensor_on_dev)
+        else:
+            # Byte-level copy: reinterpret both as flat uint8 and copy in-place.
+            # Both reg (contiguous by construction) and tensor_on_dev support
+            # .view(torch.uint8) after .view(-1).
+            reg.view(-1).view(torch.uint8).copy_(
+                tensor_on_dev.view(-1).view(torch.uint8)
+            )
+        return
+
+    # 2. CUDA path: cudaMemcpy H2D for CUDA device pointers
     libcudart = _get_copy_lib()
     if libcudart is not None:
         mem_type = _get_pointer_mem_type(libcudart, ptr)
@@ -162,6 +241,7 @@ def _write_back_to_ptr(ptr: int, tensor: torch.Tensor) -> None:
                 )
             return
 
+    # 3. CPU path
     ctypes.memmove(ptr, tensor.data_ptr(), total_bytes)
 
 
