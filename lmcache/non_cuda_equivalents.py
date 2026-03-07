@@ -456,32 +456,23 @@ def single_layer_kv_transfer(
             block_offset = slot_idx % block_size
 
             for kv in range(2):  # 0=Key, 1=Value
-                if is_two_major:
-                    # [2, num_blocks, block_size, num_heads, head_size]
-                    vllm_slice = vllm_key_value_cache[
-                        kv, block_idx, block_offset
-                    ]  # [num_heads, head_size]
-                else:
-                    # [num_blocks, 2, block_size, num_heads, head_size]
-                    vllm_slice = vllm_key_value_cache[
-                        block_idx, kv, block_offset
-                    ]  # [num_heads, head_size]
-
-                vllm_flat = vllm_slice.reshape(-1)  # [num_heads * head_size]
-
-                if token_major:
-                    # [num_tokens, 2, num_heads * head_size]
-                    lmc_flat = lmc_key_value_cache[token_idx, kv]
-                else:
-                    # [2, num_tokens, num_heads * head_size]
-                    lmc_flat = lmc_key_value_cache[kv, token_idx]
+                vllm_idx = (
+                    (kv, block_idx, block_offset)
+                    if is_two_major
+                    else (block_idx, kv, block_offset)
+                )
+                lmc_idx = (token_idx, kv) if token_major else (kv, token_idx)
 
                 if direction == TransferDirection.D2H:
                     # vLLM -> LMCache
-                    lmc_flat.copy_(vllm_flat)
+                    lmc_key_value_cache[lmc_idx] = vllm_key_value_cache[
+                        vllm_idx
+                    ].reshape(-1)
                 else:
                     # LMCache -> vLLM
-                    vllm_slice.copy_(lmc_flat.reshape(num_heads, head_size))
+                    vllm_key_value_cache[vllm_idx] = lmc_key_value_cache[
+                        lmc_idx
+                    ].reshape(num_heads, head_size)
 
 
 def single_layer_kv_transfer_sgl(
