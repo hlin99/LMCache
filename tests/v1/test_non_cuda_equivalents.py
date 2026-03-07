@@ -1,11 +1,76 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Any
 import unittest.mock
+import warnings
 
 # Third Party
 import pytest
 import torch
+
+# Environment variable to override the tensor device used in tests.
+_DEVICE_ENV_VAR = "LMCACHE_TENSOR_DEVICE"
+
+
+def _get_configured_device(default_device: str) -> torch.device:
+    """Return torch.device honoring an env override when provided."""
+    requested = os.getenv(_DEVICE_ENV_VAR)
+    if requested:
+        try:
+            return torch.device(requested)
+        except (TypeError, ValueError):
+            warnings.warn(
+                f"Invalid {_DEVICE_ENV_VAR}='{requested}', "
+                f"falling back to '{default_device}'"
+            )
+    return torch.device(default_device)
+
+
+def _canonical_device(device: torch.device) -> torch.device:
+    """Normalize a device, filling in CUDA index with current device when absent."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return dev
+
+
+def _is_cuda(device: torch.device) -> bool:
+    """Return True when the configured device is CUDA and available."""
+    dev = torch.device(device)
+    return dev.type == "cuda" and torch.cuda.is_available()
+
+
+def _seed_for_device(seed: int, device: torch.device) -> None:
+    """Seed RNGs for the requested device type when supported."""
+    torch.manual_seed(seed)
+    dev = torch.device(device)
+    if dev.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    elif dev.type == "xpu" and hasattr(torch, "xpu") and hasattr(
+        torch.xpu, "manual_seed_all"
+    ):
+        torch.xpu.manual_seed_all(seed)  # type: ignore[attr-defined]
+    elif dev.type == "hpu" and hasattr(torch, "hpu") and hasattr(
+        torch.hpu, "manual_seed_all"
+    ):
+        torch.hpu.manual_seed_all(seed)  # type: ignore[attr-defined]
+
+
+def _synchronize_device(device: torch.device) -> None:
+    """Synchronize the configured device when a sync API exists."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif dev.type == "xpu" and hasattr(torch, "xpu") and hasattr(
+        torch.xpu, "synchronize"
+    ):
+        torch.xpu.synchronize()  # type: ignore[attr-defined]
+    elif dev.type == "hpu" and hasattr(torch, "hpu") and hasattr(
+        torch.hpu, "synchronize"
+    ):
+        torch.hpu.synchronize()  # type: ignore[attr-defined]
+
 
 # ==========================================
 # 1. Backend Configuration
@@ -19,16 +84,22 @@ def _build_backend_params() -> list:
     - cuda_ops: uses lmcache.c_ops (requires CUDA and the CUDA extension)
     - non_cuda_gpu: uses lmcache.non_cuda_equivalents with GPU visible
     - non_cuda_no_gpu: uses lmcache.non_cuda_equivalents with GPU mocked away
+
+    The tensor device used for each backend can be overridden via the
+    LMCACHE_TENSOR_DEVICE environment variable (e.g., cuda, cpu, hpu, xpu).
     """
     params = []
     cuda_available = torch.cuda.is_available()
+    requested_device = _get_configured_device("cuda" if cuda_available else "cpu")
 
-    if cuda_available:
+    if requested_device.type == "cuda" and cuda_available:
         try:
             # First Party
             import lmcache.c_ops as _c_ops
 
-            params.append(pytest.param(("cuda_ops", _c_ops, True), id="cuda_ops"))
+            params.append(
+                pytest.param(("cuda_ops", _c_ops, requested_device), id="cuda_ops")
+            )
         except ImportError:
             pass
 
@@ -36,14 +107,22 @@ def _build_backend_params() -> list:
         import lmcache.non_cuda_equivalents as _non_cuda_ops
 
         params.append(
-            pytest.param(("non_cuda_gpu", _non_cuda_ops, False), id="non_cuda_gpu")
+            pytest.param(
+                ("non_cuda_gpu", _non_cuda_ops, requested_device), id="non_cuda_gpu"
+            )
         )
 
     # First Party
     import lmcache.non_cuda_equivalents as _non_cuda_ops_nv
 
+    no_gpu_device = (
+        requested_device if requested_device.type != "cuda" else torch.device("cpu")
+    )
     params.append(
-        pytest.param(("non_cuda_no_gpu", _non_cuda_ops_nv, False), id="non_cuda_no_gpu")
+        pytest.param(
+            ("non_cuda_no_gpu", _non_cuda_ops_nv, no_gpu_device),
+            id="non_cuda_no_gpu",
+        )
     )
     return params
 
@@ -56,17 +135,17 @@ _results: dict[tuple[str, str], dict[str, Any]] = {}
 
 @pytest.fixture(scope="module", params=_BACKEND_PARAMS)
 def backend(request: pytest.FixtureRequest) -> Any:
-    """Yield (backend_id, ops_module, is_cuda_backend) for each backend config.
+    """Yield (backend_id, ops_module, tensor_device) for each backend config.
 
     For the non_cuda_no_gpu variant, torch.cuda.is_available is patched to
     return False so the scenario code behaves as if no GPU is present.
     """
-    backend_id, ops, is_cuda_backend = request.param
+    backend_id, ops, device = request.param
     if backend_id == "non_cuda_no_gpu":
         with unittest.mock.patch("torch.cuda.is_available", return_value=False):
-            yield backend_id, ops, is_cuda_backend
+            yield backend_id, ops, device
     else:
-        yield backend_id, ops, is_cuda_backend
+        yield backend_id, ops, device
 
 
 # ==========================================
@@ -75,12 +154,14 @@ def backend(request: pytest.FixtureRequest) -> Any:
 
 
 def scenario_get_gpu_pci_bus_id(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test get_gpu_pci_bus_id returns a valid string on CUDA backends."""
+    device = _canonical_device(device)
+    is_cuda_backend = _is_cuda(device)
     res = ops.get_gpu_pci_bus_id(0)
 
-    if is_cuda_backend and torch.cuda.is_available():
+    if is_cuda_backend:
         assert res is not None, "get_gpu_pci_bus_id returned None"
         assert isinstance(res, str) and len(res) > 0
 
@@ -88,21 +169,20 @@ def scenario_get_gpu_pci_bus_id(
     return {"get_gpu_pci_bus_id": torch.tensor([1], dtype=torch.int32)}
 
 
-def scenario_calculate_cdf(ops: Any, is_cuda_backend: bool) -> dict[str, torch.Tensor]:
+def scenario_calculate_cdf(ops: Any, device: torch.device) -> dict[str, torch.Tensor]:
     """Test calculate_cdf for multiple bin counts."""
+    device = _canonical_device(device)
+    is_cuda_backend = _is_cuda(device)
     num_bins_list = [1, 2, 5, 11, 15, 31, 32, 63]
     results: dict[str, torch.Tensor] = {}
 
     for num_bins in num_bins_list:
-        torch.manual_seed(42)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(42)
+        _seed_for_device(42, device)
 
         input_tensor = torch.randint(0, num_bins, (1, 1000, 1), dtype=torch.int8)
 
-        if is_cuda_backend:
-            target_dev = f"cuda:{torch.cuda.current_device()}"
-            input_tensor = input_tensor.to(target_dev)
+        target_dev = device if device.type != "cpu" else torch.device("cpu")
+        input_tensor = input_tensor.to(target_dev)
 
         raw_output = ops.calculate_cdf(input_tensor, num_bins)
         out_cpu = raw_output.flatten().cpu()
@@ -120,12 +200,11 @@ def scenario_calculate_cdf(ops: Any, is_cuda_backend: bool) -> dict[str, torch.T
 
 
 def scenario_rotary_embedding_k_fused(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test rotary_embedding_k_fused for both NeoX and GPT-J rotation styles."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     # 1. Setup Dimensions
     num_tokens = 128
@@ -145,22 +224,15 @@ def scenario_rotary_embedding_k_fused(
     results: dict[str, torch.Tensor] = {}
     for is_neox in [True, False]:
         # Reset seed for consistent key tensor across both tests
-        torch.manual_seed(42)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(42)
+        _seed_for_device(42, device)
 
         key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32)
 
-        if is_cuda_backend:
-            target_dev = f"cuda:{torch.cuda.current_device()}"
-            old_positions_dev = old_positions.to(target_dev)
-            new_positions_dev = new_positions.to(target_dev)
-            key = key.to(target_dev)
-            cos_sin_cache_dev = cos_sin_cache.to(target_dev)
-        else:
-            old_positions_dev = old_positions
-            new_positions_dev = new_positions
-            cos_sin_cache_dev = cos_sin_cache
+        target_dev = device
+        old_positions_dev = old_positions.to(target_dev)
+        new_positions_dev = new_positions.to(target_dev)
+        key = key.to(target_dev)
+        cos_sin_cache_dev = cos_sin_cache.to(target_dev)
 
         # 3. Execute (in-place update on key)
         ops.rotary_embedding_k_fused(
@@ -180,26 +252,25 @@ def scenario_rotary_embedding_k_fused(
 
 
 def scenario_lmcache_memcpy_async(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test lmcache_memcpy_async for H2D and D2H memory transfers."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     # 1. Setup dimensions and mock data (4KB)
     nbytes = 1024 * 4
     src_host = torch.randint(1, 255, (nbytes,), dtype=torch.uint8)
     gpu_buffer = torch.zeros(nbytes, dtype=torch.uint8)
 
-    if torch.cuda.is_available():
+    if _is_cuda(device):
         dst_host = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
     else:
         dst_host = torch.zeros(nbytes, dtype=torch.uint8)
 
     # 2. Assign directions and device locations
-    if is_cuda_backend:
-        gpu_buffer = gpu_buffer.to(f"cuda:{torch.cuda.current_device()}")
+    if device.type != "cpu":
+        gpu_buffer = gpu_buffer.to(device)
 
     h2d_dir = ops.TransferDirection.H2D
     d2h_dir = ops.TransferDirection.D2H
@@ -214,8 +285,7 @@ def scenario_lmcache_memcpy_async(
         16,
     )
 
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # --- PART B: D2H (Device to Host) ---
     ops.lmcache_memcpy_async(
@@ -227,8 +297,7 @@ def scenario_lmcache_memcpy_async(
         16,
     )
 
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 3. Internal sanity check
     final_result = dst_host.cpu()
@@ -241,13 +310,13 @@ def scenario_lmcache_memcpy_async(
 
 
 def scenario_lmcache_memcpy_async_alignment(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor] | None:
     """Validate host-buffer alignment chunking mirrors C++ split logic."""
+    device = _canonical_device(device)
+    _seed_for_device(0, device)
     if not hasattr(ops, "_copy_bytes_with_tensor"):
         pytest.skip("Chunk inspection only applies to Python fallback backend")
-
-    torch.manual_seed(0)
 
     nbytes = 200
     host_buffer_offset = 32
@@ -295,16 +364,16 @@ def scenario_lmcache_memcpy_async_alignment(
 
 
 def scenario_load_and_reshape_flash(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test load_and_reshape_flash extracts KV cache tokens into contiguous buffer."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    device = _canonical_device(device)
+    is_cuda_backend = _is_cuda(device)
+    _seed_for_device(42, device)
 
     # 1. Standard Params
-    src_device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
-    dst_device = "cpu"
+    src_device = device
+    dst_device = torch.device("cpu")
 
     num_blocks = 100
     block_size = 16
@@ -357,8 +426,7 @@ def scenario_load_and_reshape_flash(
             )
         extracted_chunks.append(mem_obj_tensor)
 
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 4. Verify: compare extracted data against original kv_cache
     #    mem_obj_tensor layout:
@@ -405,16 +473,16 @@ def scenario_load_and_reshape_flash(
 
 
 def scenario_reshape_and_cache_back_flash(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test reshape_and_cache_back_flash writes tokens back into paged KV cache."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    device = _canonical_device(device)
+    is_cuda_backend = _is_cuda(device)
+    _seed_for_device(42, device)
 
     # 1. Environment Setup
     src_device = "cpu"
-    dst_device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    dst_device = device
 
     num_blocks = 100
     block_size = 16
@@ -488,8 +556,7 @@ def scenario_reshape_and_cache_back_flash(
             )
         current_token_offset += chunk_len
 
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 6. Verify: check written values against source pattern
     for layer_id in range(num_layers):
@@ -525,12 +592,11 @@ def scenario_reshape_and_cache_back_flash(
 
 
 def scenario_encode_fast_new(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test encode_fast_new produces valid, non-empty encoded output."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     # 1. Hyperparameters
     nlayers = 2
@@ -539,7 +605,7 @@ def scenario_encode_fast_new(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    src_device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    src_device = device
 
     # 2. Construct Data
     # A. CDF: uniform distribution, strictly increasing
@@ -579,8 +645,7 @@ def scenario_encode_fast_new(
         output_lengths,
     )
 
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 5. Verify
     lengths_cpu = output_lengths.cpu()
@@ -595,12 +660,11 @@ def scenario_encode_fast_new(
 
 
 def scenario_decode_fast_new(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test decode_fast_new correctly decodes a round-tripped encoded stream."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     # 1. Config
     nlayers = 2
@@ -609,7 +673,7 @@ def scenario_decode_fast_new(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    exec_device = device
 
     # 2. Data Generation
     cdf = torch.randint(
@@ -618,25 +682,25 @@ def scenario_decode_fast_new(
         (nlayers, nchannels, alphabet_size),
         dtype=torch.int32,
     )
-    cdf = torch.cumsum(cdf, dim=-1).to(device).to(torch.int16)
+    cdf = torch.cumsum(cdf, dim=-1).to(exec_device).to(torch.int16)
 
     input_sym = torch.randint(
         0,
         alphabet_size - 2,
         (nlayers, ntokens, nchannels),
         dtype=torch.int8,
-    ).to(device)
+    ).to(exec_device)
 
     # 3. Encode first (need encoded data to test decode)
     encoded_buffer = torch.zeros(
         (nlayers, nchannels, max_buf_len),
         dtype=torch.uint8,
-        device=device,
+        device=exec_device,
     )
     encoded_lengths = torch.zeros(
         (nlayers, nchannels),
         dtype=torch.int32,
-        device=device,
+        device=exec_device,
     )
 
     ops.encode_fast_new(
@@ -645,8 +709,7 @@ def scenario_decode_fast_new(
         encoded_buffer,
         encoded_lengths,
     )
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 4. Decode
     decoded_sym = torch.zeros_like(input_sym, dtype=torch.uint8)
@@ -657,8 +720,7 @@ def scenario_decode_fast_new(
         encoded_lengths,
         decoded_sym,
     )
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 5. Verify: decoded must match original
     input_uint8 = input_sym.to(torch.uint8)
@@ -678,12 +740,11 @@ def scenario_decode_fast_new(
 
 
 def scenario_decode_fast_prefsum(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test decode_fast_prefsum correctly decodes with prefix-sum offsets."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     # 1. Configuration
     nlayers = 2
@@ -692,7 +753,7 @@ def scenario_decode_fast_prefsum(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    exec_device = device
 
     # 2. Data Generation (Normalized CDF)
     cdf = torch.randint(
@@ -704,29 +765,28 @@ def scenario_decode_fast_prefsum(
     cdf = torch.cumsum(cdf, dim=-1).float()
     cdf = (cdf / cdf[..., -1:] * 65536).to(torch.int32)
     cdf[..., -1] = 65536
-    cdf = cdf.to(device).to(torch.int16).contiguous()
+    cdf = cdf.to(exec_device).to(torch.int16).contiguous()
 
     input_sym = torch.randint(
         0,
         alphabet_size - 2,
         (nlayers, ntokens, nchannels),
         dtype=torch.int8,
-    ).to(device)
+    ).to(exec_device)
 
     # 3. Encode to get variable lengths
     tmp_buf = torch.zeros(
         (nlayers, nchannels, max_buf_len),
         dtype=torch.uint8,
-        device=device,
+        device=exec_device,
     )
     tmp_len = torch.zeros(
         (nlayers, nchannels),
         dtype=torch.int32,
-        device=device,
+        device=exec_device,
     )
     ops.encode_fast_new(cdf, input_sym, tmp_buf, tmp_len)
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 4. Pack into 1D dense bytestream
     lens_flat = tmp_len.cpu().flatten().tolist()
@@ -743,7 +803,7 @@ def scenario_decode_fast_prefsum(
 
     # 5. Offsets (end-position via cumsum)
     lengths_prefsum = (
-        tmp_len.flatten().cumsum(0).reshape(tmp_len.shape).to(torch.int64).to(device)
+        tmp_len.flatten().cumsum(0).reshape(tmp_len.shape).to(torch.int64).to(exec_device)
     ).contiguous()
 
     # 6. Decode
@@ -752,7 +812,7 @@ def scenario_decode_fast_prefsum(
             input_sym,
             dtype=torch.uint8,
         )
-        .to(device)
+        .to(exec_device)
         .contiguous()
     )
 
@@ -762,8 +822,7 @@ def scenario_decode_fast_prefsum(
         lengths_prefsum,
         decoded_sym,
     )
-    if is_cuda_backend:
-        torch.cuda.synchronize()
+    _synchronize_device(device)
 
     # 7. Verify roundtrip
     input_ref = input_sym.to(torch.uint8)
@@ -785,14 +844,11 @@ def scenario_decode_fast_prefsum(
 
 
 def scenario_single_layer_kv_transfer(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test single_layer_kv_transfer for multiple KV formats and directions."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
-    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     num_tokens = 64
     num_blocks = 256
@@ -915,8 +971,7 @@ def scenario_single_layer_kv_transfer(
             gpu_kv_format,
             token_major,
         )
-        if is_cuda_backend:
-            torch.cuda.synchronize()
+        _synchronize_device(device)
 
         # ── 5. Verify ──
         if not direction:
@@ -985,8 +1040,7 @@ def scenario_single_layer_kv_transfer(
             fmt,
             token_major,
         )
-        if is_cuda_backend:
-            torch.cuda.synchronize()
+        _synchronize_device(device)
 
         result = lmc_tensor.cpu() if direction else vllm_tensor.cpu()
         results[f"single_layer_kv_transfer_{dir_tag}_mla_{is_mla}"] = result
@@ -995,14 +1049,11 @@ def scenario_single_layer_kv_transfer(
 
 
 def scenario_single_layer_kv_transfer_sgl(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test single_layer_kv_transfer_sgl for SGLang KV format."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
-    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     num_tokens = 32
     num_blocks = 128
@@ -1113,8 +1164,7 @@ def scenario_single_layer_kv_transfer_sgl(
             ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D,
             token_major,
         )
-        if is_cuda_backend:
-            torch.cuda.synchronize()
+        _synchronize_device(device)
 
         # 5. Verify
         case_desc = f"TM={token_major}, Dir={dir_tag}"
@@ -1150,14 +1200,11 @@ def scenario_single_layer_kv_transfer_sgl(
 
 
 def scenario_multi_layer_kv_transfer(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test multi_layer_kv_transfer for multiple paged KV formats and directions."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
-    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     num_layers = 2
     num_tokens = 4
@@ -1271,8 +1318,7 @@ def scenario_multi_layer_kv_transfer(
                 gpu_kv_format,
                 bs_arg,
             )
-            if is_cuda_backend:
-                torch.cuda.synchronize()
+            _synchronize_device(device)
 
             # ── 5. Verify (internal, per-format) ──
             for t_id in range(num_tokens):
@@ -1351,8 +1397,7 @@ def scenario_multi_layer_kv_transfer(
             canonical_format,
             1,
         )
-        if is_cuda_backend:
-            torch.cuda.synchronize()
+        _synchronize_device(device)
 
         results[f"multi_layer_kv_transfer_{dir_tag}"] = key_value.cpu()
 
@@ -1360,14 +1405,11 @@ def scenario_multi_layer_kv_transfer(
 
 
 def scenario_multi_layer_kv_transfer_unilateral(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test multi_layer_kv_transfer_unilateral for non-interleaved K/V pointers."""
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
-    device = f"cuda:{torch.cuda.current_device()}" if is_cuda_backend else "cpu"
+    device = _canonical_device(device)
+    _seed_for_device(42, device)
 
     num_layers = 2
     num_tokens = 4
@@ -1490,8 +1532,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 xfer_dir,
                 gpu_kv_format,
             )
-            if is_cuda_backend:
-                torch.cuda.synchronize()
+            _synchronize_device(device)
 
             # ── 4. Verify ──
             for t_id in range(num_tokens):
@@ -1577,8 +1618,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
             xfer_dir,
             ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         )
-        if is_cuda_backend:
-            torch.cuda.synchronize()
+        _synchronize_device(device)
 
         results[f"multi_layer_kv_transfer_unilateral_{dir_tag}"] = lmc_tensor.cpu()
 
@@ -1586,7 +1626,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
 
 
 def scenario_alloc_free_pinned_ptr(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test alloc_pinned_ptr and free_pinned_ptr round-trip."""
     alloc_size = 4096
@@ -1604,7 +1644,7 @@ def scenario_alloc_free_pinned_ptr(
 
 
 def scenario_alloc_free_numa_ptr(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test alloc_numa_ptr and free_numa_ptr round-trip."""
     alloc_size = 4096
@@ -1622,7 +1662,7 @@ def scenario_alloc_free_numa_ptr(
 
 
 def scenario_alloc_free_pinned_numa_ptr(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test alloc_pinned_numa_ptr and free_pinned_numa_ptr round-trip."""
     alloc_size = 4096
@@ -1640,7 +1680,7 @@ def scenario_alloc_free_pinned_numa_ptr(
 
 
 def scenario_alloc_free_shm_pinned_ptr(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test alloc_shm_pinned_ptr and free_shm_pinned_ptr round-trip."""
     alloc_size = 4096
@@ -1658,7 +1698,7 @@ def scenario_alloc_free_shm_pinned_ptr(
 
 
 def scenario_transfer_direction_enum(
-    ops: Any, is_cuda_backend: bool
+    ops: Any, device: torch.device
 ) -> dict[str, torch.Tensor]:
     """Test TransferDirection enum has distinct H2D and D2H members."""
     # 1. Verify enum members exist
@@ -1730,8 +1770,8 @@ def test_scenario(
     Results are stored in the module-level _results dict for later comparison
     by test_compare.
     """
-    backend_id, ops, is_cuda_backend = backend
-    result = fn(ops, is_cuda_backend)
+    backend_id, ops, device = backend
+    result = fn(ops, device)
     if result is not None:
         _results[(name, backend_id)] = result
 
