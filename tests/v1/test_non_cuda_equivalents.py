@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Any
 import unittest.mock
 
@@ -9,10 +10,24 @@ import torch
 
 
 def _canonical_device(device: torch.device) -> torch.device:
-    """Normalize a device, filling in CUDA index with current device when absent."""
+    """Normalize a device, falling back to CPU when the target backend is unavailable."""
     dev = torch.device(device)
-    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
-        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    if dev.type == "cuda":
+        if torch.cuda.is_available():
+            if dev.index is None:
+                return torch.device(f"cuda:{torch.cuda.current_device()}")
+            return dev
+        return torch.device("cpu")
+
+    # For non-CPU devices (hpu/xpu/ipu, etc.), gracefully fall back to CPU when
+    # the backend is missing or the allocator is unsupported in this build.
+    if dev.type != "cpu":
+        try:
+            torch.empty(0, device=dev)
+            return dev
+        except (RuntimeError, NotImplementedError, ValueError):
+            return torch.device("cpu")
+
     return dev
 
 
@@ -80,13 +95,17 @@ def _build_backend_params() -> list:
     params = []
     cuda_available = torch.cuda.is_available()
     device_str = "cuda" if cuda_available else "cpu"
+    override_device = os.environ.get("LMCACHE_TENSOR_DEVICE")
+    target_device = override_device or device_str
 
     if device_str == "cuda" and cuda_available:
         try:
             # First Party
             import lmcache.c_ops as _c_ops
 
-            params.append(pytest.param(("cuda_ops", _c_ops, device_str), id="cuda_ops"))
+            params.append(
+                pytest.param(("cuda_ops", _c_ops, target_device), id="cuda_ops")
+            )
         except ImportError:
             pass
 
@@ -102,7 +121,7 @@ def _build_backend_params() -> list:
 
     params.append(
         pytest.param(
-            ("non_cuda_no_gpu", _non_cuda_ops_nv, "hpu"),
+            ("non_cuda_no_gpu", _non_cuda_ops_nv, override_device or "cpu"),
             id="non_cuda_no_gpu",
         )
     )
