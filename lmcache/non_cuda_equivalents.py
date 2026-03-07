@@ -21,6 +21,15 @@ _tensor_registry: dict[int, torch.Tensor] = {}
 _shm_registry: dict[int, shared_memory.SharedMemory] = {}
 _buf_registry: dict[int, ctypes.Array] = {}
 
+# Registry for paged buffer tensors: maps data_ptr() -> tensor.
+# Callers on non-CUDA non-CPU devices (MPS, XPU, etc.) register their paged
+# buffer tensors here via register_ptr() before calling multi_layer_kv_transfer
+# or multi_layer_kv_transfer_unilateral.  _tensor_from_ptr returns a direct
+# in-place view of the registered tensor (no CPU copy), so all operations use
+# native PyTorch and work on the tensor's original device without needing any
+# CUDA library.
+_ptr_to_tensor: dict[int, torch.Tensor] = {}
+
 # Cached copy library for lmcache_memcpy_async (lazy-initialized)
 _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
@@ -37,10 +46,102 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
     return _copy_lib
 
 
+def register_ptr(ptr: int, tensor: torch.Tensor) -> None:
+    """Register a paged buffer tensor by its data pointer for pure-PyTorch access.
+
+    Callers on non-CUDA non-CPU devices (MPS, XPU, etc.) where CUDA libraries
+    are unavailable should call this before invoking
+    :func:`multi_layer_kv_transfer` or :func:`multi_layer_kv_transfer_unilateral`.
+
+    Once registered, :func:`_tensor_from_ptr` returns an **in-place view** of
+    the registered tensor (on its original device).  Operations are performed
+    directly on that device using native PyTorch, so no CPU copy or CUDA library
+    is needed.  :func:`_write_back_to_ptr` is a no-op for registered tensors
+    because the view was already modified in-place.
+
+    The tensor **must be contiguous** (freshly allocated ``torch.zeros`` tensors
+    always satisfy this).
+
+    Args:
+        ptr: The integer data pointer of the tensor (``tensor.data_ptr()``).
+        tensor: The paged buffer tensor to register.  May reside on any device.
+
+    Raises:
+        ValueError: If the tensor is not contiguous.
+    """
+    if not tensor.is_contiguous():
+        raise ValueError(
+            "register_ptr: tensor must be contiguous. "
+            "Call tensor.contiguous() before registering."
+        )
+    _ptr_to_tensor[ptr] = tensor
+
+
+def unregister_ptr(ptr: int) -> None:
+    """Remove a previously registered paged buffer tensor from the PyTorch registry.
+
+    Args:
+        ptr: The integer data pointer that was passed to :func:`register_ptr`.
+    """
+    _ptr_to_tensor.pop(ptr, None)
+
+
+def _get_pointer_mem_type(libcudart: ctypes.CDLL, ptr: int) -> int:
+    """Query cudaPointerGetAttributes to determine where a pointer lives.
+
+    Uses a 256-byte oversized buffer to avoid ABI differences across CUDA
+    versions (the struct layout varies but the memType field is always the
+    second int).
+
+    Args:
+        libcudart: Loaded CUDA runtime shared library.
+        ptr: Raw integer pointer to query.
+
+    Returns:
+        The memoryType integer from cudaPointerAttributes:
+        0 = unregistered host (or unknown), 1 = host, 2 = device, 3 = managed.
+        Returns 0 on any error (treated as CPU/unregistered).
+    """
+    buf_size = 256
+    attr_buf = (ctypes.c_uint8 * buf_size)()
+    ctypes.memset(attr_buf, 0, buf_size)
+    ret = libcudart.cudaPointerGetAttributes(
+        ctypes.cast(attr_buf, ctypes.c_void_p),
+        ctypes.c_void_p(ptr),
+    )
+    if ret != 0:
+        return 0
+    # memType is the second int (offset 4 bytes) in the struct
+    mem_type = ctypes.c_int.from_buffer(attr_buf, 4).value
+    return mem_type
+
+
 def _tensor_from_ptr(
     ptr: int, shape: tuple[int, ...], dtype: torch.dtype
 ) -> torch.Tensor:
-    """Create a CPU tensor view over a raw pointer."""
+    """Return a tensor backed by the memory at *ptr*, reshaped to *shape*.
+
+    Lookup order:
+    1. ``_ptr_to_tensor`` registry (any device, pure-PyTorch path): if the
+       caller registered the paged buffer via :func:`register_ptr`, returns an
+       **in-place view** of the registered tensor on its original device.
+       No copy, no CUDA library needed.
+    2. CUDA path: when ``libcudart`` is available and the pointer is CUDA device
+       memory, copies to a new CPU tensor via ``cudaMemcpy`` (D2H).
+    3. CPU ctypes path: zero-copy ``frombuffer`` view for CPU pointers.
+
+    Args:
+        ptr: Raw integer pointer (any device pointer previously registered via
+             :func:`register_ptr`, or a CPU / CUDA device pointer).
+        shape: Desired tensor shape.
+        dtype: Element dtype.  For registered tensors this must match the
+               registered tensor's dtype.
+
+    Returns:
+        A tensor containing the pointed-to data.  For registered tensors the
+        tensor resides on the original device; for the other paths it is a CPU
+        tensor.
+    """
     if ptr == 0:
         raise ValueError("Pointer must be non-zero")
     numel = 1
@@ -48,9 +149,82 @@ def _tensor_from_ptr(
         numel *= int(dim)
     element_size = torch.empty((), dtype=dtype).element_size()
     total_bytes = numel * element_size
+
+    # 1. Registered-tensor path: return an in-place view on the tensor's device.
+    # The view shares storage with the registered tensor, so any in-place
+    # modification is immediately visible there — no writeback required.
+    if ptr in _ptr_to_tensor:
+        reg = _ptr_to_tensor[ptr]
+        return reg.view(*shape)
+
+    # 2. CUDA path: cudaMemcpy D2H for CUDA device pointers
+    libcudart = _get_copy_lib()
+    if libcudart is not None:
+        mem_type = _get_pointer_mem_type(libcudart, ptr)
+        if mem_type == 2:  # cudaMemoryTypeDevice
+            cpu_tensor = torch.empty(numel, dtype=dtype)
+            # cudaMemcpyDeviceToHost = 2
+            ret = libcudart.cudaMemcpy(
+                ctypes.c_void_p(cpu_tensor.data_ptr()),
+                ctypes.c_void_p(ptr),
+                ctypes.c_size_t(total_bytes),
+                ctypes.c_int(2),
+            )
+            if ret != 0:
+                raise RuntimeError(
+                    f"cudaMemcpy (D2H) in _tensor_from_ptr failed: {ret}"
+                )
+            return cpu_tensor.view(*shape)
+
+    # 3. CPU pointer: zero-copy frombuffer view
     buffer_type = ctypes.c_uint8 * total_bytes
     buf = buffer_type.from_address(ptr)
     return torch.frombuffer(buf, dtype=dtype).view(*shape)
+
+
+def _write_back_to_ptr(ptr: int, tensor: torch.Tensor) -> None:
+    """Write tensor data back to the memory at *ptr*.
+
+    1. ``_ptr_to_tensor`` registry: **no-op**.  :func:`_tensor_from_ptr`
+       already returned an in-place view of the registered tensor, so any
+       in-place modification was already written to the underlying buffer.
+    2. CUDA path: ``cudaMemcpy`` H2D when ``libcudart`` is available and the
+       pointer is CUDA device memory.
+    3. CPU path: ``ctypes.memmove`` for CPU pointers.
+
+    Args:
+        ptr: Destination raw integer pointer (CPU, CUDA, or registered device).
+        tensor: Source tensor (CPU for paths 2/3; on the registered device for
+                path 1, though it is not used in that case).
+    """
+    # 1. Registered-tensor path: no-op — the view from _tensor_from_ptr shares
+    # storage with the registered tensor, so in-place ops already updated it.
+    if ptr in _ptr_to_tensor:
+        return
+
+    tensor = tensor.contiguous()
+    total_bytes = tensor.numel() * tensor.element_size()
+
+    # 2. CUDA path: cudaMemcpy H2D for CUDA device pointers
+    libcudart = _get_copy_lib()
+    if libcudart is not None:
+        mem_type = _get_pointer_mem_type(libcudart, ptr)
+        if mem_type == 2:  # cudaMemoryTypeDevice
+            # cudaMemcpyHostToDevice = 1
+            ret = libcudart.cudaMemcpy(
+                ctypes.c_void_p(ptr),
+                ctypes.c_void_p(tensor.data_ptr()),
+                ctypes.c_size_t(total_bytes),
+                ctypes.c_int(1),
+            )
+            if ret != 0:
+                raise RuntimeError(
+                    f"cudaMemcpy (H2D) in _write_back_to_ptr failed: {ret}"
+                )
+            return
+
+    # 3. CPU path
+    ctypes.memmove(ptr, tensor.data_ptr(), total_bytes)
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
@@ -230,14 +404,34 @@ def multi_layer_kv_transfer(
     hidden_size = key_value.size(3)
     k_or_v_size = 1 if is_mla else 2
 
-    slots = slot_mapping.to(dtype=torch.long, device="cpu")
-    valid_mask = slots >= 0
+    # Compute valid tokens and slots on CPU (needed for ptr_list arithmetic).
+    slots_cpu = slot_mapping.to(dtype=torch.long, device="cpu")
+    valid_mask = slots_cpu >= 0
     if not torch.any(valid_mask):
         return
-    valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
-    valid_slots = slots[valid_tokens]
+    valid_tokens_cpu = torch.nonzero(valid_mask, as_tuple=True)[0]
+    valid_slots_cpu = slots_cpu[valid_tokens_cpu]
 
     ptr_list = key_value_ptrs.cpu().tolist()
+
+    # Determine the device on which tensor operations will run:
+    # - Registered tensors (non-CUDA device): _tensor_from_ptr returns an
+    #   in-place view on their device → work on that device directly.
+    # - Raw CPU / CUDA pointers: _tensor_from_ptr returns a CPU tensor → work
+    #   on CPU (CUDA pointers are downloaded D2H before use).
+    first_ptr = int(ptr_list[0]) if ptr_list else 0
+    if first_ptr in _ptr_to_tensor:
+        work_device = _ptr_to_tensor[first_ptr].device
+    else:
+        work_device = torch.device("cpu")
+
+    # key_value.to(work_device) returns the same object when already on that
+    # device (PyTorch guarantee), so `kv_work is key_value` iff no copy needed.
+    kv_work = (
+        key_value if key_value.device == work_device else key_value.to(work_device)
+    )
+    valid_tokens_dev = valid_tokens_cpu.to(work_device)
+    valid_slots_dev = valid_slots_cpu.to(work_device)
 
     for layer_id in range(num_layers):
         paged_ptr = int(ptr_list[layer_id])
@@ -250,47 +444,57 @@ def multi_layer_kv_transfer(
             paged = _tensor_from_ptr(
                 paged_ptr,
                 (k_or_v_size, page_buffer_size, hidden_size),
-                key_value.dtype,
+                kv_work.dtype,
             )
-            src = key_value[:, layer_id, valid_tokens]
+            src = kv_work[:, layer_id, valid_tokens_dev]
             if direction == TransferDirection.H2D:
-                paged.index_copy_(1, valid_slots, src)
+                paged.index_copy_(1, valid_slots_dev, src)
+                _write_back_to_ptr(paged_ptr, paged)
             else:
-                gathered = paged.index_select(1, valid_slots)
-                key_value[:, layer_id, valid_tokens] = gathered
+                gathered = paged.index_select(1, valid_slots_dev)
+                kv_work[:, layer_id, valid_tokens_dev] = gathered
 
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-            num_blocks = max(int(torch.max(valid_slots).item() // block_size + 1), 1)
+            num_blocks = max(
+                int(torch.max(valid_slots_cpu).item() // block_size + 1), 1
+            )
             paged = _tensor_from_ptr(
                 paged_ptr,
                 (num_blocks, 2, block_size, hidden_size),
-                key_value.dtype,
+                kv_work.dtype,
             )
 
-            blk_idx = torch.div(valid_slots, block_size, rounding_mode="floor")
-            blk_off = valid_slots % block_size
+            blk_idx = torch.div(valid_slots_dev, block_size, rounding_mode="floor")
+            blk_off = valid_slots_dev % block_size
 
             if direction == TransferDirection.H2D:
-                src = key_value[:, layer_id, valid_tokens].permute(1, 0, 2)
+                src = kv_work[:, layer_id, valid_tokens_dev].permute(1, 0, 2)
                 paged[blk_idx, :, blk_off] = src
+                _write_back_to_ptr(paged_ptr, paged)
             else:
                 fetched = paged[blk_idx, :, blk_off].permute(1, 0, 2)
-                key_value[:, layer_id, valid_tokens] = fetched
+                kv_work[:, layer_id, valid_tokens_dev] = fetched
 
         elif gpu_kv_format in (
             GPUKVFormat.NL_X_NB_BS_HS,
             GPUKVFormat.NL_X_NBBS_ONE_HS,
         ):
             paged = _tensor_from_ptr(
-                paged_ptr, (page_buffer_size, hidden_size), key_value.dtype
+                paged_ptr, (page_buffer_size, hidden_size), kv_work.dtype
             )
             if direction == TransferDirection.H2D:
-                paged[valid_slots] = key_value[0, layer_id, valid_tokens]
+                paged[valid_slots_dev] = kv_work[0, layer_id, valid_tokens_dev]
+                _write_back_to_ptr(paged_ptr, paged)
             else:
-                key_value[0, layer_id, valid_tokens] = paged[valid_slots]
+                kv_work[0, layer_id, valid_tokens_dev] = paged[valid_slots_dev]
 
         else:
             raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+
+    # Write kv_work results back to key_value when they are different objects
+    # (i.e., key_value was on a different device and kv_work is a copy).
+    if direction == TransferDirection.D2H and kv_work is not key_value:
+        key_value.copy_(kv_work.to(key_value.device))
 
 
 def multi_layer_kv_transfer_unilateral(
@@ -339,35 +543,51 @@ def multi_layer_kv_transfer_unilateral(
         )
 
     # ── Non-MLA path: unilateral (separate K/V buffers per layer) ──
+    # Compute valid tokens and slots on CPU (needed for ptr_list arithmetic).
+    slots_cpu = slot_mapping.to(dtype=torch.long, device="cpu")
+    valid_mask = slots_cpu >= 0
+    if not torch.any(valid_mask):
+        return
+    valid_tokens_cpu = torch.nonzero(valid_mask, as_tuple=True)[0]
+    valid_slots_cpu = slots_cpu[valid_tokens_cpu]
+
+    ptr_list = key_value_ptrs.cpu().tolist()
+
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
 
-    slots = slot_mapping.to(dtype=torch.long, device="cpu")
-    valid_mask = slots >= 0
-    if not torch.any(valid_mask):
-        return
-    valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
-    valid_slots = slots[valid_tokens]
+    # Determine working device (see multi_layer_kv_transfer for details).
+    first_ptr = int(ptr_list[0]) if ptr_list else 0
+    if first_ptr in _ptr_to_tensor:
+        work_device = _ptr_to_tensor[first_ptr].device
+    else:
+        work_device = torch.device("cpu")
 
-    ptr_list = key_value_ptrs.cpu().tolist()
+    kv_work = (
+        key_value if key_value.device == work_device else key_value.to(work_device)
+    )
+    valid_tokens_dev = valid_tokens_cpu.to(work_device)
+    valid_slots_dev = valid_slots_cpu.to(work_device)
 
     for layer_id in range(num_layers):
         k_ptr = int(ptr_list[layer_id])
         v_ptr = int(ptr_list[layer_id + num_layers])
 
-        k_buf = _tensor_from_ptr(
-            k_ptr, (page_buffer_size, hidden_size), key_value.dtype
-        )
-        v_buf = _tensor_from_ptr(
-            v_ptr, (page_buffer_size, hidden_size), key_value.dtype
-        )
+        k_buf = _tensor_from_ptr(k_ptr, (page_buffer_size, hidden_size), kv_work.dtype)
+        v_buf = _tensor_from_ptr(v_ptr, (page_buffer_size, hidden_size), kv_work.dtype)
 
         if direction == TransferDirection.H2D:
-            k_buf[valid_slots] = key_value[0, layer_id, valid_tokens]
-            v_buf[valid_slots] = key_value[1, layer_id, valid_tokens]
+            k_buf[valid_slots_dev] = kv_work[0, layer_id, valid_tokens_dev]
+            v_buf[valid_slots_dev] = kv_work[1, layer_id, valid_tokens_dev]
+            _write_back_to_ptr(k_ptr, k_buf)
+            _write_back_to_ptr(v_ptr, v_buf)
         else:
-            key_value[0, layer_id, valid_tokens] = k_buf[valid_slots]
-            key_value[1, layer_id, valid_tokens] = v_buf[valid_slots]
+            kv_work[0, layer_id, valid_tokens_dev] = k_buf[valid_slots_dev]
+            kv_work[1, layer_id, valid_tokens_dev] = v_buf[valid_slots_dev]
+
+    # Write kv_work results back to key_value when they are different objects.
+    if direction == TransferDirection.D2H and kv_work is not key_value:
+        key_value.copy_(kv_work.to(key_value.device))
 
 
 def single_layer_kv_transfer(
@@ -401,13 +621,19 @@ def single_layer_kv_transfer(
         H2D = LMCache  -> vLLM GPU
         D2H = vLLM GPU -> LMCache
     """
+    # Slots are computed on CPU because only Python int arithmetic is used
+    # for indexing. Python int indices work on any PyTorch device tensor, so
+    # lmc_key_value_cache and vllm_key_value_cache are used as-is (no CPU
+    # copy). Modifications happen in-place; no writeback step is needed.
+    slot_cpu = slot_mapping.to(dtype=torch.long, device="cpu")
+
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
     )
 
-    num_tokens = slot_mapping.size(0)
-    slots = slot_mapping.cpu().tolist()
+    num_tokens = slot_cpu.size(0)
+    slots = slot_cpu.tolist()
 
     if is_mla:
         # ── MLA format ──
@@ -425,14 +651,14 @@ def single_layer_kv_transfer(
 
             if direction == TransferDirection.D2H:
                 # vLLM -> LMCache
-                lmc_key_value_cache[token_idx] = vllm_key_value_cache[
-                    block_idx, block_offset
-                ]
+                lmc_key_value_cache[token_idx].copy_(
+                    vllm_key_value_cache[block_idx, block_offset]
+                )
             else:
                 # LMCache -> vLLM
-                vllm_key_value_cache[block_idx, block_offset] = lmc_key_value_cache[
-                    token_idx
-                ]
+                vllm_key_value_cache[block_idx, block_offset].copy_(
+                    lmc_key_value_cache[token_idx]
+                )
 
     else:
         # ── Non-MLA format ──
@@ -481,10 +707,10 @@ def single_layer_kv_transfer(
 
                 # ── Transfer ──
                 if direction == TransferDirection.D2H:
-                    # vLLM -> LMCache
+                    # vLLM -> LMCache (.copy_() supports cross-device)
                     lmc_flat.copy_(vllm_flat)
                 else:
-                    # LMCache -> vLLM
+                    # LMCache -> vLLM (.copy_() supports cross-device)
                     vllm_slice.copy_(lmc_flat.reshape(num_heads, head_size))
 
 
@@ -509,18 +735,25 @@ def single_layer_kv_transfer_sgl(
         direction: False for LMCache -> SGLang, True for SGLang -> LMCache
         token_major: Boolean to determine the layout of lmc_key_value_cache
     """
+    # Compute slots on CPU for Python arithmetic; index tensors are then moved
+    # to the sgl/lmc device for advanced indexing.  No CPU copies of the cache
+    # tensors are made — all operations run natively on their current device.
+    slot_cpu = slot_mapping.to(dtype=torch.long, device="cpu")
 
-    # 1. Get basic dimensions
+    # 1. Get basic dimensions (from the sgl tensors, on their device)
+    sgl_dev = sgl_key_cache.device
+    lmc_dev = lmc_key_value_cache.device
     block_size = sgl_key_cache.size(1)
     num_heads = sgl_key_cache.size(2)
     head_size = sgl_key_cache.size(3)
 
-    # 2. Calculate block indices and offsets within the blocks from slot_mapping
-    # In SGLang/vLLM, slot_idx = block_idx * block_size + block_offset
-    valid_mask = slot_mapping >= 0
-    valid_slots = slot_mapping[valid_mask]
-    block_indices = valid_slots // block_size
-    block_offsets = valid_slots % block_size
+    # 2. Calculate block indices and offsets — on the sgl device for
+    # advanced indexing into sgl_key_cache / sgl_value_cache.
+    valid_mask_cpu = slot_cpu >= 0
+    valid_slots_cpu = slot_cpu[valid_mask_cpu]
+    block_indices = (valid_slots_cpu // block_size).to(sgl_dev)
+    block_offsets = (valid_slots_cpu % block_size).to(sgl_dev)
+    valid_mask_lmc = valid_mask_cpu.to(lmc_dev)
 
     # 3. Prepare LMCache views for K and V
     if token_major:
@@ -535,23 +768,24 @@ def single_layer_kv_transfer_sgl(
     # 4. Perform the transfer
     if direction == TransferDirection.H2D:
         # --- Direction: LMCache to SGLang (Paged Buffer) ---
-        # Reshape LMC flat tensors to match SGL [num_heads, head_size]
-        src_k_reshaped = lmc_k[valid_mask].view(-1, num_heads, head_size)
-        src_v_reshaped = lmc_v[valid_mask].view(-1, num_heads, head_size)
+        # Reshape LMC flat tensors to match SGL [num_heads, head_size] and
+        # move to the sgl device for the scatter operation.
+        src_k = lmc_k[valid_mask_lmc].view(-1, num_heads, head_size).to(sgl_dev)
+        src_v = lmc_v[valid_mask_lmc].view(-1, num_heads, head_size).to(sgl_dev)
 
-        # Advanced indexing: update specific slots in the paged cache
-        sgl_key_cache[block_indices, block_offsets] = src_k_reshaped
-        sgl_value_cache[block_indices, block_offsets] = src_v_reshaped
+        # In-place scatter into the sgl caches (on sgl_dev)
+        sgl_key_cache[block_indices, block_offsets] = src_k
+        sgl_value_cache[block_indices, block_offsets] = src_v
 
     else:
         # --- Direction: SGLang (Paged Buffer) to LMCache ---
-        # Gather tensors from paged cache based on mapping
-        sampled_k = sgl_key_cache[block_indices, block_offsets]
-        sampled_v = sgl_value_cache[block_indices, block_offsets]
+        # Gather from paged cache and move to the lmc device.
+        sampled_k = sgl_key_cache[block_indices, block_offsets].to(lmc_dev)
+        sampled_v = sgl_value_cache[block_indices, block_offsets].to(lmc_dev)
 
-        # Flatten the head dimensions and copy into LMC tensors
-        lmc_k[valid_mask] = sampled_k.reshape(-1, num_heads * head_size)
-        lmc_v[valid_mask] = sampled_v.reshape(-1, num_heads * head_size)
+        # In-place update of lmc tensors (on lmc_dev)
+        lmc_k[valid_mask_lmc] = sampled_k.reshape(-1, num_heads * head_size)
+        lmc_v[valid_mask_lmc] = sampled_v.reshape(-1, num_heads * head_size)
 
 
 def load_and_reshape_flash(
@@ -568,32 +802,28 @@ def load_and_reshape_flash(
     Note: In the context of 'test_extract_and_load_back', this function performs
     an EXTRACT operation (Reads from GPU Cache and writes to Pinned CPU memory).
     """
-    # 1. Prepare indices on the target device
-    # Mapping must be on the same GPU as the cache to perform indexing
-    device = key_cache.device
-    slot_mapping = slot_mapping.to(device=device, dtype=torch.long)
-
+    # Compute block indices on the cache device for advanced indexing.
+    # No CPU copy of key_cache / value_cache is made — operations run natively
+    # on whatever device the caches are on.
+    cache_dev = key_cache.device
+    slot_dev = slot_mapping.to(dtype=torch.long, device=cache_dev)
     block_size = key_cache.size(1)
 
     # Calculate physical locations within the paged cache
-    block_indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
-    block_offsets = slot_mapping % block_size
+    block_indices = torch.div(slot_dev, block_size, rounding_mode="floor")
+    block_offsets = slot_dev % block_size
 
-    # 2. Extract data from Cache (Gather operation)
-    # The result k_out/v_out will be on the GPU
+    # Extract data from Cache (Gather operation)
     # Shape: [num_tokens, num_heads, head_size]
     k_out = key_cache[block_indices, block_offsets]
     v_out = value_cache[block_indices, block_offsets]
 
-    # 3. Write to the destination tensor (CPU Copy)
+    # Write to the destination tensor (convert to key_value's device if needed)
     # Target shape: [2, num_layers, num_tokens, hidden_dim]
-
     # Flatten heads into the hidden dimension: [T, NumHeads, HeadSize] -> [T, HiddenDim]
     hidden_dim = k_out.shape[1] * k_out.shape[2]
-
-    # Assignment automatically handles the Device-to-Host (D2H) transfer
-    key_value[0, layer_idx] = k_out.view(-1, hidden_dim)
-    key_value[1, layer_idx] = v_out.view(-1, hidden_dim)
+    key_value[0, layer_idx] = k_out.view(-1, hidden_dim).to(key_value.device)
+    key_value[1, layer_idx] = v_out.view(-1, hidden_dim).to(key_value.device)
 
 
 def reshape_and_cache_back_flash(
@@ -615,41 +845,26 @@ def reshape_and_cache_back_flash(
 
     Logic:
         1. Extract the specific layer's data from key_value.
-        2. Move it to the GPU (if it's on CPU).
-        3. Reshape it to match the cache's head structure.
-        4. Scatter (write) it into the non-contiguous cache blocks using slot_mapping.
+        2. Reshape it to match the cache's head structure.
+        3. Scatter (write) it into the caches using slot_mapping.
+        All tensors are operated on their native devices; no CPU copies are made.
     """
-
-    # 1. Setup Device & Dimensions
-    # The cache is on the GPU, so all indices and source data must eventually be there.
-    device = key_cache.device
-
+    # Compute block indices on the cache device for advanced indexing.
+    cache_dev = key_cache.device
+    slot_dev = slot_mapping.to(dtype=torch.long, device=cache_dev)
     block_size = key_cache.size(1)
     num_heads = key_cache.size(2)
     head_size = key_cache.size(3)
 
-    # 2. Prepare Indices
-    # slot_mapping might be on CPU, must move to GPU for indexing.
-    slot_mapping = slot_mapping.to(device=device, dtype=torch.long)
-
     # Calculate physical block indices and offsets
-    block_indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
-    block_offsets = slot_mapping % block_size
+    block_indices = torch.div(slot_dev, block_size, rounding_mode="floor")
+    block_offsets = slot_dev % block_size
 
-    # 3. Process Source Data (Key)
-    # Step A: Slice the specific layer from the source tensor
-    # Source shape: [2, num_layers, num_tokens, hidden_dim] -> [num_tokens, hidden_dim]
-    k_src_flat = key_value[0, layer_idx]
-    v_src_flat = key_value[1, layer_idx]
+    # Slice the specific layer from key_value and move to cache device
+    k_src = key_value[0, layer_idx].to(cache_dev).view(-1, num_heads, head_size)
+    v_src = key_value[1, layer_idx].to(cache_dev).view(-1, num_heads, head_size)
 
-    # Step B: Reshape & Move to GPU
-    # .to(device) handles the CPU -> GPU transfer if key_value is in pinned memory.
-    # View shape: [num_tokens, num_heads, head_size]
-    k_src = k_src_flat.to(device).view(-1, num_heads, head_size)
-    v_src = v_src_flat.to(device).view(-1, num_heads, head_size)
-
-    # 4. Write to Cache (Scatter)
-    # Using Advanced Indexing to write data into specific blocks/offsets
+    # Scatter into the caches (in-place on cache_dev)
     key_cache[block_indices, block_offsets] = k_src
     value_cache[block_indices, block_offsets] = v_src
 
@@ -810,8 +1025,8 @@ def encode_fast_new(cdf, input_sym, output_buffer, output_lengths):
                 ptr += 1
             out_len_np[layer_idx, channel_idx] = ptr
 
-    output_buffer.copy_(torch.from_numpy(out_buf_np))
-    output_lengths.copy_(torch.from_numpy(out_len_np))
+    output_buffer.copy_(torch.from_numpy(out_buf_np).to(output_buffer.device))
+    output_lengths.copy_(torch.from_numpy(out_len_np).to(output_lengths.device))
 
 
 def uint32_val(val):
@@ -935,7 +1150,7 @@ def decode_fast_new(cdf, bytestreams, lengths, output):
 
     # Mypy: Validate output is not None before copying
     if output is not None:
-        output.copy_(torch.from_numpy(out_np))
+        output.copy_(torch.from_numpy(out_np).to(output.device))
 
 
 def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
@@ -1037,7 +1252,7 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
                             else 0
                         )
 
-    output.copy_(torch.from_numpy(out_np))
+    output.copy_(torch.from_numpy(out_np).to(output.device))
 
 
 def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
@@ -1045,10 +1260,13 @@ def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
     Equivalent to CUDA calculate_cdf.
     Input: Expects a 3D tensor (e.g., [1, N, 1]).
     num_bins: Total number of bins (max_val + 1).
-    Returns: Tensor of length (num_bins + 1) with CDF values.
+    Returns: Tensor of length (num_bins + 1) with CDF values on the same
+    device as input_tensor.
     """
-    # Force flattening to match bincount expectation
-    flat_input = input_tensor.flatten().long()
+    orig_device = input_tensor.device
+
+    # Force flattening to match bincount expectation; bincount requires CPU
+    flat_input = input_tensor.cpu().flatten().long()
 
     # Use num_bins directly to match the CUDA kernel's 'Alphabet Size'
     counts = torch.bincount(flat_input, minlength=num_bins)
@@ -1061,9 +1279,9 @@ def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
     if cdf[-1] > 0:
         cdf = cdf / cdf[-1]
 
-    cdf = torch.cat([torch.tensor([0.0], device=cdf.device), cdf])
+    cdf = torch.cat([torch.tensor([0.0]), cdf])
 
-    return cdf
+    return cdf.to(orig_device)
 
 
 def rotary_embedding_k_fused(
@@ -1080,6 +1298,10 @@ def rotary_embedding_k_fused(
     embedding at new_positions. head_size is unused but kept for API
     compatibility with the CUDA equivalent.
 
+    All operations are performed on ``key``'s device using native PyTorch.
+    No CPU copies are made — the function works on any device that PyTorch
+    supports (CPU, CUDA, MPS, XPU, etc.).
+
     Args:
         old_positions: Token positions whose rotary embedding to reverse.
         new_positions: Token positions whose rotary embedding to apply.
@@ -1089,11 +1311,17 @@ def rotary_embedding_k_fused(
         is_neox: If True, uses NeoX-style rotary (contiguous halves);
             otherwise uses GPT-J-style (interleaved).
     """
-    rot_dim = cos_sin_cache.shape[1]
+    # Operate on key's device; move position and cache tensors there as needed.
+    dev = key.device
+    old_pos = old_positions.to(dev)
+    new_pos = new_positions.to(dev)
+    cos_sin = cos_sin_cache.to(dev)
+
+    rot_dim = cos_sin.shape[1]
     half_rot = rot_dim // 2
 
-    old_cs = cos_sin_cache[old_positions]
-    new_cs = cos_sin_cache[new_positions]
+    old_cs = cos_sin[old_pos]
+    new_cs = cos_sin[new_pos]
 
     oc, os = old_cs[:, :half_rot].unsqueeze(1), old_cs[:, half_rot:].unsqueeze(1)
     nc, ns = new_cs[:, :half_rot].unsqueeze(1), new_cs[:, half_rot:].unsqueeze(1)
@@ -1111,6 +1339,7 @@ def rotary_embedding_k_fused(
     x_out = x_rev * nc - y_rev * ns
     y_out = y_rev * nc + x_rev * ns
 
+    # Write results directly back into key in-place (on dev)
     if is_neox:
         key[..., :half_rot] = x_out
         key[..., half_rot:rot_dim] = y_out

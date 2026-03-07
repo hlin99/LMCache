@@ -28,18 +28,14 @@ def _build_backend_params() -> list:
         try:
             import lmcache.c_ops as c_ops_module
 
-            params.append(
-                pytest.param(("cuda_ops", c_ops_module, True), id="cuda_ops")
-            )
+            params.append(pytest.param(("cuda_ops", c_ops_module, True), id="cuda_ops"))
         except ImportError:
             pass
 
         import lmcache.non_cuda_equivalents as non_cuda_ops_gpu
 
         params.append(
-            pytest.param(
-                ("non_cuda_gpu", non_cuda_ops_gpu, False), id="non_cuda_gpu"
-            )
+            pytest.param(("non_cuda_gpu", non_cuda_ops_gpu, False), id="non_cuda_gpu")
         )
 
     import lmcache.non_cuda_equivalents as non_cuda_ops_no_gpu
@@ -94,9 +90,7 @@ def scenario_get_gpu_pci_bus_id(
     return {"get_gpu_pci_bus_id": torch.tensor([1], dtype=torch.int32)}
 
 
-def scenario_calculate_cdf(
-    ops: Any, is_cuda_backend: bool
-) -> dict[str, torch.Tensor]:
+def scenario_calculate_cdf(ops: Any, is_cuda_backend: bool) -> dict[str, torch.Tensor]:
     """Test calculate_cdf for multiple bin counts."""
     num_bins_list = [1, 2, 5, 11, 15, 31, 32, 63]
     results: dict[str, torch.Tensor] = {}
@@ -271,10 +265,11 @@ def scenario_lmcache_memcpy_async_alignment(
         chunk_sizes.append(int(num_bytes))
         original_copy(dest_ptr, src_ptr, num_bytes)
 
-    with unittest.mock.patch.object(
-        ops, "_get_copy_lib", return_value=None
-    ), unittest.mock.patch.object(
-        ops, "_copy_bytes_with_tensor", side_effect=tracking_copy
+    with (
+        unittest.mock.patch.object(ops, "_get_copy_lib", return_value=None),
+        unittest.mock.patch.object(
+            ops, "_copy_bytes_with_tensor", side_effect=tracking_copy
+        ),
     ):
         ops.lmcache_memcpy_async(
             dst.data_ptr(),
@@ -285,10 +280,14 @@ def scenario_lmcache_memcpy_async_alignment(
             host_buffer_alignments,
         )
 
-    assert torch.equal(dst, src), "Data copy should preserve contents with alignment splitting"
+    assert torch.equal(dst, src), (
+        "Data copy should preserve contents with alignment splitting"
+    )
 
     expected_chunks = [32, 64, 64, 40]
-    assert chunk_sizes == expected_chunks, f"Chunk sizes {chunk_sizes} did not match expected {expected_chunks}"
+    assert chunk_sizes == expected_chunks, (
+        f"Chunk sizes {chunk_sizes} did not match expected {expected_chunks}"
+    )
 
     return {
         "lmcache_memcpy_async_alignment": torch.tensor(
@@ -1747,9 +1746,7 @@ def test_compare(name: str) -> None:
     """
     available = _BACKEND_IDS  # ordered list of backend_ids from _build_backend_params
     backend_results = {
-        bid: _results[(name, bid)]
-        for bid in available
-        if (name, bid) in _results
+        bid: _results[(name, bid)] for bid in available if (name, bid) in _results
     }
 
     assert len(backend_results) >= 1, (
@@ -1797,3 +1794,177 @@ def test_compare(name: str) -> None:
                     pytest.fail(
                         f"{name}/{key}: '{bid}'={val} != '{base_bid}'={base_val}"
                     )
+
+
+# ==========================================
+# 5. Standalone: register_ptr pure-PyTorch path
+# ==========================================
+
+
+def test_register_ptr_pytorch_path() -> None:
+    """Validate register_ptr / unregister_ptr enable the pure-PyTorch path.
+
+    The registered-tensor path in _tensor_from_ptr returns an **in-place view**
+    of the registered tensor (on its original device).  No _get_copy_lib mock
+    is needed because the registered path never calls _get_copy_lib.
+
+    Exercises both H2D (LMCache → paged) and D2H (paged → LMCache) directions
+    for multi_layer_kv_transfer and multi_layer_kv_transfer_unilateral, and
+    verifies that modifications happen directly on the registered tensors
+    without any CPU copy.
+    """
+    import lmcache.non_cuda_equivalents as ops
+
+    num_layers = 2
+    num_tokens = 4
+    head_size = 8
+    page_buffer_size = 10
+    dtype = torch.float32
+
+    slot_mapping = torch.tensor([0, 2, 5, 9], dtype=torch.int64)
+
+    # ── multi_layer_kv_transfer: H2D ──────────────────────────────────
+    key_value = torch.zeros((2, num_layers, num_tokens, head_size), dtype=dtype)
+    for kv in range(2):
+        for ly in range(num_layers):
+            for t in range(num_tokens):
+                key_value[kv, ly, t] = float(kv * 5000 + ly * 1000 + t * 10)
+
+    page_buffers = [
+        torch.zeros((2, page_buffer_size, head_size), dtype=dtype)
+        for _ in range(num_layers)
+    ]
+    # Register each paged buffer: _tensor_from_ptr returns an in-place view
+    for pb in page_buffers:
+        ops.register_ptr(pb.data_ptr(), pb)
+
+    key_value_ptrs = torch.tensor(
+        [pb.data_ptr() for pb in page_buffers], dtype=torch.int64
+    )
+
+    ops.multi_layer_kv_transfer(
+        key_value,
+        key_value_ptrs,
+        slot_mapping,
+        torch.device("cpu"),
+        page_buffer_size,
+        ops.TransferDirection.H2D,
+        ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        1,
+    )
+
+    # Modifications must appear directly on page_buffers (in-place, no copy)
+    for t_id, slot in enumerate(slot_mapping.tolist()):
+        for ly in range(num_layers):
+            for kv in range(2):
+                expected = float(kv * 5000 + ly * 1000 + t_id * 10)
+                got = page_buffers[ly][kv, slot, 0].item()
+                assert abs(got - expected) < 1e-3, (
+                    f"H2D mismatch at kv={kv} ly={ly} t={t_id}: "
+                    f"expected={expected}, got={got}"
+                )
+
+    # Unregister
+    for pb in page_buffers:
+        ops.unregister_ptr(pb.data_ptr())
+
+    # ── multi_layer_kv_transfer: D2H ──────────────────────────────────
+    key_value_d2h = torch.zeros((2, num_layers, num_tokens, head_size), dtype=dtype)
+    page_buffers_d2h = []
+    for ly in range(num_layers):
+        pb = torch.zeros((2, page_buffer_size, head_size), dtype=dtype)
+        for s in range(page_buffer_size):
+            pb[0, s] = float(ly * 2000 + s * 10)
+            pb[1, s] = float(ly * 2000 + s * 10 + 7000)
+        page_buffers_d2h.append(pb)
+        ops.register_ptr(pb.data_ptr(), pb)
+
+    key_value_ptrs_d2h = torch.tensor(
+        [pb.data_ptr() for pb in page_buffers_d2h], dtype=torch.int64
+    )
+
+    ops.multi_layer_kv_transfer(
+        key_value_d2h,
+        key_value_ptrs_d2h,
+        slot_mapping,
+        torch.device("cpu"),
+        page_buffer_size,
+        ops.TransferDirection.D2H,
+        ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        1,
+    )
+
+    for t_id, slot in enumerate(slot_mapping.tolist()):
+        for ly in range(num_layers):
+            for kv in range(2):
+                offset = 7000 if kv == 1 else 0
+                expected = float(ly * 2000 + slot * 10 + offset)
+                got = key_value_d2h[kv, ly, t_id, 0].item()
+                assert abs(got - expected) < 1e-3, (
+                    f"D2H mismatch at kv={kv} ly={ly} t={t_id}: "
+                    f"expected={expected}, got={got}"
+                )
+
+    for pb in page_buffers_d2h:
+        ops.unregister_ptr(pb.data_ptr())
+
+    # ── multi_layer_kv_transfer_unilateral: H2D ───────────────────────
+    kv_u = torch.zeros((2, num_layers, num_tokens, head_size), dtype=dtype)
+    for kv in range(2):
+        for ly in range(num_layers):
+            for t in range(num_tokens):
+                kv_u[kv, ly, t] = float(kv * 3000 + ly * 500 + t * 10)
+
+    k_bufs = [
+        torch.zeros((page_buffer_size, head_size), dtype=dtype)
+        for _ in range(num_layers)
+    ]
+    v_bufs = [
+        torch.zeros((page_buffer_size, head_size), dtype=dtype)
+        for _ in range(num_layers)
+    ]
+    for buf in k_bufs + v_bufs:
+        ops.register_ptr(buf.data_ptr(), buf)
+
+    ptr_list = [kb.data_ptr() for kb in k_bufs] + [vb.data_ptr() for vb in v_bufs]
+    kv_ptrs_u = torch.tensor(ptr_list, dtype=torch.int64)
+
+    ops.multi_layer_kv_transfer_unilateral(
+        kv_u,
+        kv_ptrs_u,
+        slot_mapping,
+        torch.device("cpu"),
+        page_buffer_size,
+        ops.TransferDirection.H2D,
+        ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+    )
+
+    for t_id, slot in enumerate(slot_mapping.tolist()):
+        for ly in range(num_layers):
+            expected_k = float(0 * 3000 + ly * 500 + t_id * 10)
+            expected_v = float(1 * 3000 + ly * 500 + t_id * 10)
+            got_k = k_bufs[ly][slot, 0].item()
+            got_v = v_bufs[ly][slot, 0].item()
+            assert abs(got_k - expected_k) < 1e-3, (
+                f"Unilateral H2D K mismatch ly={ly} t={t_id}: "
+                f"expected={expected_k}, got={got_k}"
+            )
+            assert abs(got_v - expected_v) < 1e-3, (
+                f"Unilateral H2D V mismatch ly={ly} t={t_id}: "
+                f"expected={expected_v}, got={got_v}"
+            )
+
+    for buf in k_bufs + v_bufs:
+        ops.unregister_ptr(buf.data_ptr())
+
+    # ── register_ptr rejects non-contiguous tensors ────────────────────
+    non_contig = torch.zeros((4, 4))[::2]
+    assert not non_contig.is_contiguous()
+    try:
+        ops.register_ptr(non_contig.data_ptr(), non_contig)
+        raise AssertionError("Expected ValueError for non-contiguous tensor")
+    except ValueError:
+        pass  # expected
+
+    # ── unregister_ptr is idempotent ───────────────────────────────────
+    ops.unregister_ptr(12345678)  # arbitrary ptr, should not raise
