@@ -30,10 +30,33 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
     """Lazily load and cache the CUDA runtime library, or None for CPU fallback."""
     global _copy_lib
     if _copy_lib is _copy_lib_NOT_LOADED:
+        # Prefer the loader exposed by torch to handle versioned sonames that
+        # ship with PyTorch wheels.
         try:
-            _copy_lib = ctypes.CDLL("libcudart.so")
-        except OSError:
-            _copy_lib = None
+            if hasattr(torch, "cuda") and hasattr(torch.cuda, "cudart"):
+                _copy_lib = torch.cuda.cudart()  # type: ignore[assignment]
+        except Exception:
+            _copy_lib = _copy_lib_NOT_LOADED
+
+        # Fall back to common libcudart sonames when torch.cuda.cudart is not
+        # available (or fails to load).
+        if _copy_lib is _copy_lib_NOT_LOADED:
+            try:
+                for name in (
+                    "libcudart.so",
+                    "libcudart.so.12",
+                    "libcudart.so.11.0",
+                    "libcudart.so.11",
+                ):
+                    try:
+                        _copy_lib = ctypes.CDLL(name)
+                        break
+                    except OSError:
+                        continue
+                else:
+                    _copy_lib = None
+            except OSError:
+                _copy_lib = None
     return _copy_lib
 
 

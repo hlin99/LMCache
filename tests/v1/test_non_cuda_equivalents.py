@@ -61,6 +61,55 @@ def _synchronize_device(device: torch.device) -> None:
         torch.hpu.synchronize()  # type: ignore[attr-defined]
 
 
+def test_get_copy_lib_prefers_torch_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_get_copy_lib should use torch.cuda.cudart when available."""
+    import lmcache.non_cuda_equivalents as ops
+
+    sentinel = object()
+
+    def forbid_cdll(_: str):
+        raise AssertionError("ctypes.CDLL should not run when cudart succeeds")
+
+    monkeypatch.setattr(ops, "_copy_lib", ops._copy_lib_NOT_LOADED)
+    monkeypatch.setattr(ops.torch.cuda, "cudart", lambda: sentinel, raising=False)
+    monkeypatch.setattr(ops.ctypes, "CDLL", forbid_cdll)
+
+    try:
+        assert ops._get_copy_lib() is sentinel
+    finally:
+        ops._copy_lib = ops._copy_lib_NOT_LOADED
+
+
+def test_get_copy_lib_checks_versioned_sonames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_get_copy_lib should probe common libcudart sonames."""
+    import lmcache.non_cuda_equivalents as ops
+
+    sentinel = object()
+    attempts: list[str] = []
+
+    def fake_cudart():
+        raise RuntimeError("no cudart available")
+
+    def fake_cdll(name: str):
+        attempts.append(name)
+        if name == "libcudart.so.12":
+            return sentinel
+        raise OSError(f"missing {name}")
+
+    monkeypatch.setattr(ops, "_copy_lib", ops._copy_lib_NOT_LOADED)
+    monkeypatch.setattr(ops.torch.cuda, "cudart", fake_cudart, raising=False)
+    monkeypatch.setattr(ops.ctypes, "CDLL", fake_cdll)
+
+    try:
+        assert ops._get_copy_lib() is sentinel
+        assert attempts[0] == "libcudart.so"
+        assert "libcudart.so.12" in attempts
+    finally:
+        ops._copy_lib = ops._copy_lib_NOT_LOADED
+
+
 # ==========================================
 # 1. Backend Configuration
 # ==========================================
