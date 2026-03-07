@@ -1260,28 +1260,41 @@ def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
     Equivalent to CUDA calculate_cdf.
     Input: Expects a 3D tensor (e.g., [1, N, 1]).
     num_bins: Total number of bins (max_val + 1).
-    Returns: Tensor of length (num_bins + 1) with CDF values on the same
-    device as input_tensor.
+    Returns: Tensor of shape (nlayers, nchannels, num_bins + 1) with values
+    scaled to match the CUDA kernel output (uint16 CDF divided by 65536)
+    on the same device as ``input_tensor``.
     """
     orig_device = input_tensor.device
+    input_cpu = input_tensor.cpu()
 
-    # Force flattening to match bincount expectation; bincount requires CPU
-    flat_input = input_tensor.cpu().flatten().long()
+    if input_cpu.dim() != 3:
+        raise ValueError("calculate_cdf expects input of shape [nlayers, ntokens, nchannels]")
 
-    # Use num_bins directly to match the CUDA kernel's 'Alphabet Size'
-    counts = torch.bincount(flat_input, minlength=num_bins)
+    nlayers, ntokens, nchannels = input_cpu.shape
+    # Rearrange to [nlayers * nchannels, ntokens] so each row is one (layer, channel)
+    symbols = input_cpu.permute(0, 2, 1).contiguous().view(-1, ntokens).to(torch.int64)
 
-    # Slice to ensure output length is exactly num_bins
-    counts = counts[:num_bins]
+    # Histogram per (layer, channel); prepend a leading zero bin to mirror CUDA's hist[0]
+    hists = torch.stack(
+        [torch.bincount(row, minlength=num_bins)[:num_bins] for row in symbols],
+        dim=0,
+    )
+    hists = torch.cat(
+        [torch.zeros((hists.size(0), 1), dtype=torch.int64), hists],
+        dim=1,
+    )
 
-    cdf = torch.cumsum(counts, dim=0).float()
+    cdf_counts = torch.cumsum(hists, dim=1)
+    totals = cdf_counts[:, -1].clamp_min(1).unsqueeze(1)  # avoid div-by-zero
 
-    if cdf[-1] > 0:
-        cdf = cdf / cdf[-1]
+    max_uint16_value = 0xFFFF - num_bins
+    # Integer-normalize to match CUDA kernel, then add bin index offset
+    normalized = (max_uint16_value * cdf_counts) // totals
+    normalized = normalized + torch.arange(num_bins + 1, dtype=torch.int64)
 
-    cdf = torch.cat([torch.tensor([0.0]), cdf])
-
-    return cdf.to(orig_device)
+    # Scale to float in [0, 1) exactly as test conversion does for CUDA outputs
+    result = (normalized.to(torch.float32) / 65536.0).view(nlayers, nchannels, num_bins + 1)
+    return result.to(orig_device)
 
 
 def rotary_embedding_k_fused(
