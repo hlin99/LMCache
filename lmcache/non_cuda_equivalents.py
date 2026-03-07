@@ -59,12 +59,8 @@ def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
         return
 
     buffer_type = ctypes.c_uint8 * num_bytes
-    dst_tensor = torch.frombuffer(
-        buffer_type.from_address(dst), dtype=torch.uint8
-    )
-    src_tensor = torch.frombuffer(
-        buffer_type.from_address(src), dtype=torch.uint8
-    )
+    dst_tensor = torch.frombuffer(buffer_type.from_address(dst), dtype=torch.uint8)
+    src_tensor = torch.frombuffer(buffer_type.from_address(src), dtype=torch.uint8)
     dst_tensor.copy_(src_tensor)
 
 
@@ -264,9 +260,7 @@ def multi_layer_kv_transfer(
                 key_value[:, layer_id, valid_tokens] = gathered
 
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-            num_blocks = max(
-                int(torch.max(valid_slots).item() // block_size + 1), 1
-            )
+            num_blocks = max(int(torch.max(valid_slots).item() // block_size + 1), 1)
             paged = _tensor_from_ptr(
                 paged_ptr,
                 (num_blocks, 2, block_size, hidden_size),
@@ -669,33 +663,33 @@ def lmcache_memcpy_async(
     host_buffer_alignments: int,
 ):
     """
-    Python fallback implementation that passes the UT by correctly
-    handling GPU pointers via libcudart.
+    Python fallback implementation.
+    When libcudart is available, uses cudaMemcpy with cudaMemcpyDefault
+    (lets CUDA runtime auto-detect pointer types).
+    When libcudart is unavailable, falls back to CPU-only tensor copy.
     """
-    # 1. Power of two check (as in C++)
+    # 1. Power of two check
     if host_buffer_alignments <= 0 or (
         host_buffer_alignments & (host_buffer_alignments - 1) != 0
     ):
         raise ValueError("host_buffer_alignments must be power of two")
 
-    # 2. Get direction value
-    # H2D: 0 -> cudaMemcpyHostToDevice (1)
-    # D2H: 1 -> cudaMemcpyDeviceToHost (2)
-    if direction == TransferDirection.H2D:
-        cuda_kind = 1
-    elif direction == TransferDirection.D2H:
-        cuda_kind = 2
+    # 2. Validate direction (for API compatibility, even though we use Default)
+    if direction not in (TransferDirection.H2D, TransferDirection.D2H):
+        raise ValueError(f"Unsupported direction: {direction}")
 
-    # 3. Load CUDA runtime library
-    # We must use the C library to handle these raw pointers
+    # 3. Determine copy strategy
     libcudart = _get_copy_lib()
+    use_cuda = libcudart is not None and hasattr(libcudart, "cudaMemcpy")
 
-    # 4. Pointer arithmetic and aligned copy loop
+    # 4. Aligned copy loop
     offset = 0
     mask = host_buffer_alignments - 1
 
     while offset < nbytes:
-        # Calculate chunks based on alignment (1:1 with C++ logic)
+        # Calculate chunks based on alignment; mirrors
+        # csrc/mem_kernels.cu::lmcache_memcpy_async split loop that honors
+        # cudaHostRegister granularity.
         aligned_area_end = (
             (offset + host_buffer_offset) & ~mask
         ) + host_buffer_alignments
@@ -708,20 +702,22 @@ def lmcache_memcpy_async(
         current_dest = dest + offset
         current_src = src + offset
 
-        # Use cudaMemcpy if available (supports GPU pointers)
-        # Note: We use synchronous cudaMemcpy for the fallback to ensure completion
-        if libcudart is not None and hasattr(libcudart, "cudaMemcpy"):
+        if use_cuda:
+            # cudaMemcpyDefault (4) lets CUDA runtime auto-detect
+            # whether pointers are host or device memory.
+            # This works for all combinations: H2H, H2D, D2H, D2D.
+
+            assert libcudart is not None  # mypy: guarded by use_cuda
             ret = libcudart.cudaMemcpy(
                 ctypes.c_void_p(current_dest),
                 ctypes.c_void_p(current_src),
                 ctypes.c_size_t(max_nbytes),
-                ctypes.c_int(cuda_kind),
+                ctypes.c_int(4),  # cudaMemcpyDefault
             )
             if ret != 0:
-                # If CUDA call fails, we try ctypes.memmove as a last resort
-                _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
+                raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
         else:
-            # Fallback for CPU-only pointers
+            # No CUDA runtime: both pointers must be CPU
             _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
 
         offset += max_nbytes
