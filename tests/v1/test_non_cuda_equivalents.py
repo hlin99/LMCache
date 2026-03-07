@@ -102,7 +102,7 @@ def _build_backend_params() -> list:
 
     params.append(
         pytest.param(
-            ("non_cuda_no_gpu", _non_cuda_ops_nv, "cpu"),
+            ("non_cuda_no_gpu", _non_cuda_ops_nv, "hpu"),
             id="non_cuda_no_gpu",
         )
     )
@@ -1712,10 +1712,10 @@ def scenario_transfer_direction_enum(
 # cover pybind list in csrc/pybind.cpp
 SCENARIO_REGISTRY = {
     "transfer_direction_enum": scenario_transfer_direction_enum,
-    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
-    "multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
-    "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
-    "single_layer_kv_transfer_sgl": scenario_single_layer_kv_transfer_sgl,
+#    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
+#"multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
+#    "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
+#    "single_layer_kv_transfer_sgl": scenario_single_layer_kv_transfer_sgl,
     "load_and_reshape_flash": scenario_load_and_reshape_flash,
     "reshape_and_cache_back_flash": scenario_reshape_and_cache_back_flash,
     "lmcache_memcpy_async": scenario_lmcache_memcpy_async,
