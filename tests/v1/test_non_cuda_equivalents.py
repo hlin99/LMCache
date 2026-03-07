@@ -110,6 +110,78 @@ def test_get_copy_lib_checks_versioned_sonames(
         ops._copy_lib = ops._copy_lib_NOT_LOADED
 
 
+def test_lmcache_memcpy_async_prefers_hpu_memcpy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HPU memcpy hook should run before CPU fallback."""
+    import lmcache.non_cuda_equivalents as ops
+
+    calls: list[tuple[int, int, int]] = []
+
+    class FakeHpu:
+        def is_available(self) -> bool:
+            return True
+
+        def memcpy(self, dst, src, size):
+            calls.append((dst.value, src.value, size.value))
+
+    fake_hpu = FakeHpu()
+
+    monkeypatch.setattr(ops, "_copy_lib", None)
+    monkeypatch.setattr(ops, "_get_copy_lib", lambda: None)
+    monkeypatch.setattr(ops.torch, "hpu", fake_hpu, raising=False)
+
+    def forbid_cpu(*_args, **_kwargs):
+        raise AssertionError("CPU memcpy fallback should not run when HPU memcpy exists")
+
+    monkeypatch.setattr(ops, "_copy_bytes_with_tensor", forbid_cpu)
+
+    ops.lmcache_memcpy_async(
+        dest=0x30,
+        src=0x20,
+        nbytes=8,
+        direction=ops.TransferDirection.H2D,
+        host_buffer_offset=0,
+        host_buffer_alignments=8,
+    )
+
+    assert calls == [(0x30, 0x20, 8)]
+
+    monkeypatch.delattr(ops.torch, "hpu", raising=False)
+    ops._copy_lib = ops._copy_lib_NOT_LOADED
+
+
+def test_lmcache_memcpy_async_raises_when_hpu_available_without_memcpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail fast instead of segfaulting when HPU is present but lacks memcpy."""
+    import lmcache.non_cuda_equivalents as ops
+
+    class FakeHpu:
+        def is_available(self) -> bool:
+            return True
+
+    monkeypatch.setattr(ops, "_copy_lib", None)
+    monkeypatch.setattr(ops, "_get_copy_lib", lambda: None)
+    monkeypatch.setattr(ops.torch, "hpu", FakeHpu(), raising=False)
+
+    def forbid_cpu(*_args, **_kwargs):
+        raise AssertionError("CPU memcpy fallback should not run when HPU is available")
+
+    monkeypatch.setattr(ops, "_copy_bytes_with_tensor", forbid_cpu)
+
+    with pytest.raises(RuntimeError, match="HPU memory copy"):
+        ops.lmcache_memcpy_async(
+            dest=0x30,
+            src=0x20,
+            nbytes=8,
+            direction=ops.TransferDirection.H2D,
+            host_buffer_offset=0,
+            host_buffer_alignments=8,
+        )
+
+    monkeypatch.delattr(ops.torch, "hpu", raising=False)
+    ops._copy_lib = ops._copy_lib_NOT_LOADED
+
+
 # ==========================================
 # 1. Backend Configuration
 # ==========================================

@@ -60,6 +60,39 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
     return _copy_lib
 
 
+def _is_hpu_available() -> bool:
+    """Return True when torch.hpu is present and available."""
+    hpu = getattr(torch, "hpu", None)
+    is_available = getattr(hpu, "is_available", None)
+    return callable(is_available) and bool(is_available())
+
+
+def _try_hpu_memcpy(dst: int, src: int, num_bytes: int) -> bool:
+    """Attempt HPU-native memcpy if Habana runtime is present."""
+    if not _is_hpu_available():
+        return False
+
+    hpu = torch.hpu  # type: ignore[attr-defined]
+    candidates = [
+        hpu,
+        getattr(hpu, "core", None),
+    ]
+    for obj in candidates:
+        if obj is None:
+            continue
+        for name in ("memcpy_async", "memcpy", "hpu_memcpy", "_hpu_memcpy"):
+            fn = getattr(obj, name, None)
+            if fn is None:
+                continue
+            try:
+                fn(ctypes.c_void_p(dst), ctypes.c_void_p(src), ctypes.c_size_t(num_bytes))
+                return True
+            except TypeError:
+                # Signature mismatch; try next candidate.
+                continue
+    return False
+
+
 def _tensor_from_ptr(
     ptr: int, shape: tuple[int, ...], dtype: torch.dtype
 ) -> torch.Tensor:
@@ -740,8 +773,16 @@ def lmcache_memcpy_async(
             if ret != 0:
                 raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
         else:
-            # No CUDA runtime: both pointers must be CPU
-            _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
+            # No CUDA runtime: try HPU-native memcpy first, then CPU fallback.
+            if _try_hpu_memcpy(current_dest, current_src, int(max_nbytes)):
+                pass
+            elif _is_hpu_available():
+                raise RuntimeError(
+                    "HPU memory copy requested but no compatible HPU memcpy "
+                    "implementation was found in torch.hpu"
+                )
+            else:
+                _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
 
         offset += max_nbytes
 
