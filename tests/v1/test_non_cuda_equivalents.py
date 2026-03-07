@@ -12,6 +12,8 @@ import torch
 # 1. Backend Configuration
 # ==========================================
 
+_c_ops_import_error: Exception | None = None
+
 
 def _build_backend_params() -> list:
     """Build pytest parameter list for the backend fixture.
@@ -31,8 +33,12 @@ def _build_backend_params() -> list:
             params.append(
                 pytest.param(("cuda_ops", c_ops_module, True), id="cuda_ops")
             )
-        except ImportError:
-            pass
+        except (ImportError, OSError) as exc:
+            global _c_ops_import_error
+            _c_ops_import_error = exc
+            params.append(
+                pytest.param(("cuda_ops", None, True), id="cuda_ops")
+            )
 
         import lmcache.non_cuda_equivalents as non_cuda_ops_gpu
 
@@ -68,6 +74,13 @@ def backend(request: pytest.FixtureRequest) -> Any:
     return False so the scenario code behaves as if no GPU is present.
     """
     backend_id, ops, is_cuda_backend = request.param
+    if backend_id == "cuda_ops" and ops is None:
+        pytest.fail(
+            f"CUDA is available but lmcache.c_ops failed to load: "
+            f"{_c_ops_import_error}\n"
+            f"This usually means the C++ extension is not built or the "
+            f".so is corrupted. Run `pip install -e .` to rebuild."
+        )
     if backend_id == "non_cuda_no_gpu":
         with unittest.mock.patch("torch.cuda.is_available", return_value=False):
             yield backend_id, ops, is_cuda_backend
