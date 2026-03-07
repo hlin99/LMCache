@@ -98,7 +98,9 @@ def _build_backend_params() -> list:
             import lmcache.c_ops as _c_ops
 
             params.append(
-                pytest.param(("cuda_ops", _c_ops, requested_device), id="cuda_ops")
+                pytest.param(
+                    ("cuda_ops", _c_ops, requested_device.type), id="cuda_ops"
+                )
             )
         except ImportError:
             pass
@@ -108,19 +110,17 @@ def _build_backend_params() -> list:
 
         params.append(
             pytest.param(
-                ("non_cuda_gpu", _non_cuda_ops, requested_device), id="non_cuda_gpu"
+                ("non_cuda_gpu", _non_cuda_ops, requested_device.type),
+                id="non_cuda_gpu",
             )
         )
 
     # First Party
     import lmcache.non_cuda_equivalents as _non_cuda_ops_nv
 
-    no_gpu_device = (
-        requested_device if requested_device.type != "cuda" else torch.device("cpu")
-    )
     params.append(
         pytest.param(
-            ("non_cuda_no_gpu", _non_cuda_ops_nv, no_gpu_device),
+            ("non_cuda_no_gpu", _non_cuda_ops_nv, "cpu"),
             id="non_cuda_no_gpu",
         )
     )
