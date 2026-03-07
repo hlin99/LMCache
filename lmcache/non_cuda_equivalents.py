@@ -221,6 +221,49 @@ def multi_layer_kv_transfer(
         H2D  = LMCache  -> PagedBuffer
         D2H  = PagedBuffer -> LMCache
     """
+    libcudart = _get_copy_lib()
+    use_cuda_copy = (
+        paged_memory_device.type == "cuda"
+        and libcudart is not None
+        and hasattr(libcudart, "cudaMemcpy")
+    )
+
+    def _copy_from_device(dst: torch.Tensor, src_ptr: int) -> None:
+        if not use_cuda_copy:
+            return
+        num_bytes = dst.numel() * dst.element_size()
+        ret = libcudart.cudaMemcpy(  # type: ignore[attr-defined]
+            ctypes.c_void_p(dst.data_ptr()),
+            ctypes.c_void_p(src_ptr),
+            ctypes.c_size_t(num_bytes),
+            ctypes.c_int(4),  # cudaMemcpyDefault
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpy (device->host) failed with error code {ret}")
+
+    def _copy_to_device(dst_ptr: int, src: torch.Tensor) -> None:
+        if not use_cuda_copy:
+            return
+        num_bytes = src.numel() * src.element_size()
+        ret = libcudart.cudaMemcpy(  # type: ignore[attr-defined]
+            ctypes.c_void_p(dst_ptr),
+            ctypes.c_void_p(src.data_ptr()),
+            ctypes.c_size_t(num_bytes),
+            ctypes.c_int(4),  # cudaMemcpyDefault
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpy (host->device) failed with error code {ret}")
+
+    def _paged_tensor_from_ptr(
+        ptr: int, shape: tuple[int, ...], direction: TransferDirection
+    ) -> torch.Tensor:
+        if use_cuda_copy:
+            paged = torch.empty(shape, dtype=key_value.dtype, device="cpu")
+            _copy_from_device(paged, ptr)
+            return paged
+
+        return _tensor_from_ptr(ptr, shape, key_value.dtype)
+
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
@@ -247,10 +290,10 @@ def multi_layer_kv_transfer(
             GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
             GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
         ):
-            paged = _tensor_from_ptr(
+            paged = _paged_tensor_from_ptr(
                 paged_ptr,
                 (k_or_v_size, page_buffer_size, hidden_size),
-                key_value.dtype,
+                direction,
             )
             src = key_value[:, layer_id, valid_tokens]
             if direction == TransferDirection.H2D:
@@ -259,12 +302,15 @@ def multi_layer_kv_transfer(
                 gathered = paged.index_select(1, valid_slots)
                 key_value[:, layer_id, valid_tokens] = gathered
 
+            if direction == TransferDirection.H2D:
+                _copy_to_device(paged_ptr, paged)
+
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
             num_blocks = max(int(torch.max(valid_slots).item() // block_size + 1), 1)
-            paged = _tensor_from_ptr(
+            paged = _paged_tensor_from_ptr(
                 paged_ptr,
                 (num_blocks, 2, block_size, hidden_size),
-                key_value.dtype,
+                direction,
             )
 
             blk_idx = torch.div(valid_slots, block_size, rounding_mode="floor")
@@ -277,17 +323,23 @@ def multi_layer_kv_transfer(
                 fetched = paged[blk_idx, :, blk_off].permute(1, 0, 2)
                 key_value[:, layer_id, valid_tokens] = fetched
 
+            if direction == TransferDirection.H2D:
+                _copy_to_device(paged_ptr, paged)
+
         elif gpu_kv_format in (
             GPUKVFormat.NL_X_NB_BS_HS,
             GPUKVFormat.NL_X_NBBS_ONE_HS,
         ):
-            paged = _tensor_from_ptr(
-                paged_ptr, (page_buffer_size, hidden_size), key_value.dtype
+            paged = _paged_tensor_from_ptr(
+                paged_ptr, (page_buffer_size, hidden_size), direction
             )
             if direction == TransferDirection.H2D:
                 paged[valid_slots] = key_value[0, layer_id, valid_tokens]
             else:
                 key_value[0, layer_id, valid_tokens] = paged[valid_slots]
+
+            if direction == TransferDirection.H2D:
+                _copy_to_device(paged_ptr, paged)
 
         else:
             raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
@@ -319,6 +371,47 @@ def multi_layer_kv_transfer_unilateral(
         H2D = LMCache  -> PagedBuffer
         D2H = PagedBuffer -> LMCache
     """
+    libcudart = _get_copy_lib()
+    use_cuda_copy = (
+        paged_memory_device.type == "cuda"
+        and libcudart is not None
+        and hasattr(libcudart, "cudaMemcpy")
+    )
+
+    def _copy_from_device(dst: torch.Tensor, src_ptr: int) -> None:
+        if not use_cuda_copy:
+            return
+        num_bytes = dst.numel() * dst.element_size()
+        ret = libcudart.cudaMemcpy(  # type: ignore[attr-defined]
+            ctypes.c_void_p(dst.data_ptr()),
+            ctypes.c_void_p(src_ptr),
+            ctypes.c_size_t(num_bytes),
+            ctypes.c_int(4),  # cudaMemcpyDefault
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpy (device->host) failed with error code {ret}")
+
+    def _copy_to_device(dst_ptr: int, src: torch.Tensor) -> None:
+        if not use_cuda_copy:
+            return
+        num_bytes = src.numel() * src.element_size()
+        ret = libcudart.cudaMemcpy(  # type: ignore[attr-defined]
+            ctypes.c_void_p(dst_ptr),
+            ctypes.c_void_p(src.data_ptr()),
+            ctypes.c_size_t(num_bytes),
+            ctypes.c_int(4),  # cudaMemcpyDefault
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpy (host->device) failed with error code {ret}")
+
+    def _paged_tensor_from_ptr(ptr: int, shape: tuple[int, ...]) -> torch.Tensor:
+        if use_cuda_copy:
+            paged = torch.empty(shape, dtype=key_value.dtype, device="cpu")
+            _copy_from_device(paged, ptr)
+            return paged
+
+        return _tensor_from_ptr(ptr, shape, key_value.dtype)
+
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
@@ -355,16 +448,14 @@ def multi_layer_kv_transfer_unilateral(
         k_ptr = int(ptr_list[layer_id])
         v_ptr = int(ptr_list[layer_id + num_layers])
 
-        k_buf = _tensor_from_ptr(
-            k_ptr, (page_buffer_size, hidden_size), key_value.dtype
-        )
-        v_buf = _tensor_from_ptr(
-            v_ptr, (page_buffer_size, hidden_size), key_value.dtype
-        )
+        k_buf = _paged_tensor_from_ptr(k_ptr, (page_buffer_size, hidden_size))
+        v_buf = _paged_tensor_from_ptr(v_ptr, (page_buffer_size, hidden_size))
 
         if direction == TransferDirection.H2D:
             k_buf[valid_slots] = key_value[0, layer_id, valid_tokens]
             v_buf[valid_slots] = key_value[1, layer_id, valid_tokens]
+            _copy_to_device(k_ptr, k_buf)
+            _copy_to_device(v_ptr, v_buf)
         else:
             key_value[0, layer_id, valid_tokens] = k_buf[valid_slots]
             key_value[1, layer_id, valid_tokens] = v_buf[valid_slots]
