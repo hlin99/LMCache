@@ -90,17 +90,15 @@ def _build_backend_params() -> list:
     """
     params = []
     cuda_available = torch.cuda.is_available()
-    requested_device = _get_configured_device("cuda" if cuda_available else "cpu")
+    device_str = "cuda" if cuda_available else "cpu"
 
-    if requested_device.type == "cuda" and cuda_available:
+    if device_str == "cuda" and cuda_available:
         try:
             # First Party
             import lmcache.c_ops as _c_ops
 
             params.append(
-                pytest.param(
-                    ("cuda_ops", _c_ops, requested_device.type), id="cuda_ops"
-                )
+                pytest.param(("cuda_ops", _c_ops, device_str), id="cuda_ops")
             )
         except ImportError:
             pass
@@ -109,10 +107,7 @@ def _build_backend_params() -> list:
         import lmcache.non_cuda_equivalents as _non_cuda_ops
 
         params.append(
-            pytest.param(
-                ("non_cuda_gpu", _non_cuda_ops, requested_device.type),
-                id="non_cuda_gpu",
-            )
+            pytest.param(("non_cuda_gpu", _non_cuda_ops, device_str), id="non_cuda_gpu")
         )
 
     # First Party
