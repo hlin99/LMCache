@@ -435,7 +435,6 @@ def single_layer_kv_transfer(
                 ]
 
     else:
-        # ── Non-MLA format ──
         # Determine vLLM layout and block_size
         is_two_major = gpu_kv_format == GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
         # flash attn:
@@ -457,7 +456,6 @@ def single_layer_kv_transfer(
             block_offset = slot_idx % block_size
 
             for kv in range(2):  # 0=Key, 1=Value
-                # ── Read vLLM side: [num_heads, head_size] ──
                 if is_two_major:
                     # [2, num_blocks, block_size, num_heads, head_size]
                     vllm_slice = vllm_key_value_cache[
@@ -471,7 +469,6 @@ def single_layer_kv_transfer(
 
                 vllm_flat = vllm_slice.reshape(-1)  # [num_heads * head_size]
 
-                # ── Read/write LMC side ──
                 if token_major:
                     # [num_tokens, 2, num_heads * head_size]
                     lmc_flat = lmc_key_value_cache[token_idx, kv]
@@ -479,7 +476,6 @@ def single_layer_kv_transfer(
                     # [2, num_tokens, num_heads * head_size]
                     lmc_flat = lmc_key_value_cache[kv, token_idx]
 
-                # ── Transfer ──
                 if direction == TransferDirection.D2H:
                     # vLLM -> LMCache
                     lmc_flat.copy_(vllm_flat)
@@ -685,7 +681,6 @@ def lmcache_memcpy_async(
     # 4. Aligned copy loop
     offset = 0
     mask = host_buffer_alignments - 1
-
     while offset < nbytes:
         # Calculate chunks based on alignment; mirrors
         # csrc/mem_kernels.cu::lmcache_memcpy_async split loop that honors
@@ -701,7 +696,7 @@ def lmcache_memcpy_async(
 
         current_dest = dest + offset
         current_src = src + offset
-
+        use_cuda = False
         if use_cuda:
             # cudaMemcpyDefault (4) lets CUDA runtime auto-detect
             # whether pointers are host or device memory.
@@ -718,8 +713,9 @@ def lmcache_memcpy_async(
                 raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
         else:
             # No CUDA runtime: both pointers must be CPU
+            print(" _copy_bytes_with_tensor +++")
             _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
-
+            print(" _copy_bytes_with_tensor ---")
         offset += max_nbytes
 
 

@@ -81,7 +81,7 @@ def _build_backend_params() -> list:
     cuda_available = torch.cuda.is_available()
     device_str = "cuda" if cuda_available else "cpu"
 
-    if device_str == "cuda" and cuda_available:
+    if device_str == "cuda1" and cuda_available:
         try:
             # First Party
             import lmcache.c_ops as _c_ops
@@ -1711,25 +1711,25 @@ def scenario_transfer_direction_enum(
 # ==========================================
 # cover pybind list in csrc/pybind.cpp
 SCENARIO_REGISTRY = {
-    "transfer_direction_enum": scenario_transfer_direction_enum,
+#    "transfer_direction_enum": scenario_transfer_direction_enum,
 #    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
 #"multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
-#    "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
+    "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
 #    "single_layer_kv_transfer_sgl": scenario_single_layer_kv_transfer_sgl,
-    "load_and_reshape_flash": scenario_load_and_reshape_flash,
-    "reshape_and_cache_back_flash": scenario_reshape_and_cache_back_flash,
-    "lmcache_memcpy_async": scenario_lmcache_memcpy_async,
-    "lmcache_memcpy_async_alignment": scenario_lmcache_memcpy_async_alignment,
-    "encode_fast_new": scenario_encode_fast_new,
-    "decode_fast_new": scenario_decode_fast_new,
-    "decode_fast_prefsum": scenario_decode_fast_prefsum,
-    "calculate_cdf": scenario_calculate_cdf,
-    "rotary_embedding_k_fused": scenario_rotary_embedding_k_fused,
-    "alloc_free_pinned_ptr": scenario_alloc_free_pinned_ptr,
-    "alloc_free_pinned_numa_ptr": scenario_alloc_free_pinned_numa_ptr,
-    "alloc_free_numa_ptr": scenario_alloc_free_numa_ptr,
-    "alloc_free_shm_pinned_ptr": scenario_alloc_free_shm_pinned_ptr,
-    "get_gpu_pci_bus_id": scenario_get_gpu_pci_bus_id,
+#    "load_and_reshape_flash": scenario_load_and_reshape_flash,
+#    "reshape_and_cache_back_flash": scenario_reshape_and_cache_back_flash,
+#    "lmcache_memcpy_async": scenario_lmcache_memcpy_async,
+#    "lmcache_memcpy_async_alignment": scenario_lmcache_memcpy_async_alignment,
+#    "encode_fast_new": scenario_encode_fast_new,
+#    "decode_fast_new": scenario_decode_fast_new,
+#    "decode_fast_prefsum": scenario_decode_fast_prefsum,
+#    "calculate_cdf": scenario_calculate_cdf,
+#    "rotary_embedding_k_fused": scenario_rotary_embedding_k_fused,
+#    "alloc_free_pinned_ptr": scenario_alloc_free_pinned_ptr,
+#    "alloc_free_pinned_numa_ptr": scenario_alloc_free_pinned_numa_ptr,
+#    "alloc_free_numa_ptr": scenario_alloc_free_numa_ptr,
+#    "alloc_free_shm_pinned_ptr": scenario_alloc_free_shm_pinned_ptr,
+#    "get_gpu_pci_bus_id": scenario_get_gpu_pci_bus_id,
 }
 
 
