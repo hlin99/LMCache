@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Any
 import unittest.mock
 
@@ -66,6 +67,11 @@ def _synchronize_device(device: torch.device) -> None:
 # ==========================================
 
 
+def _hpu_available() -> bool:
+    """Return True when an HPU device is present and torch.hpu is usable."""
+    return hasattr(torch, "hpu") and torch.hpu.is_available()  # type: ignore[attr-defined]
+
+
 def _build_backend_params() -> list:
     """Build pytest parameter list for the backend fixture.
 
@@ -76,6 +82,8 @@ def _build_backend_params() -> list:
 
     The tensor device used for each backend can be overridden via the
     LMCACHE_TENSOR_DEVICE environment variable (e.g., cuda, cpu, hpu, xpu).
+    When running the non_cuda_no_gpu backend, the device defaults to "hpu" on
+    HPU-equipped machines and falls back to "cpu" otherwise.
     """
     params = []
     cuda_available = torch.cuda.is_available()
@@ -100,9 +108,14 @@ def _build_backend_params() -> list:
     # First Party
     import lmcache.non_cuda_equivalents as _non_cuda_ops_nv
 
+    # Allow explicit override; otherwise use HPU when available, else CPU.
+    no_gpu_device = os.environ.get(
+        "LMCACHE_TENSOR_DEVICE",
+        "hpu" if _hpu_available() else "cpu",
+    )
     params.append(
         pytest.param(
-            ("non_cuda_no_gpu", _non_cuda_ops_nv, "hpu"),
+            ("non_cuda_no_gpu", _non_cuda_ops_nv, no_gpu_device),
             id="non_cuda_no_gpu",
         )
     )
