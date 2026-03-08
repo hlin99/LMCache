@@ -96,11 +96,7 @@ def scenario_calculate_cdf(ops: Any, device: str) -> dict[str, torch.Tensor]:
     for num_bins in num_bins_list:
         torch.manual_seed(42)
 
-        input_tensor = torch.randint(0, num_bins, (1, 1000, 1), dtype=torch.int8)
-
-        if device == "cuda":
-            target_dev = f"cuda:{torch.cuda.current_device()}"
-            input_tensor = input_tensor.to(target_dev)
+        input_tensor = torch.randint(0, num_bins, (1, 1000, 1), dtype=torch.int8, device=device)
 
         raw_output = ops.calculate_cdf(input_tensor, num_bins)
         out_cpu = raw_output.flatten().cpu()
@@ -130,11 +126,11 @@ def scenario_rotary_embedding_k_fused(
     max_position = 2048
     rotary_dim = head_size
 
-    # 2. Generate Inputs
-    old_positions = torch.randint(0, 1000, (num_tokens,), dtype=torch.long)
+    # 2. Generate Inputs on the target device
+    old_positions = torch.randint(0, 1000, (num_tokens,), dtype=torch.long, device=device)
     new_positions = old_positions + 1
 
-    cos_sin_cache = torch.randn(max_position, rotary_dim, dtype=torch.float32)
+    cos_sin_cache = torch.randn(max_position, rotary_dim, dtype=torch.float32, device=device)
 
     # Test both is_neox=True (NeoX-style, contiguous halves) and
     # is_neox=False (GPT-J-style, interleaved)
@@ -143,26 +139,15 @@ def scenario_rotary_embedding_k_fused(
         # Reset seed for consistent key tensor across both tests
         torch.manual_seed(42)
 
-        key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32)
-
-        if device == "cuda":
-            target_dev = f"cuda:{torch.cuda.current_device()}"
-            old_positions_dev = old_positions.to(target_dev)
-            new_positions_dev = new_positions.to(target_dev)
-            key = key.to(target_dev)
-            cos_sin_cache_dev = cos_sin_cache.to(target_dev)
-        else:
-            old_positions_dev = old_positions
-            new_positions_dev = new_positions
-            cos_sin_cache_dev = cos_sin_cache
+        key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32, device=device)
 
         # 3. Execute (in-place update on key)
         ops.rotary_embedding_k_fused(
-            old_positions_dev,
-            new_positions_dev,
+            old_positions,
+            new_positions,
             key,
             head_size,
-            cos_sin_cache_dev,
+            cos_sin_cache,
             is_neox,
         )
 
@@ -182,16 +167,12 @@ def scenario_lmcache_memcpy_async(
     # 1. Setup dimensions and mock data (4KB)
     nbytes = 1024 * 4
     src_host = torch.randint(1, 255, (nbytes,), dtype=torch.uint8)
-    gpu_buffer = torch.zeros(nbytes, dtype=torch.uint8)
+    gpu_buffer = torch.zeros(nbytes, dtype=torch.uint8, device=device)
 
     if torch.cuda.is_available():
         dst_host = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
     else:
         dst_host = torch.zeros(nbytes, dtype=torch.uint8)
-
-    # 2. Assign directions and device locations
-    if device == "cuda":
-        gpu_buffer = gpu_buffer.to(f"cuda:{torch.cuda.current_device()}")
 
     h2d_dir = ops.TransferDirection.H2D
     d2h_dir = ops.TransferDirection.D2H
@@ -293,7 +274,7 @@ def scenario_load_and_reshape_flash(
     torch.manual_seed(42)
 
     # 1. Standard Params
-    src_device = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
+    src_device = device
     dst_device = "cpu"
 
     num_blocks = 100
@@ -402,7 +383,7 @@ def scenario_reshape_and_cache_back_flash(
 
     # 1. Environment Setup
     src_device = "cpu"
-    dst_device = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
+    dst_device = device
 
     num_blocks = 100
     block_size = 16
@@ -525,9 +506,7 @@ def scenario_encode_fast_new(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    src_device = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
-
-    # 2. Construct Data
+    # 2. Construct Data on target device
     # A. CDF: uniform distribution, strictly increasing
     step = 100 // alphabet_size
     base_cdf = torch.arange(0, 100, step, dtype=torch.int32)
@@ -536,25 +515,25 @@ def scenario_encode_fast_new(
     cdf_cpu = (
         base_cdf.unsqueeze(0).unsqueeze(0).expand(nlayers, nchannels, -1).contiguous()
     )
-    cdf = cdf_cpu.to(dtype=torch.int16, device=src_device)
+    cdf = cdf_cpu.to(dtype=torch.int16, device=device)
 
     # B. Input symbols: cycling 0..14
     total_syms = nlayers * ntokens * nchannels
     input_cpu = torch.arange(total_syms, dtype=torch.float32)
     input_cpu = (input_cpu % (alphabet_size - 1)).to(torch.int8)
     input_cpu = input_cpu.reshape(nlayers, ntokens, nchannels)
-    input_sym = input_cpu.to(device=src_device)
+    input_sym = input_cpu.to(device=device)
 
     # 3. Prepare Outputs
     output_buffer = torch.zeros(
         (nlayers, nchannels, max_buf_len),
         dtype=torch.uint8,
-        device=src_device,
+        device=device,
     )
     output_lengths = torch.zeros(
         (nlayers, nchannels),
         dtype=torch.int32,
-        device=src_device,
+        device=device,
     )
 
     # 4. Execute
@@ -593,34 +572,34 @@ def scenario_decode_fast_new(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    device_str = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
-
-    # 2. Data Generation
+    # 2. Data Generation on device
     cdf = torch.randint(
         1,
         100,
         (nlayers, nchannels, alphabet_size),
         dtype=torch.int32,
+        device=device,
     )
-    cdf = torch.cumsum(cdf, dim=-1).to(device_str).to(torch.int16)
+    cdf = torch.cumsum(cdf, dim=-1).to(torch.int16)
 
     input_sym = torch.randint(
         0,
         alphabet_size - 2,
         (nlayers, ntokens, nchannels),
         dtype=torch.int8,
-    ).to(device_str)
+        device=device,
+    )
 
     # 3. Encode first (need encoded data to test decode)
     encoded_buffer = torch.zeros(
         (nlayers, nchannels, max_buf_len),
         dtype=torch.uint8,
-        device=device_str,
+        device=device,
     )
     encoded_lengths = torch.zeros(
         (nlayers, nchannels),
         dtype=torch.int32,
-        device=device_str,
+        device=device,
     )
 
     ops.encode_fast_new(
@@ -674,37 +653,37 @@ def scenario_decode_fast_prefsum(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    device_str = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
-
-    # 2. Data Generation (Normalized CDF)
+    # 2. Data Generation (Normalized CDF) on device
     cdf = torch.randint(
         1,
         100,
         (nlayers, nchannels, alphabet_size),
         dtype=torch.int32,
+        device=device,
     )
     cdf = torch.cumsum(cdf, dim=-1).float()
     cdf = (cdf / cdf[..., -1:] * 65536).to(torch.int32)
     cdf[..., -1] = 65536
-    cdf = cdf.to(device_str).to(torch.int16).contiguous()
+    cdf = cdf.to(torch.int16).contiguous()
 
     input_sym = torch.randint(
         0,
         alphabet_size - 2,
         (nlayers, ntokens, nchannels),
         dtype=torch.int8,
-    ).to(device_str)
+        device=device,
+    )
 
     # 3. Encode to get variable lengths
     tmp_buf = torch.zeros(
         (nlayers, nchannels, max_buf_len),
         dtype=torch.uint8,
-        device=device_str,
+        device=device,
     )
     tmp_len = torch.zeros(
         (nlayers, nchannels),
         dtype=torch.int32,
-        device=device_str,
+        device=device,
     )
     ops.encode_fast_new(cdf, input_sym, tmp_buf, tmp_len)
     if device == "cuda":
@@ -720,12 +699,12 @@ def scenario_decode_fast_prefsum(
     bytestream_1d = torch.tensor(
         all_bytes,
         dtype=torch.uint8,
-        device=device_str,
+        device=device,
     ).contiguous()
 
     # 5. Offsets (end-position via cumsum)
     lengths_prefsum = (
-        tmp_len.flatten().cumsum(0).reshape(tmp_len.shape).to(torch.int64).to(device_str)
+        tmp_len.flatten().cumsum(0).reshape(tmp_len.shape).to(torch.int64).to(device)
     ).contiguous()
 
     # 6. Decode
@@ -734,7 +713,7 @@ def scenario_decode_fast_prefsum(
             input_sym,
             dtype=torch.uint8,
         )
-        .to(device_str)
+        .to(device)
         .contiguous()
     )
 
@@ -772,8 +751,6 @@ def scenario_single_layer_kv_transfer(
     """Test single_layer_kv_transfer for multiple KV formats and directions."""
     torch.manual_seed(42)
 
-    device_str = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
-
     num_tokens = 64
     num_blocks = 256
     block_size = 16
@@ -785,7 +762,7 @@ def scenario_single_layer_kv_transfer(
         0,
         num_tokens * 2,
         2,
-        device=device_str,
+        device=device,
     ).to(torch.int64)
 
     # (gpu_kv_format, is_mla, token_major, direction)
@@ -839,12 +816,12 @@ def scenario_single_layer_kv_transfer(
             vllm_size *= s
 
         lmc_tensor = (
-            (torch.arange(lmc_size, device=device_str) % 1000)
+            (torch.arange(lmc_size, device=device) % 1000)
             .to(torch.float16)
             .reshape(lmc_shape)
         )
         vllm_tensor = (
-            (torch.arange(vllm_size, device=device_str) % 1000)
+            (torch.arange(vllm_size, device=device) % 1000)
             .to(torch.float16)
             .reshape(vllm_shape)
         )
@@ -946,12 +923,12 @@ def scenario_single_layer_kv_transfer(
             vllm_size *= s
 
         lmc_tensor = (
-            (torch.arange(lmc_size, device=device_str) % 1000)
+            (torch.arange(lmc_size, device=device) % 1000)
             .to(torch.float16)
             .reshape(lmc_shape)
         )
         vllm_tensor = (
-            (torch.arange(vllm_size, device=device_str) % 1000)
+            (torch.arange(vllm_size, device=device) % 1000)
             .to(torch.float16)
             .reshape(vllm_shape)
         )
@@ -980,8 +957,6 @@ def scenario_single_layer_kv_transfer_sgl(
     """Test single_layer_kv_transfer_sgl for SGLang KV format."""
     torch.manual_seed(42)
 
-    device_str = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
-
     num_tokens = 32
     num_blocks = 128
     block_size = 16
@@ -993,7 +968,7 @@ def scenario_single_layer_kv_transfer_sgl(
         0,
         num_tokens * 3,
         3,
-        device=device_str,
+        device=device,
     ).to(torch.int64)
 
     # (token_major, direction)
@@ -1031,17 +1006,17 @@ def scenario_single_layer_kv_transfer_sgl(
             sgl_size *= s
 
         lmc_tensor = (
-            (torch.arange(lmc_size, device=device_str) % 500)
+            (torch.arange(lmc_size, device=device) % 500)
             .to(torch.float16)
             .reshape(lmc_shape)
         )
         sgl_k_tensor = (
-            (torch.arange(sgl_size, device=device_str) % 500 + 500)
+            (torch.arange(sgl_size, device=device) % 500 + 500)
             .to(torch.float16)
             .reshape(sgl_shape)
         )
         sgl_v_tensor = (
-            (torch.arange(sgl_size, device=device_str) % 500 + 1000)
+            (torch.arange(sgl_size, device=device) % 500 + 1000)
             .to(torch.float16)
             .reshape(sgl_shape)
         )
@@ -1133,8 +1108,6 @@ def scenario_multi_layer_kv_transfer(
     """Test multi_layer_kv_transfer for multiple paged KV formats and directions."""
     torch.manual_seed(42)
 
-    device_str = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
-
     num_layers = 2
     num_tokens = 4
     head_size = 16
@@ -1145,7 +1118,7 @@ def scenario_multi_layer_kv_transfer(
     slot_mapping = torch.tensor(
         [0, 2, 5, 9],
         dtype=torch.int64,
-        device=device_str,
+        device=device,
     )
 
     # ── Format-specific test cases ──
@@ -1167,7 +1140,7 @@ def scenario_multi_layer_kv_transfer(
 
             # ── 1. LMCache Tensor ──
             lmc_shape = (k_or_v_size, num_layers, num_tokens, head_size)
-            key_value = torch.zeros(lmc_shape, dtype=dtype, device=device_str)
+            key_value = torch.zeros(lmc_shape, dtype=dtype, device=device)
 
             if not direction:  # LMC → Paged
                 for kv in range(k_or_v_size):
@@ -1189,20 +1162,20 @@ def scenario_multi_layer_kv_transfer(
                     pb = torch.zeros(
                         (num_blocks, 2, bs_arg, head_size),
                         dtype=dtype,
-                        device=device_str,
+                        device=device,
                     )
                 elif is_mla:
                     pb = torch.zeros(
                         (page_buffer_size, head_size),
                         dtype=dtype,
-                        device=device_str,
+                        device=device,
                     )
                 else:
                     # Handles NB_NL_TWO_BS_NH_HS and NL_X_TWO_NB_BS_NH_HS
                     pb = torch.zeros(
                         (2, page_buffer_size, head_size),
                         dtype=dtype,
-                        device=device_str,
+                        device=device,
                     )
 
                 if direction:  # Paged → LMC
@@ -1212,7 +1185,7 @@ def scenario_multi_layer_kv_transfer(
                                 kv * 7000
                                 + ly * 2000
                                 + s * 10
-                                + torch.arange(head_size, device=device_str)
+                                + torch.arange(head_size, device=device)
                             ).to(dtype)
                             if gpu_kv_format == ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
                                 blk_idx = s // bs_arg
@@ -1230,7 +1203,7 @@ def scenario_multi_layer_kv_transfer(
             key_value_ptrs = torch.tensor(
                 [pb.data_ptr() for pb in page_buffers],
                 dtype=torch.int64,
-                device=device_str,
+                device=device,
             )
 
             # ── 4. Execute ──
@@ -1241,7 +1214,7 @@ def scenario_multi_layer_kv_transfer(
                 key_value,
                 key_value_ptrs,
                 slot_mapping,
-                torch.device(device_str),
+                torch.device(device),
                 page_buffer_size,
                 xfer_dir,
                 gpu_kv_format,
@@ -1283,13 +1256,13 @@ def scenario_multi_layer_kv_transfer(
     for direction in [True, False]:
         dir_tag = "paged2lmc" if direction else "lmc2paged"
         lmc_shape = (2, num_layers, num_tokens, head_size)
-        key_value = torch.zeros(lmc_shape, dtype=dtype, device=device_str)
+        key_value = torch.zeros(lmc_shape, dtype=dtype, device=device)
 
         if not direction:
             for ly in range(num_layers):
                 for t in range(num_tokens):
                     val = (
-                        ly * 1000 + t * 10 + torch.arange(head_size, device=device_str)
+                        ly * 1000 + t * 10 + torch.arange(head_size, device=device)
                     ).to(dtype)
                     key_value[0, ly, t] = val
                     key_value[1, ly, t] = val + 500
@@ -1299,12 +1272,12 @@ def scenario_multi_layer_kv_transfer(
             pb = torch.zeros(
                 (2, page_buffer_size, head_size),
                 dtype=dtype,
-                device=device_str,
+                device=device,
             )
             if direction:
                 for s in range(page_buffer_size):
                     val = (
-                        ly * 2000 + s * 10 + torch.arange(head_size, device=device_str)
+                        ly * 2000 + s * 10 + torch.arange(head_size, device=device)
                     ).to(dtype)
                     pb[0, s] = val
                     pb[1, s] = val + 700
@@ -1313,7 +1286,7 @@ def scenario_multi_layer_kv_transfer(
         key_value_ptrs = torch.tensor(
             [pb.data_ptr() for pb in page_buffers],
             dtype=torch.int64,
-            device=device_str,
+            device=device,
         )
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
@@ -1321,7 +1294,7 @@ def scenario_multi_layer_kv_transfer(
             key_value,
             key_value_ptrs,
             slot_mapping,
-            torch.device(device_str),
+            torch.device(device),
             page_buffer_size,
             xfer_dir,
             canonical_format,
@@ -1341,8 +1314,6 @@ def scenario_multi_layer_kv_transfer_unilateral(
     """Test multi_layer_kv_transfer_unilateral for non-interleaved K/V pointers."""
     torch.manual_seed(42)
 
-    device_str = f"{device}:{torch.cuda.current_device()}" if device == "cuda" else device
-
     num_layers = 2
     num_tokens = 4
     head_size = 16
@@ -1352,7 +1323,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
     slot_mapping = torch.tensor(
         [1, 3, 4, 7],
         dtype=torch.int64,
-        device=device_str,
+        device=device,
     )
 
     # ── Test cases: (gpu_kv_format, is_mla) ──
@@ -1376,7 +1347,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
 
             # ── 1. LMCache Tensor ──
             lmc_shape = (k_or_v_size, num_layers, num_tokens, head_size)
-            lmc_tensor = torch.zeros(lmc_shape, dtype=dtype, device=device_str)
+            lmc_tensor = torch.zeros(lmc_shape, dtype=dtype, device=device)
 
             if not direction:  # LMC → Paged
                 for kv in range(k_or_v_size):
@@ -1386,7 +1357,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                                 kv * 5000
                                 + ly * 1000
                                 + t * 10
-                                + torch.arange(head_size, device=device_str)
+                                + torch.arange(head_size, device=device)
                             ).to(dtype)
                             lmc_tensor[kv, ly, t] = val
 
@@ -1399,14 +1370,14 @@ def scenario_multi_layer_kv_transfer_unilateral(
                     pb = torch.zeros(
                         (page_buffer_size, head_size),
                         dtype=dtype,
-                        device=device_str,
+                        device=device,
                     )
                     if direction:  # Paged → LMC
                         for s in range(page_buffer_size):
                             val = (
                                 ly * 2000
                                 + s * 10
-                                + torch.arange(head_size, device=device_str)
+                                + torch.arange(head_size, device=device)
                             ).to(dtype)
                             pb[s] = val
                     page_buffers.append(pb)
@@ -1414,7 +1385,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 key_value_ptrs = torch.tensor(
                     [pb.data_ptr() for pb in page_buffers],
                     dtype=torch.int64,
-                    device=device_str,
+                    device=device,
                 )
             else:
                 # Non-MLA unilateral: separate K/V buffers
@@ -1426,7 +1397,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                         pb = torch.zeros(
                             (page_buffer_size, head_size),
                             dtype=dtype,
-                            device=device_str,
+                            device=device,
                         )
                         if direction:  # Paged → LMC
                             for s in range(page_buffer_size):
@@ -1434,7 +1405,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                                     kv * 7000
                                     + ly * 2000
                                     + s * 10
-                                    + torch.arange(head_size, device=device_str)
+                                    + torch.arange(head_size, device=device)
                                 ).to(dtype)
                                 pb[s] = val
                         buffers[(kv, ly)] = pb
@@ -1448,7 +1419,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 key_value_ptrs = torch.tensor(
                     ptr_list,
                     dtype=torch.int64,
-                    device=device_str,
+                    device=device,
                 ).contiguous()
 
             # ── 3. Execute ──
@@ -1459,7 +1430,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 lmc_tensor,
                 key_value_ptrs,
                 slot_mapping,
-                torch.device(device_str),
+                torch.device(device),
                 page_buffer_size,
                 xfer_dir,
                 gpu_kv_format,
@@ -1496,7 +1467,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
         dir_tag = "p2l" if direction else "l2p"
 
         lmc_shape = (2, num_layers, num_tokens, head_size)
-        lmc_tensor = torch.zeros(lmc_shape, dtype=dtype, device=device_str)
+        lmc_tensor = torch.zeros(lmc_shape, dtype=dtype, device=device)
 
         if not direction:
             for kv in range(2):
@@ -1506,7 +1477,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                             kv * 5000
                             + ly * 1000
                             + t * 10
-                            + torch.arange(head_size, device=device_str)
+                            + torch.arange(head_size, device=device)
                         ).to(dtype)
                         lmc_tensor[kv, ly, t] = val
 
@@ -1516,7 +1487,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 pb = torch.zeros(
                     (page_buffer_size, head_size),
                     dtype=dtype,
-                    device=device_str,
+                    device=device,
                 )
                 if direction:
                     for s in range(page_buffer_size):
@@ -1524,7 +1495,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                             kv * 7000
                             + ly * 2000
                             + s * 10
-                            + torch.arange(head_size, device=device_str)
+                            + torch.arange(head_size, device=device)
                         ).to(dtype)
                         pb[s] = val
                 buffers[(kv, ly)] = pb
@@ -1538,7 +1509,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
         key_value_ptrs = torch.tensor(
             ptr_list,
             dtype=torch.int64,
-            device=device_str,
+            device=device,
         ).contiguous()
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
@@ -1546,7 +1517,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
             lmc_tensor,
             key_value_ptrs,
             slot_mapping,
-            torch.device(device_str),
+            torch.device(device),
             page_buffer_size,
             xfer_dir,
             ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
