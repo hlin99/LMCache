@@ -57,8 +57,8 @@ def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
     """Copy raw bytes between pointers using torch tensor semantics.
 
     Note: This function only works for CPU-accessible memory. For device
-    memory (CUDA/XPU), use lmcache_memcpy_async with the appropriate runtime
-    library or PyTorch's tensor copy operations.
+    memory (CUDA/XPU), use PyTorch's tensor copy operations directly
+    (e.g., tensor.copy_()) instead of raw pointer-based operations.
     """
     if num_bytes <= 0:
         return
@@ -672,6 +672,10 @@ def lmcache_memcpy_async(
     When libcudart is available, uses cudaMemcpy with cudaMemcpyDefault
     (lets CUDA runtime auto-detect pointer types).
     When libcudart is unavailable, falls back to CPU-only tensor copy.
+
+    Note: This implementation cannot handle device memory (CUDA/XPU) without
+    the CUDA runtime library. For XPU or other non-CUDA devices, use PyTorch's
+    native tensor operations (tensor.copy_()) instead of raw pointer operations.
     """
     # 1. Power of two check
     if host_buffer_alignments <= 0 or (
