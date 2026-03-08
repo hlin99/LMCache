@@ -96,7 +96,8 @@ def scenario_calculate_cdf(ops: Any, device: str) -> dict[str, torch.Tensor]:
     for num_bins in num_bins_list:
         torch.manual_seed(42)
 
-        input_tensor = torch.randint(0, num_bins, (1, 1000, 1), dtype=torch.int8, device=device)
+        # Create on CPU first for consistent RNG across backends
+        input_tensor = torch.randint(0, num_bins, (1, 1000, 1), dtype=torch.int8).to(device)
 
         raw_output = ops.calculate_cdf(input_tensor, num_bins)
         out_cpu = raw_output.flatten().cpu()
@@ -126,11 +127,11 @@ def scenario_rotary_embedding_k_fused(
     max_position = 2048
     rotary_dim = head_size
 
-    # 2. Generate Inputs on the target device
-    old_positions = torch.randint(0, 1000, (num_tokens,), dtype=torch.long, device=device)
+    # 2. Generate Inputs on CPU first for consistent RNG across backends
+    old_positions = torch.randint(0, 1000, (num_tokens,), dtype=torch.long).to(device)
     new_positions = old_positions + 1
 
-    cos_sin_cache = torch.randn(max_position, rotary_dim, dtype=torch.float32, device=device)
+    cos_sin_cache = torch.randn(max_position, rotary_dim, dtype=torch.float32).to(device)
 
     # Test both is_neox=True (NeoX-style, contiguous halves) and
     # is_neox=False (GPT-J-style, interleaved)
@@ -139,7 +140,7 @@ def scenario_rotary_embedding_k_fused(
         # Reset seed for consistent key tensor across both tests
         torch.manual_seed(42)
 
-        key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32, device=device)
+        key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float32).to(device)
 
         # 3. Execute (in-place update on key)
         ops.rotary_embedding_k_fused(
@@ -572,23 +573,21 @@ def scenario_decode_fast_new(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    # 2. Data Generation on device
+    # 2. Data Generation on CPU first for consistent RNG across backends
     cdf = torch.randint(
         1,
         100,
         (nlayers, nchannels, alphabet_size),
         dtype=torch.int32,
-        device=device,
     )
-    cdf = torch.cumsum(cdf, dim=-1).to(torch.int16)
+    cdf = torch.cumsum(cdf, dim=-1).to(torch.int16).to(device)
 
     input_sym = torch.randint(
         0,
         alphabet_size - 2,
         (nlayers, ntokens, nchannels),
         dtype=torch.int8,
-        device=device,
-    )
+    ).to(device)
 
     # 3. Encode first (need encoded data to test decode)
     encoded_buffer = torch.zeros(
@@ -653,26 +652,24 @@ def scenario_decode_fast_prefsum(
     alphabet_size = 16
     max_buf_len = ntokens * 2
 
-    # 2. Data Generation (Normalized CDF) on device
+    # 2. Data Generation (Normalized CDF) on CPU first for consistent RNG
     cdf = torch.randint(
         1,
         100,
         (nlayers, nchannels, alphabet_size),
         dtype=torch.int32,
-        device=device,
     )
     cdf = torch.cumsum(cdf, dim=-1).float()
     cdf = (cdf / cdf[..., -1:] * 65536).to(torch.int32)
     cdf[..., -1] = 65536
-    cdf = cdf.to(torch.int16).contiguous()
+    cdf = cdf.to(torch.int16).to(device).contiguous()
 
     input_sym = torch.randint(
         0,
         alphabet_size - 2,
         (nlayers, ntokens, nchannels),
         dtype=torch.int8,
-        device=device,
-    )
+    ).to(device)
 
     # 3. Encode to get variable lengths
     tmp_buf = torch.zeros(
