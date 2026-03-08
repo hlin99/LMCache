@@ -10,6 +10,7 @@ import torch
 # First Party
 import lmcache.non_cuda_equivalents as _py_ops
 
+import habana_frameworks.torch
 # ==========================================
 # 0. utils functions.
 # ==========================================
@@ -32,8 +33,10 @@ def device_sync(device: str) -> None:
     elif device == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.synchronize()
+    elif device == "hpu":
+        if hasattr(torch, "hpu") and torch.hpu.is_available():
+            torch.hpu.synchronize()
     else:
-        # TODO: add more device here
         pass
     # CPU requires no synchronization
 
@@ -79,6 +82,9 @@ def _build_backend_params() -> list:
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         params.append(pytest.param(("xpu_py_ops", _py_ops, "xpu"), id="xpu_py_ops"))
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        params.append(pytest.param(("hpu_py_ops", _py_ops, "hpu"), id="hpu_py_ops"))
 
     return params
 

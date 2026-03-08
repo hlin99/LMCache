@@ -15,6 +15,7 @@ import subprocess
 # Third Party
 import numpy as np
 import torch
+import habana_frameworks.torch
 
 # Store the tensor objects in memory so that they can be accessed
 # outside the scope of this file
