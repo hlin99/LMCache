@@ -43,7 +43,7 @@ def _build_backend_params() -> list:
     import lmcache.non_cuda_equivalents as _non_cuda_ops_nv
 
     params.append(
-        pytest.param(("non_cuda_no_gpu", _non_cuda_ops_nv, "xpu"), id="non_cuda_no_gpu")
+        pytest.param(("non_cuda_no_gpu", _non_cuda_ops_nv, "cpu"), id="non_cuda_no_gpu")
     )
     return params
 
