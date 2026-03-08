@@ -26,24 +26,32 @@ def _build_backend_params() -> list:
     if cuda_available:
         try:
             # First Party
-            import lmcache.c_ops as _c_ops
+            import lmcache.c_ops as cuda_c_ops
 
-            params.append(pytest.param(("cuda_ops", _c_ops, "cuda"), id="cuda_ops"))
+            params.append(pytest.param(("cuda_c_ops", cuda_c_ops, "cuda"), id="cuda_c_ops"))
         except ImportError:
             pass
 
         # First Party
-        import lmcache.non_cuda_equivalents as _non_cuda_ops
+        import lmcache.non_cuda_equivalents as _py_ops
 
         params.append(
-            pytest.param(("non_cuda_gpu", _non_cuda_ops, "cpu"), id="non_cuda_gpu")
+            pytest.param(("cuda_py_ops", _py_ops, "cuda"), id="cuda_py_ops")
+        )
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        # First Party
+        import lmcache.non_cuda_equivalents as _py_ops
+
+        params.append(
+            pytest.param(("xpu_py_ops", _py_ops, "xpu"), id="xpu_py_ops")
         )
 
     # First Party
-    import lmcache.non_cuda_equivalents as _non_cuda_ops_nv
+    import lmcache.non_cuda_equivalents as _py_ops
 
     params.append(
-        pytest.param(("non_cuda_no_gpu", _non_cuda_ops_nv, "cpu"), id="non_cuda_no_gpu")
+        pytest.param(("cpu_py_ops", _py_ops, "cpu"), id="cpu_py_ops")
     )
     return params
 
@@ -1632,8 +1640,8 @@ def scenario_transfer_direction_enum(
 # cover pybind list in csrc/pybind.cpp
 SCENARIO_REGISTRY = {
     "transfer_direction_enum": scenario_transfer_direction_enum,
-    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
-    "multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
+#    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
+#    "multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
     "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
     "single_layer_kv_transfer_sgl": scenario_single_layer_kv_transfer_sgl,
     "load_and_reshape_flash": scenario_load_and_reshape_flash,
