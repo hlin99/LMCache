@@ -174,6 +174,14 @@ def scenario_lmcache_memcpy_async(
     """Test lmcache_memcpy_async for H2D and D2H memory transfers."""
     torch.manual_seed(42)
 
+    # Skip this test for XPU with Python fallback since it cannot handle device memory
+    # The Python fallback uses ctypes which cannot access device memory
+    if device == "xpu" and not hasattr(ops, "lmcache_memcpy_async_cuda"):
+        pytest.skip(
+            "XPU device memory operations not supported with Python fallback. "
+            "Python fallback requires CUDA runtime library for device transfers."
+        )
+
     # 1. Setup dimensions and mock data (4KB)
     nbytes = 1024 * 4
     src_host = torch.randint(1, 255, (nbytes,), dtype=torch.uint8)
@@ -199,6 +207,8 @@ def scenario_lmcache_memcpy_async(
 
     if device == "cuda":
         torch.cuda.synchronize()
+    elif device == "xpu":
+        torch.xpu.synchronize()
 
     # --- PART B: D2H (Device to Host) ---
     ops.lmcache_memcpy_async(
@@ -212,6 +222,8 @@ def scenario_lmcache_memcpy_async(
 
     if device == "cuda":
         torch.cuda.synchronize()
+    elif device == "xpu":
+        torch.xpu.synchronize()
 
     # 3. Internal sanity check
     final_result = dst_host.cpu()
@@ -229,6 +241,12 @@ def scenario_lmcache_memcpy_async_alignment(
     """Validate host-buffer alignment chunking mirrors C++ split logic."""
     if not hasattr(ops, "_copy_bytes_with_tensor"):
         pytest.skip("Chunk inspection only applies to Python fallback backend")
+
+    # This test only works with CPU tensors since it patches the Python fallback
+    if device != "cpu":
+        pytest.skip(
+            "Alignment chunking test requires CPU tensors and Python fallback"
+        )
 
     torch.manual_seed(0)
 
