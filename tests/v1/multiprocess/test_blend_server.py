@@ -27,6 +27,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache.utils import device_sync
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,
@@ -1150,7 +1151,7 @@ def test_cb_retrieve_verify_data_correctness(
     assert result is True, "Retrieve should succeed"
 
     # Verify tensor values match after GPU sync
-    torch.cuda.synchronize()
+    device_sync("cuda")
     source_slice = cb_client_context.get_tensor_slice(
         source_offset, expected_hit_count_per_paragraph
     )
@@ -1343,7 +1344,7 @@ def test_cb_store_final_then_normal_lookup_retrieve(
     assert retrieve_result is True, "Retrieve should succeed"
 
     # Verify the correctness
-    torch.cuda.synchronize()
+    device_sync("cuda")
     for layer in range(client_context.num_layers):
         tensor_slice = client_context.get_tensor_slice(
             layer, 0, expected_hit_chunks * 16

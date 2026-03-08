@@ -42,6 +42,26 @@ logger = init_logger(__name__)
 KVCache = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
 
 
+# Device utility functions
+def device_sync(device: str) -> None:
+    """Synchronize device operations.
+
+    Args:
+        device: Device string ("cuda", "xpu", or "cpu")
+
+    This function synchronizes operations for GPU devices:
+    - For CUDA devices, calls torch.cuda.synchronize()
+    - For XPU devices, calls torch.xpu.synchronize()
+    - For CPU, no synchronization is needed (returns immediately)
+    """
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.synchronize()
+    # CPU requires no synchronization
+
+
 # Math utility functions
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""

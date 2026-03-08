@@ -10,6 +10,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.utils import device_sync
 from lmcache.v1.gpu_connector.gpu_connectors import (
     SGLangGPUConnector,
     VLLMBufferLayerwiseGPUConnector,
@@ -97,7 +98,7 @@ def patch_pin_allocator():
 
     def fake_pin_close(self):
         if not self._unregistered:
-            torch.cuda.synchronize()
+            device_sync("cuda")
             # torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
             self._unregistered = True
 

@@ -7,6 +7,9 @@ import unittest.mock
 import pytest
 import torch
 
+# First Party
+from lmcache.utils import device_sync
+
 # ==========================================
 # 1. Backend Configuration
 # ==========================================
@@ -198,8 +201,7 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
         16,
     )
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # --- PART B: D2H (Device to Host) ---
     ops.lmcache_memcpy_async(
@@ -211,8 +213,7 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
         16,
     )
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 3. Internal sanity check
     final_result = dst_host.cpu()
@@ -343,8 +344,7 @@ def scenario_load_and_reshape_flash(ops: Any, device: str) -> dict[str, torch.Te
             )
         extracted_chunks.append(mem_obj_tensor)
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 4. Verify: compare extracted data against original kv_cache
     #    mem_obj_tensor layout:
@@ -472,8 +472,7 @@ def scenario_reshape_and_cache_back_flash(
             )
         current_token_offset += chunk_len
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 6. Verify: check written values against source pattern
     for layer_id in range(num_layers):
@@ -557,8 +556,7 @@ def scenario_encode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
         output_lengths,
     )
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 5. Verify
     lengths_cpu = output_lengths.cpu()
@@ -617,8 +615,7 @@ def scenario_decode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
         encoded_buffer,
         encoded_lengths,
     )
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 4. Decode
     decoded_sym = torch.zeros_like(input_sym, dtype=torch.uint8)
@@ -629,8 +626,7 @@ def scenario_decode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
         encoded_lengths,
         decoded_sym,
     )
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 5. Verify: decoded must match original
     input_uint8 = input_sym.to(torch.uint8)
@@ -691,8 +687,7 @@ def scenario_decode_fast_prefsum(ops: Any, device: str) -> dict[str, torch.Tenso
         device=device,
     )
     ops.encode_fast_new(cdf, input_sym, tmp_buf, tmp_len)
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 4. Pack into 1D dense bytestream
     lens_flat = tmp_len.cpu().flatten().tolist()
@@ -728,8 +723,7 @@ def scenario_decode_fast_prefsum(ops: Any, device: str) -> dict[str, torch.Tenso
         lengths_prefsum,
         decoded_sym,
     )
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 7. Verify roundtrip
     input_ref = input_sym.to(torch.uint8)

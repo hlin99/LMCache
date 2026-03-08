@@ -8,6 +8,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.utils import device_sync
 from lmcache.v1.memory_management import PinMemoryAllocator
 
 if not torch.cuda.is_available():
@@ -135,7 +136,7 @@ def test_extract_and_load_back(num_tokens):
             )
         memory_obj_old_list.append(memory_obj_old)
     end_event.record()
-    torch.cuda.synchronize()
+    device_sync("cuda")
     elapsed_time_ms = start_event.elapsed_time(end_event)
     print("Old extract time: ", elapsed_time_ms / 1000)
 
@@ -162,7 +163,7 @@ def test_extract_and_load_back(num_tokens):
         memory_obj_new_list.append(memory_obj_new)
     end_event.record()
     # wait for all the operations to finish
-    torch.cuda.synchronize()
+    device_sync("cuda")
     elapsed_time_ms = start_event.elapsed_time(end_event)
     print("New extract time: ", elapsed_time_ms / 1000)
     check_mem_obj_equal(
@@ -253,7 +254,7 @@ def test_multi_layer_kernel(num_tokens, gpu_kv_format):
         memory_obj_old_list.append(memory_obj_old)
     end_event.record()
     # wait for all the operations to finish
-    torch.cuda.synchronize()
+    device_sync("cuda")
     elapsed_time_ms = start_event.elapsed_time(end_event)
     print("Old extract time: ", elapsed_time_ms / 1000)
 
@@ -289,7 +290,7 @@ def test_multi_layer_kernel(num_tokens, gpu_kv_format):
 
     end_event.record()
     # wait for all the operations to finish
-    torch.cuda.synchronize()
+    device_sync("cuda")
     elapsed_time_ms = start_event.elapsed_time(end_event)
     print("New extract time: ", elapsed_time_ms / 1000)
 
@@ -386,7 +387,7 @@ def test_multi_layer_kernel_use_mla(num_tokens, head_size, gpu_kv_format):
         memory_obj_old_list.append(memory_obj_old)
     end_event.record()
     # wait for all the operations to finish
-    torch.cuda.synchronize()
+    device_sync("cuda")
     elapsed_time_ms = start_event.elapsed_time(end_event)
     print("Old extract time: ", elapsed_time_ms / 1000)
 
@@ -420,7 +421,7 @@ def test_multi_layer_kernel_use_mla(num_tokens, head_size, gpu_kv_format):
 
     end_event.record()
     # wait for all the operations to finish
-    torch.cuda.synchronize()
+    device_sync("cuda")
     elapsed_time_ms = start_event.elapsed_time(end_event)
     print("New extract time: ", elapsed_time_ms / 1000)
 
@@ -575,13 +576,13 @@ def test_lmcache_memcpy_async():
     # Launch default cuda copy
     with pytest.raises(RuntimeError):
         big_gpu_tensor.copy_(big_cpu_tensor, non_blocking=True)
-        torch.cuda.synchronize()
+        device_sync("cuda")
 
     # Launc default cuda copy for a small page
     big_gpu_tensor[: elements_per_chunk // 2].copy_(
         big_cpu_tensor[: elements_per_chunk // 2], non_blocking=True
     )
-    torch.cuda.synchronize()
+    device_sync("cuda")
 
     check_gpu_and_cpu_equal(
         big_gpu_tensor[: elements_per_chunk // 2],
@@ -618,7 +619,7 @@ def test_lmcache_memcpy_async():
             start,
             chunk_size,
         )
-        torch.cuda.synchronize()
+        device_sync("cuda")
 
         check_gpu_and_cpu_equal(
             big_gpu_tensor[start // dtype.itemsize : end // dtype.itemsize],
@@ -646,7 +647,7 @@ def test_lmcache_memcpy_async():
             start,
             chunk_size,
         )
-        torch.cuda.synchronize()
+        device_sync("cuda")
 
         check_gpu_and_cpu_equal(
             big_gpu_tensor[start // dtype.itemsize : end // dtype.itemsize],
