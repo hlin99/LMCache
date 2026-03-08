@@ -54,7 +54,12 @@ def _tensor_from_ptr(
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
-    """Copy raw bytes between pointers using torch tensor semantics."""
+    """Copy raw bytes between pointers using torch tensor semantics.
+
+    Note: This function only works for CPU-accessible memory. For device
+    memory (CUDA/XPU), use lmcache_memcpy_async with the appropriate runtime
+    library or PyTorch's tensor copy operations.
+    """
     if num_bytes <= 0:
         return
 
