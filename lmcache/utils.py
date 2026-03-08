@@ -663,3 +663,42 @@ def mock_up_broadcast_fn(t: torch.Tensor, i: int) -> None:
 
 def mock_up_broadcast_object_fn(a: Any, i: int) -> None:
     raise NotImplementedError("Calling invalid broadcast object function")
+
+
+#### Device synchronization utilities ####
+def device_synchronize(device: Optional[Union[torch.device, str]] = None) -> None:
+    """Synchronize the specified device.
+
+    This function abstracts device-specific synchronization operations to provide
+    a unified interface similar to torch.device.sync (if it existed).
+
+    Args:
+        device: The device to synchronize. Can be:
+            - torch.device object
+            - string like "cuda", "cuda:0", "cpu", etc.
+            - None (synchronizes the current CUDA device if CUDA is available)
+
+    Examples:
+        device_synchronize()  # Sync current CUDA device if available
+        device_synchronize("cuda")  # Sync CUDA device
+        device_synchronize("cuda:0")  # Sync specific CUDA device
+        device_synchronize(torch.device("cuda:1"))  # Sync using device object
+    """
+    if device is None:
+        # Default behavior: synchronize CUDA if available
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return
+
+    # Convert to torch.device if string
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # Synchronize based on device type
+    if device.type == "cuda":
+        if device.index is not None:
+            torch.cuda.synchronize(device.index)
+        else:
+            torch.cuda.synchronize()
+    # For CPU and other devices, no synchronization is needed
+    # as operations are already synchronous

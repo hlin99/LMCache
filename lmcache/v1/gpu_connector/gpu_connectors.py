@@ -9,7 +9,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
-from lmcache.utils import EngineType, _lmcache_nvtx_annotate
+from lmcache.utils import EngineType, _lmcache_nvtx_annotate, device_synchronize
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.utils import (
     assert_is_vllm_flash_attn_or_flash_infer,
@@ -764,7 +764,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
-                torch.cuda.synchronize()
+                device_synchronize()
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -1496,7 +1496,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
-            torch.cuda.synchronize()
+            device_synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT

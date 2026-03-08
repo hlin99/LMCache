@@ -19,7 +19,7 @@ import torch
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.utils import _lmcache_nvtx_annotate, device_synchronize
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.system_detection import NUMAMapping
 import lmcache.c_ops as lmc_ops
@@ -433,8 +433,7 @@ def _free_cpu_memory(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
 ) -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    device_synchronize()
 
     _, free_info = _resolve_pinned_alloc_free(
         numa_mapping,
@@ -2061,8 +2060,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
     def close(self):
         if not self._unregistered:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            device_synchronize()
             if self.buffer.numel() == 0:
                 return
             _free_cpu_memory(
