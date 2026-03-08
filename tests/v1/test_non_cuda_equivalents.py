@@ -8,9 +8,32 @@ import pytest
 import torch
 
 # ==========================================
-# 1. Backend Configuration
+# 0. utils functions.
 # ==========================================
 
+# Device utility functions
+def device_sync(device: str) -> None:
+    """Synchronize device operations.
+
+    Args:
+        device: Device string ("cuda", "xpu", or "cpu")
+
+    This function synchronizes operations for GPU devices:
+    - For CUDA devices, calls torch.cuda.synchronize()
+    - For XPU devices, calls torch.xpu.synchronize()
+    - For CPU, no synchronization is needed (returns immediately)
+    """
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elif device == "xpu":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.synchronize()
+    # CPU requires no synchronization
+
+
+# ==========================================
+# 1. Backend Configuration
+# ==========================================
 
 def _build_backend_params() -> list:
     """Build pytest parameter list for the backend fixture.
@@ -198,8 +221,7 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
         16,
     )
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # --- PART B: D2H (Device to Host) ---
     ops.lmcache_memcpy_async(
@@ -211,8 +233,7 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
         16,
     )
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 3. Internal sanity check
     final_result = dst_host.cpu()
@@ -343,8 +364,7 @@ def scenario_load_and_reshape_flash(ops: Any, device: str) -> dict[str, torch.Te
             )
         extracted_chunks.append(mem_obj_tensor)
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 4. Verify: compare extracted data against original kv_cache
     #    mem_obj_tensor layout:
@@ -472,8 +492,7 @@ def scenario_reshape_and_cache_back_flash(
             )
         current_token_offset += chunk_len
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 6. Verify: check written values against source pattern
     for layer_id in range(num_layers):
@@ -557,8 +576,7 @@ def scenario_encode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
         output_lengths,
     )
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 5. Verify
     lengths_cpu = output_lengths.cpu()
@@ -617,8 +635,7 @@ def scenario_decode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
         encoded_buffer,
         encoded_lengths,
     )
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 4. Decode
     decoded_sym = torch.zeros_like(input_sym, dtype=torch.uint8)
@@ -629,8 +646,7 @@ def scenario_decode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
         encoded_lengths,
         decoded_sym,
     )
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 5. Verify: decoded must match original
     input_uint8 = input_sym.to(torch.uint8)
@@ -691,8 +707,7 @@ def scenario_decode_fast_prefsum(ops: Any, device: str) -> dict[str, torch.Tenso
         device=device,
     )
     ops.encode_fast_new(cdf, input_sym, tmp_buf, tmp_len)
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 4. Pack into 1D dense bytestream
     lens_flat = tmp_len.cpu().flatten().tolist()
@@ -728,8 +743,7 @@ def scenario_decode_fast_prefsum(ops: Any, device: str) -> dict[str, torch.Tenso
         lengths_prefsum,
         decoded_sym,
     )
-    if device == "cuda":
-        torch.cuda.synchronize()
+    device_sync(device)
 
     # 7. Verify roundtrip
     input_ref = input_sym.to(torch.uint8)
@@ -875,8 +889,7 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
             gpu_kv_format,
             token_major,
         )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        device_sync(device)
 
         # ── 5. Verify ──
         if not direction:
@@ -945,8 +958,7 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
             fmt,
             token_major,
         )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        device_sync(device)
 
         result = lmc_tensor.cpu() if direction else vllm_tensor.cpu()
         results[f"single_layer_kv_transfer_{dir_tag}_mla_{is_mla}"] = result
@@ -1069,8 +1081,7 @@ def scenario_single_layer_kv_transfer_sgl(
             ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D,
             token_major,
         )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        device_sync(device)
 
         # 5. Verify
         case_desc = f"TM={token_major}, Dir={dir_tag}"
@@ -1233,8 +1244,7 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                 gpu_kv_format,
                 bs_arg,
             )
-            if device == "cuda":
-                torch.cuda.synchronize()
+            device_sync(device)
 
             # ── 5. Verify (internal, per-format) ──
             for t_id in range(num_tokens):
@@ -1314,8 +1324,7 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
             canonical_format,
             1,
         )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        device_sync(device)
 
         results[f"multi_layer_kv_transfer_{dir_tag}"] = key_value.cpu()
 
@@ -1469,8 +1478,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 xfer_dir,
                 gpu_kv_format,
             )
-            if device == "cuda":
-                torch.cuda.synchronize()
+            device_sync(device)
 
             # ── 4. Verify ──
             for t_id in range(num_tokens):
@@ -1557,8 +1565,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
             xfer_dir,
             ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        device_sync(device)
 
         results[f"multi_layer_kv_transfer_unilateral_{dir_tag}"] = lmc_tensor.cpu()
 
