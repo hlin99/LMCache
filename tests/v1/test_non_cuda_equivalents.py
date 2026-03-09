@@ -1302,11 +1302,14 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                     pb[1, s] = val + 700
             page_buffers.append(pb)
 
-        key_value_ptrs = torch.tensor(
-            [pb.data_ptr() for pb in page_buffers],
-            dtype=torch.int64,
-            device=device,
-        )
+        if use_tensor_list:
+            key_value_ptrs = page_buffers
+        else:
+            key_value_ptrs = torch.tensor(
+                [pb.data_ptr() for pb in page_buffers],
+                dtype=torch.int64,
+                device=device,
+            )
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
         ops.multi_layer_kv_transfer(
@@ -1538,17 +1541,25 @@ def scenario_multi_layer_kv_transfer_unilateral(
                         pb[s] = val
                 buffers[(kv, ly)] = pb
 
-        ptr_list = []
-        for ly in range(num_layers):
-            ptr_list.append(buffers[(0, ly)].data_ptr())
-        for ly in range(num_layers):
-            ptr_list.append(buffers[(1, ly)].data_ptr())
-
-        key_value_ptrs = torch.tensor(
-            ptr_list,
-            dtype=torch.int64,
-            device=device,
-        ).contiguous()
+        if use_tensor_list:
+            # Tensor list mode: [K_l0, K_l1, ..., V_l0, V_l1, ...]
+            tensor_list = []
+            for ly in range(num_layers):
+                tensor_list.append(buffers[(0, ly)])
+            for ly in range(num_layers):
+                tensor_list.append(buffers[(1, ly)])
+            key_value_ptrs = tensor_list
+        else:
+            ptr_list = []
+            for ly in range(num_layers):
+                ptr_list.append(buffers[(0, ly)].data_ptr())
+            for ly in range(num_layers):
+                ptr_list.append(buffers[(1, ly)].data_ptr())
+            key_value_ptrs = torch.tensor(
+                ptr_list,
+                dtype=torch.int64,
+                device=device,
+            ).contiguous()
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
         ops.multi_layer_kv_transfer_unilateral(
