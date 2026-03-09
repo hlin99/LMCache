@@ -289,9 +289,8 @@ class GPUKVFormat(IntEnum):
     NL_X_NBBS_ONE_HS = 5
 
 
-def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
-    """Non-CUDA equivalent of allocating pinned memory with NUMA awareness.
-    Note: NUMA and pinned memory are not supported on non-CUDA."""
+def _alloc_cpu_ptr(size: int) -> int:
+    """Allocate a plain CPU tensor and register its pointer."""
 
     # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
     tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
@@ -303,10 +302,16 @@ def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     # returned by the CUDA equivalent function
     ptr = tensor.data_ptr()
 
-    # Store the tensor so it can be accessed outide this function scope
+    # Store the tensor so it can be accessed outside this function scope
     _tensor_registry[ptr] = tensor
 
     return ptr
+
+
+def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
+    """Non-CUDA equivalent of allocating pinned memory with NUMA awareness.
+    Note: NUMA and pinned memory are not supported on non-CUDA."""
+    return _alloc_cpu_ptr(size)
 
 
 def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
@@ -319,21 +324,7 @@ def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
 def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     """Non-CUDA equivalent of allocating pinned memory and returning pointer
     to it. Note: Pinned memory is not supported on non-CUDA."""
-
-    # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
-    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
-
-    # First-touch initialization (forces physical allocation)
-    tensor.fill_(0)
-
-    # Get a pointer to the start of the tensor object as this is what is
-    # returned by the CUDA equivalent function
-    ptr = tensor.data_ptr()
-
-    # Store the tensor so it can be accessed outide this function scope
-    _tensor_registry[ptr] = tensor
-
-    return ptr
+    return _alloc_cpu_ptr(size)
 
 
 def free_pinned_ptr(ptr: int) -> None:
