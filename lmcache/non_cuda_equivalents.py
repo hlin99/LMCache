@@ -712,93 +712,76 @@ def lmcache_memcpy_async(
     host_buffer_alignments: int,
 ):
     """
-    Python fallback implementation.
-    When libcudart is available, uses cudaMemcpy with cudaMemcpyDefault
-    (lets CUDA runtime auto-detect pointer types).
-    When libcudart is unavailable, falls back to CPU-only tensor copy.
+    Python fallback for lmcache_memcpy_async.
+
+    - Tensor mode (non-CUDA devices like HPU): uses .to(device) + copy_()
+    - Pointer mode with libcudart: uses synchronous cudaMemcpy (cudaMemcpyDefault)
+    - Pointer mode without libcudart: uses CPU tensor copy
+
+    Unlike the C++ version (which uses cudaMemcpyAsync and must split copies
+    at cudaHostRegister boundaries), this Python fallback does NOT need
+    alignment-based chunking because:
+    - cudaMemcpy (synchronous) handles cross-cudaHostRegister boundaries
+      internally via staging buffers
+    - CPU tensor copy has no alignment constraints
+    - Tensor mode bypasses raw pointers entirely
 
     dest:
-        - If int: raw memory pointer (used for CUDA/CPU devices where we work with pointers).
-        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices where we operate on tensor objects directly).
+        - If int: raw memory pointer (used for CUDA/CPU devices where we
+          work with pointers).
+        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices
+          where we operate on tensor objects directly).
 
     src:
-        - If int: raw memory pointer (used for CUDA/CPU devices where we work with pointers).
-        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices where we operate on tensor objects directly).
+        - If int: raw memory pointer (used for CUDA/CPU devices where we
+          work with pointers).
+        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices
+          where we operate on tensor objects directly).
     """
-    # 1. Power of two check
+    # 1. Power of two check (kept for API compatibility)
     if host_buffer_alignments <= 0 or (
         host_buffer_alignments & (host_buffer_alignments - 1) != 0
     ):
         raise ValueError("host_buffer_alignments must be power of two")
 
-    # 2. Validate direction (for API compatibility, even though we use Default)
+    # 2. Validate direction
     if direction not in (TransferDirection.H2D, TransferDirection.D2H):
         raise ValueError(f"Unsupported direction: {direction}")
 
-    # 3. Handle both tensor (pointer) mode and tensor object mode
+    # 3. Tensor mode for non-CUDA devices (HPU, XPU, etc.)
     use_tensor_mode = isinstance(dest, torch.Tensor) and isinstance(src, torch.Tensor)
 
     if use_tensor_mode:
-        # Tensor mode for non-CUDA devices
-        # Some device backends silently fail on view().copy_() 
-        # across devices. Use .to(device) which is always reliable.
+        # .to(device) creates a new tensor on dest's device — always works
+        # even across device boundaries without raw-pointer constraints.
         num_elements = nbytes // src.element_size()
         src_slice = src.flatten()[:num_elements]
-        
-        # .to(device) creates a new tensor on dest's device — always works
         copied = src_slice.to(dest.device)
-        
-        # Now both are on the same device, copy_ is safe
         dest.flatten()[:num_elements].copy_(copied)
         return
 
-    # Pointer mode: use the original implementation
+    # 4. Pointer mode
     if not isinstance(dest, int) or not isinstance(src, int):
-        raise TypeError("dest and src must be both int (pointer mode) or both torch.Tensor (tensor mode)")
+        raise TypeError(
+            "dest and src must be both int (pointer mode) "
+            "or both torch.Tensor (tensor mode)"
+        )
 
-    # 4. Determine copy strategy
     libcudart = _get_copy_lib()
-    use_cuda = libcudart is not None and hasattr(libcudart, "cudaMemcpy")
-
-    # 5. Aligned copy loop
-    offset = 0
-    mask = host_buffer_alignments - 1
-
-    while offset < nbytes:
-        # Calculate chunks based on alignment; mirrors
-        # csrc/mem_kernels.cu::lmcache_memcpy_async split loop that honors
-        # cudaHostRegister granularity.
-        aligned_area_end = (
-            (offset + host_buffer_offset) & ~mask
-        ) + host_buffer_alignments
-        real_end = min(host_buffer_offset + nbytes, aligned_area_end)
-        max_nbytes = real_end - offset - host_buffer_offset
-
-        if max_nbytes <= 0:
-            break
-
-        current_dest = dest + offset
-        current_src = src + offset
-
-        if use_cuda:
-            # cudaMemcpyDefault (4) lets CUDA runtime auto-detect
-            # whether pointers are host or device memory.
-            # This works for all combinations: H2H, H2D, D2H, D2D.
-
-            assert libcudart is not None  # mypy: guarded by use_cuda
-            ret = libcudart.cudaMemcpy(
-                ctypes.c_void_p(current_dest),
-                ctypes.c_void_p(current_src),
-                ctypes.c_size_t(max_nbytes),
-                ctypes.c_int(4),  # cudaMemcpyDefault
-            )
-            if ret != 0:
-                raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
-        else:
-            # No CUDA runtime: both pointers must be CPU
-            _copy_bytes_with_tensor(current_dest, current_src, int(max_nbytes))
-
-        offset += max_nbytes
+    if libcudart is not None and hasattr(libcudart, "cudaMemcpy"):
+        # Synchronous cudaMemcpy handles cross-cudaHostRegister boundaries
+        # internally — no manual alignment splitting needed.
+        ret = libcudart.cudaMemcpy(
+            ctypes.c_void_p(dest),
+            ctypes.c_void_p(src),
+            ctypes.c_size_t(nbytes),
+            ctypes.c_int(4),  # cudaMemcpyDefault
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
+    else:
+        # Pure CPU copy — no alignment constraints.
+        _copy_bytes_with_tensor(dest, src, nbytes)
 
 
 def encode_fast_new(cdf, input_sym, output_buffer, output_lengths):
