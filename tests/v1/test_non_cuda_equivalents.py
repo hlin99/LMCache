@@ -1219,10 +1219,12 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                 key_value_ptrs = page_buffers
             else:
                 # Pointer mode: create tensor of int64 pointers
+                # IMPORTANT: For CUDA devices, the pointer tensor must be on CPU
+                # so that the C++ kernel can use cudaHostGetDevicePointer to access it
                 key_value_ptrs = torch.tensor(
                     [pb.data_ptr() for pb in page_buffers],
                     dtype=torch.int64,
-                    device=device,
+                    device="cpu",
                 )
 
             # ── 4. Execute ──
@@ -1305,10 +1307,11 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
         if use_tensor_list:
             key_value_ptrs = page_buffers
         else:
+            # Pointer mode: pointer tensor must be on CPU
             key_value_ptrs = torch.tensor(
                 [pb.data_ptr() for pb in page_buffers],
                 dtype=torch.int64,
-                device=device,
+                device="cpu",
             )
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
@@ -1413,10 +1416,11 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 if use_tensor_list:
                     key_value_ptrs = page_buffers
                 else:
+                    # Pointer mode: pointer tensor must be on CPU
                     key_value_ptrs = torch.tensor(
                         [pb.data_ptr() for pb in page_buffers],
                         dtype=torch.int64,
-                        device=device,
+                        device="cpu",
                     )
             else:
                 # Non-MLA unilateral: separate K/V buffers
@@ -1450,7 +1454,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                         tensor_list.append(buffers[(1, ly)])
                     key_value_ptrs = tensor_list
                 else:
-                    # Pointer mode
+                    # Pointer mode: pointer tensor must be on CPU
                     ptr_list = []
                     for ly in range(num_layers):
                         ptr_list.append(buffers[(0, ly)].data_ptr())
@@ -1460,7 +1464,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                     key_value_ptrs = torch.tensor(
                         ptr_list,
                         dtype=torch.int64,
-                        device=device,
+                        device="cpu",
                     ).contiguous()
 
             # ── 3. Execute ──
@@ -1550,6 +1554,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 tensor_list.append(buffers[(1, ly)])
             key_value_ptrs = tensor_list
         else:
+            # Pointer mode: pointer tensor must be on CPU
             ptr_list = []
             for ly in range(num_layers):
                 ptr_list.append(buffers[(0, ly)].data_ptr())
@@ -1558,7 +1563,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
             key_value_ptrs = torch.tensor(
                 ptr_list,
                 dtype=torch.int64,
-                device=device,
+                device="cpu",
             ).contiguous()
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
