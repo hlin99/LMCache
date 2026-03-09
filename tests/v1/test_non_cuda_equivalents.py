@@ -1713,81 +1713,114 @@ SCENARIO_REGISTRY = {
 # ==========================================
 
 
-@pytest.mark.parametrize("name,fn", list(SCENARIO_REGISTRY.items()))
-def test_scenario(
-    backend: tuple,
-    name: str,
-    fn: Any,
-) -> None:
-    """Run a single scenario with a specific backend configuration.
+class TestScenarios:
+    """Test class to ensure test_scenario runs before test_compare.
 
-    Each (scenario, backend) pair is a separate pytest test case, giving
-    per-scenario per-backend failure reporting without subprocess indirection.
+    **Execution Order Guarantee:**
+    By grouping tests in a class and using alphabetically ordered method names
+    (test_1_scenario, test_2_compare), pytest will execute all scenario tests
+    before any compare tests, ensuring _results dict is fully populated.
 
-    Results are stored in the module-level _results dict for later comparison
-    by test_compare.
+    **Why this is necessary:**
+    - test_1_scenario: runs each scenario function with each backend and stores
+      results in the module-level _results dictionary
+    - test_2_compare: reads from _results to compare outputs across backends
+
+    Without explicit ordering, pytest might interleave test_1_scenario and
+    test_2_compare executions, causing test_2_compare to fail when it tries to
+    access results that haven't been stored yet.
+
+    **How pytest ordering works:**
+    Within a test class, pytest collects and executes test methods in the order
+    they appear in the class definition. By naming them test_1_* and test_2_*,
+    we ensure that all test_1_scenario parametrized tests complete before any
+    test_2_compare tests begin.
+
+    **Alternative solutions considered:**
+    - pytest-ordering plugin: requires external dependency
+    - pytest-dependency plugin: requires external dependency
+    - Single test function: would lose per-scenario test granularity
+    - Fixtures: cannot easily guarantee ordering across parametrized tests
     """
-    backend_id, ops, device = backend
-    result = fn(ops, device)
-    if result is not None:
-        _results[(name, backend_id)] = result
 
+    @pytest.mark.parametrize("name,fn", list(SCENARIO_REGISTRY.items()))
+    def test_1_scenario(
+        self,
+        backend: tuple,
+        name: str,
+        fn: Any,
+    ) -> None:
+        """Run a single scenario with a specific backend configuration.
 
-@pytest.mark.parametrize("name", list(SCENARIO_REGISTRY.keys()))
-def test_compare(name: str) -> None:
-    """Compare results across backends for a single scenario.
+        Each (scenario, backend) pair is a separate pytest test case, giving
+        per-scenario per-backend failure reporting without subprocess indirection.
 
-    When multiple backends ran (CUDA available), asserts that non_cuda
-    equivalents produce numerically identical results to cuda_ops.
-    When only one backend ran (no CUDA), simply verifies results were stored.
-    """
-    available = [p.values[0][0] for p in _BACKEND_PARAMS]  # list of backend_ids
-    backend_results = {
-        bid: _results[(name, bid)] for bid in available if (name, bid) in _results
-    }
+        Results are stored in the module-level _results dict for later comparison
+        by test_2_compare.
+        """
+        backend_id, ops, device = backend
+        result = fn(ops, device)
+        if result is not None:
+            _results[(name, backend_id)] = result
 
-    assert len(backend_results) >= 1, (
-        f"{name}: no results collected — were all test_scenario tests skipped?"
-    )
+    @pytest.mark.parametrize("name", list(SCENARIO_REGISTRY.keys()))
+    def test_2_compare(self, name: str) -> None:
+        """Compare results across backends for a single scenario.
 
-    if len(backend_results) < 2:
-        # Only one backend available (no CUDA); just verify results exist
-        return
+        When multiple backends ran (CUDA available), asserts that non_cuda
+        equivalents produce numerically identical results to cuda_ops.
+        When only one backend ran (no CUDA), simply verifies results were stored.
 
-    # Collect all result keys across all backends for this scenario
-    all_keys: set[str] = set()
-    for res in backend_results.values():
-        all_keys.update(res.keys())
+        This test runs after test_1_scenario due to alphabetical ordering of
+        method names within the TestScenarios class.
+        """
+        available = [p.values[0][0] for p in _BACKEND_PARAMS]  # list of backend_ids
+        backend_results = {
+            bid: _results[(name, bid)] for bid in available if (name, bid) in _results
+        }
 
-    base_bid = next(iter(backend_results))  # first available backend as reference
+        assert len(backend_results) >= 1, (
+            f"{name}: no results collected — were all test_1_scenario tests skipped?"
+        )
 
-    for key in sorted(all_keys):
-        base_val = backend_results[base_bid].get(key)
-        if base_val is None:
-            continue
+        if len(backend_results) < 2:
+            # Only one backend available (no CUDA); just verify results exist
+            return
 
-        for bid, res in backend_results.items():
-            if bid == base_bid:
+        # Collect all result keys across all backends for this scenario
+        all_keys: set[str] = set()
+        for res in backend_results.values():
+            all_keys.update(res.keys())
+
+        base_bid = next(iter(backend_results))  # first available backend as reference
+
+        for key in sorted(all_keys):
+            base_val = backend_results[base_bid].get(key)
+            if base_val is None:
                 continue
-            val = res.get(key)
-            if val is None:
-                pytest.fail(
-                    f"{name}/{key}: backend '{bid}' has no result "
-                    f"(reference backend '{base_bid}' does)"
-                )
-                continue
 
-            if isinstance(val, torch.Tensor):
-                v_current = val.detach().cpu().float()
-                v_base = base_val.detach().cpu().float()
-                if not torch.allclose(v_current, v_base, rtol=1e-4, atol=1e-4):
-                    max_diff = (v_current - v_base).abs().max().item()
+            for bid, res in backend_results.items():
+                if bid == base_bid:
+                    continue
+                val = res.get(key)
+                if val is None:
                     pytest.fail(
-                        f"{name}/{key}: '{bid}' vs '{base_bid}' mismatch, "
-                        f"max diff = {max_diff:.2e}"
+                        f"{name}/{key}: backend '{bid}' has no result "
+                        f"(reference backend '{base_bid}' does)"
                     )
-            else:
-                if val != base_val:
-                    pytest.fail(
-                        f"{name}/{key}: '{bid}'={val} != '{base_bid}'={base_val}"
-                    )
+                    continue
+
+                if isinstance(val, torch.Tensor):
+                    v_current = val.detach().cpu().float()
+                    v_base = base_val.detach().cpu().float()
+                    if not torch.allclose(v_current, v_base, rtol=1e-4, atol=1e-4):
+                        max_diff = (v_current - v_base).abs().max().item()
+                        pytest.fail(
+                            f"{name}/{key}: '{bid}' vs '{base_bid}' mismatch, "
+                            f"max diff = {max_diff:.2e}"
+                        )
+                else:
+                    if val != base_val:
+                        pytest.fail(
+                            f"{name}/{key}: '{bid}'={val} != '{base_bid}'={base_val}"
+                        )
