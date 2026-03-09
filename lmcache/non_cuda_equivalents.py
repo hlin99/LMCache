@@ -28,7 +28,17 @@ _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
 
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
-    """Lazily load and cache the CUDA runtime library, or None for CPU fallback."""
+    """Lazily load and cache the CUDA runtime library, or None for CPU fallback.
+
+    Returns:
+        Optional[ctypes.CDLL]: The loaded libcudart library if available, or None
+            if CUDA runtime cannot be found. The result is cached to avoid repeated
+            library loading attempts.
+
+    Note:
+        This function is idempotent and thread-safe due to Python's GIL.
+        The library is only loaded once on the first call.
+    """
     global _copy_lib
     if _copy_lib is _copy_lib_NOT_LOADED:
         try:
@@ -227,6 +237,8 @@ def _tensor_from_cuda_ptr(
         ctypes.c_size_t,  # count
         ctypes.c_int,  # kind
     ]
+    # cudaMemcpyKind enum: cudaMemcpyDeviceToDevice = 3
+    # See CUDA Runtime API documentation for cudaMemcpy
     _MEMCPY_D2D = 3
 
     dst = torch.empty(numel, dtype=dtype, device=device)
@@ -303,7 +315,7 @@ def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     # returned by the CUDA equivalent function
     ptr = tensor.data_ptr()
 
-    # Store the tensor so it can be accessed outide this function scope
+    # Store the tensor so it can be accessed outside this function scope
     _tensor_registry[ptr] = tensor
 
     return ptr
@@ -330,7 +342,7 @@ def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     # returned by the CUDA equivalent function
     ptr = tensor.data_ptr()
 
-    # Store the tensor so it can be accessed outide this function scope
+    # Store the tensor so it can be accessed outside this function scope
     _tensor_registry[ptr] = tensor
 
     return ptr
@@ -362,7 +374,8 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     shm = shared_memory.SharedMemory(name=name, create=True, size=size)
 
     array_type = ctypes.c_uint8 * size
-    buf = array_type.from_buffer(shm.buf)
+    # mypy: shm.buf is always non-None after successful creation
+    buf = array_type.from_buffer(shm.buf)  # type: ignore[arg-type]
     ptr = ctypes.addressof(buf)
 
     # Store references to keep them alive
@@ -980,7 +993,7 @@ def lmcache_memcpy_async(
             ctypes.c_void_p(dest),
             ctypes.c_void_p(src),
             ctypes.c_size_t(nbytes),
-            ctypes.c_int(4),  # cudaMemcpyDefault
+            ctypes.c_int(4),  # cudaMemcpyDefault (auto-detect direction)
         )
         if ret != 0:
             raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
