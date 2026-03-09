@@ -290,7 +290,16 @@ class GPUKVFormat(IntEnum):
 
 
 def _alloc_cpu_ptr(size: int) -> int:
-    """Allocate a plain CPU tensor and register its pointer."""
+    """Allocate a plain CPU tensor, register it, and return its data pointer.
+
+    Args:
+        size: Number of bytes to allocate.
+
+    Returns:
+        An integer representing the pointer to the start of the allocated
+        tensor's data buffer. The tensor is stored in ``_tensor_registry``
+        to prevent it from being garbage-collected while the pointer is live.
+    """
 
     # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
     tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
