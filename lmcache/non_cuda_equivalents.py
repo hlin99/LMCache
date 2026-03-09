@@ -38,32 +38,17 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
 
 
 def _tensor_from_ptr(
-    ptr: int, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device = None
+    ptr: int, shape: tuple[int, ...], dtype: torch.dtype
 ) -> torch.Tensor:
-    """Create a tensor view over a raw pointer.
-
-    Args:
-        ptr: Raw memory pointer
-        shape: Desired tensor shape
-        dtype: Tensor data type
-        device: Device where the memory resides (default: CPU)
+    """Create a CPU tensor view over a raw pointer.
 
     Note:
         This function uses ctypes to create tensor views from raw pointers.
-        It only works reliably for CPU-accessible memory. For device memory
-        (CUDA, XPU, HPU), use tensor list mode instead of pointer mode.
+        It only works for CPU-accessible memory. For device memory (CUDA, XPU, HPU),
+        use tensor list mode instead of pointer mode in multi_layer_kv_transfer.
     """
     if ptr == 0:
         raise ValueError("Pointer must be non-zero")
-
-    # Check if device is specified and is not CPU
-    if device is not None and device.type != "cpu":
-        raise ValueError(
-            f"_tensor_from_ptr only supports CPU memory. "
-            f"Got device: {device}. "
-            f"For device memory, use tensor list mode instead of pointer mode."
-        )
-
     numel = 1
     for dim in shape:
         numel *= int(dim)
@@ -272,6 +257,14 @@ def multi_layer_kv_transfer(
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
+        # Validate that pointer mode is only used with CPU memory
+        if paged_memory_device.type != "cpu":
+            raise ValueError(
+                f"Pointer mode is only supported for CPU memory. "
+                f"Got device: {paged_memory_device}. "
+                f"For device memory, pass key_value_ptrs as a list of tensors "
+                f"instead of a tensor of pointers."
+            )
         ptr_list = key_value_ptrs.tolist()
 
     for layer_id in range(num_layers):
@@ -292,7 +285,6 @@ def multi_layer_kv_transfer(
                     paged_ptr,
                     (k_or_v_size, page_buffer_size, hidden_size),
                     key_value.dtype,
-                    paged_memory_device,
                 )
             elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
                 num_blocks = max(
@@ -302,7 +294,6 @@ def multi_layer_kv_transfer(
                     paged_ptr,
                     (num_blocks, 2, block_size, hidden_size),
                     key_value.dtype,
-                    paged_memory_device,
                 )
             elif gpu_kv_format in (
                 GPUKVFormat.NL_X_NB_BS_HS,
@@ -312,7 +303,6 @@ def multi_layer_kv_transfer(
                     paged_ptr,
                     (page_buffer_size, hidden_size),
                     key_value.dtype,
-                    paged_memory_device,
                 )
             else:
                 raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
@@ -417,6 +407,14 @@ def multi_layer_kv_transfer_unilateral(
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
+        # Validate that pointer mode is only used with CPU memory
+        if paged_memory_device.type != "cpu":
+            raise ValueError(
+                f"Pointer mode is only supported for CPU memory. "
+                f"Got device: {paged_memory_device}. "
+                f"For device memory, pass key_value_ptrs as a list of tensors "
+                f"instead of a tensor of pointers."
+            )
         ptr_list = key_value_ptrs.tolist()
 
     for layer_id in range(num_layers):
@@ -434,13 +432,11 @@ def multi_layer_kv_transfer_unilateral(
                 k_ptr,
                 (page_buffer_size, hidden_size),
                 key_value.dtype,
-                paged_memory_device,
             )
             v_buf = _tensor_from_ptr(
                 v_ptr,
                 (page_buffer_size, hidden_size),
                 key_value.dtype,
-                paged_memory_device,
             )
 
         if direction == TransferDirection.H2D:
