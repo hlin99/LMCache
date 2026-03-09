@@ -799,6 +799,14 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
         (ops.GPUKVFormat.NL_X_NB_BS_HS, True, True, True),
     ]
 
+    CANONICAL = {
+        (False, True, False, ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS),
+        (False, True, True, ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS),
+        (True, True, False, ops.GPUKVFormat.NL_X_NB_BS_HS),
+        (True, True, True, ops.GPUKVFormat.NL_X_NB_BS_HS),
+    }
+    results: dict[str, torch.Tensor] = {}
+
     for gpu_kv_format, is_mla, token_major, direction in test_cases:
         dir_tag = "v2l" if direction else "l2v"
         is_two_major = gpu_kv_format == ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
@@ -910,59 +918,11 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
                 msg=f"Mismatch in {case_desc}",
             )
 
-    # ── 6. Collect canonical results for cross-backend comparison ──
-    # Use flash attn (two_major) format to match original file names
-    canonical_cases = [
-        (False, True, False),  # l2v, non-MLA
-        (False, True, True),  # v2l, non-MLA
-        (True, True, False),  # l2v, MLA
-        (True, True, True),  # v2l, MLA
-    ]
-
-    results: dict[str, torch.Tensor] = {}
-    for is_mla, token_major, direction in canonical_cases:
-        dir_tag = "v2l" if direction else "l2v"
-
-        if is_mla:
-            lmc_shape = (num_tokens, hidden_size)
-            vllm_shape = (num_blocks, block_size, hidden_size)
-            fmt = ops.GPUKVFormat.NL_X_NB_BS_HS
-        else:
-            lmc_shape = (num_tokens, 2, hidden_size)
-            vllm_shape = (2, num_blocks, block_size, num_heads, head_size)
-            fmt = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
-
-        lmc_size = 1
-        for s in lmc_shape:
-            lmc_size *= s
-        vllm_size = 1
-        for s in vllm_shape:
-            vllm_size *= s
-
-        lmc_tensor = (
-            (torch.arange(lmc_size, device=device) % 1000)
-            .to(torch.float16)
-            .reshape(lmc_shape)
-        )
-        vllm_tensor = (
-            (torch.arange(vllm_size, device=device) % 1000)
-            .to(torch.float16)
-            .reshape(vllm_shape)
-        )
-
-        xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
-        ops.single_layer_kv_transfer(
-            lmc_tensor,
-            vllm_tensor,
-            slot_mapping,
-            xfer_dir,
-            fmt,
-            token_major,
-        )
-        device_sync(device)
-
-        result = lmc_tensor.cpu() if direction else vllm_tensor.cpu()
-        results[f"single_layer_kv_transfer_{dir_tag}_mla_{is_mla}"] = result
+        # Save canonical result for cross-backend comparison (if applicable)
+        key = (is_mla, token_major, direction, gpu_kv_format)
+        if key in CANONICAL:
+            result = lmc_tensor.cpu() if direction else vllm_tensor.cpu()
+            results[f"single_layer_kv_transfer_{dir_tag}_mla_{is_mla}"] = result
 
     return results
 
