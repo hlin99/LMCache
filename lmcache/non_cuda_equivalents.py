@@ -704,8 +704,8 @@ def reshape_and_cache_back_flash(
 
 
 def lmcache_memcpy_async(
-    dest: int,
-    src: int,
+    dest: int | torch.Tensor,
+    src: int | torch.Tensor,
     nbytes: int,
     direction: TransferDirection,
     host_buffer_offset: int,
@@ -716,6 +716,14 @@ def lmcache_memcpy_async(
     When libcudart is available, uses cudaMemcpy with cudaMemcpyDefault
     (lets CUDA runtime auto-detect pointer types).
     When libcudart is unavailable, falls back to CPU-only tensor copy.
+
+    dest:
+        - If int: raw memory pointer (used for CUDA/CPU devices where we work with pointers).
+        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices where we operate on tensor objects directly).
+
+    src:
+        - If int: raw memory pointer (used for CUDA/CPU devices where we work with pointers).
+        - If torch.Tensor: tensor object (used for non-CUDA/CPU devices where we operate on tensor objects directly).
     """
     # 1. Power of two check
     if host_buffer_alignments <= 0 or (
@@ -727,11 +735,26 @@ def lmcache_memcpy_async(
     if direction not in (TransferDirection.H2D, TransferDirection.D2H):
         raise ValueError(f"Unsupported direction: {direction}")
 
-    # 3. Determine copy strategy
+    # 3. Handle both tensor (pointer) mode and tensor object mode
+    use_tensor_mode = isinstance(dest, torch.Tensor) and isinstance(src, torch.Tensor)
+
+    if use_tensor_mode:
+        # Tensor mode: use PyTorch's copy operations directly
+        # Create views for the specified byte range
+        dest_view = dest.view(torch.uint8)[:nbytes]
+        src_view = src.view(torch.uint8)[:nbytes]
+        dest_view.copy_(src_view)
+        return
+
+    # Pointer mode: use the original implementation
+    if not isinstance(dest, int) or not isinstance(src, int):
+        raise TypeError("dest and src must be both int (pointer mode) or both torch.Tensor (tensor mode)")
+
+    # 4. Determine copy strategy
     libcudart = _get_copy_lib()
     use_cuda = libcudart is not None and hasattr(libcudart, "cudaMemcpy")
 
-    # 4. Aligned copy loop
+    # 5. Aligned copy loop
     offset = 0
     mask = host_buffer_alignments - 1
 

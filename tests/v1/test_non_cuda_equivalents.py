@@ -190,13 +190,12 @@ def scenario_rotary_embedding_k_fused(ops: Any, device: str) -> dict[str, torch.
 
 
 def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tensor]:
-    """Test lmcache_memcpy_async for H2D and D2H memory transfers."""
-    torch.manual_seed(42)
+    """Test lmcache_memcpy_async for H2D and D2H memory transfers.
 
-    if device != "cpu" and device != "cuda":
-        pytest.skip(
-            "Only cpu/cuda device memory operations are supported with Python fallback. "
-        )
+    Tests both pointer mode (int pointers) and tensor mode (torch.Tensor objects).
+    Uses pointer mode for CPU/CUDA devices and tensor mode for other devices.
+    """
+    torch.manual_seed(42)
 
     # 1. Setup dimensions and mock data (4KB)
     nbytes = 1024 * 4
@@ -211,27 +210,54 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
     h2d_dir = ops.TransferDirection.H2D
     d2h_dir = ops.TransferDirection.D2H
 
+    # Decide mode based on device: use pointer mode for CPU/CUDA, tensor mode for others
+    use_tensor_mode = device not in ("cpu", "cuda")
+
     # --- PART A: H2D (Host to Device) ---
-    ops.lmcache_memcpy_async(
-        gpu_buffer.data_ptr(),
-        src_host.data_ptr(),
-        nbytes,
-        h2d_dir,
-        0,
-        16,
-    )
+    if use_tensor_mode:
+        # Tensor mode: pass tensor objects directly
+        ops.lmcache_memcpy_async(
+            gpu_buffer,
+            src_host,
+            nbytes,
+            h2d_dir,
+            0,
+            16,
+        )
+    else:
+        # Pointer mode: pass data pointers
+        ops.lmcache_memcpy_async(
+            gpu_buffer.data_ptr(),
+            src_host.data_ptr(),
+            nbytes,
+            h2d_dir,
+            0,
+            16,
+        )
 
     device_sync(device)
 
     # --- PART B: D2H (Device to Host) ---
-    ops.lmcache_memcpy_async(
-        dst_host.data_ptr(),
-        gpu_buffer.data_ptr(),
-        nbytes,
-        d2h_dir,
-        0,
-        16,
-    )
+    if use_tensor_mode:
+        # Tensor mode: pass tensor objects directly
+        ops.lmcache_memcpy_async(
+            dst_host,
+            gpu_buffer,
+            nbytes,
+            d2h_dir,
+            0,
+            16,
+        )
+    else:
+        # Pointer mode: pass data pointers
+        ops.lmcache_memcpy_async(
+            dst_host.data_ptr(),
+            gpu_buffer.data_ptr(),
+            nbytes,
+            d2h_dir,
+            0,
+            16,
+        )
 
     device_sync(device)
 
