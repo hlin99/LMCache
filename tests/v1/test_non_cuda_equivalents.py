@@ -1595,6 +1595,8 @@ def scenario_multi_layer_kv_transfer_unilateral(
 
 def scenario_alloc_free_pinned_ptr(ops: Any, device: str) -> dict[str, torch.Tensor]:
     """Test alloc_pinned_ptr and free_pinned_ptr round-trip."""
+    if not hasattr(ops, "alloc_pinned_ptr"):
+        pytest.skip("alloc_pinned_ptr not available on this backend")
     alloc_size = 4096
     flags = 0  # cudaHostAllocDefault
 
@@ -1629,6 +1631,8 @@ def scenario_alloc_free_pinned_numa_ptr(
     ops: Any, device: str
 ) -> dict[str, torch.Tensor]:
     """Test alloc_pinned_numa_ptr and free_pinned_numa_ptr round-trip."""
+    if not hasattr(ops, "alloc_pinned_numa_ptr"):
+        pytest.skip("alloc_pinned_numa_ptr not available on this backend")
     alloc_size = 4096
     node = 0  # NUMA node 0
 
@@ -1647,6 +1651,8 @@ def scenario_alloc_free_shm_pinned_ptr(
     ops: Any, device: str
 ) -> dict[str, torch.Tensor]:
     """Test alloc_shm_pinned_ptr and free_shm_pinned_ptr round-trip."""
+    if not hasattr(ops, "alloc_shm_pinned_ptr"):
+        pytest.skip("alloc_shm_pinned_ptr not available on this backend")
     alloc_size = 4096
     shm_name = "/test_lmcache_shm"
 
