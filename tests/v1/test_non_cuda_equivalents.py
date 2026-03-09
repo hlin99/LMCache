@@ -1142,8 +1142,12 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
         (ops.GPUKVFormat.NL_X_NBBS_ONE_HS, True, 1),  # SGLang MLA
     ]
 
-    # Decide mode based on device: use pointer mode for CPU/CUDA, tensor list mode for others
-    use_tensor_list = device not in ("cpu", "cuda")
+    # Decide mode based on ops module and device:
+    # - C extension (c_ops): can use pointer mode on any device
+    # - Python fallback (non_cuda_equivalents): use tensor list mode for non-CPU devices
+    #   because _tensor_from_ptr uses ctypes which can't access device memory
+    is_python_fallback = "non_cuda_equivalents" in ops.__name__
+    use_tensor_list = is_python_fallback and device != "cpu"
 
     for gpu_kv_format, is_mla, bs_arg in format_cases:
         k_or_v_size = 1 if is_mla else 2
@@ -1364,8 +1368,12 @@ def scenario_multi_layer_kv_transfer_unilateral(
         ),  # SGLang MLA (delegates to multi_layer_kv_transfer)
     ]
 
-    # Decide mode based on device: use pointer mode for CPU/CUDA, tensor list mode for others
-    use_tensor_list = device not in ("cpu", "cuda")
+    # Decide mode based on ops module and device:
+    # - C extension (c_ops): can use pointer mode on any device
+    # - Python fallback (non_cuda_equivalents): use tensor list mode for non-CPU devices
+    #   because _tensor_from_ptr uses ctypes which can't access device memory
+    is_python_fallback = "non_cuda_equivalents" in ops.__name__
+    use_tensor_list = is_python_fallback and device != "cpu"
 
     for gpu_kv_format, is_mla in format_cases:
         k_or_v_size = 1 if is_mla else 2
