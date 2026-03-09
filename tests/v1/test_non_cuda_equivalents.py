@@ -1607,6 +1607,8 @@ def scenario_alloc_free_pinned_ptr(ops: Any, device: str) -> dict[str, torch.Ten
 
 def scenario_alloc_free_numa_ptr(ops: Any, device: str) -> dict[str, torch.Tensor]:
     """Test alloc_numa_ptr and free_numa_ptr round-trip."""
+    if not hasattr(ops, "alloc_numa_ptr"):
+        pytest.skip("alloc_numa_ptr not available on this backend")
     alloc_size = 4096
     node = 0  # NUMA node 0 (always exists)
 
