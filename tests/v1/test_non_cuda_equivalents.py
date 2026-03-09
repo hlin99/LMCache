@@ -407,8 +407,12 @@ def scenario_load_and_reshape_flash(ops: Any, device: str) -> dict[str, torch.Te
                     f"max diff={v_diff}"
                 )
 
-    # 5. Return extracted data for cross-backend comparison
-    return {"load_and_reshape_flash": extracted_chunks[0].cpu()}
+    # 5. Return ALL extracted chunks concatenated for cross-backend comparison
+    return {
+        "load_and_reshape_flash": torch.cat(
+            [c.cpu() for c in extracted_chunks], dim=2
+        )
+    }
 
 
 def scenario_reshape_and_cache_back_flash(
