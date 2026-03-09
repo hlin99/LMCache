@@ -27,6 +27,35 @@ _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
 
+def _alloc_cpu_ptr(size: int) -> int:
+    """Allocate a plain CPU byte buffer and return its data pointer.
+
+    Creates a 1-D uint8 CPU tensor of ``size`` bytes, performs a
+    first-touch write to force physical allocation, stores the tensor in
+    ``_tensor_registry`` so it stays alive, and returns the raw data
+    pointer as an integer.
+
+    Args:
+        size: Number of bytes to allocate.
+
+    Returns:
+        Integer data pointer to the start of the allocated buffer.
+    """
+    # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
+    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
+
+    # First-touch initialization (forces physical allocation)
+    tensor.fill_(0)
+
+    # Get a pointer to the start of the tensor data
+    ptr = tensor.data_ptr()
+
+    # Store the tensor so it can be accessed outside this function scope
+    _tensor_registry[ptr] = tensor
+
+    return ptr
+
+
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
     """Lazily load and cache the CUDA runtime library, or None for CPU fallback."""
     global _copy_lib
@@ -292,21 +321,7 @@ class GPUKVFormat(IntEnum):
 def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     """Non-CUDA equivalent of allocating pinned memory with NUMA awareness.
     Note: NUMA and pinned memory are not supported on non-CUDA."""
-
-    # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
-    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
-
-    # First-touch initialization (forces physical allocation)
-    tensor.fill_(0)
-
-    # Get a pointer to the start of the tensor object as this is what is
-    # returned by the CUDA equivalent function
-    ptr = tensor.data_ptr()
-
-    # Store the tensor so it can be accessed outide this function scope
-    _tensor_registry[ptr] = tensor
-
-    return ptr
+    return _alloc_cpu_ptr(size)
 
 
 def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
@@ -319,21 +334,7 @@ def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
 def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     """Non-CUDA equivalent of allocating pinned memory and returning pointer
     to it. Note: Pinned memory is not supported on non-CUDA."""
-
-    # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
-    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
-
-    # First-touch initialization (forces physical allocation)
-    tensor.fill_(0)
-
-    # Get a pointer to the start of the tensor object as this is what is
-    # returned by the CUDA equivalent function
-    ptr = tensor.data_ptr()
-
-    # Store the tensor so it can be accessed outide this function scope
-    _tensor_registry[ptr] = tensor
-
-    return ptr
+    return _alloc_cpu_ptr(size)
 
 
 def free_pinned_ptr(ptr: int) -> None:
@@ -386,15 +387,30 @@ def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
         shm.unlink()
 
 
-def alloc_numa_ptr(size: int, numa_id: int = 0) -> int:
-    """Non-CUDA equivalent of allocating numa memory and returning pointer
-    to it. Note: Numa memory is not supported on non-CUDA."""
-    return alloc_pinned_numa_ptr(size, numa_id)
+def alloc_numa_ptr(size: int, node: int = 0) -> int:
+    """Non-CUDA equivalent of NUMA-aware memory allocation.
+
+    Note: NUMA binding is not supported on non-CUDA/non-Linux; falls back to
+    plain CPU allocation.
+
+    Args:
+        size: Number of bytes to allocate.
+        node: NUMA node index (ignored on non-CUDA/non-Linux).
+
+    Returns:
+        Integer data pointer to the allocated buffer.
+    """
+    return _alloc_cpu_ptr(size)
 
 
-def free_numa_ptr(ptr: int, size: int | None = None) -> None:
-    """Non-CUDA equivalent of freeing a previously allocated NUMA pointer."""
-    return free_pinned_numa_ptr(ptr, size)
+def free_numa_ptr(ptr: int, size: int = 0) -> None:
+    """Non-CUDA equivalent of freeing a previously NUMA-allocated pointer.
+
+    Args:
+        ptr: Data pointer previously returned by ``alloc_numa_ptr``.
+        size: Original allocation size in bytes (ignored on non-CUDA/non-Linux).
+    """
+    _tensor_registry.pop(ptr, None)
 
 
 def multi_layer_kv_transfer(
