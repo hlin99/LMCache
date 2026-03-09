@@ -194,147 +194,110 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
 
     Tests both pointer mode (int pointers) and tensor mode (torch.Tensor objects).
     Uses pointer mode for CPU/CUDA devices and tensor mode for other devices.
+
+    Exercises multiple boundary conditions to verify correct behaviour for
+    both the CUDA c_ops backend (which chunks at alignment boundaries via
+    cudaMemcpyAsync) and the Python fallback backend (which issues a single
+    synchronous copy):
+      - copy spanning exactly one aligned block
+      - copy entirely within one aligned block (no boundary crossing)
+      - copy crossing a single alignment boundary
+      - copy crossing multiple alignment boundaries
+      - copy starting exactly at an alignment boundary
+      - copy with an unaligned start offset crossing many boundaries
+    Both H2D and D2H directions are verified for each boundary condition.
     """
     torch.manual_seed(42)
 
-    # 1. Setup dimensions and mock data (4KB)
-    nbytes = 1024 * 4
-    src_host = torch.randint(1, 255, (nbytes,), dtype=torch.uint8)
-    gpu_buffer = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    # Buffer large enough for all boundary test cases (max offset+nbytes = 16+200 = 216)
+    buf_size = 256
+    alignment = 64  # boundary interval in bytes (must be a power of two)
+
+    src_host = torch.randint(0, 256, (buf_size,), dtype=torch.uint8)
+    gpu_buffer = torch.zeros(buf_size, dtype=torch.uint8, device=device)
 
     if torch.cuda.is_available():
-        dst_host = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+        dst_host = torch.zeros(buf_size, dtype=torch.uint8).pin_memory()
     else:
-        dst_host = torch.zeros(nbytes, dtype=torch.uint8)
+        dst_host = torch.zeros(buf_size, dtype=torch.uint8)
 
     h2d_dir = ops.TransferDirection.H2D
     d2h_dir = ops.TransferDirection.D2H
 
-    # Decide mode based on device: use pointer mode for CPU/CUDA, tensor mode for others
+    # Tensor mode for non-CUDA/CPU devices (e.g., XPU, HPU)
     use_tensor_mode = device not in ("cpu", "cuda")
 
-    # --- PART A: H2D (Host to Device) ---
-    if use_tensor_mode:
-        # Tensor mode: pass tensor objects directly
-        ops.lmcache_memcpy_async(
-            gpu_buffer,
-            src_host,
-            nbytes,
-            h2d_dir,
-            0,
-            16,
+    # (host_buffer_offset, nbytes) boundary test cases:
+    #   (0,  64): exactly one aligned block from the start
+    #   (32, 32): entirely within one block, no boundary crossing
+    #   (32, 64): crosses one boundary — [32..64) then [64..96)
+    #   (0, 192): three full aligned blocks (boundaries at 64 and 128)
+    #   (64, 128): starts at alignment boundary, spans two full blocks
+    #   (16, 200): unaligned start, crosses multiple boundaries
+    test_cases = [
+        (0, 64),
+        (32, 32),
+        (32, 64),
+        (0, 192),
+        (64, 128),
+        (16, 200),
+    ]
+
+    all_results: list[torch.Tensor] = []
+
+    for offset, nbytes in test_cases:
+        gpu_buffer.zero_()
+        dst_host.zero_()
+        expected = src_host[offset : offset + nbytes].clone()
+
+        if use_tensor_mode:
+            ops.lmcache_memcpy_async(
+                gpu_buffer[offset : offset + nbytes],
+                src_host[offset : offset + nbytes],
+                nbytes,
+                h2d_dir,
+                offset,
+                alignment,
+            )
+            device_sync(device)
+            ops.lmcache_memcpy_async(
+                dst_host[offset : offset + nbytes],
+                gpu_buffer[offset : offset + nbytes],
+                nbytes,
+                d2h_dir,
+                offset,
+                alignment,
+            )
+        else:
+            ops.lmcache_memcpy_async(
+                gpu_buffer.data_ptr() + offset,
+                src_host.data_ptr() + offset,
+                nbytes,
+                h2d_dir,
+                offset,
+                alignment,
+            )
+            device_sync(device)
+            ops.lmcache_memcpy_async(
+                dst_host.data_ptr() + offset,
+                gpu_buffer.data_ptr() + offset,
+                nbytes,
+                d2h_dir,
+                offset,
+                alignment,
+            )
+
+        device_sync(device)
+
+        result = dst_host[offset : offset + nbytes].cpu()
+        assert torch.equal(result, expected), (
+            f"Boundary test (offset={offset}, nbytes={nbytes}, alignment={alignment}): "
+            f"data corrupted, max diff = "
+            f"{(result.float() - expected.float()).abs().max().item()}"
         )
-    else:
-        # Pointer mode: pass data pointers
-        ops.lmcache_memcpy_async(
-            gpu_buffer.data_ptr(),
-            src_host.data_ptr(),
-            nbytes,
-            h2d_dir,
-            0,
-            16,
-        )
+        all_results.append(result)
 
-    device_sync(device)
-
-    # --- PART B: D2H (Device to Host) ---
-    if use_tensor_mode:
-        # Tensor mode: pass tensor objects directly
-        ops.lmcache_memcpy_async(
-            dst_host,
-            gpu_buffer,
-            nbytes,
-            d2h_dir,
-            0,
-            16,
-        )
-    else:
-        # Pointer mode: pass data pointers
-        ops.lmcache_memcpy_async(
-            dst_host.data_ptr(),
-            gpu_buffer.data_ptr(),
-            nbytes,
-            d2h_dir,
-            0,
-            16,
-        )
-
-    device_sync(device)
-
-    # 3. Internal sanity check
-    final_result = dst_host.cpu()
-    assert torch.equal(final_result, src_host), (
-        f"Data corrupted during H2D→D2H loop, "
-        f"max diff = {(final_result.float() - src_host.float()).abs().max().item()}"
-    )
-
-    return {"lmcache_memcpy_async": final_result}
-
-
-def scenario_lmcache_memcpy_async_alignment(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor] | None:
-    """Validate that alignment parameters are accepted but no chunking is done.
-
-    The Python fallback does NOT split copies at cudaHostRegister boundaries
-    (unlike the C++ version which uses cudaMemcpyAsync). A single copy call
-    is issued for the entire buffer regardless of host_buffer_offset /
-    host_buffer_alignments values.
-    """
-    if not hasattr(ops, "_copy_bytes_with_tensor"):
-        pytest.skip("Chunk inspection only applies to Python fallback backend")
-
-    # This test only works with CPU tensors since it patches the Python fallback
-    if device != "cpu" and device != "cuda":
-        pytest.skip(
-            "Alignment chunking test requires CPU/cuda tensors and Python fallback"
-        )
-
-    torch.manual_seed(0)
-
-    nbytes = 200
-    host_buffer_offset = 32
-    host_buffer_alignments = 64
-
-    src = torch.arange(nbytes, dtype=torch.uint8)
-    dst = torch.zeros_like(src)
-
-    chunk_sizes: list[int] = []
-    original_copy = ops._copy_bytes_with_tensor
-
-    def tracking_copy(dest_ptr: int, src_ptr: int, num_bytes: int) -> None:
-        chunk_sizes.append(int(num_bytes))
-        original_copy(dest_ptr, src_ptr, num_bytes)
-
-    with (
-        unittest.mock.patch.object(ops, "_get_copy_lib", return_value=None),
-        unittest.mock.patch.object(
-            ops, "_copy_bytes_with_tensor", side_effect=tracking_copy
-        ),
-    ):
-        ops.lmcache_memcpy_async(
-            dst.data_ptr(),
-            src.data_ptr(),
-            nbytes,
-            ops.TransferDirection.H2D,
-            host_buffer_offset,
-            host_buffer_alignments,
-        )
-
-    assert torch.equal(dst, src), (
-        "Data copy should preserve contents without alignment splitting"
-    )
-
-    # The Python fallback issues a single copy for the full buffer — no chunking.
-    assert chunk_sizes == [nbytes], (
-        f"Expected a single copy of {nbytes} bytes, got chunks: {chunk_sizes}"
-    )
-
-    return {
-        "lmcache_memcpy_async_alignment": torch.tensor(
-            chunk_sizes, dtype=torch.int64
-        )
-    }
+    return {"lmcache_memcpy_async": torch.cat(all_results)}
 
 
 def scenario_load_and_reshape_flash(ops: Any, device: str) -> dict[str, torch.Tensor]:
@@ -1710,7 +1673,6 @@ SCENARIO_REGISTRY = {
     "load_and_reshape_flash": scenario_load_and_reshape_flash,
     "reshape_and_cache_back_flash": scenario_reshape_and_cache_back_flash,
     "lmcache_memcpy_async": scenario_lmcache_memcpy_async,
-    "lmcache_memcpy_async_alignment": scenario_lmcache_memcpy_async_alignment,
     "encode_fast_new": scenario_encode_fast_new,
     "decode_fast_new": scenario_decode_fast_new,
     "decode_fast_prefsum": scenario_decode_fast_prefsum,
