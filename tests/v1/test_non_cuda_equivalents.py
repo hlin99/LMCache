@@ -49,6 +49,9 @@ def _build_backend_params() -> list:
     - cpy_py_ops: uses lmcache.non_cuda_equivalents with GPU mocked away
     - xpu_py_ops: uses lmcache.non_cuda_equivalents with XPU visible
     """
+    # First Party
+    import lmcache.non_cuda_equivalents as _py_ops
+
     params = []
     cuda_available = torch.cuda.is_available()
 
@@ -63,19 +66,10 @@ def _build_backend_params() -> list:
         except ImportError:
             pass
 
-        # First Party
-        import lmcache.non_cuda_equivalents as _py_ops
-
         params.append(pytest.param(("cuda_py_ops", _py_ops, "cuda"), id="cuda_py_ops"))
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        # First Party
-        import lmcache.non_cuda_equivalents as _py_ops
-
         params.append(pytest.param(("xpu_py_ops", _py_ops, "xpu"), id="xpu_py_ops"))
-
-    # First Party
-    import lmcache.non_cuda_equivalents as _py_ops
 
     params.append(pytest.param(("cpu_py_ops", _py_ops, "cpu"), id="cpu_py_ops"))
     return params
