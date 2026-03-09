@@ -83,6 +83,16 @@ def _build_backend_params() -> list:
 
 _BACKEND_PARAMS = _build_backend_params()
 
+# Preferred order for choosing the gold reference backend in test_2_compare.
+# cuda_c_ops (native CUDA extensions) is the most authoritative; the list
+# falls back through software implementations until a match is found.
+_REFERENCE_PRIORITY = [
+    "cuda_c_ops",
+    "cuda_py_ops",
+    "xpu_py_ops",
+    "cpu_py_ops",
+]
+
 # Module-level storage: (scenario_name, backend_id) -> {result_key: tensor}
 _results: dict[tuple[str, str], dict[str, Any]] = {}
 
@@ -1796,7 +1806,10 @@ class TestScenarios:
         for res in backend_results.values():
             all_keys.update(res.keys())
 
-        base_bid = next(iter(backend_results))  # first available backend as reference
+        base_bid = next(
+            (bid for bid in _REFERENCE_PRIORITY if bid in backend_results),
+            next(iter(backend_results)),  # ultimate fallback
+        )
 
         for key in sorted(all_keys):
             base_val = backend_results[base_bid].get(key)
