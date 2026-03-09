@@ -38,19 +38,54 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
 
 
 def _tensor_from_ptr(
-    ptr: int, shape: tuple[int, ...], dtype: torch.dtype
+    ptr: int, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    """Create a CPU tensor view over a raw pointer."""
+    """Create a tensor view over a raw pointer.
+
+    Args:
+        ptr: Raw memory address (integer pointer)
+        shape: Desired tensor shape
+        dtype: Data type for the tensor
+        device: Device where the pointer memory resides (cpu, cuda, xpu, etc.)
+
+    Returns:
+        Tensor view over the memory at the given pointer
+
+    Note:
+        For CPU: Uses ctypes to wrap the pointer and torch.frombuffer.
+        For CUDA: Uses torch storage API with _new_with_weak_ptr to create a view.
+        The returned tensor shares memory with the pointer - no copy is made.
+    """
     if ptr == 0:
         raise ValueError("Pointer must be non-zero")
+
     numel = 1
     for dim in shape:
         numel *= int(dim)
     element_size = torch.empty((), dtype=dtype).element_size()
     total_bytes = numel * element_size
-    buffer_type = ctypes.c_uint8 * total_bytes
-    buf = buffer_type.from_address(ptr)
-    return torch.frombuffer(buf, dtype=dtype).view(*shape)
+
+    if device.type == "cpu":
+        # CPU path: use ctypes to wrap the pointer
+        buffer_type = ctypes.c_uint8 * total_bytes
+        buf = buffer_type.from_address(ptr)
+        return torch.frombuffer(buf, dtype=dtype).view(*shape)
+    elif device.type == "cuda":
+        # CUDA path: create storage from existing device pointer
+        # Use the internal _new_with_weak_ptr API to wrap external CUDA memory
+        storage = torch.UntypedStorage._new_with_weak_ptr(  # noqa: SLF001
+            ptr, device=device, size=total_bytes
+        )
+
+        # Create tensor from storage with the desired shape
+        tensor = torch.empty((), dtype=dtype, device=device)
+        tensor.set_(storage, 0, shape)
+        return tensor
+    else:
+        raise ValueError(
+            f"Unsupported device type: {device.type}. "
+            f"Only 'cpu' and 'cuda' are supported."
+        )
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
@@ -271,6 +306,7 @@ def multi_layer_kv_transfer(
                     paged_ptr,
                     (k_or_v_size, page_buffer_size, hidden_size),
                     key_value.dtype,
+                    paged_memory_device,
                 )
             elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
                 num_blocks = max(
@@ -280,13 +316,17 @@ def multi_layer_kv_transfer(
                     paged_ptr,
                     (num_blocks, 2, block_size, hidden_size),
                     key_value.dtype,
+                    paged_memory_device,
                 )
             elif gpu_kv_format in (
                 GPUKVFormat.NL_X_NB_BS_HS,
                 GPUKVFormat.NL_X_NBBS_ONE_HS,
             ):
                 paged = _tensor_from_ptr(
-                    paged_ptr, (page_buffer_size, hidden_size), key_value.dtype
+                    paged_ptr,
+                    (page_buffer_size, hidden_size),
+                    key_value.dtype,
+                    paged_memory_device,
                 )
             else:
                 raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
@@ -405,10 +445,16 @@ def multi_layer_kv_transfer_unilateral(
             v_ptr = int(ptr_list[layer_id + num_layers])
 
             k_buf = _tensor_from_ptr(
-                k_ptr, (page_buffer_size, hidden_size), key_value.dtype
+                k_ptr,
+                (page_buffer_size, hidden_size),
+                key_value.dtype,
+                paged_memory_device,
             )
             v_buf = _tensor_from_ptr(
-                v_ptr, (page_buffer_size, hidden_size), key_value.dtype
+                v_ptr,
+                (page_buffer_size, hidden_size),
+                key_value.dtype,
+                paged_memory_device,
             )
 
         if direction == TransferDirection.H2D:
