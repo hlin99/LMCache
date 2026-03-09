@@ -1555,7 +1555,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                         pb[s] = val
                 buffers[(kv, ly)] = pb
 
-        key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]  # type: ignore[no-redef]
+        canonical_key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]
         if use_tensor_list:
             # Tensor list mode: [K_l0, K_l1, ..., V_l0, V_l1, ...]
             tensor_list = []
@@ -1563,14 +1563,14 @@ def scenario_multi_layer_kv_transfer_unilateral(
                 tensor_list.append(buffers[(0, ly)])
             for ly in range(num_layers):
                 tensor_list.append(buffers[(1, ly)])
-            key_value_ptrs = tensor_list
+            canonical_key_value_ptrs = tensor_list
         else:
             ptr_list = []
             for ly in range(num_layers):
                 ptr_list.append(buffers[(0, ly)].data_ptr())
             for ly in range(num_layers):
                 ptr_list.append(buffers[(1, ly)].data_ptr())
-            key_value_ptrs = torch.tensor(
+            canonical_key_value_ptrs = torch.tensor(
                 ptr_list,
                 dtype=torch.int64,
                 device=device,
@@ -1579,7 +1579,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
         ops.multi_layer_kv_transfer_unilateral(
             lmc_tensor,
-            key_value_ptrs,
+            canonical_key_value_ptrs,
             slot_mapping,
             torch.device(device),
             page_buffer_size,
