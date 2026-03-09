@@ -1743,6 +1743,11 @@ class TestScenarios:
     - Fixtures: cannot easily guarantee ordering across parametrized tests
     """
 
+    @pytest.fixture(scope="module", autouse=True)
+    def _clear_results(self) -> None:
+        """Clear the module-level results cache before each test module run."""
+        _results.clear()
+
     @pytest.mark.parametrize("name,fn", list(SCENARIO_REGISTRY.items()))
     def test_1_scenario(
         self,
