@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any
+from typing import Any, Union
 import unittest.mock
 
 # Third Party
@@ -586,7 +586,7 @@ def scenario_encode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
     assert (lengths_cpu <= max_buf_len).all(), "Buffer overflow detected!"
 
     # 6. Return: first 20 bytes of layer 0, channel 0
-    valid_len = lengths_cpu[0, 0].item()
+    valid_len = int(lengths_cpu[0, 0].item())
     res = output_buffer[0, 0, : min(valid_len, 20)].cpu()
     return {"encode_fast_new": res}
 
@@ -1221,6 +1221,7 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                 page_buffers.append(pb)
 
             # ── 3. Prepare key_value_ptrs (pointer mode or tensor list mode) ──
+            key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]
             if use_tensor_list:
                 # Tensor list mode: pass the tensor objects directly
                 key_value_ptrs = page_buffers
@@ -1250,7 +1251,7 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
 
             # ── 5. Verify (internal, per-format) ──
             for t_id in range(num_tokens):
-                s_idx = slot_mapping[t_id].item()
+                s_idx = int(slot_mapping[t_id].item())
                 for ly in range(num_layers):
                     for kv in range(k_or_v_size):
                         lmc_val = key_value[kv, ly, t_id]
@@ -1398,6 +1399,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                             lmc_tensor[kv, ly, t] = val
 
             # ── 2. Paged Buffers ──
+            key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]
             if is_mla:
                 # MLA delegates to multi_layer_kv_transfer
                 # ptrs: [layer0, layer1, ...], each -> [page_buffer_size, head_size]
@@ -1488,7 +1490,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
 
             # ── 4. Verify ──
             for t_id in range(num_tokens):
-                s_idx = slot_mapping[t_id].item()
+                s_idx = int(slot_mapping[t_id].item())
                 for ly in range(num_layers):
                     for kv in range(k_or_v_size):
                         lmc_val = lmc_tensor[kv, ly, t_id]
@@ -1549,6 +1551,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                         pb[s] = val
                 buffers[(kv, ly)] = pb
 
+        key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]  # type: ignore[no-redef]
         if use_tensor_list:
             # Tensor list mode: [K_l0, K_l1, ..., V_l0, V_l1, ...]
             tensor_list = []
