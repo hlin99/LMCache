@@ -52,12 +52,30 @@ def _tensor_from_ptr(
         Tensor view over the memory at the given pointer
 
     Note:
-        For CPU: Uses ctypes to wrap the pointer and torch.frombuffer.
-        For CUDA: Uses torch storage API with _new_with_weak_ptr to create a view.
-        The returned tensor shares memory with the pointer - no copy is made.
+        This function creates a CPU tensor view over the memory at the given pointer.
+
+        For CPU device: The pointer points to regular CPU memory.
+
+        For CUDA device: The pointer points to pinned (page-locked) CPU memory that
+        has been registered with CUDA for efficient GPU transfers. While the memory
+        is CPU-accessible (and this function returns a CPU tensor), it's optimized
+        for GPU DMA operations.
+
+        For other device types: Not supported in pointer mode. Use tensor list mode
+        (pass list[Tensor] instead of int64 pointer tensor) for devices like XPU.
+
+        The returned tensor always has device='cpu' regardless of the input device
+        parameter, because Python code can only directly access CPU-addressable memory.
     """
     if ptr == 0:
         raise ValueError("Pointer must be non-zero")
+
+    # Validate device type
+    if device.type not in ("cpu", "cuda"):
+        raise ValueError(
+            f"Unsupported device type '{device.type}' for pointer mode. "
+            f"Use tensor list mode for non-CPU/CUDA devices."
+        )
 
     numel = 1
     for dim in shape:
@@ -65,27 +83,11 @@ def _tensor_from_ptr(
     element_size = torch.empty((), dtype=dtype).element_size()
     total_bytes = numel * element_size
 
-    if device.type == "cpu":
-        # CPU path: use ctypes to wrap the pointer
-        buffer_type = ctypes.c_uint8 * total_bytes
-        buf = buffer_type.from_address(ptr)
-        return torch.frombuffer(buf, dtype=dtype).view(*shape)
-    elif device.type == "cuda":
-        # CUDA path: create storage from existing device pointer
-        # Use the internal _new_with_weak_ptr API to wrap external CUDA memory
-        storage = torch.UntypedStorage._new_with_weak_ptr(  # noqa: SLF001
-            ptr, device=device, size=total_bytes
-        )
-
-        # Create tensor from storage with the desired shape
-        tensor = torch.empty((), dtype=dtype, device=device)
-        tensor.set_(storage, 0, shape)
-        return tensor
-    else:
-        raise ValueError(
-            f"Unsupported device type: {device.type}. "
-            f"Only 'cpu' and 'cuda' are supported."
-        )
+    # Both CPU and CUDA use the same ctypes approach because the pointer
+    # must point to CPU-accessible memory (regular or pinned) for Python code
+    buffer_type = ctypes.c_uint8 * total_bytes
+    buf = buffer_type.from_address(ptr)
+    return torch.frombuffer(buf, dtype=dtype).view(*shape)
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
