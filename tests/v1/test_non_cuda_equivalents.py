@@ -274,6 +274,7 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
                 offset,
                 alignment,
             )
+            device_sync(device)
         else:
             ops.lmcache_memcpy_async(
                 gpu_buffer.data_ptr() + offset,
@@ -292,6 +293,7 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
                 offset,
                 alignment,
             )
+            device_sync(device)
 
         device_sync(device)
 
