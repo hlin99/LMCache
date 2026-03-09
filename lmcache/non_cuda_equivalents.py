@@ -241,7 +241,7 @@ def multi_layer_kv_transfer(
     hidden_size = key_value.size(3)
     k_or_v_size = 1 if is_mla else 2
 
-    slots = slot_mapping.to(dtype=torch.long, device="cpu")
+    slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
     if not torch.any(valid_mask):
         return
@@ -251,7 +251,7 @@ def multi_layer_kv_transfer(
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
-        ptr_list = key_value_ptrs.cpu().tolist()
+        ptr_list = key_value_ptrs.tolist()
 
     for layer_id in range(num_layers):
         # Get the paged buffer for this layer
@@ -381,7 +381,7 @@ def multi_layer_kv_transfer_unilateral(
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
 
-    slots = slot_mapping.to(dtype=torch.long, device="cpu")
+    slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
     if not torch.any(valid_mask):
         return
@@ -391,7 +391,7 @@ def multi_layer_kv_transfer_unilateral(
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
-        ptr_list = key_value_ptrs.cpu().tolist()
+        ptr_list = key_value_ptrs.tolist()
 
     for layer_id in range(num_layers):
         # Get K and V buffers for this layer
@@ -456,7 +456,7 @@ def single_layer_kv_transfer(
     )
 
     num_tokens = slot_mapping.size(0)
-    slots = slot_mapping.cpu().tolist()
+    slots = slot_mapping.tolist()
 
     if is_mla:
         # ── MLA format ──
