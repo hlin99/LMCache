@@ -44,9 +44,10 @@ def _build_backend_params() -> list:
     """Build pytest parameter list for the backend fixture.
 
     Returns one entry per available backend configuration:
-    - cuda_ops: uses lmcache.c_ops (requires CUDA and the CUDA extension)
-    - non_cuda_gpu: uses lmcache.non_cuda_equivalents with GPU visible
-    - non_cuda_no_gpu: uses lmcache.non_cuda_equivalents with GPU mocked away
+    - cuda_c_ops: uses lmcache.c_ops (requires CUDA and the CUDA extension)
+    - cuda_py_ops: uses lmcache.non_cuda_equivalents with GPU visible
+    - cpy_py_ops: uses lmcache.non_cuda_equivalents with GPU mocked away
+    - xpu_py_ops: uses lmcache.non_cuda_equivalents with XPU visible
     """
     params = []
     cuda_available = torch.cuda.is_available()
@@ -90,11 +91,11 @@ _results: dict[tuple[str, str], dict[str, Any]] = {}
 def backend(request: pytest.FixtureRequest) -> Any:
     """Yield (backend_id, ops_module, device) for each backend config.
 
-    For the non_cuda_no_gpu variant, torch.cuda.is_available is patched to
+    For the cpu_py_ops variant, torch.cuda.is_available is patched to
     return False so the scenario code behaves as if no GPU is present.
     """
     backend_id, ops, device = request.param
-    if backend_id == "non_cuda_no_gpu":
+    if backend_id == "cpu_py_ops":
         with unittest.mock.patch("torch.cuda.is_available", return_value=False):
             yield backend_id, ops, device
     else:
