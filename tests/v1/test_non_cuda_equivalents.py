@@ -38,6 +38,125 @@ def device_sync(device: str) -> None:
     # CPU requires no synchronization
 
 
+def test_multi_layer_kv_transfer_pointer_mode_uses_memcpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pointer mode should route through memcpy instead of pointer tensor views."""
+    num_layers = 2
+    num_tokens = 3
+    head_size = 4
+    page_buffer_size = 8
+
+    key_value = torch.arange(
+        2 * num_layers * num_tokens * head_size,
+        dtype=torch.float32,
+    ).view(2, num_layers, num_tokens, head_size)
+    page_buffers = [
+        torch.zeros((2, page_buffer_size, head_size), dtype=key_value.dtype)
+        for _ in range(num_layers)
+    ]
+    slot_mapping = torch.tensor([0, 3, 6], dtype=torch.int64)
+    key_value_ptrs = torch.tensor(
+        [buffer.data_ptr() for buffer in page_buffers],
+        dtype=torch.int64,
+    )
+
+    original_memcpy = _py_ops.lmcache_memcpy_async
+    memcpy_calls: list[tuple[int, int, int, Any]] = []
+
+    def _recording_memcpy(dest: int, src: int, nbytes: int, direction: Any, *_: Any) -> None:
+        memcpy_calls.append((dest, src, nbytes, direction))
+        original_memcpy(dest, src, nbytes, direction, 0, 1)
+
+    monkeypatch.setattr(
+        _py_ops,
+        "_tensor_from_ptr",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("_tensor_from_ptr should not be used in pointer mode")
+        ),
+    )
+    monkeypatch.setattr(_py_ops, "lmcache_memcpy_async", _recording_memcpy)
+
+    _py_ops.multi_layer_kv_transfer(
+        key_value,
+        key_value_ptrs,
+        slot_mapping,
+        torch.device("cpu"),
+        page_buffer_size,
+        _py_ops.TransferDirection.H2D,
+        _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        1,
+    )
+
+    assert len(memcpy_calls) == num_layers * num_tokens * 2
+    for layer_id, page_buffer in enumerate(page_buffers):
+        for token_idx, slot_idx in enumerate(slot_mapping.tolist()):
+            torch.testing.assert_close(page_buffer[:, slot_idx], key_value[:, layer_id, token_idx])
+
+
+def test_multi_layer_kv_transfer_unilateral_pointer_mode_uses_memcpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unilateral pointer mode should route through memcpy instead of pointer views."""
+    num_layers = 2
+    num_tokens = 3
+    head_size = 4
+    page_buffer_size = 8
+
+    key_value = torch.arange(
+        2 * num_layers * num_tokens * head_size,
+        dtype=torch.float32,
+    ).view(2, num_layers, num_tokens, head_size)
+    key_buffers = [
+        torch.zeros((page_buffer_size, head_size), dtype=key_value.dtype)
+        for _ in range(num_layers)
+    ]
+    value_buffers = [
+        torch.zeros((page_buffer_size, head_size), dtype=key_value.dtype)
+        for _ in range(num_layers)
+    ]
+    slot_mapping = torch.tensor([1, 4, 7], dtype=torch.int64)
+    key_value_ptrs = torch.tensor(
+        [buffer.data_ptr() for buffer in key_buffers + value_buffers],
+        dtype=torch.int64,
+    )
+
+    original_memcpy = _py_ops.lmcache_memcpy_async
+    memcpy_calls: list[tuple[int, int, int, Any]] = []
+
+    def _recording_memcpy(dest: int, src: int, nbytes: int, direction: Any, *_: Any) -> None:
+        memcpy_calls.append((dest, src, nbytes, direction))
+        original_memcpy(dest, src, nbytes, direction, 0, 1)
+
+    monkeypatch.setattr(
+        _py_ops,
+        "_tensor_from_ptr",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("_tensor_from_ptr should not be used in pointer mode")
+        ),
+    )
+    monkeypatch.setattr(_py_ops, "lmcache_memcpy_async", _recording_memcpy)
+
+    _py_ops.multi_layer_kv_transfer_unilateral(
+        key_value,
+        key_value_ptrs,
+        slot_mapping,
+        torch.device("cpu"),
+        page_buffer_size,
+        _py_ops.TransferDirection.H2D,
+        _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+    )
+
+    assert len(memcpy_calls) == num_layers * num_tokens * 2
+    for layer_id in range(num_layers):
+        for token_idx, slot_idx in enumerate(slot_mapping.tolist()):
+            torch.testing.assert_close(key_buffers[layer_id][slot_idx], key_value[0, layer_id, token_idx])
+            torch.testing.assert_close(
+                value_buffers[layer_id][slot_idx],
+                key_value[1, layer_id, token_idx],
+            )
+
+
 # ==========================================
 # 1. Backend Configuration
 # ==========================================
