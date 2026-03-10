@@ -4,11 +4,11 @@
 # CUDA-specific operations.
 #
 # Standard
+import ctypes
+import ctypes.util
 from enum import Enum, IntEnum
 from multiprocessing import shared_memory
 from typing import Sequence
-import ctypes
-import ctypes.util
 
 # Third Party
 import torch
@@ -38,6 +38,11 @@ class GPUKVFormat(IntEnum):
 
 
 def _get_copy_lib() -> ctypes.CDLL | None:
+    """Lazily load libcudart for raw pointer copies.
+
+    Returns:
+        Loaded libcudart handle, or None when CUDA runtime is unavailable.
+    """
     global _copy_lib
     if _copy_lib is _copy_lib_not_loaded:
         try:
@@ -53,6 +58,11 @@ def _get_copy_lib() -> ctypes.CDLL | None:
 
 
 def _cuda_memcpy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Copy bytes between two raw pointers.
+
+    Uses cudaMemcpy(cudaMemcpyDefault) when libcudart is available.
+    Falls back to ctypes.memmove for CPU-only environments.
+    """
     if nbytes <= 0:
         return
 
@@ -72,6 +82,7 @@ def _cuda_memcpy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
 
 
 def _is_pointer_seq(values: Sequence[object]) -> bool:
+    """Return True when all sequence elements are integer pointers."""
     return all(isinstance(value, int) for value in values)
 
 
@@ -183,6 +194,11 @@ def multi_layer_kv_transfer(
     block_size: int = 0,
     skip_prefix_n_tokens: int = 0,
 ) -> None:
+    """Fallback multi-layer KV transfer for pointer-based paged buffers.
+
+    This implementation supports pointer-form `key_value_ptrs` and performs
+    row-wise copies via cudaMemcpy semantics for both H2D and D2H directions.
+    """
     del paged_memory_device
     del skip_prefix_n_tokens
     num_layers = key_value.size(1)
@@ -195,6 +211,8 @@ def multi_layer_kv_transfer(
         GPUKVFormat.NL_X_NBBS_ONE_HS,
     )
     kv_size = 1 if is_mla else 2
+    if gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS and block_size <= 0:
+        raise ValueError("block_size must be positive for NL_X_NB_TWO_BS_NH_HS")
 
     if isinstance(key_value_ptrs, torch.Tensor):
         pointer_values = [int(ptr) for ptr in key_value_ptrs.tolist()]
@@ -217,9 +235,8 @@ def multi_layer_kv_transfer(
         for layer_idx in range(num_layers):
             layer_ptr = pointer_values[layer_idx]
             for kv_idx in range(kv_size):
-                src_ptr: int
-                dst_ptr: int
                 lmc_offset = (
+                    # key_value layout: [kv_size, num_layers, num_tokens, hidden_size]
                     ((kv_idx * num_layers + layer_idx) * num_tokens + token_idx)
                     * row_nbytes
                 )
@@ -264,6 +281,11 @@ def multi_layer_kv_transfer_unilateral(
     direction: TransferDirection,
     gpu_kv_format: GPUKVFormat,
 ) -> None:
+    """Fallback unilateral multi-layer KV transfer for pointer buffers.
+
+    For MLA formats it delegates to `multi_layer_kv_transfer`. For non-MLA
+    formats, it handles separate key/value pointer arrays.
+    """
     if gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
@@ -306,6 +328,7 @@ def multi_layer_kv_transfer_unilateral(
         for layer_idx in range(num_layers):
             for kv_idx in range(2):
                 lmc_offset = (
+                    # key_value layout: [2, num_layers, num_tokens, hidden_size]
                     ((kv_idx * num_layers + layer_idx) * num_tokens + token_idx)
                     * row_nbytes
                 )
