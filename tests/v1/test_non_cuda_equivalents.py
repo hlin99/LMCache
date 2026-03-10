@@ -1706,7 +1706,7 @@ def scenario_transfer_direction_enum(ops: Any, device: str) -> dict[str, torch.T
 # cover pybind list in csrc/pybind.cpp
 SCENARIO_REGISTRY = {
     "transfer_direction_enum": scenario_transfer_direction_enum,
-    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
+#    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
     "multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
     "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
     "single_layer_kv_transfer_sgl": scenario_single_layer_kv_transfer_sgl,
