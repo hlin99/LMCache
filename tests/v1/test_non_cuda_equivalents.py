@@ -1694,6 +1694,146 @@ def scenario_transfer_direction_enum(ops: Any, device: str) -> dict[str, torch.T
     }
 
 
+def test_multi_layer_kv_transfer_pointer_mode_uses_lmcache_memcpy_async() -> None:
+    """Pointer mode should route contiguous row copies through lmcache_memcpy_async."""
+    dtype = torch.float32
+    num_layers = 2
+    num_tokens = 3
+    head_size = 4
+    page_buffer_size = 8
+    slot_mapping = torch.tensor([0, -1, 5], dtype=torch.int64)
+    key_value = torch.arange(
+        2 * num_layers * num_tokens * head_size,
+        dtype=dtype,
+    ).view(2, num_layers, num_tokens, head_size)
+    page_buffers = [
+        torch.full((2, page_buffer_size, head_size), -1.0, dtype=dtype)
+        for _ in range(num_layers)
+    ]
+    key_value_ptrs = torch.tensor(
+        [page_buffer.data_ptr() for page_buffer in page_buffers],
+        dtype=torch.int64,
+    )
+
+    memcpy_calls: list[tuple[int, int, int, Any]] = []
+    original_memcpy_async = _py_ops.lmcache_memcpy_async
+
+    def tracked_memcpy_async(
+        dest: int | torch.Tensor,
+        src: int | torch.Tensor,
+        nbytes: int,
+        direction: Any,
+        host_buffer_offset: int,
+        host_buffer_alignments: int,
+    ) -> None:
+        memcpy_calls.append((int(dest), int(src), nbytes, direction))
+        original_memcpy_async(
+            dest,
+            src,
+            nbytes,
+            direction,
+            host_buffer_offset,
+            host_buffer_alignments,
+        )
+
+    with unittest.mock.patch.object(
+        _py_ops,
+        "lmcache_memcpy_async",
+        side_effect=tracked_memcpy_async,
+    ):
+        _py_ops.multi_layer_kv_transfer(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            _py_ops.TransferDirection.H2D,
+            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            1,
+        )
+
+    expected_calls = num_layers * 2 * 2
+    assert len(memcpy_calls) == expected_calls
+    assert all(call[2] == head_size * key_value.element_size() for call in memcpy_calls)
+    assert all(
+        call[3] == _py_ops.TransferDirection.H2D for call in memcpy_calls
+    )
+    torch.testing.assert_close(page_buffers[0][0, 0], key_value[0, 0, 0])
+    torch.testing.assert_close(page_buffers[0][1, 0], key_value[1, 0, 0])
+    torch.testing.assert_close(page_buffers[1][0, 5], key_value[0, 1, 2])
+    torch.testing.assert_close(page_buffers[1][1, 5], key_value[1, 1, 2])
+
+
+def test_multi_layer_kv_transfer_unilateral_pointer_mode_uses_lmcache_memcpy_async(
+) -> None:
+    """Unilateral pointer mode should route K/V row copies through memcpy."""
+    dtype = torch.float32
+    num_layers = 2
+    num_tokens = 3
+    head_size = 4
+    page_buffer_size = 8
+    slot_mapping = torch.tensor([1, -1, 6], dtype=torch.int64)
+    key_value = torch.arange(
+        2 * num_layers * num_tokens * head_size,
+        dtype=dtype,
+    ).view(2, num_layers, num_tokens, head_size)
+    buffers = [
+        torch.full((page_buffer_size, head_size), -1.0, dtype=dtype)
+        for _ in range(num_layers * 2)
+    ]
+    key_value_ptrs = torch.tensor(
+        [buffer.data_ptr() for buffer in buffers],
+        dtype=torch.int64,
+    )
+
+    memcpy_calls: list[tuple[int, int, int, Any]] = []
+    original_memcpy_async = _py_ops.lmcache_memcpy_async
+
+    def tracked_memcpy_async(
+        dest: int | torch.Tensor,
+        src: int | torch.Tensor,
+        nbytes: int,
+        direction: Any,
+        host_buffer_offset: int,
+        host_buffer_alignments: int,
+    ) -> None:
+        memcpy_calls.append((int(dest), int(src), nbytes, direction))
+        original_memcpy_async(
+            dest,
+            src,
+            nbytes,
+            direction,
+            host_buffer_offset,
+            host_buffer_alignments,
+        )
+
+    with unittest.mock.patch.object(
+        _py_ops,
+        "lmcache_memcpy_async",
+        side_effect=tracked_memcpy_async,
+    ):
+        _py_ops.multi_layer_kv_transfer_unilateral(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            _py_ops.TransferDirection.H2D,
+            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        )
+
+    expected_calls = num_layers * 2 * 2
+    assert len(memcpy_calls) == expected_calls
+    assert all(call[2] == head_size * key_value.element_size() for call in memcpy_calls)
+    assert all(
+        call[3] == _py_ops.TransferDirection.H2D for call in memcpy_calls
+    )
+    torch.testing.assert_close(buffers[0][1], key_value[0, 0, 0])
+    torch.testing.assert_close(buffers[2][1], key_value[1, 0, 0])
+    torch.testing.assert_close(buffers[1][6], key_value[0, 1, 2])
+    torch.testing.assert_close(buffers[3][6], key_value[1, 1, 2])
+
+
 # ==========================================
 # 3. Registry
 # ==========================================

@@ -264,6 +264,59 @@ def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
     dst_tensor.copy_(src_tensor)
 
 
+def _supports_pointer_memcpy(device: torch.device) -> bool:
+    """Return whether raw-pointer memcpy is supported for the device."""
+    return device.type in ("cpu", "cuda")
+
+
+def _copy_kv_row_with_memcpy(
+    key_value_ptr: int,
+    paged_ptr: int,
+    row_nbytes: int,
+    direction: "TransferDirection",
+) -> None:
+    """Copy one contiguous KV row using the raw-pointer memcpy helper."""
+    if direction == TransferDirection.H2D:
+        dest, src = paged_ptr, key_value_ptr
+    else:
+        dest, src = key_value_ptr, paged_ptr
+
+    lmcache_memcpy_async(dest, src, row_nbytes, direction, 0, 1)
+
+
+def _paged_row_ptr_for_multi_layer(
+    base_ptr: int,
+    slot_idx: int,
+    kv_idx: int,
+    hidden_size: int,
+    element_size: int,
+    page_buffer_size: int,
+    gpu_kv_format: "GPUKVFormat",
+    block_size: int,
+) -> int:
+    """Return the raw pointer for one paged KV row in multi-layer transfer."""
+    if gpu_kv_format in (
+        GPUKVFormat.NB_NL_TWO_BS_NH_HS,
+        GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
+    ):
+        row_offset = (kv_idx * page_buffer_size + slot_idx) * hidden_size
+    elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+        block_idx, block_offset = divmod(slot_idx, block_size)
+        row_offset = (
+            ((block_idx * 2 + kv_idx) * block_size + block_offset) * hidden_size
+        )
+    elif gpu_kv_format in (
+        GPUKVFormat.NL_X_NB_BS_HS,
+        GPUKVFormat.NL_X_NBBS_ONE_HS,
+    ):
+        row_offset = slot_idx * hidden_size
+    else:
+        raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+
+    return base_ptr + row_offset * element_size
+
+
 class TransferDirection(Enum):
     H2D = 0
     D2H = 1
@@ -455,6 +508,44 @@ def multi_layer_kv_transfer(
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
 
+        if _supports_pointer_memcpy(key_value.device) and _supports_pointer_memcpy(
+            paged_memory_device
+        ):
+            element_size = key_value.element_size()
+            row_nbytes = hidden_size * element_size
+            token_slot_pairs = list(
+                zip(
+                    valid_tokens.tolist(),
+                    valid_slots.tolist(),
+                    strict=False,
+                )
+            )
+
+            for layer_id in range(num_layers):
+                paged_ptr = int(ptr_list[layer_id])
+                for token_idx, slot_idx in token_slot_pairs:
+                    for kv_idx in range(k_or_v_size):
+                        key_value_ptr = key_value[
+                            kv_idx, layer_id, token_idx
+                        ].data_ptr()
+                        paged_row_ptr = _paged_row_ptr_for_multi_layer(
+                            paged_ptr,
+                            slot_idx,
+                            kv_idx,
+                            hidden_size,
+                            element_size,
+                            page_buffer_size,
+                            gpu_kv_format,
+                            block_size,
+                        )
+                        _copy_kv_row_with_memcpy(
+                            key_value_ptr,
+                            paged_row_ptr,
+                            row_nbytes,
+                            direction,
+                        )
+            return
+
     for layer_id in range(num_layers):
         # Get the paged buffer for this layer
         if use_tensor_mode:
@@ -599,6 +690,40 @@ def multi_layer_kv_transfer_unilateral(
     if not use_tensor_mode:
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
+
+        if _supports_pointer_memcpy(key_value.device) and _supports_pointer_memcpy(
+            paged_memory_device
+        ):
+            element_size = key_value.element_size()
+            row_nbytes = hidden_size * element_size
+            token_slot_pairs = list(
+                zip(
+                    valid_tokens.tolist(),
+                    valid_slots.tolist(),
+                    strict=False,
+                )
+            )
+
+            for layer_id in range(num_layers):
+                k_ptr = int(ptr_list[layer_id])
+                v_ptr = int(ptr_list[layer_id + num_layers])
+                for token_idx, slot_idx in token_slot_pairs:
+                    key_ptr = key_value[0, layer_id, token_idx].data_ptr()
+                    value_ptr = key_value[1, layer_id, token_idx].data_ptr()
+                    row_offset = slot_idx * row_nbytes
+                    _copy_kv_row_with_memcpy(
+                        key_ptr,
+                        k_ptr + row_offset,
+                        row_nbytes,
+                        direction,
+                    )
+                    _copy_kv_row_with_memcpy(
+                        value_ptr,
+                        v_ptr + row_offset,
+                        row_nbytes,
+                        direction,
+                    )
+            return
 
     for layer_id in range(num_layers):
         # Get K and V buffers for this layer
