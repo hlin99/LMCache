@@ -447,15 +447,14 @@ def multi_layer_kv_transfer(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
-    token_slot_pairs = list(
-        zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True)
-    )
-
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
+        token_slot_pairs = list(
+            zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True)
+        )
         row_nbytes = hidden_size * key_value.element_size()
 
     for layer_id in range(num_layers):
@@ -617,15 +616,14 @@ def multi_layer_kv_transfer_unilateral(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
-    token_slot_pairs = list(
-        zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True)
-    )
-
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
+        token_slot_pairs = list(
+            zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True)
+        )
         row_nbytes = hidden_size * key_value.element_size()
 
     for layer_id in range(num_layers):
