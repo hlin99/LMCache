@@ -1425,7 +1425,7 @@ def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
         dtype=torch.int16,
         device=input_tensor.device,
     )
-    max_uint16_minus_bins = 0xFFFF - num_bins
+    normalization_range = 0xFFFF - num_bins
 
     for layer_idx in range(nlayers):
         layer_data = input_long[layer_idx].transpose(0, 1)
@@ -1440,7 +1440,9 @@ def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
             )
             total = int(cumulative[-1].item())
             if total > 0:
-                normalized = (max_uint16_minus_bins * cumulative) // total
+                # Match CUDA: scale into uint16 range while reserving `+i`
+                # strictly-increasing bias so adjacent bins never collapse.
+                normalized = (normalization_range * cumulative) // total
                 normalized = normalized + torch.arange(
                     num_bins + 1,
                     device=input_tensor.device,
