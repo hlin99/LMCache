@@ -1914,7 +1914,7 @@ def test_multi_layer_kv_transfer_batch_operations(
     valid_slots = slot_mapping[valid_tokens].to(dtype=torch.long)
 
     for ly in range(num_layers):
-        for i, (tok, slot) in enumerate(zip(valid_tokens, valid_slots, strict=True)):
+        for tok, slot in zip(valid_tokens, valid_slots, strict=True):
             slot_val = int(slot.item())
             tok_val = int(tok.item())
             for kv in range(k_or_v_size):
