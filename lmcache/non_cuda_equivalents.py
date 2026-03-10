@@ -488,7 +488,7 @@ def multi_layer_kv_transfer(
         raise TypeError(
             f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
         )
-
+    logger.error("page_buffer_size=%s, direction=%s, gpu_kv_format=%s, key_value.device=%s, slot_mapping.device=%s, paged_memory_device=%s", page_buffer_size, direction, gpu_kv_format,key_value.device,slot_mapping.device,paged_memory_device)
     # 1. Filter out invalid slots and obtain a clean 1-D index tensor.
     slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
@@ -497,6 +497,9 @@ def multi_layer_kv_transfer(
 
     valid_slots = slots[valid_mask]
 
+    valid_slots = valid_slots.to(paged_memory_device)
+    valid_mask = valid_mask.to(paged_memory_device)
+    key_value = key_value.to(paged_memory_device)
     # 2. Determine architecture variant and tensor dimensions.
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
@@ -575,6 +578,7 @@ def multi_layer_kv_transfer(
                 # Batch scatter along dim=1 (the page_buffer_size dimension).
                 paged_tensor.index_copy_(1, valid_slots, lmc_valid)
             else:
+                logger.error("hlin, here, paged_tensor.device=%s", paged_tensor.device)
                 gathered = paged_tensor.index_select(1, valid_slots)
                 key_value[:, layer_id, valid_mask, :] = gathered
         torch.cuda.synchronize()
