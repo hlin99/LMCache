@@ -600,9 +600,9 @@ def scenario_encode_fast_new(ops: Any, device: str) -> dict[str, torch.Tensor]:
     assert (lengths_cpu > 0).all(), "Encoding produced zero-length output!"
     assert (lengths_cpu <= max_buf_len).all(), "Buffer overflow detected!"
 
-    # 6. Return: first 20 bytes of layer 0, channel 0
+    # 6. Return: first 200 bytes of layer 0, channel 0
     valid_len = int(lengths_cpu[0, 0].item())
-    res = output_buffer[0, 0, : min(valid_len, 20)].cpu()
+    res = output_buffer[0, 0, : min(valid_len, 200)].cpu()
     return {"encode_fast_new": res}
 
 
