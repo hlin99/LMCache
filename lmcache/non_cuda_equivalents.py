@@ -7,7 +7,7 @@
 from enum import Enum, IntEnum
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 import ctypes
 import ctypes.util
 import subprocess
@@ -28,7 +28,11 @@ _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
 
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
-    """Lazily load and cache the CUDA runtime library, or None for CPU fallback."""
+    """Lazily load and cache the CUDA runtime library, or None for CPU fallback.
+
+    Sets restype/argtypes on cudaMemcpy once at load time so that 64-bit
+    pointer arguments are never silently truncated to 32 bits on 64-bit Linux.
+    """
     global _copy_lib
     if _copy_lib is _copy_lib_NOT_LOADED:
         try:
@@ -37,6 +41,17 @@ def _get_copy_lib() -> Optional[ctypes.CDLL]:
                 _copy_lib = ctypes.CDLL(libcudart_path)
             else:
                 _copy_lib = ctypes.CDLL("libcudart.so")
+            # Configure cudaMemcpy signature once so pointers are always
+            # passed as 64-bit values regardless of platform defaults.
+            if _copy_lib is not None and hasattr(_copy_lib, "cudaMemcpy"):
+                _fn = _copy_lib.cudaMemcpy
+                _fn.restype = ctypes.c_int
+                _fn.argtypes = [
+                    ctypes.c_void_p,  # dst  (64-bit)
+                    ctypes.c_void_p,  # src  (64-bit)
+                    ctypes.c_size_t,  # count
+                    ctypes.c_int,  # kind
+                ]
         except OSError:
             _copy_lib = None
     return _copy_lib
@@ -174,29 +189,35 @@ def _tensor_from_cuda_ptr(
     # ------------------------------------------------------------------ #
     # Strategy 2: __cuda_array_interface__                               #
     # Standard CUDA array interchange protocol. Zero-copy.               #
-    # bfloat16 is not a valid numpy dtype, so we smuggle it as int16 and #
+    # bfloat16 has no numpy equivalent, so we smuggle it as int16 and   #
     # view back.                                                         #
     # ------------------------------------------------------------------ #
     try:
-        # Third Party
-
-        _DTYPE_TO_NUMPY: dict[torch.dtype, str] = {
-            torch.float16: "float16",
-            torch.float32: "float32",
-            torch.float64: "float64",
-            torch.int8: "int8",
-            torch.int16: "int16",
-            torch.int32: "int32",
-            torch.int64: "int64",
-            torch.uint8: "uint8",
-            torch.bool: "bool",
+        _DTYPE_TO_TYPESTR: dict[torch.dtype, str] = {
+            torch.float16: "<f2",
+            torch.float32: "<f4",
+            torch.float64: "<f8",
+            torch.int8: "|i1",
+            torch.int16: "<i2",
+            torch.int32: "<i4",
+            torch.int64: "<i8",
+            torch.uint8: "|u1",
+            torch.bool: "|b1",
+            torch.bfloat16: "<i2",  # smuggled as int16
         }
         is_bf16 = dtype == torch.bfloat16
+        wire_dtype = torch.int16 if is_bf16 else dtype
+        typestr = _DTYPE_TO_TYPESTR[wire_dtype]
 
         class _CudaArrayWrapper:
             """Minimal __cuda_array_interface__ carrier."""
 
-            __cuda_array_interface__: Dict[str, Any] = {}
+            __cuda_array_interface__ = {
+                "shape": (numel,),
+                "typestr": typestr,
+                "data": (ptr, False),
+                "version": 3,
+            }
 
         t = torch.as_tensor(_CudaArrayWrapper(), device=device)
         if is_bf16:
@@ -219,14 +240,8 @@ def _tensor_from_cuda_ptr(
             "wrapping a CUDA pointer failed."
         )
 
+    # restype/argtypes are set once in _get_copy_lib(); just use the function.
     cudaMemcpy = libcudart.cudaMemcpy
-    cudaMemcpy.restype = ctypes.c_int
-    cudaMemcpy.argtypes = [
-        ctypes.c_void_p,  # dst
-        ctypes.c_void_p,  # src
-        ctypes.c_size_t,  # count
-        ctypes.c_int,  # kind
-    ]
     _MEMCPY_D2D = 3
 
     dst = torch.empty(numel, dtype=dtype, device=device)
@@ -449,6 +464,13 @@ def multi_layer_kv_transfer(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
+    # Index tensors must live on the same device as the tensor being indexed.
+    # valid_tokens/valid_slots follow slot_mapping's device (often CPU), but
+    # key_value may be on GPU and paged buffers live on paged_memory_device.
+    kv_device = key_value.device
+    valid_tokens_kv = valid_tokens.to(kv_device)
+    valid_slots_page = valid_slots.to(paged_memory_device)
+
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
@@ -477,7 +499,7 @@ def multi_layer_kv_transfer(
                 )
             elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
                 num_blocks = max(
-                    int(torch.max(valid_slots).item() // block_size + 1), 1
+                    int(torch.max(valid_slots_page).item() // block_size + 1), 1
                 )
                 paged = _tensor_from_ptr(
                     paged_ptr,
@@ -501,32 +523,32 @@ def multi_layer_kv_transfer(
             GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
             GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
         ):
-            src = key_value[:, layer_id, valid_tokens]
+            src = key_value[:, layer_id, valid_tokens_kv]
             if direction == TransferDirection.H2D:
-                paged.index_copy_(1, valid_slots, src)
+                paged.index_copy_(1, valid_slots_page, src)
             else:
-                gathered = paged.index_select(1, valid_slots)
-                key_value[:, layer_id, valid_tokens] = gathered
+                gathered = paged.index_select(1, valid_slots_page)
+                key_value[:, layer_id, valid_tokens_kv] = gathered
 
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-            blk_idx = torch.div(valid_slots, block_size, rounding_mode="floor")
-            blk_off = valid_slots % block_size
+            blk_idx = torch.div(valid_slots_page, block_size, rounding_mode="floor")
+            blk_off = valid_slots_page % block_size
 
             if direction == TransferDirection.H2D:
-                src = key_value[:, layer_id, valid_tokens].permute(1, 0, 2)
+                src = key_value[:, layer_id, valid_tokens_kv].permute(1, 0, 2)
                 paged[blk_idx, :, blk_off] = src
             else:
                 fetched = paged[blk_idx, :, blk_off].permute(1, 0, 2)
-                key_value[:, layer_id, valid_tokens] = fetched
+                key_value[:, layer_id, valid_tokens_kv] = fetched
 
         elif gpu_kv_format in (
             GPUKVFormat.NL_X_NB_BS_HS,
             GPUKVFormat.NL_X_NBBS_ONE_HS,
         ):
             if direction == TransferDirection.H2D:
-                paged[valid_slots] = key_value[0, layer_id, valid_tokens]
+                paged[valid_slots_page] = key_value[0, layer_id, valid_tokens_kv]
             else:
-                key_value[0, layer_id, valid_tokens] = paged[valid_slots]
+                key_value[0, layer_id, valid_tokens_kv] = paged[valid_slots_page]
 
         else:
             raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
@@ -594,6 +616,11 @@ def multi_layer_kv_transfer_unilateral(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
+    # Index tensors must live on the same device as the tensor being indexed.
+    kv_device = key_value.device
+    valid_tokens_kv = valid_tokens.to(kv_device)
+    valid_slots_page = valid_slots.to(paged_memory_device)
+
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
@@ -619,11 +646,11 @@ def multi_layer_kv_transfer_unilateral(
             )
 
         if direction == TransferDirection.H2D:
-            k_buf[valid_slots] = key_value[0, layer_id, valid_tokens]
-            v_buf[valid_slots] = key_value[1, layer_id, valid_tokens]
+            k_buf[valid_slots_page] = key_value[0, layer_id, valid_tokens_kv]
+            v_buf[valid_slots_page] = key_value[1, layer_id, valid_tokens_kv]
         else:
-            key_value[0, layer_id, valid_tokens] = k_buf[valid_slots]
-            key_value[1, layer_id, valid_tokens] = v_buf[valid_slots]
+            key_value[0, layer_id, valid_tokens_kv] = k_buf[valid_slots_page]
+            key_value[1, layer_id, valid_tokens_kv] = v_buf[valid_slots_page]
 
 
 def single_layer_kv_transfer(
@@ -976,12 +1003,9 @@ def lmcache_memcpy_async(
     if libcudart is not None and hasattr(libcudart, "cudaMemcpy"):
         # Synchronous cudaMemcpy handles cross-cudaHostRegister boundaries
         # internally — no manual alignment splitting needed.
-        ret = libcudart.cudaMemcpy(
-            ctypes.c_void_p(dest),
-            ctypes.c_void_p(src),
-            ctypes.c_size_t(nbytes),
-            ctypes.c_int(4),  # cudaMemcpyDefault
-        )
+        # restype/argtypes are set once in _get_copy_lib() to ensure 64-bit
+        # pointers are never truncated.
+        ret = libcudart.cudaMemcpy(dest, src, nbytes, 4)  # cudaMemcpyDefault
         if ret != 0:
             raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
     else:
