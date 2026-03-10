@@ -1910,6 +1910,19 @@ def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
         )
 
     assert copy_spy.call_count == num_layers * valid_token_count * k_or_v_size
+    if use_tensor_list:
+        assert all(
+            isinstance(call.args[0], torch.Tensor)
+            and isinstance(call.args[1], torch.Tensor)
+            for call in copy_spy.call_args_list
+        )
+    else:
+        assert all(
+            isinstance(call.args[0], (int, torch.Tensor))
+            and isinstance(call.args[1], (int, torch.Tensor))
+            and isinstance(call.args[0], int) != isinstance(call.args[1], int)
+            for call in copy_spy.call_args_list
+        )
 
 
 @pytest.mark.parametrize("use_tensor_list", [False, True])
@@ -1959,3 +1972,50 @@ def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
         )
 
     assert copy_spy.call_count == num_layers * valid_token_count * 2
+    if use_tensor_list:
+        assert all(
+            isinstance(call.args[0], torch.Tensor)
+            and isinstance(call.args[1], torch.Tensor)
+            for call in copy_spy.call_args_list
+        )
+    else:
+        assert all(
+            isinstance(call.args[0], (int, torch.Tensor))
+            and isinstance(call.args[1], (int, torch.Tensor))
+            and isinstance(call.args[0], int) != isinstance(call.args[1], int)
+            for call in copy_spy.call_args_list
+        )
+
+
+@pytest.mark.parametrize("pointer_operand", ["dest", "src"])
+def test_lmcache_memcpy_async_accepts_mixed_pointer_and_tensor_operands(
+    pointer_operand: str,
+) -> None:
+    """Ensure mixed pointer/tensor copies are normalized by lmcache_memcpy_async."""
+    src = torch.arange(16, dtype=torch.uint8)
+    dst = torch.zeros(16, dtype=torch.uint8)
+
+    src_view = src[2:10]
+    dst_view = dst[4:12]
+    nbytes = src_view.numel() * src_view.element_size()
+
+    if pointer_operand == "dest":
+        _py_ops.lmcache_memcpy_async(
+            dst_view.data_ptr(),
+            src_view,
+            nbytes,
+            _py_ops.TransferDirection.H2D,
+            0,
+            1,
+        )
+    else:
+        _py_ops.lmcache_memcpy_async(
+            dst_view,
+            src_view.data_ptr(),
+            nbytes,
+            _py_ops.TransferDirection.D2H,
+            0,
+            1,
+        )
+
+    torch.testing.assert_close(dst_view, src_view)
