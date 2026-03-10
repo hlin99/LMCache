@@ -1104,37 +1104,23 @@ def lmcache_memcpy_async(
     if direction not in (TransferDirection.H2D, TransferDirection.D2H):
         raise ValueError(f"Unsupported direction: {direction}")
 
-    # 3. Tensor-backed mode. Mixed pointer/tensor copies are normalized to
-    # tensor views here so callers can pass whichever operand form they have.
+    # 3. Tensor-backed mode. 
+    # Mixed pointer/tensor are not allowed
     if isinstance(dest, torch.Tensor) or isinstance(src, torch.Tensor):
         logger.error("tensor mode")
-        tensor_operand = dest if isinstance(dest, torch.Tensor) else src
-        assert isinstance(tensor_operand, torch.Tensor)
-
-        if nbytes % tensor_operand.element_size() != 0:
+        if not (isinstance(dest, torch.Tensor) and isinstance(src, torch.Tensor)):
+            raise TypeError(
+                "Mixed types are not allowed: both dest and src must be torch.Tensor "
+                "if either of them is a tensor."
+            )
+        if nbytes % dest.element_size() != 0:
             raise ValueError("nbytes must align with tensor element size")
 
-        num_elements = nbytes // tensor_operand.element_size()
-        dest_slice = (
-            dest.flatten()[:num_elements]
-            if isinstance(dest, torch.Tensor)
-            else _tensor_from_ptr(
-                dest,
-                (num_elements,),
-                tensor_operand.dtype,
-                tensor_operand.device,
-            )
-        )
-        src_slice = (
-            src.flatten()[:num_elements]
-            if isinstance(src, torch.Tensor)
-            else _tensor_from_ptr(
-                src,
-                (num_elements,),
-                tensor_operand.dtype,
-                tensor_operand.device,
-            )
-        )
+        num_elements = nbytes // dest.element_size()
+
+        dest_slice = dest.flatten()[:num_elements]
+        src_slice = src.flatten()[:num_elements]
+
         copied = src_slice.to(dest_slice.device)
         dest_slice.copy_(copied)
         return
