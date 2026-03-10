@@ -7,6 +7,9 @@ import unittest.mock
 import pytest
 import torch
 
+# First Party
+from lmcache.non_cuda_equivalents import _get_copy_lib
+
 # ==========================================
 # 0. utils functions.
 # ==========================================
@@ -52,6 +55,11 @@ def _build_backend_params() -> list:
     params = []
     cuda_available = torch.cuda.is_available()
 
+    # First Party
+    import lmcache.non_cuda_equivalents as _py_ops
+
+    params.append(pytest.param(("cpu_py_ops", _py_ops, "cpu"), id="cpu_py_ops"))
+
     if cuda_available:
         try:
             # First Party
@@ -63,21 +71,18 @@ def _build_backend_params() -> list:
         except ImportError:
             pass
 
-        # First Party
-        import lmcache.non_cuda_equivalents as _py_ops
-
-        params.append(pytest.param(("cuda_py_ops", _py_ops, "cuda"), id="cuda_py_ops"))
+        if _get_copy_lib() is not None:
+            params.append(
+                pytest.param(("cuda_py_ops", _py_ops, "cuda"), id="cuda_cuda_py_ops")
+            )
+        else:
+            params.append(
+                pytest.param(("cuda_py_ops", _py_ops, "cpu"), id="cuda_cpu_py_ops")
+            )
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        # First Party
-        import lmcache.non_cuda_equivalents as _py_ops
-
         params.append(pytest.param(("xpu_py_ops", _py_ops, "xpu"), id="xpu_py_ops"))
 
-    # First Party
-    import lmcache.non_cuda_equivalents as _py_ops
-
-    params.append(pytest.param(("cpu_py_ops", _py_ops, "cpu"), id="cpu_py_ops"))
     return params
 
 
