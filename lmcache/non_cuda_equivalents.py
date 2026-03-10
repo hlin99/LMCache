@@ -507,6 +507,11 @@ def _materialize_paged_buffers(
     function creates safe tensor copies of each buffer, avoiding
     out-of-bounds access that can occur with manual pointer arithmetic.
 
+    For CUDA pointers the function allocates a fresh GPU tensor and uses
+    ``cudaMemcpy`` (Device-to-Device) to populate it, bypassing the
+    fragile ``_tensor_from_ptr`` / ``_tensor_from_cuda_ptr`` path which
+    frequently fails with out-of-bounds access.
+
     Args:
         key_value_ptrs: Int64 tensor of raw memory pointers.
         num_buffers: Number of buffers to materialize.
@@ -521,12 +526,41 @@ def _materialize_paged_buffers(
     tensors: list[torch.Tensor] = []
     for i in range(num_buffers):
         ptr = int(key_value_ptrs[i].item())
-        t = _tensor_from_ptr(ptr, shape, dtype, device=device)
-        # _tensor_from_cuda_ptr already allocates + copies for CUDA.
-        # _tensor_from_cpu_ptr returns a zero-copy view, so clone it.
-        if device.type != "cuda":
-            t = t.clone()
-        tensors.append(t)
+        if device.type == "cuda":
+            # Allocate a new GPU tensor and copy data from the raw
+            # pointer via cudaMemcpy D2D – safe and reliable.
+            dst = torch.empty(shape, dtype=dtype, device=device)
+            total_bytes = dst.numel() * dst.element_size()
+            libcudart = _get_copy_lib()
+            if libcudart is None:
+                raise RuntimeError(
+                    "Cannot materialize CUDA buffer: libcudart not found"
+                )
+            cudaMemcpy = libcudart.cudaMemcpy
+            cudaMemcpy.restype = ctypes.c_int
+            cudaMemcpy.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            _MEMCPY_D2D = 3
+            torch.cuda.synchronize(device)
+            err = cudaMemcpy(
+                ctypes.c_void_p(dst.data_ptr()),
+                ctypes.c_void_p(ptr),
+                ctypes.c_size_t(total_bytes),
+                ctypes.c_int(_MEMCPY_D2D),
+            )
+            if err != 0:
+                raise RuntimeError(
+                    f"cudaMemcpy D2D failed with error code {err}"
+                )
+            tensors.append(dst)
+        else:
+            # CPU path: create view from pointer and clone it
+            t = _tensor_from_ptr(ptr, shape, dtype, device=device)
+            tensors.append(t.clone())
     return tensors
 
 
