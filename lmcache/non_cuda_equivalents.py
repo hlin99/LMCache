@@ -811,6 +811,10 @@ def single_layer_kv_transfer_sgl(
         direction: False for LMCache -> SGLang, True for SGLang -> LMCache
         token_major: Boolean to determine the layout of lmc_key_value_cache
     """
+    slot_mapping = slot_mapping.to(dtype=torch.long)
+    valid_mask = slot_mapping >= 0
+    if not valid_mask.any():
+        return
 
     # 1. Get basic dimensions
     block_size = sgl_key_cache.size(1)
@@ -819,7 +823,6 @@ def single_layer_kv_transfer_sgl(
 
     # 2. Calculate block indices and offsets within the blocks from slot_mapping
     # In SGLang/vLLM, slot_idx = block_idx * block_size + block_offset
-    valid_mask = slot_mapping >= 0
     valid_slots = slot_mapping[valid_mask]
     block_indices = valid_slots // block_size
     block_offsets = valid_slots % block_size
@@ -838,8 +841,8 @@ def single_layer_kv_transfer_sgl(
     if direction == TransferDirection.H2D:
         # --- Direction: LMCache to SGLang (Paged Buffer) ---
         # Reshape LMC flat tensors to match SGL [num_heads, head_size]
-        src_k_reshaped = lmc_k[valid_mask].view(-1, num_heads, head_size)
-        src_v_reshaped = lmc_v[valid_mask].view(-1, num_heads, head_size)
+        src_k_reshaped = lmc_k[valid_mask].reshape(-1, num_heads, head_size)
+        src_v_reshaped = lmc_v[valid_mask].reshape(-1, num_heads, head_size)
 
         # Advanced indexing: update specific slots in the paged cache
         sgl_key_cache[block_indices, block_offsets] = src_k_reshaped
