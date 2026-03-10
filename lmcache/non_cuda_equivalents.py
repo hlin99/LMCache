@@ -26,6 +26,8 @@ _buf_registry: dict[int, ctypes.Array] = {}
 _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
+from lmcache.logging import init_logger
+logger = init_logger(__name__)
 
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
     """Lazily load and cache the CUDA runtime library, or None for CPU fallback."""
@@ -285,6 +287,7 @@ def _copy_hidden_row_async(
         The multi-layer KV transfer fallbacks pass either tensor rows or raw
         pointers here and let ``lmcache_memcpy_async`` normalize the operands.
     """
+    logger.error("_copy_hidden_row_async")
     lmcache_memcpy_async(
         dest,
         src,
@@ -524,11 +527,19 @@ def multi_layer_kv_transfer(
         H2D  = LMCache  -> PagedBuffer
         D2H  = PagedBuffer -> LMCache
     """
+    if isinstance(key_value_ptrs, torch.Tensor):
+        logger.error(" key_value_ptrs is a tensor ")
+    elif isinstance(key_value_ptrs, list):
+        logger.error(" key_value_ptrs is a tensor list")
+
+    else:
+        raise TypeError(f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}")
+
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
     )
-
+    logger.error("1")
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
     k_or_v_size = 1 if is_mla else 2
@@ -551,8 +562,11 @@ def multi_layer_kv_transfer(
             GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
             GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
         ):
+            logger.error("2")
+
             for token_idx, slot_idx in valid_pairs:
                 for kv_idx in range(k_or_v_size):
+                    logger.error("2.1")
                     paged_row = _get_multi_layer_paged_row(
                         key_value_ptrs,
                         layer_id,
@@ -580,6 +594,8 @@ def multi_layer_kv_transfer(
                         )
 
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+            logger.error("3")
+
             for token_idx, slot_idx in valid_pairs:
                 for kv_idx in range(k_or_v_size):
                     paged_row = _get_multi_layer_paged_row(
@@ -612,6 +628,8 @@ def multi_layer_kv_transfer(
             GPUKVFormat.NL_X_NB_BS_HS,
             GPUKVFormat.NL_X_NBBS_ONE_HS,
         ):
+            logger.error("5")
+
             for token_idx, slot_idx in valid_pairs:
                 paged_row = _get_multi_layer_paged_row(
                     key_value_ptrs,
@@ -1089,6 +1107,7 @@ def lmcache_memcpy_async(
     # 3. Tensor-backed mode. Mixed pointer/tensor copies are normalized to
     # tensor views here so callers can pass whichever operand form they have.
     if isinstance(dest, torch.Tensor) or isinstance(src, torch.Tensor):
+        logger.error("tensor mode")
         tensor_operand = dest if isinstance(dest, torch.Tensor) else src
         assert isinstance(tensor_operand, torch.Tensor)
 
@@ -1120,25 +1139,30 @@ def lmcache_memcpy_async(
         dest_slice.copy_(copied)
         return
 
+    logger.error("Pointer mode")
+
     # 4. Pointer mode
     if not isinstance(dest, int) or not isinstance(src, int):
         raise TypeError(
             "dest and src must be both int (pointer mode) "
             "or both torch.Tensor (tensor mode)"
         )
-
+    
     libcudart = _get_copy_lib()
     if libcudart is not None and hasattr(libcudart, "cudaMemcpy"):
-        # Synchronous cudaMemcpy handles cross-cudaHostRegister boundaries
-        # internally — no manual alignment splitting needed.
-        ret = libcudart.cudaMemcpy(
-            ctypes.c_void_p(dest),
-            ctypes.c_void_p(src),
-            ctypes.c_size_t(nbytes),
-            ctypes.c_int(4),  # cudaMemcpyDefault
-        )
-        if ret != 0:
-            raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
+        try:
+            # Synchronous cudaMemcpy handles cross-cudaHostRegister boundaries
+            # internally — no manual alignment splitting needed.
+            ret = libcudart.cudaMemcpy(
+                ctypes.c_void_p(dest),
+                ctypes.c_void_p(src),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_int(4),  # cudaMemcpyDefault
+            )
+            if ret != 0:
+                raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
+        except AttributeError:
+            logger.error("hlin hlin hlin %s", AttributeError)
     else:
         # Pure CPU copy — no alignment constraints.
         _copy_bytes_with_tensor(dest, src, nbytes)
