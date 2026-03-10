@@ -449,6 +449,11 @@ def multi_layer_kv_transfer(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
+    # Ensure valid_tokens and valid_slots are on the same device as key_value
+    # to avoid device mismatch when indexing
+    valid_tokens = valid_tokens.to(device)
+    valid_slots = valid_slots.to(device)
+
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
@@ -593,6 +598,11 @@ def multi_layer_kv_transfer_unilateral(
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
+
+    # Ensure valid_tokens and valid_slots are on the same device as key_value
+    # to avoid device mismatch when indexing
+    valid_tokens = valid_tokens.to(device)
+    valid_slots = valid_slots.to(device)
 
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
