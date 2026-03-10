@@ -454,6 +454,7 @@ def multi_layer_kv_transfer(
     Each paged buffer (one per layer) layout depends on gpu_kv_format:
         - NB_NL_TWO_BS_NH_HS / NL_X_TWO_NB_BS_NH_HS / TWO_X_NL_X_NBBS_NH_HS:
               [k_or_v_size, page_buffer_size, hidden_size]
+              (k_or_v_size is 2 for separate K/V, 1 for MLA)
         - NL_X_NB_TWO_BS_NH_HS (flash infer):
               [num_blocks, 2, block_size, hidden_size]
         - NL_X_NB_BS_HS / NL_X_NBBS_ONE_HS (MLA):
@@ -601,9 +602,11 @@ def _multi_layer_kv_transfer_ptr_mode(
             # paged layout: [k_or_v_size, page_buffer_size, hidden_size]
             paged_kv_stride = page_buffer_size * hidden_size
             for kv in range(k_or_v_size):
-                for i in range(len(valid_tokens_list)):
-                    token_idx = valid_tokens_list[i]
-                    slot_idx = valid_slots_list[i]
+                for token_idx, slot_idx in zip(
+                    valid_tokens_list,
+                    valid_slots_list,
+                    strict=True,
+                ):
                     kv_addr = (
                         kv_base
                         + (
@@ -625,9 +628,11 @@ def _multi_layer_kv_transfer_ptr_mode(
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
             # paged layout: [num_blocks, 2, block_size, hidden_size]
             for kv in range(k_or_v_size):
-                for i in range(len(valid_tokens_list)):
-                    token_idx = valid_tokens_list[i]
-                    slot_idx = valid_slots_list[i]
+                for token_idx, slot_idx in zip(
+                    valid_tokens_list,
+                    valid_slots_list,
+                    strict=True,
+                ):
                     blk_idx = slot_idx // block_size
                     blk_off = slot_idx % block_size
                     kv_addr = (
@@ -655,9 +660,11 @@ def _multi_layer_kv_transfer_ptr_mode(
             GPUKVFormat.NL_X_NBBS_ONE_HS,
         ):
             # paged layout: [page_buffer_size, hidden_size] (MLA)
-            for i in range(len(valid_tokens_list)):
-                token_idx = valid_tokens_list[i]
-                slot_idx = valid_slots_list[i]
+            for token_idx, slot_idx in zip(
+                valid_tokens_list,
+                valid_slots_list,
+                strict=True,
+            ):
                 kv_addr = (
                     kv_base
                     + (
@@ -765,10 +772,11 @@ def multi_layer_kv_transfer_unilateral(
             k_ptr = int(ptr_list[layer_id])
             v_ptr = int(ptr_list[layer_id + num_layers])
 
-            for i in range(len(valid_tokens_list)):
-                token_idx = valid_tokens_list[i]
-                slot_idx = valid_slots_list[i]
-
+            for token_idx, slot_idx in zip(
+                valid_tokens_list,
+                valid_slots_list,
+                strict=True,
+            ):
                 # K: key_value[0, layer_id, token_idx, :]
                 kv_k_addr = (
                     kv_base
