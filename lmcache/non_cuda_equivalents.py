@@ -478,8 +478,11 @@ def multi_layer_kv_transfer(
     gpu_kv_format: GPUKVFormat,
     block_size: int,
 ):
+    """Python fallback for copying multi-layer KV rows between LMCache and paged buffers."""
     if not isinstance(key_value_ptrs, (torch.Tensor, list)):
-        raise TypeError(f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}")
+        raise TypeError(
+            f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
+        )
 
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
@@ -490,6 +493,7 @@ def multi_layer_kv_transfer(
     hidden_size = key_value.size(3)
     k_or_v_size = 1 if is_mla else 2
     
+    # Filter invalid slots and keep only valid token/slot pairs.
     slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
     if not torch.any(valid_mask):
@@ -505,8 +509,7 @@ def multi_layer_kv_transfer(
     row_nbytes = hidden_size * key_value.element_size()
 
     for layer_id in range(num_layers):
-        
-        # Merge redundant loops for all non-MLA formats
+        # Non-MLA formats copy both K and V rows.
         if gpu_kv_format in (
             GPUKVFormat.NB_NL_TWO_BS_NH_HS,
             GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
@@ -532,7 +535,7 @@ def multi_layer_kv_transfer(
                             row_nbytes, direction,
                         )
 
-        # MLA formats (kv_idx is fixed to 0)
+        # MLA formats use a single row (kv_idx is fixed to 0).
         elif gpu_kv_format in (
             GPUKVFormat.NL_X_NB_BS_HS,
             GPUKVFormat.NL_X_NBBS_ONE_HS,
