@@ -1852,13 +1852,17 @@ def _uses_mixed_pointer_tensor_operands(call: unittest.mock._Call) -> bool:
     ],
 )
 @pytest.mark.parametrize("use_tensor_list", [False, True])
-def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
+def test_multi_layer_kv_transfer_delegates_row_copies(
     gpu_kv_format: _py_ops.GPUKVFormat,
     block_size: int,
     k_or_v_size: int,
     use_tensor_list: bool,
 ) -> None:
-    """Ensure the Python fallback copy path delegates row copies to memcpy."""
+    """Ensure multi_layer_kv_transfer delegates row copies to _copy_hidden_row_async.
+
+    Both pointer mode (tensor of int64 pointers) and tensor list mode should
+    produce tensor arguments after materialization.
+    """
     num_layers = 2
     num_tokens = 4
     hidden_size = 8
@@ -1900,8 +1904,8 @@ def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
 
     with unittest.mock.patch.object(
         _py_ops,
-        "lmcache_memcpy_async",
-        wraps=_py_ops.lmcache_memcpy_async,
+        "_copy_hidden_row_async",
+        wraps=_py_ops._copy_hidden_row_async,
     ) as copy_spy:
         _py_ops.multi_layer_kv_transfer(
             key_value,
@@ -1915,26 +1919,23 @@ def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
         )
 
     assert copy_spy.call_count == num_layers * valid_token_count * k_or_v_size
-    if use_tensor_list:
-        assert all(
-            isinstance(call.args[0], torch.Tensor)
-            and isinstance(call.args[1], torch.Tensor)
-            for call in copy_spy.call_args_list
-        )
-    else:
-        assert all(
-            isinstance(call.args[0], (int, torch.Tensor))
-            and isinstance(call.args[1], (int, torch.Tensor))
-            and _uses_mixed_pointer_tensor_operands(call)
-            for call in copy_spy.call_args_list
-        )
+    # After materialization, both pointer mode and list mode pass tensors
+    assert all(
+        isinstance(call.args[0], torch.Tensor)
+        and isinstance(call.args[1], torch.Tensor)
+        for call in copy_spy.call_args_list
+    )
 
 
 @pytest.mark.parametrize("use_tensor_list", [False, True])
-def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
+def test_multi_layer_kv_transfer_unilateral_delegates_row_copies(
     use_tensor_list: bool,
 ) -> None:
-    """Ensure unilateral row copies also delegate to lmcache_memcpy_async."""
+    """Ensure unilateral row copies delegate to _copy_hidden_row_async.
+
+    Both pointer mode and tensor list mode should produce tensor arguments
+    after materialization.
+    """
     num_layers = 2
     num_tokens = 4
     hidden_size = 8
@@ -1963,8 +1964,8 @@ def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
 
     with unittest.mock.patch.object(
         _py_ops,
-        "lmcache_memcpy_async",
-        wraps=_py_ops.lmcache_memcpy_async,
+        "_copy_hidden_row_async",
+        wraps=_py_ops._copy_hidden_row_async,
     ) as copy_spy:
         _py_ops.multi_layer_kv_transfer_unilateral(
             key_value,
@@ -1977,19 +1978,12 @@ def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
         )
 
     assert copy_spy.call_count == num_layers * valid_token_count * 2
-    if use_tensor_list:
-        assert all(
-            isinstance(call.args[0], torch.Tensor)
-            and isinstance(call.args[1], torch.Tensor)
-            for call in copy_spy.call_args_list
-        )
-    else:
-        assert all(
-            isinstance(call.args[0], (int, torch.Tensor))
-            and isinstance(call.args[1], (int, torch.Tensor))
-            and _uses_mixed_pointer_tensor_operands(call)
-            for call in copy_spy.call_args_list
-        )
+    # After materialization, both pointer mode and list mode pass tensors
+    assert all(
+        isinstance(call.args[0], torch.Tensor)
+        and isinstance(call.args[1], torch.Tensor)
+        for call in copy_spy.call_args_list
+    )
 
 
 @pytest.mark.parametrize("pointer_operand", ["dest", "src"])

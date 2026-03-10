@@ -468,6 +468,119 @@ def free_numa_ptr(ptr: int, size: int | None = None) -> None:
     return free_pinned_numa_ptr(ptr, size)
 
 
+def _get_paged_buffer_shape(
+    gpu_kv_format: "GPUKVFormat",
+    page_buffer_size: int,
+    hidden_size: int,
+    block_size: int,
+) -> tuple[int, ...]:
+    """Compute the shape of a single layer's paged buffer based on format.
+
+    Args:
+        gpu_kv_format: The GPU KV cache format enum.
+        page_buffer_size: Total number of slots (num_blocks * block_size).
+        hidden_size: Number of elements per token.
+        block_size: Block size for block-based formats.
+
+    Returns:
+        Shape tuple for one layer's paged buffer.
+    """
+    if gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+        num_blocks = page_buffer_size // block_size
+        return (num_blocks, 2, block_size, hidden_size)
+    if gpu_kv_format in (GPUKVFormat.NL_X_NB_BS_HS, GPUKVFormat.NL_X_NBBS_ONE_HS):
+        return (page_buffer_size, hidden_size)
+    # NL_X_TWO_NB_BS_NH_HS, NB_NL_TWO_BS_NH_HS, TWO_X_NL_X_NBBS_NH_HS
+    return (2, page_buffer_size, hidden_size)
+
+
+def _materialize_paged_buffers(
+    key_value_ptrs: torch.Tensor,
+    num_buffers: int,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Allocate new memory and copy each paged buffer from raw pointers.
+
+    When ``key_value_ptrs`` is a tensor of raw memory pointers, this
+    function creates safe tensor copies of each buffer, avoiding
+    out-of-bounds access that can occur with manual pointer arithmetic.
+
+    Args:
+        key_value_ptrs: Int64 tensor of raw memory pointers.
+        num_buffers: Number of buffers to materialize.
+        shape: Shape for each buffer.
+        dtype: Element dtype of the buffer data.
+        device: Device where the raw pointers reside.
+
+    Returns:
+        List of newly allocated tensors, each containing a copy of the
+        data from the corresponding raw pointer.
+    """
+    tensors: list[torch.Tensor] = []
+    for i in range(num_buffers):
+        ptr = int(key_value_ptrs[i].item())
+        t = _tensor_from_ptr(ptr, shape, dtype, device=device)
+        # _tensor_from_cuda_ptr already allocates + copies for CUDA.
+        # _tensor_from_cpu_ptr returns a zero-copy view, so clone it.
+        if device.type != "cuda":
+            t = t.clone()
+        tensors.append(t)
+    return tensors
+
+
+def _write_back_buffers(
+    tensors: list[torch.Tensor],
+    original_ptrs: list[int],
+    device: torch.device,
+) -> None:
+    """Copy modified buffer tensors back to the original raw pointers.
+
+    Used after an H2D transfer to persist writes that were made on
+    materialized copies back into the actual paged-buffer memory.
+
+    Args:
+        tensors: Modified buffer tensors (one per layer/buffer).
+        original_ptrs: Corresponding raw memory pointers.
+        device: Device where the raw pointers reside.
+    """
+    for tensor, ptr in zip(tensors, original_ptrs, strict=True):
+        total_bytes = tensor.numel() * tensor.element_size()
+        if device.type == "cuda":
+            libcudart = _get_copy_lib()
+            if libcudart is None:
+                raise RuntimeError(
+                    "Cannot write back to CUDA pointer: libcudart not found"
+                )
+            cudaMemcpy = libcudart.cudaMemcpy
+            cudaMemcpy.restype = ctypes.c_int
+            cudaMemcpy.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            _MEMCPY_D2D = 3
+            torch.cuda.synchronize(device)
+            err = cudaMemcpy(
+                ctypes.c_void_p(ptr),
+                ctypes.c_void_p(tensor.data_ptr()),
+                ctypes.c_size_t(total_bytes),
+                ctypes.c_int(_MEMCPY_D2D),
+            )
+            if err != 0:
+                raise RuntimeError(
+                    f"cudaMemcpy D2D writeback failed with error code {err}"
+                )
+        else:
+            buf_type = ctypes.c_uint8 * total_bytes
+            dst_buf = buf_type.from_address(ptr)
+            dst_tensor = torch.frombuffer(dst_buf, dtype=torch.uint8)
+            src_bytes = tensor.contiguous().view(-1).view(torch.uint8)
+            dst_tensor.copy_(src_bytes)
+
+
 def multi_layer_kv_transfer(
     key_value: torch.Tensor,
     key_value_ptrs: torch.Tensor | list[torch.Tensor],
@@ -485,11 +598,31 @@ def multi_layer_kv_transfer(
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
     )
-    
+
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
     k_or_v_size = 1 if is_mla else 2
-    
+
+    # Safety: when key_value_ptrs is a tensor of raw pointers, materialize
+    # each paged buffer as a safe tensor copy to avoid out-of-bounds access
+    # from raw pointer arithmetic.  Performance loss is acceptable.
+    original_ptrs: list[int] | None = None
+    if isinstance(key_value_ptrs, torch.Tensor):
+        device = (
+            paged_memory_device
+            if isinstance(paged_memory_device, torch.device)
+            else torch.device(paged_memory_device)
+        )
+        shape = _get_paged_buffer_shape(
+            gpu_kv_format, page_buffer_size, hidden_size, block_size,
+        )
+        original_ptrs = [
+            int(key_value_ptrs[i].item()) for i in range(num_layers)
+        ]
+        key_value_ptrs = _materialize_paged_buffers(
+            key_value_ptrs, num_layers, shape, key_value.dtype, device,
+        )
+
     slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
     if not torch.any(valid_mask):
@@ -558,6 +691,15 @@ def multi_layer_kv_transfer(
         else:
             raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
 
+    # For H2D: write modified materialized buffers back to original pointers
+    if original_ptrs is not None and direction == TransferDirection.H2D:
+        device = (
+            paged_memory_device
+            if isinstance(paged_memory_device, torch.device)
+            else torch.device(paged_memory_device)
+        )
+        _write_back_buffers(key_value_ptrs, original_ptrs, device)
+
 def multi_layer_kv_transfer_unilateral(
     key_value: torch.Tensor,
     key_value_ptrs: torch.Tensor | list[torch.Tensor],
@@ -610,6 +752,24 @@ def multi_layer_kv_transfer_unilateral(
     # ── Non-MLA path: unilateral (separate K/V buffers per layer) ──
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
+
+    # Safety: when key_value_ptrs is a tensor of raw pointers, materialize
+    # each paged buffer as a safe tensor copy to avoid out-of-bounds access.
+    original_ptrs: list[int] | None = None
+    if isinstance(key_value_ptrs, torch.Tensor):
+        device = (
+            paged_memory_device
+            if isinstance(paged_memory_device, torch.device)
+            else torch.device(paged_memory_device)
+        )
+        num_buffers = num_layers * 2
+        shape = (page_buffer_size, hidden_size)
+        original_ptrs = [
+            int(key_value_ptrs[i].item()) for i in range(num_buffers)
+        ]
+        key_value_ptrs = _materialize_paged_buffers(
+            key_value_ptrs, num_buffers, shape, key_value.dtype, device,
+        )
 
     slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
@@ -670,6 +830,15 @@ def multi_layer_kv_transfer_unilateral(
                     row_nbytes,
                     direction,
                 )
+
+    # For H2D: write modified materialized buffers back to original pointers
+    if original_ptrs is not None and direction == TransferDirection.H2D:
+        device = (
+            paged_memory_device
+            if isinstance(paged_memory_device, torch.device)
+            else torch.device(paged_memory_device)
+        )
+        _write_back_buffers(key_value_ptrs, original_ptrs, device)
 
 
 def single_layer_kv_transfer(
