@@ -681,7 +681,8 @@ def single_layer_kv_transfer(
     token_major: bool,
 ):
     """
-    Python fallback for single_layer_kv_transfer
+    Vectorized Python fallback for single_layer_kv_transfer
+    (eliminates per-token loops).
 
     Transfers KV data between LMCache buffer
     and a single vLLM paged KV cache layer.
@@ -703,38 +704,38 @@ def single_layer_kv_transfer(
         H2D = LMCache  -> vLLM GPU
         D2H = vLLM GPU -> LMCache
     """
+    slots = slot_mapping.to(dtype=torch.long)
+    valid_mask = slots >= 0
+
+    if not valid_mask.any():
+        return
+
+    valid_token_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+    valid_slots = slots[valid_token_indices]
+
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
     )
-
-    num_tokens = slot_mapping.size(0)
-    slots = slot_mapping.tolist()
 
     if is_mla:
         # ── MLA format ──
         # vllm: [num_blocks, block_size, head_size]
         # lmc:  [num_tokens, aligned_head_size]
         block_size = vllm_key_value_cache.size(1)
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
 
-        for token_idx in range(num_tokens):
-            slot_idx = slots[token_idx]
-            if slot_idx < 0:
-                continue
-
-            block_idx = slot_idx // block_size
-            block_offset = slot_idx % block_size
-
-            if direction == TransferDirection.D2H:
-                # vLLM -> LMCache
-                lmc_key_value_cache[token_idx] = vllm_key_value_cache[
-                    block_idx, block_offset
-                ]
-            else:
-                # LMCache -> vLLM
-                vllm_key_value_cache[block_idx, block_offset] = lmc_key_value_cache[
-                    token_idx
-                ]
+        if direction == TransferDirection.D2H:
+            # vLLM -> LMCache
+            lmc_key_value_cache[valid_token_indices] = vllm_key_value_cache[
+                block_indices, block_offsets
+            ]
+        else:
+            # LMCache -> vLLM
+            vllm_key_value_cache[block_indices, block_offsets] = lmc_key_value_cache[
+                valid_token_indices
+            ]
 
     else:
         # ── Non-MLA format ──
@@ -749,45 +750,32 @@ def single_layer_kv_transfer(
         block_size = vllm_key_value_cache.size(2)
         num_heads = vllm_key_value_cache.size(3)
         head_size = vllm_key_value_cache.size(4)
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
 
-        for token_idx in range(num_tokens):
-            slot_idx = slots[token_idx]
-            if slot_idx < 0:
-                continue
-
-            block_idx = slot_idx // block_size
-            block_offset = slot_idx % block_size
-
-            for kv in range(2):  # 0=Key, 1=Value
-                # ── Read vLLM side: [num_heads, head_size] ──
+        for kv in range(2):
+            if direction == TransferDirection.D2H:
                 if is_two_major:
-                    # [2, num_blocks, block_size, num_heads, head_size]
-                    vllm_slice = vllm_key_value_cache[
-                        kv, block_idx, block_offset
-                    ]  # [num_heads, head_size]
+                    gathered = vllm_key_value_cache[kv, block_indices, block_offsets]
                 else:
-                    # [num_blocks, 2, block_size, num_heads, head_size]
-                    vllm_slice = vllm_key_value_cache[
-                        block_idx, kv, block_offset
-                    ]  # [num_heads, head_size]
+                    gathered = vllm_key_value_cache[block_indices, kv, block_offsets]
 
-                vllm_flat = vllm_slice.reshape(-1)  # [num_heads * head_size]
-
-                # ── Read/write LMC side ──
+                gathered_flat = gathered.reshape(-1, num_heads * head_size)
                 if token_major:
-                    # [num_tokens, 2, num_heads * head_size]
-                    lmc_flat = lmc_key_value_cache[token_idx, kv]
+                    lmc_key_value_cache[valid_token_indices, kv] = gathered_flat
                 else:
-                    # [2, num_tokens, num_heads * head_size]
-                    lmc_flat = lmc_key_value_cache[kv, token_idx]
+                    lmc_key_value_cache[kv, valid_token_indices] = gathered_flat
+            else:
+                if token_major:
+                    lmc_src = lmc_key_value_cache[valid_token_indices, kv]
+                else:
+                    lmc_src = lmc_key_value_cache[kv, valid_token_indices]
+                lmc_reshaped = lmc_src.reshape(-1, num_heads, head_size)
 
-                # ── Transfer ──
-                if direction == TransferDirection.D2H:
-                    # vLLM -> LMCache
-                    lmc_flat.copy_(vllm_flat)
+                if is_two_major:
+                    vllm_key_value_cache[kv, block_indices, block_offsets] = lmc_reshaped
                 else:
-                    # LMCache -> vLLM
-                    vllm_slice.copy_(lmc_flat.reshape(num_heads, head_size))
+                    vllm_key_value_cache[block_indices, kv, block_offsets] = lmc_reshaped
 
 
 def single_layer_kv_transfer_sgl(
