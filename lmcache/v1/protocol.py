@@ -96,6 +96,32 @@ def get_remote_metadata_bytes():
     return REMOTE_METADATA_BYTES
 
 
+def _pad_shape_to_4d(shape: torch.Size) -> torch.Size:
+    """
+    Pad a shape to 4D by prepending 1s.
+
+    Args:
+        shape: The input shape (can be 1D, 2D, 3D, or 4D)
+
+    Returns:
+        A 4D shape
+
+    Examples:
+        [100] -> [1, 1, 1, 100]
+        [100, 200] -> [1, 1, 100, 200]
+        [100, 2, 4096] -> [1, 100, 2, 4096]
+        [2, 32, 100, 4096] -> [2, 32, 100, 4096]
+    """
+    if len(shape) == 4:
+        return shape
+    elif len(shape) < 4:
+        # Pad with 1s at the beginning
+        padding = [1] * (4 - len(shape))
+        return torch.Size(padding + list(shape))
+    else:
+        raise ValueError(f"Shape dimension {len(shape)} is greater than 4")
+
+
 @dataclass
 class RemoteMetadata:
     length: int
@@ -106,12 +132,13 @@ class RemoteMetadata:
     def _prepare_params(self):
         params = [self.length, int(self.fmt.value)]
         for shape, dtype in zip(self.shapes, self.dtypes, strict=True):
-            assert len(shape) == 4, "Shape dimension should be 4"
+            # Pad shapes to 4D if needed
+            padded_shape = _pad_shape_to_4d(shape)
             params.append(DTYPE_TO_INT[dtype])
-            params.append(shape[0])
-            params.append(shape[1])
-            params.append(shape[2])
-            params.append(shape[3])
+            params.append(padded_shape[0])
+            params.append(padded_shape[1])
+            params.append(padded_shape[2])
+            params.append(padded_shape[3])
         return params
 
     def serialize_into(self, buffer):
@@ -171,7 +198,8 @@ class ClientMetaMessage:
 
         # NOTE(Jiayi): 4 is the maximum dimension of memory object.
         # Pass in shape [x, 0, 0, 0] if it is a bytes memory object
-        assert len(self.shape) == 4, "Shape dimension should be 4"
+        # Pad shape to 4D if needed
+        padded_shape = _pad_shape_to_4d(self.shape)
 
         packed_bytes = struct.pack(
             f"iiiiiiiii{MAX_KEY_LENGTH}s",
@@ -180,10 +208,10 @@ class ClientMetaMessage:
             int(self.fmt.value),
             DTYPE_TO_INT[self.dtype],
             LOCATION_TO_INT[self.location],
-            self.shape[0],
-            self.shape[1],
-            self.shape[2],
-            self.shape[3],
+            padded_shape[0],
+            padded_shape[1],
+            padded_shape[2],
+            padded_shape[3],
             key_str.encode().ljust(MAX_KEY_LENGTH),
         )
         return packed_bytes
@@ -223,17 +251,18 @@ class ServerMetaMessage:
     location: Optional[str] = None
 
     def serialize(self) -> bytes:
-        assert len(self.shape) == 4, "Shape dimension should be 4"
+        # Pad shape to 4D if needed
+        padded_shape = _pad_shape_to_4d(self.shape)
         packed_bytes = struct.pack(
             "iiiiiiiii",
             self.code.value,
             self.length,
             int(self.fmt.value),
             DTYPE_TO_INT[self.dtype],
-            self.shape[0],
-            self.shape[1],
-            self.shape[2],
-            self.shape[3],
+            padded_shape[0],
+            padded_shape[1],
+            padded_shape[2],
+            padded_shape[3],
             LOCATION_TO_INT[self.location],
         )
         return packed_bytes
