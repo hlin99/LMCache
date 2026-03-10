@@ -273,8 +273,10 @@ def _copy_hidden_row_async(
     """Copy one contiguous hidden-state row via ``lmcache_memcpy_async``.
 
     Args:
-        dest: Destination row as either a raw pointer or tensor view.
-        src: Source row as either a raw pointer or tensor view.
+        dest: Destination row as either a raw pointer or tensor view. Raw
+            pointers must remain valid for at least ``nbytes`` bytes.
+        src: Source row as either a raw pointer or tensor view. Raw pointers
+            must remain valid for at least ``nbytes`` bytes.
         nbytes: Number of bytes to copy for the row.
         direction: Transfer direction passed through to
             ``lmcache_memcpy_async`` for API compatibility.

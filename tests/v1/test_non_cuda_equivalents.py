@@ -1838,6 +1838,11 @@ class TestScenarios:
                         )
 
 
+def _uses_mixed_pointer_tensor_operands(call: unittest.mock._Call) -> bool:
+    """Return whether a memcpy spy call used one pointer and one tensor operand."""
+    return isinstance(call.args[0], int) != isinstance(call.args[1], int)
+
+
 @pytest.mark.parametrize(
     ("gpu_kv_format", "block_size", "k_or_v_size"),
     [
@@ -1920,7 +1925,7 @@ def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
         assert all(
             isinstance(call.args[0], (int, torch.Tensor))
             and isinstance(call.args[1], (int, torch.Tensor))
-            and isinstance(call.args[0], int) != isinstance(call.args[1], int)
+            and _uses_mixed_pointer_tensor_operands(call)
             for call in copy_spy.call_args_list
         )
 
@@ -1982,7 +1987,7 @@ def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
         assert all(
             isinstance(call.args[0], (int, torch.Tensor))
             and isinstance(call.args[1], (int, torch.Tensor))
-            and isinstance(call.args[0], int) != isinstance(call.args[1], int)
+            and _uses_mixed_pointer_tensor_operands(call)
             for call in copy_spy.call_args_list
         )
 
