@@ -1836,3 +1836,163 @@ class TestScenarios:
                         pytest.fail(
                             f"{name}/{key}: '{bid}'={val} != '{base_bid}'={base_val}"
                         )
+
+
+@pytest.mark.parametrize(
+    "direction",
+    [_py_ops.TransferDirection.H2D, _py_ops.TransferDirection.D2H],
+)
+def test_multi_layer_kv_transfer_pointer_mode_uses_memcpy(
+    direction: _py_ops.TransferDirection,
+) -> None:
+    """Pointer-mode multi_layer_kv_transfer should copy rows via memcpy."""
+    num_layers = 2
+    num_tokens = 3
+    hidden_size = 4
+    page_buffer_size = 6
+    dtype = torch.float32
+
+    slot_mapping = torch.tensor([0, 2, 5], dtype=torch.int64)
+    key_value = torch.zeros((2, num_layers, num_tokens, hidden_size), dtype=dtype)
+    page_buffers = [
+        torch.zeros((2, page_buffer_size, hidden_size), dtype=dtype)
+        for _ in range(num_layers)
+    ]
+
+    if direction == _py_ops.TransferDirection.H2D:
+        for kv_idx in range(2):
+            for layer_id in range(num_layers):
+                for token_idx in range(num_tokens):
+                    key_value[kv_idx, layer_id, token_idx] = (
+                        kv_idx * 1000
+                        + layer_id * 100
+                        + token_idx * 10
+                        + torch.arange(hidden_size, dtype=dtype)
+                    )
+    else:
+        for layer_id, paged in enumerate(page_buffers):
+            for kv_idx in range(2):
+                for slot_idx in range(page_buffer_size):
+                    paged[kv_idx, slot_idx] = (
+                        kv_idx * 2000
+                        + layer_id * 100
+                        + slot_idx * 10
+                        + torch.arange(hidden_size, dtype=dtype)
+                    )
+
+    key_value_ptrs = torch.tensor(
+        [paged.data_ptr() for paged in page_buffers],
+        dtype=torch.int64,
+    )
+
+    with (
+        unittest.mock.patch.object(
+            _py_ops,
+            "_tensor_from_ptr",
+            side_effect=AssertionError("pointer mode should not build tensor views"),
+        ),
+        unittest.mock.patch.object(
+            _py_ops,
+            "lmcache_memcpy_async",
+            wraps=_py_ops.lmcache_memcpy_async,
+        ) as memcpy_mock,
+    ):
+        _py_ops.multi_layer_kv_transfer(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            direction,
+            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            1,
+        )
+
+    assert memcpy_mock.call_count == num_layers * num_tokens * 2
+
+    for token_idx, slot_idx in enumerate(slot_mapping.tolist()):
+        for layer_id in range(num_layers):
+            for kv_idx in range(2):
+                expected = page_buffers[layer_id][kv_idx, slot_idx]
+                actual = key_value[kv_idx, layer_id, token_idx]
+                torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "direction",
+    [_py_ops.TransferDirection.H2D, _py_ops.TransferDirection.D2H],
+)
+def test_multi_layer_kv_transfer_unilateral_pointer_mode_uses_memcpy(
+    direction: _py_ops.TransferDirection,
+) -> None:
+    """Pointer-mode unilateral transfer should copy rows via memcpy."""
+    num_layers = 2
+    num_tokens = 3
+    hidden_size = 4
+    page_buffer_size = 6
+    dtype = torch.float32
+
+    slot_mapping = torch.tensor([1, 3, 4], dtype=torch.int64)
+    key_value = torch.zeros((2, num_layers, num_tokens, hidden_size), dtype=dtype)
+    buffers = {
+        (kv_idx, layer_id): torch.zeros((page_buffer_size, hidden_size), dtype=dtype)
+        for kv_idx in range(2)
+        for layer_id in range(num_layers)
+    }
+
+    if direction == _py_ops.TransferDirection.H2D:
+        for kv_idx in range(2):
+            for layer_id in range(num_layers):
+                for token_idx in range(num_tokens):
+                    key_value[kv_idx, layer_id, token_idx] = (
+                        kv_idx * 1000
+                        + layer_id * 100
+                        + token_idx * 10
+                        + torch.arange(hidden_size, dtype=dtype)
+                    )
+    else:
+        for (kv_idx, layer_id), paged in buffers.items():
+            for slot_idx in range(page_buffer_size):
+                paged[slot_idx] = (
+                    kv_idx * 2000
+                    + layer_id * 100
+                    + slot_idx * 10
+                    + torch.arange(hidden_size, dtype=dtype)
+                )
+
+    key_value_ptrs = torch.tensor(
+        [buffers[(0, layer_id)].data_ptr() for layer_id in range(num_layers)]
+        + [buffers[(1, layer_id)].data_ptr() for layer_id in range(num_layers)],
+        dtype=torch.int64,
+    )
+
+    with (
+        unittest.mock.patch.object(
+            _py_ops,
+            "_tensor_from_ptr",
+            side_effect=AssertionError("pointer mode should not build tensor views"),
+        ),
+        unittest.mock.patch.object(
+            _py_ops,
+            "lmcache_memcpy_async",
+            wraps=_py_ops.lmcache_memcpy_async,
+        ) as memcpy_mock,
+    ):
+        _py_ops.multi_layer_kv_transfer_unilateral(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            direction,
+            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        )
+
+    assert memcpy_mock.call_count == num_layers * num_tokens * 2
+
+    for token_idx, slot_idx in enumerate(slot_mapping.tolist()):
+        for layer_id in range(num_layers):
+            for kv_idx in range(2):
+                expected = buffers[(kv_idx, layer_id)][slot_idx]
+                actual = key_value[kv_idx, layer_id, token_idx]
+                torch.testing.assert_close(actual, expected)
