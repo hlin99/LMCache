@@ -267,13 +267,15 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
         dst_host.zero_()
         expected = src_host[offset : offset + nbytes].clone()
 
+        device_sync(device)
+
         if use_tensor_mode:
             ops.lmcache_memcpy_async(
                 gpu_buffer[offset : offset + nbytes],
                 src_host[offset : offset + nbytes],
                 nbytes,
                 h2d_dir,
-                offset,
+                0,
                 alignment,
             )
             device_sync(device)
@@ -282,7 +284,7 @@ def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tens
                 gpu_buffer[offset : offset + nbytes],
                 nbytes,
                 d2h_dir,
-                offset,
+                0,
                 alignment,
             )
         else:
