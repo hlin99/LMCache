@@ -269,7 +269,25 @@ def _copy_hidden_row_async(
     src: torch.Tensor,
     direction: "TransferDirection",
 ) -> None:
-    """Copy one contiguous hidden-state row via lmcache_memcpy_async."""
+    """Copy one contiguous hidden-state row via ``lmcache_memcpy_async``.
+
+    Args:
+        dest: Destination tensor row. Must be contiguous and have the same
+            number of elements as ``src``.
+        src: Source tensor row. Must be contiguous and have the same number
+            of elements as ``dest``.
+        direction: Transfer direction passed through to
+            ``lmcache_memcpy_async`` for API compatibility.
+
+    Raises:
+        ValueError: If ``dest`` and ``src`` have different sizes or either row
+            is not contiguous.
+
+    Notes:
+        The multi-layer KV transfer fallbacks use this helper only with 1D row
+        slices so that tensor-mode copies remain backed by the original tensor
+        storage instead of advanced-indexing temporaries.
+    """
     if dest.numel() != src.numel():
         raise ValueError("dest and src must have the same number of elements")
     if not dest.is_contiguous() or not src.is_contiguous():
@@ -469,7 +487,10 @@ def multi_layer_kv_transfer(
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
-    valid_pairs = list(zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True))
+    valid_pairs = tuple(
+        (int(token_idx.item()), int(slot_idx.item()))
+        for token_idx, slot_idx in zip(valid_tokens, valid_slots, strict=True)
+    )
 
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
@@ -639,7 +660,10 @@ def multi_layer_kv_transfer_unilateral(
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
-    valid_pairs = list(zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True))
+    valid_pairs = tuple(
+        (int(token_idx.item()), int(slot_idx.item()))
+        for token_idx, slot_idx in zip(valid_tokens, valid_slots, strict=True)
+    )
 
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
