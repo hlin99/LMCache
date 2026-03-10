@@ -478,85 +478,104 @@ def multi_layer_kv_transfer(
     gpu_kv_format: GPUKVFormat,
     block_size: int,
 ):
+    """
+    Fully vectorized Python fallback for multi_layer_kv_transfer.
+    Eliminates ALL token- and KV-level Python loops.
+    """
     if not isinstance(key_value_ptrs, (torch.Tensor, list)):
-        raise TypeError(f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}")
+        raise TypeError(
+            f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
+        )
 
+    # 1. Filter out invalid slots and obtain a clean 1-D index tensor.
+    slots = slot_mapping.to(dtype=torch.long)
+    valid_mask = slots >= 0
+    if not valid_mask.any():
+        return
+
+    valid_slots = slots[valid_mask]
+
+    # 2. Determine architecture variant and tensor dimensions.
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
     )
-    
+    is_flash_infer = gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS
+
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
-    k_or_v_size = 1 if is_mla else 2
-    
-    slots = slot_mapping.to(dtype=torch.long)
-    valid_mask = slots >= 0
-    if not torch.any(valid_mask):
-        return
-        
-    valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
-    valid_slots = slots[valid_tokens]
-    valid_pairs = tuple(
-        (int(token_idx.item()), int(slot_idx.item()))
-        for token_idx, slot_idx in zip(valid_tokens, valid_slots, strict=True)
-    )
 
-    row_nbytes = hidden_size * key_value.element_size()
+    # For the flash_infer interleaved layout, pre-compute block-level indices.
+    if is_flash_infer:
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
 
+    # Determine the physical shape of the underlying paged tensor
+    # (used when wrapping a raw pointer).
+    if is_mla:
+        layer_shape = (page_buffer_size, hidden_size)
+    elif is_flash_infer:
+        num_blocks = page_buffer_size // block_size
+        layer_shape = (num_blocks, 2, block_size, hidden_size)
+    else:
+        layer_shape = (2, page_buffer_size, hidden_size)
+
+    # 3. Iterate over layers — the only remaining Python-level loop.
     for layer_id in range(num_layers):
-        
-        # Merge redundant loops for all non-MLA formats
-        if gpu_kv_format in (
-            GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-            GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
-            GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
-            GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
-        ):
-            for token_idx, slot_idx in valid_pairs:
-                for kv_idx in range(k_or_v_size):
-                    paged_row = _get_multi_layer_paged_row(
-                        key_value_ptrs, layer_id, kv_idx, slot_idx,
-                        page_buffer_size, hidden_size, key_value.dtype,
-                        gpu_kv_format, block_size,
-                    )
-                    
-                    if direction == TransferDirection.H2D:
-                        _copy_hidden_row_async(
-                            paged_row, key_value[kv_idx, layer_id, token_idx],
-                            row_nbytes, direction,
-                        )
-                    else:
-                        _copy_hidden_row_async(
-                            key_value[kv_idx, layer_id, token_idx], paged_row,
-                            row_nbytes, direction,
-                        )
 
-        # MLA formats (kv_idx is fixed to 0)
-        elif gpu_kv_format in (
-            GPUKVFormat.NL_X_NB_BS_HS,
-            GPUKVFormat.NL_X_NBBS_ONE_HS,
-        ):
-            for token_idx, slot_idx in valid_pairs:
-                paged_row = _get_multi_layer_paged_row(
-                    key_value_ptrs, layer_id, 0, slot_idx,
-                    page_buffer_size, hidden_size, key_value.dtype,
-                    gpu_kv_format, block_size,
-                )
-                
-                if direction == TransferDirection.H2D:
-                    _copy_hidden_row_async(
-                        paged_row, key_value[0, layer_id, token_idx],
-                        row_nbytes, direction,
-                    )
-                else:
-                    _copy_hidden_row_async(
-                        key_value[0, layer_id, token_idx], paged_row,
-                        row_nbytes, direction,
-                    )
+        # --- A. Obtain the physical device-memory view for this layer. ---
+        if isinstance(key_value_ptrs, list):
+            paged_tensor = key_value_ptrs[layer_id]
+        else:
+            ptr = int(key_value_ptrs[layer_id].item())
+            # Convert a raw device pointer into a PyTorch tensor view.
+            paged_tensor = _tensor_from_ptr(
+                ptr, layer_shape, key_value.dtype, paged_memory_device
+            )
+
+        # --- B. Vectorized bulk data transfer. ---
+        if is_mla:
+            # Paged layout : [page_buffer_size, hidden_size]
+            # LMCache source (MLA has a single merged head, so dim-0 is indexed
+            # with 0 directly): [num_valid, hidden_size]
+            lmc_valid = key_value[0, layer_id, valid_mask, :]
+
+            if direction == TransferDirection.H2D:
+                # LMCache -> GPU (scatter into paged memory)
+                paged_tensor.index_copy_(0, valid_slots, lmc_valid)
+            else:
+                # GPU -> LMCache (gather from paged memory)
+                gathered = paged_tensor.index_select(0, valid_slots)
+                key_value[0, layer_id, valid_mask, :] = gathered
+
+        elif is_flash_infer:
+            # Paged layout : [num_blocks, 2, block_size, hidden_size]
+            # LMCache source: [2, num_valid, hidden_size]
+            lmc_valid = key_value[:, layer_id, valid_mask, :]
+
+            if direction == TransferDirection.H2D:
+                # Transpose so the shape becomes [num_valid, 2, hidden_size],
+                # matching the advanced-indexing slice of paged_tensor.
+                src_data = lmc_valid.transpose(0, 1)
+                # Multi-dimensional scatter — guaranteed in-place write.
+                paged_tensor[block_indices, :, block_offsets, :] = src_data
+            else:
+                # Multi-dimensional gather.
+                gathered = paged_tensor[block_indices, :, block_offsets, :]
+                key_value[:, layer_id, valid_mask, :] = gathered.transpose(0, 1)
 
         else:
-            raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+            # Paged layout : [2, page_buffer_size, hidden_size]
+            # LMCache source: [2, num_valid, hidden_size]
+            lmc_valid = key_value[:, layer_id, valid_mask, :]
+
+            if direction == TransferDirection.H2D:
+                # Batch scatter along dim=1 (the page_buffer_size dimension).
+                paged_tensor.index_copy_(1, valid_slots, lmc_valid)
+            else:
+                gathered = paged_tensor.index_select(1, valid_slots)
+                key_value[:, layer_id, valid_mask, :] = gathered
+
 
 def multi_layer_kv_transfer_unilateral(
     key_value: torch.Tensor,
