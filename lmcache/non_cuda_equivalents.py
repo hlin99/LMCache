@@ -681,7 +681,8 @@ def single_layer_kv_transfer(
     token_major: bool,
 ):
     """
-    Fully vectorized Python fallback for single_layer_kv_transfer.
+    Vectorized Python fallback for single_layer_kv_transfer
+    (eliminates per-token loops).
 
     Transfers KV data between LMCache buffer
     and a single vLLM paged KV cache layer.
@@ -709,8 +710,8 @@ def single_layer_kv_transfer(
     if not valid_mask.any():
         return
 
-    valid_token_idx = torch.nonzero(valid_mask, as_tuple=True)[0]
-    valid_slots = slots[valid_token_idx]
+    valid_token_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+    valid_slots = slots[valid_token_indices]
 
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
@@ -727,13 +728,13 @@ def single_layer_kv_transfer(
 
         if direction == TransferDirection.D2H:
             # vLLM -> LMCache
-            lmc_key_value_cache[valid_token_idx] = vllm_key_value_cache[
+            lmc_key_value_cache[valid_token_indices] = vllm_key_value_cache[
                 block_indices, block_offsets
             ]
         else:
             # LMCache -> vLLM
             vllm_key_value_cache[block_indices, block_offsets] = lmc_key_value_cache[
-                valid_token_idx
+                valid_token_indices
             ]
 
     else:
@@ -761,14 +762,14 @@ def single_layer_kv_transfer(
 
                 gathered_flat = gathered.reshape(-1, num_heads * head_size)
                 if token_major:
-                    lmc_key_value_cache[valid_token_idx, kv] = gathered_flat
+                    lmc_key_value_cache[valid_token_indices, kv] = gathered_flat
                 else:
-                    lmc_key_value_cache[kv, valid_token_idx] = gathered_flat
+                    lmc_key_value_cache[kv, valid_token_indices] = gathered_flat
             else:
                 if token_major:
-                    lmc_src = lmc_key_value_cache[valid_token_idx, kv]
+                    lmc_src = lmc_key_value_cache[valid_token_indices, kv]
                 else:
-                    lmc_src = lmc_key_value_cache[kv, valid_token_idx]
+                    lmc_src = lmc_key_value_cache[kv, valid_token_indices]
                 lmc_reshaped = lmc_src.reshape(-1, num_heads, head_size)
 
                 if is_two_major:

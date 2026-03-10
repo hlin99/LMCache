@@ -1850,7 +1850,7 @@ def test_single_layer_kv_transfer_skips_invalid_slots(
     gpu_kv_format: _py_ops.GPUKVFormat,
     token_major: bool,
 ) -> None:
-    """Ensure invalid (-1) slot mappings are ignored for both transfer directions."""
+    """Ensure invalid (-1) slots are ignored for D2H/H2D in MLA and non-MLA."""
     slot_mapping = torch.tensor([0, -1, 3, -1], dtype=torch.int64)
     valid_mask = slot_mapping >= 0
 
