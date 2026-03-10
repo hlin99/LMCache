@@ -524,29 +524,36 @@ def _materialize_paged_buffers(
         data from the corresponding raw pointer.
     """
     tensors: list[torch.Tensor] = []
+
+    # Pre-configure cudaMemcpy for the CUDA path (done once, not per buffer).
+    _cuda_memcpy_fn = None
+    if device.type == "cuda":
+        libcudart = _get_copy_lib()
+        if libcudart is None:
+            raise RuntimeError(
+                "Cannot materialize CUDA buffer: libcudart not found"
+            )
+        _cuda_memcpy_fn = libcudart.cudaMemcpy
+        _cuda_memcpy_fn.restype = ctypes.c_int
+        _cuda_memcpy_fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        torch.cuda.synchronize(device)
+
+    _MEMCPY_D2D = 3  # cudaMemcpyDeviceToDevice
+
     for i in range(num_buffers):
         ptr = int(key_value_ptrs[i].item())
         if device.type == "cuda":
+            assert _cuda_memcpy_fn is not None
             # Allocate a new GPU tensor and copy data from the raw
             # pointer via cudaMemcpy D2D – safe and reliable.
             dst = torch.empty(shape, dtype=dtype, device=device)
             total_bytes = dst.numel() * dst.element_size()
-            libcudart = _get_copy_lib()
-            if libcudart is None:
-                raise RuntimeError(
-                    "Cannot materialize CUDA buffer: libcudart not found"
-                )
-            cudaMemcpy = libcudart.cudaMemcpy
-            cudaMemcpy.restype = ctypes.c_int
-            cudaMemcpy.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_int,
-            ]
-            _MEMCPY_D2D = 3
-            torch.cuda.synchronize(device)
-            err = cudaMemcpy(
+            err = _cuda_memcpy_fn(
                 ctypes.c_void_p(dst.data_ptr()),
                 ctypes.c_void_p(ptr),
                 ctypes.c_size_t(total_bytes),
