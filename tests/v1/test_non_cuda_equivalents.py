@@ -64,9 +64,14 @@ def test_multi_layer_kv_transfer_pointer_mode_uses_memcpy(
     original_memcpy = _py_ops.lmcache_memcpy_async
     memcpy_calls: list[tuple[int, int, int, Any]] = []
 
-    def _recording_memcpy(dest: int, src: int, nbytes: int, direction: Any, *_: Any) -> None:
+    def _recording_memcpy(
+        dest: int, src: int, nbytes: int, direction: Any, *args: Any
+    ) -> None:
         memcpy_calls.append((dest, src, nbytes, direction))
-        original_memcpy(dest, src, nbytes, direction, 0, 1)
+        if args:
+            original_memcpy(dest, src, nbytes, direction, *args)
+        else:
+            original_memcpy(dest, src, nbytes, direction, 0, 1)
 
     monkeypatch.setattr(
         _py_ops,
@@ -124,9 +129,14 @@ def test_multi_layer_kv_transfer_unilateral_pointer_mode_uses_memcpy(
     original_memcpy = _py_ops.lmcache_memcpy_async
     memcpy_calls: list[tuple[int, int, int, Any]] = []
 
-    def _recording_memcpy(dest: int, src: int, nbytes: int, direction: Any, *_: Any) -> None:
+    def _recording_memcpy(
+        dest: int, src: int, nbytes: int, direction: Any, *args: Any
+    ) -> None:
         memcpy_calls.append((dest, src, nbytes, direction))
-        original_memcpy(dest, src, nbytes, direction, 0, 1)
+        if args:
+            original_memcpy(dest, src, nbytes, direction, *args)
+        else:
+            original_memcpy(dest, src, nbytes, direction, 0, 1)
 
     monkeypatch.setattr(
         _py_ops,
