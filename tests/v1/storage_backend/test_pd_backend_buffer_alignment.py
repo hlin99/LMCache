@@ -66,7 +66,9 @@ def test_buffer_size_alignment_cpu():
     )
 
     # Calculate the expected aligned size
-    expected_aligned_size = (origin_buffer_size // expected_chunk_size) * expected_chunk_size
+    expected_aligned_size = (
+        origin_buffer_size // expected_chunk_size
+    ) * expected_chunk_size
 
     # This should NOT raise an assertion error anymore
     # The buffer size should be automatically aligned
