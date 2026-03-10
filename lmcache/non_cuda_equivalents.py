@@ -195,9 +195,6 @@ def _tensor_from_cuda_ptr(
         if is_bf16:
             t = t.view(torch.bfloat16)
         
-        logger.error(" 2  _tensor_from_cuda_ptr")
-        torch.cuda.synchronize()
-
         return t.view(*shape)
     except Exception as e:
         logger.debug(f"Strategy 2 (__cuda_array_interface__) failed: {e}")
@@ -224,8 +221,6 @@ def _tensor_from_cuda_ptr(
     )
     if err != 0:
         raise RuntimeError(f"cudaMemcpy D2D failed with error code {err}.")
-    logger.error(" 3  _tensor_from_cuda_ptr")
-
     return dst.view(*shape)
 
 
