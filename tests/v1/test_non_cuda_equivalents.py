@@ -1694,6 +1694,106 @@ def scenario_transfer_direction_enum(ops: Any, device: str) -> dict[str, torch.T
     }
 
 
+def test_multi_layer_kv_transfer_pointer_mode_uses_memcpy() -> None:
+    """Pointer mode should route through lmcache_memcpy_async, not _tensor_from_ptr."""
+    dtype = torch.float32
+    key_value = torch.arange(16, dtype=dtype).reshape(2, 1, 2, 4).contiguous()
+    slot_mapping = torch.tensor([1, 3], dtype=torch.int64)
+    page_buffer_size = 6
+    paged = torch.zeros((2, page_buffer_size, 4), dtype=dtype).contiguous()
+    key_value_ptrs = torch.tensor([paged.data_ptr()], dtype=torch.int64)
+
+    copy_calls: list[tuple[int, int, int]] = []
+
+    def _fake_memcpy_async(
+        dest: int | torch.Tensor,
+        src: int | torch.Tensor,
+        nbytes: int,
+        direction: Any,
+        host_buffer_offset: int,
+        host_buffer_alignments: int,
+    ) -> None:
+        assert isinstance(dest, int)
+        assert isinstance(src, int)
+        copy_calls.append((dest, src, nbytes))
+        _py_ops._copy_bytes_with_tensor(dest, src, nbytes)
+
+    with unittest.mock.patch.object(
+        _py_ops, "lmcache_memcpy_async", side_effect=_fake_memcpy_async
+    ), unittest.mock.patch.object(
+        _py_ops,
+        "_tensor_from_ptr",
+        side_effect=AssertionError(
+            "_tensor_from_ptr should not be used in pointer mode"
+        ),
+    ):
+        _py_ops.multi_layer_kv_transfer(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            _py_ops.TransferDirection.H2D,
+            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            1,
+        )
+
+    assert copy_calls, "Expected pointer mode to perform memcpy calls"
+    torch.testing.assert_close(paged[:, slot_mapping], key_value[:, 0])
+
+
+def test_multi_layer_kv_transfer_unilateral_pointer_mode_uses_memcpy() -> None:
+    """Unilateral pointer mode should route through lmcache_memcpy_async."""
+    dtype = torch.float32
+    key_value = torch.arange(16, dtype=dtype).reshape(2, 1, 2, 4).contiguous()
+    slot_mapping = torch.tensor([0, 2], dtype=torch.int64)
+    page_buffer_size = 5
+    k_buf = torch.zeros((page_buffer_size, 4), dtype=dtype).contiguous()
+    v_buf = torch.zeros((page_buffer_size, 4), dtype=dtype).contiguous()
+    key_value_ptrs = torch.tensor(
+        [k_buf.data_ptr(), v_buf.data_ptr()],
+        dtype=torch.int64,
+    )
+
+    copy_calls: list[tuple[int, int, int]] = []
+
+    def _fake_memcpy_async(
+        dest: int | torch.Tensor,
+        src: int | torch.Tensor,
+        nbytes: int,
+        direction: Any,
+        host_buffer_offset: int,
+        host_buffer_alignments: int,
+    ) -> None:
+        assert isinstance(dest, int)
+        assert isinstance(src, int)
+        copy_calls.append((dest, src, nbytes))
+        _py_ops._copy_bytes_with_tensor(dest, src, nbytes)
+
+    with unittest.mock.patch.object(
+        _py_ops, "lmcache_memcpy_async", side_effect=_fake_memcpy_async
+    ), unittest.mock.patch.object(
+        _py_ops,
+        "_tensor_from_ptr",
+        side_effect=AssertionError(
+            "_tensor_from_ptr should not be used in pointer mode"
+        ),
+    ):
+        _py_ops.multi_layer_kv_transfer_unilateral(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            _py_ops.TransferDirection.H2D,
+            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        )
+
+    assert copy_calls, "Expected pointer mode to perform memcpy calls"
+    torch.testing.assert_close(k_buf[slot_mapping], key_value[0, 0])
+    torch.testing.assert_close(v_buf[slot_mapping], key_value[1, 0])
+
+
 # ==========================================
 # 3. Registry
 # ==========================================

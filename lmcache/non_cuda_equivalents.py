@@ -440,8 +440,6 @@ def multi_layer_kv_transfer(
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
     k_or_v_size = 1 if is_mla else 2
-    device = key_value.device
-
     slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
     if not torch.any(valid_mask):
@@ -449,51 +447,78 @@ def multi_layer_kv_transfer(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
+    token_slot_pairs = list(
+        zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True)
+    )
+
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
+        row_nbytes = hidden_size * key_value.element_size()
 
     for layer_id in range(num_layers):
-        # Get the paged buffer for this layer
+        if not use_tensor_mode:
+            paged_ptr = int(ptr_list[layer_id])
+            for token_idx, slot_idx in token_slot_pairs:
+                if gpu_kv_format in (
+                    GPUKVFormat.NB_NL_TWO_BS_NH_HS,
+                    GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+                    GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
+                ):
+                    for kv_idx in range(k_or_v_size):
+                        lmc_ptr = int(key_value[kv_idx, layer_id, token_idx].data_ptr())
+                        slot_ptr = paged_ptr + (
+                            (kv_idx * page_buffer_size + slot_idx) * row_nbytes
+                        )
+                        if direction == TransferDirection.H2D:
+                            lmcache_memcpy_async(
+                                slot_ptr, lmc_ptr, row_nbytes, direction, 0, 1
+                            )
+                        else:
+                            lmcache_memcpy_async(
+                                lmc_ptr, slot_ptr, row_nbytes, direction, 0, 1
+                            )
+                elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+                    block_idx = slot_idx // block_size
+                    block_offset = slot_idx % block_size
+                    for kv_idx in range(k_or_v_size):
+                        lmc_ptr = int(key_value[kv_idx, layer_id, token_idx].data_ptr())
+                        slot_ptr = paged_ptr + (
+                            ((block_idx * 2 + kv_idx) * block_size + block_offset)
+                            * row_nbytes
+                        )
+                        if direction == TransferDirection.H2D:
+                            lmcache_memcpy_async(
+                                slot_ptr, lmc_ptr, row_nbytes, direction, 0, 1
+                            )
+                        else:
+                            lmcache_memcpy_async(
+                                lmc_ptr, slot_ptr, row_nbytes, direction, 0, 1
+                            )
+                elif gpu_kv_format in (
+                    GPUKVFormat.NL_X_NB_BS_HS,
+                    GPUKVFormat.NL_X_NBBS_ONE_HS,
+                ):
+                    lmc_ptr = int(key_value[0, layer_id, token_idx].data_ptr())
+                    slot_ptr = paged_ptr + slot_idx * row_nbytes
+                    if direction == TransferDirection.H2D:
+                        lmcache_memcpy_async(
+                            slot_ptr, lmc_ptr, row_nbytes, direction, 0, 1
+                        )
+                    else:
+                        lmcache_memcpy_async(
+                            lmc_ptr, slot_ptr, row_nbytes, direction, 0, 1
+                        )
+                else:
+                    raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+            continue
+
+        # Tensor-list mode only
         if use_tensor_mode:
             # Direct tensor mode: use the tensor object directly
             paged = key_value_ptrs[layer_id]
-        else:
-            # Pointer mode: create tensor view from pointer
-            paged_ptr = int(ptr_list[layer_id])
-
-            if gpu_kv_format in (
-                GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-                GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
-                GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
-            ):
-                paged = _tensor_from_ptr(
-                    paged_ptr,
-                    (k_or_v_size, page_buffer_size, hidden_size),
-                    key_value.dtype,
-                    device,
-                )
-            elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-                num_blocks = max(
-                    int(torch.max(valid_slots).item() // block_size + 1), 1
-                )
-                paged = _tensor_from_ptr(
-                    paged_ptr,
-                    (num_blocks, 2, block_size, hidden_size),
-                    key_value.dtype,
-                    device,
-                )
-            elif gpu_kv_format in (
-                GPUKVFormat.NL_X_NB_BS_HS,
-                GPUKVFormat.NL_X_NBBS_ONE_HS,
-            ):
-                paged = _tensor_from_ptr(
-                    paged_ptr, (page_buffer_size, hidden_size), key_value.dtype, device
-                )
-            else:
-                raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
 
         # Perform the transfer based on format
         if gpu_kv_format in (
@@ -562,8 +587,6 @@ def multi_layer_kv_transfer_unilateral(
         H2D = LMCache  -> PagedBuffer
         D2H = PagedBuffer -> LMCache
     """
-    device = key_value.device
-
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
@@ -594,29 +617,47 @@ def multi_layer_kv_transfer_unilateral(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
+    token_slot_pairs = list(
+        zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True)
+    )
+
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
     if not use_tensor_mode:
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
+        row_nbytes = hidden_size * key_value.element_size()
 
     for layer_id in range(num_layers):
-        # Get K and V buffers for this layer
+        if not use_tensor_mode:
+            k_ptr = int(ptr_list[layer_id])
+            v_ptr = int(ptr_list[layer_id + num_layers])
+            for token_idx, slot_idx in token_slot_pairs:
+                lmc_k_ptr = int(key_value[0, layer_id, token_idx].data_ptr())
+                lmc_v_ptr = int(key_value[1, layer_id, token_idx].data_ptr())
+                slot_k_ptr = k_ptr + slot_idx * row_nbytes
+                slot_v_ptr = v_ptr + slot_idx * row_nbytes
+                if direction == TransferDirection.H2D:
+                    lmcache_memcpy_async(
+                        slot_k_ptr, lmc_k_ptr, row_nbytes, direction, 0, 1
+                    )
+                    lmcache_memcpy_async(
+                        slot_v_ptr, lmc_v_ptr, row_nbytes, direction, 0, 1
+                    )
+                else:
+                    lmcache_memcpy_async(
+                        lmc_k_ptr, slot_k_ptr, row_nbytes, direction, 0, 1
+                    )
+                    lmcache_memcpy_async(
+                        lmc_v_ptr, slot_v_ptr, row_nbytes, direction, 0, 1
+                    )
+            continue
+
+        # Tensor-list mode only
         if use_tensor_mode:
             # Direct tensor mode: use the tensor objects directly
             k_buf = key_value_ptrs[layer_id]
             v_buf = key_value_ptrs[layer_id + num_layers]
-        else:
-            # Pointer mode: create tensor views from pointers
-            k_ptr = int(ptr_list[layer_id])
-            v_ptr = int(ptr_list[layer_id + num_layers])
-
-            k_buf = _tensor_from_ptr(
-                k_ptr, (page_buffer_size, hidden_size), key_value.dtype, device
-            )
-            v_buf = _tensor_from_ptr(
-                v_ptr, (page_buffer_size, hidden_size), key_value.dtype, device
-            )
 
         if direction == TransferDirection.H2D:
             k_buf[valid_slots] = key_value[0, layer_id, valid_tokens]
