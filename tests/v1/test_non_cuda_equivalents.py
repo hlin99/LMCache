@@ -1838,6 +1838,138 @@ class TestScenarios:
                         )
 
 
+@pytest.mark.parametrize(
+    ("gpu_kv_format", "token_major"),
+    [
+        (_py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS, True),
+        (_py_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS, False),
+        (_py_ops.GPUKVFormat.NL_X_NB_BS_HS, True),
+    ],
+)
+def test_single_layer_kv_transfer_skips_invalid_slots(
+    gpu_kv_format: _py_ops.GPUKVFormat,
+    token_major: bool,
+) -> None:
+    """Ensure invalid (-1) slot mappings are ignored for both transfer directions."""
+    slot_mapping = torch.tensor([0, -1, 3, -1], dtype=torch.int64)
+    valid_mask = slot_mapping >= 0
+
+    num_tokens = slot_mapping.numel()
+    block_size = 2
+    num_blocks = 3
+    num_heads = 2
+    head_size = 3
+    hidden_size = num_heads * head_size
+
+    is_mla = gpu_kv_format == _py_ops.GPUKVFormat.NL_X_NB_BS_HS
+
+    if is_mla:
+        lmc_d2h = torch.full((num_tokens, hidden_size), -1.0)
+        vllm_src = torch.arange(
+            num_blocks * block_size * hidden_size, dtype=torch.float32
+        ).view(num_blocks, block_size, hidden_size)
+
+        _py_ops.single_layer_kv_transfer(
+            lmc_d2h,
+            vllm_src,
+            slot_mapping,
+            _py_ops.TransferDirection.D2H,
+            gpu_kv_format,
+            token_major,
+        )
+
+        block_indices = slot_mapping[valid_mask] // block_size
+        block_offsets = slot_mapping[valid_mask] % block_size
+        expected_d2h = torch.full_like(lmc_d2h, -1.0)
+        expected_d2h[valid_mask] = vllm_src[block_indices, block_offsets]
+        torch.testing.assert_close(lmc_d2h, expected_d2h)
+
+        lmc_h2d = torch.arange(num_tokens * hidden_size, dtype=torch.float32).view(
+            num_tokens, hidden_size
+        )
+        vllm_h2d = torch.full_like(vllm_src, -2.0)
+        _py_ops.single_layer_kv_transfer(
+            lmc_h2d,
+            vllm_h2d,
+            slot_mapping,
+            _py_ops.TransferDirection.H2D,
+            gpu_kv_format,
+            token_major,
+        )
+        expected_h2d = torch.full_like(vllm_src, -2.0)
+        expected_h2d[block_indices, block_offsets] = lmc_h2d[valid_mask]
+        torch.testing.assert_close(vllm_h2d, expected_h2d)
+        return
+
+    if gpu_kv_format == _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+        vllm_template = torch.arange(
+            2 * num_blocks * block_size * num_heads * head_size,
+            dtype=torch.float32,
+        ).view(2, num_blocks, block_size, num_heads, head_size)
+    else:
+        vllm_template = torch.arange(
+            num_blocks * 2 * block_size * num_heads * head_size,
+            dtype=torch.float32,
+        ).view(num_blocks, 2, block_size, num_heads, head_size)
+
+    lmc_shape = (
+        (num_tokens, 2, hidden_size) if token_major else (2, num_tokens, hidden_size)
+    )
+
+    lmc_d2h = torch.full(lmc_shape, -1.0)
+    _py_ops.single_layer_kv_transfer(
+        lmc_d2h,
+        vllm_template.clone(),
+        slot_mapping,
+        _py_ops.TransferDirection.D2H,
+        gpu_kv_format,
+        token_major,
+    )
+
+    block_indices = slot_mapping[valid_mask] // block_size
+    block_offsets = slot_mapping[valid_mask] % block_size
+    expected_d2h = torch.full(lmc_shape, -1.0)
+
+    if gpu_kv_format == _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+        k = vllm_template[0, block_indices, block_offsets].reshape(-1, hidden_size)
+        v = vllm_template[1, block_indices, block_offsets].reshape(-1, hidden_size)
+    else:
+        k = vllm_template[block_indices, 0, block_offsets].reshape(-1, hidden_size)
+        v = vllm_template[block_indices, 1, block_offsets].reshape(-1, hidden_size)
+
+    if token_major:
+        expected_d2h[valid_mask, 0] = k
+        expected_d2h[valid_mask, 1] = v
+    else:
+        expected_d2h[0, valid_mask] = k
+        expected_d2h[1, valid_mask] = v
+    torch.testing.assert_close(lmc_d2h, expected_d2h)
+
+    lmc_h2d = torch.arange(2 * num_tokens * hidden_size, dtype=torch.float32).view(
+        lmc_shape
+    )
+    vllm_h2d = torch.full_like(vllm_template, -2.0)
+    _py_ops.single_layer_kv_transfer(
+        lmc_h2d,
+        vllm_h2d,
+        slot_mapping,
+        _py_ops.TransferDirection.H2D,
+        gpu_kv_format,
+        token_major,
+    )
+
+    expected_h2d = torch.full_like(vllm_template, -2.0)
+    src = lmc_h2d if token_major else lmc_h2d.permute(1, 0, 2)
+    src = src[valid_mask].reshape(-1, 2, num_heads, head_size)
+    if gpu_kv_format == _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+        expected_h2d[0, block_indices, block_offsets] = src[:, 0]
+        expected_h2d[1, block_indices, block_offsets] = src[:, 1]
+    else:
+        expected_h2d[block_indices, 0, block_offsets] = src[:, 0]
+        expected_h2d[block_indices, 1, block_offsets] = src[:, 1]
+    torch.testing.assert_close(vllm_h2d, expected_h2d)
+
+
 def _uses_mixed_pointer_tensor_operands(call: unittest.mock._Call) -> bool:
     """Return whether a memcpy spy call used one pointer and one tensor operand."""
     return isinstance(call.args[0], int) != isinstance(call.args[1], int)
