@@ -264,6 +264,85 @@ def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
     dst_tensor.copy_(src_tensor)
 
 
+_CUDA_MEMCPY_DEFAULT = (
+    4  # cudaMemcpyDefault enum value from CUDA Runtime API (cuda_runtime_api.h)
+)
+_cuda_memcpy_fn: Optional[Any] = None
+
+
+def _get_cuda_memcpy() -> Optional[Any]:
+    """Return a cached cudaMemcpy function pointer with signatures set.
+
+    Returns:
+        A callable cudaMemcpy function pointer, or ``None`` if libcudart is not
+        available or does not expose cudaMemcpy.
+    """
+    global _cuda_memcpy_fn
+    if _cuda_memcpy_fn is not None:
+        return _cuda_memcpy_fn
+
+    libcudart = _get_copy_lib()
+    if libcudart is None or not hasattr(libcudart, "cudaMemcpy"):
+        return None
+
+    fn = libcudart.cudaMemcpy
+    fn.restype = ctypes.c_int
+    fn.argtypes = [
+        ctypes.c_void_p,  # dst
+        ctypes.c_void_p,  # src
+        ctypes.c_size_t,  # count
+        ctypes.c_int,  # kind
+    ]
+    _cuda_memcpy_fn = fn
+    return _cuda_memcpy_fn
+
+
+def _cuda_memcpy_default(dst: int, src: int, num_bytes: int) -> None:
+    """Copy raw bytes with cudaMemcpyDefault, falling back to CPU tensor copy.
+
+    When libcudart is not available the function silently uses
+    ``_copy_bytes_with_tensor`` to perform a host copy instead. Pointer
+    arguments must reference either CUDA or CPU (host) memory. The fallback path
+    is transparent to the caller but may have different performance
+    characteristics than cudaMemcpy, and it requires both pointers to be
+    CPU-accessible.
+
+    Raises:
+        RuntimeError: if cudaMemcpy returns a non-zero error code.
+
+    Args:
+        dst: Destination pointer address.
+        src: Source pointer address.
+        num_bytes: Number of bytes to copy.
+
+    Note:
+        If `num_bytes` is less than or equal to zero, the function returns
+        immediately without performing any copy.
+    """
+    if num_bytes <= 0:
+        return
+
+    cuda_memcpy_fn = _get_cuda_memcpy()
+    if cuda_memcpy_fn is not None:
+        ret = cuda_memcpy_fn(
+            ctypes.c_void_p(dst),
+            ctypes.c_void_p(src),
+            ctypes.c_size_t(num_bytes),
+            ctypes.c_int(_CUDA_MEMCPY_DEFAULT),  # cudaMemcpyDefault
+        )
+        if ret != 0:
+            raise RuntimeError(
+                f"cudaMemcpy failed with error code {ret} "
+                f"(dst=0x{dst:x}, src=0x{src:x}, bytes={num_bytes}); "
+                "refer to CUDA cudaMemcpy error codes (e.g., 1 = "
+                "cudaErrorInvalidValue) for details."
+            )
+        return
+
+    # Fallback: host copy
+    _copy_bytes_with_tensor(dst, src, num_bytes)
+
+
 class TransferDirection(Enum):
     H2D = 0
     D2H = 1
@@ -448,52 +527,55 @@ def multi_layer_kv_transfer(
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
+    valid_tokens_list = valid_tokens.tolist()
+    valid_slots_list = valid_slots.tolist()
 
     # Handle both tensor (pointer) mode and list (tensor) mode
-    use_tensor_mode = isinstance(key_value_ptrs, list)
-    if not use_tensor_mode:
+    use_tensor_list = isinstance(key_value_ptrs, list)
+    if not use_tensor_list:
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
+        bytes_per_token = hidden_size * key_value.element_size()
+
+        for layer_id in range(num_layers):
+            base_ptr = int(ptr_list[layer_id])
+
+            for token_idx, slot in zip(valid_tokens_list, valid_slots_list):
+                for kv in range(k_or_v_size):
+                    lmc_tensor = key_value[kv, layer_id, token_idx]
+                    lmc_ptr = int(lmc_tensor.data_ptr())
+
+                    if gpu_kv_format in (
+                        GPUKVFormat.NB_NL_TWO_BS_NH_HS,
+                        GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+                        GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
+                    ):
+                        paged_offset = (kv * page_buffer_size + slot) * hidden_size
+                    elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+                        blk_idx = slot // block_size
+                        blk_off = slot % block_size
+                        paged_offset = (
+                            ((blk_idx * 2 + kv) * block_size + blk_off) * hidden_size
+                        )
+                    elif gpu_kv_format in (
+                        GPUKVFormat.NL_X_NB_BS_HS,
+                        GPUKVFormat.NL_X_NBBS_ONE_HS,
+                    ):
+                        paged_offset = slot * hidden_size
+                    else:
+                        raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+
+                    paged_ptr = base_ptr + paged_offset * key_value.element_size()
+
+                    if direction == TransferDirection.H2D:
+                        _cuda_memcpy_default(paged_ptr, lmc_ptr, bytes_per_token)
+                    else:
+                        _cuda_memcpy_default(lmc_ptr, paged_ptr, bytes_per_token)
+        return
 
     for layer_id in range(num_layers):
-        # Get the paged buffer for this layer
-        if use_tensor_mode:
-            # Direct tensor mode: use the tensor object directly
-            paged = key_value_ptrs[layer_id]
-        else:
-            # Pointer mode: create tensor view from pointer
-            paged_ptr = int(ptr_list[layer_id])
-
-            if gpu_kv_format in (
-                GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-                GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
-                GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
-            ):
-                paged = _tensor_from_ptr(
-                    paged_ptr,
-                    (k_or_v_size, page_buffer_size, hidden_size),
-                    key_value.dtype,
-                    device,
-                )
-            elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-                num_blocks = max(
-                    int(torch.max(valid_slots).item() // block_size + 1), 1
-                )
-                paged = _tensor_from_ptr(
-                    paged_ptr,
-                    (num_blocks, 2, block_size, hidden_size),
-                    key_value.dtype,
-                    device,
-                )
-            elif gpu_kv_format in (
-                GPUKVFormat.NL_X_NB_BS_HS,
-                GPUKVFormat.NL_X_NBBS_ONE_HS,
-            ):
-                paged = _tensor_from_ptr(
-                    paged_ptr, (page_buffer_size, hidden_size), key_value.dtype, device
-                )
-            else:
-                raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+        # Direct tensor mode: use the tensor object directly
+        paged = key_value_ptrs[layer_id]
 
         # Perform the transfer based on format
         if gpu_kv_format in (
@@ -593,30 +675,41 @@ def multi_layer_kv_transfer_unilateral(
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
+    valid_tokens_list = valid_tokens.tolist()
+    valid_slots_list = valid_slots.tolist()
 
     # Handle both tensor (pointer) mode and list (tensor) mode
-    use_tensor_mode = isinstance(key_value_ptrs, list)
-    if not use_tensor_mode:
+    use_tensor_list = isinstance(key_value_ptrs, list)
+    if not use_tensor_list:
         assert isinstance(key_value_ptrs, torch.Tensor)
         ptr_list = key_value_ptrs.tolist()
+        bytes_per_token = hidden_size * key_value.element_size()
+
+        for layer_id in range(num_layers):
+            k_base = int(ptr_list[layer_id])
+            v_base = int(ptr_list[layer_id + num_layers])
+
+            for token_idx, slot in zip(valid_tokens_list, valid_slots_list):
+                src_k = key_value[0, layer_id, token_idx]
+                src_v = key_value[1, layer_id, token_idx]
+
+                paged_k_ptr = k_base + slot * hidden_size * key_value.element_size()
+                paged_v_ptr = v_base + slot * hidden_size * key_value.element_size()
+                lmc_k_ptr = int(src_k.data_ptr())
+                lmc_v_ptr = int(src_v.data_ptr())
+
+                if direction == TransferDirection.H2D:
+                    _cuda_memcpy_default(paged_k_ptr, lmc_k_ptr, bytes_per_token)
+                    _cuda_memcpy_default(paged_v_ptr, lmc_v_ptr, bytes_per_token)
+                else:
+                    _cuda_memcpy_default(lmc_k_ptr, paged_k_ptr, bytes_per_token)
+                    _cuda_memcpy_default(lmc_v_ptr, paged_v_ptr, bytes_per_token)
+        return
 
     for layer_id in range(num_layers):
-        # Get K and V buffers for this layer
-        if use_tensor_mode:
-            # Direct tensor mode: use the tensor objects directly
-            k_buf = key_value_ptrs[layer_id]
-            v_buf = key_value_ptrs[layer_id + num_layers]
-        else:
-            # Pointer mode: create tensor views from pointers
-            k_ptr = int(ptr_list[layer_id])
-            v_ptr = int(ptr_list[layer_id + num_layers])
-
-            k_buf = _tensor_from_ptr(
-                k_ptr, (page_buffer_size, hidden_size), key_value.dtype, device
-            )
-            v_buf = _tensor_from_ptr(
-                v_ptr, (page_buffer_size, hidden_size), key_value.dtype, device
-            )
+        # Direct tensor mode: use the tensor objects directly
+        k_buf = key_value_ptrs[layer_id]
+        v_buf = key_value_ptrs[layer_id + num_layers]
 
         if direction == TransferDirection.H2D:
             k_buf[valid_slots] = key_value[0, layer_id, valid_tokens]
