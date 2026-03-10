@@ -4,8 +4,11 @@
 # CUDA-specific operations.
 #
 # Standard
+from enum import Enum, IntEnum
 from multiprocessing import shared_memory
+from typing import Sequence
 import ctypes
+import ctypes.util
 
 # Third Party
 import torch
@@ -15,6 +18,61 @@ import torch
 _tensor_registry: dict[int, torch.Tensor] = {}
 _shm_registry: dict[int, shared_memory.SharedMemory] = {}
 _buf_registry: dict[int, ctypes.Array] = {}
+
+_copy_lib_not_loaded = object()
+_copy_lib: ctypes.CDLL | None | object = _copy_lib_not_loaded
+
+
+class TransferDirection(Enum):
+    H2D = 0
+    D2H = 1
+
+
+class GPUKVFormat(IntEnum):
+    NB_NL_TWO_BS_NH_HS = 0
+    NL_X_TWO_NB_BS_NH_HS = 1
+    NL_X_NB_TWO_BS_NH_HS = 2
+    NL_X_NB_BS_HS = 3
+    TWO_X_NL_X_NBBS_NH_HS = 4
+    NL_X_NBBS_ONE_HS = 5
+
+
+def _get_copy_lib() -> ctypes.CDLL | None:
+    global _copy_lib
+    if _copy_lib is _copy_lib_not_loaded:
+        try:
+            libcudart_path = ctypes.util.find_library("cudart")
+            _copy_lib = (
+                ctypes.CDLL(libcudart_path)
+                if libcudart_path
+                else ctypes.CDLL("libcudart.so")
+            )
+        except OSError:
+            _copy_lib = None
+    return _copy_lib
+
+
+def _cuda_memcpy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    if nbytes <= 0:
+        return
+
+    copy_lib = _get_copy_lib()
+    if copy_lib is None:
+        ctypes.memmove(dst_ptr, src_ptr, nbytes)
+        return
+
+    ret = copy_lib.cudaMemcpy(
+        ctypes.c_void_p(dst_ptr),
+        ctypes.c_void_p(src_ptr),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(4),  # cudaMemcpyDefault
+    )
+    if ret != 0:
+        raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
+
+
+def _is_pointer_seq(values: Sequence[object]) -> bool:
+    return all(isinstance(value, int) for value in values)
 
 
 def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
@@ -112,3 +170,149 @@ def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
     if shm is not None:
         shm.close()
         shm.unlink()
+
+
+def multi_layer_kv_transfer(
+    key_value: torch.Tensor,
+    key_value_ptrs: torch.Tensor | list[torch.Tensor] | list[int],
+    slot_mapping: torch.Tensor,
+    paged_memory_device: torch.device,
+    page_buffer_size: int,
+    direction: TransferDirection,
+    gpu_kv_format: GPUKVFormat,
+    block_size: int = 0,
+    skip_prefix_n_tokens: int = 0,
+) -> None:
+    del paged_memory_device
+    del skip_prefix_n_tokens
+    num_layers = key_value.size(1)
+    num_tokens = key_value.size(2)
+    hidden_size = key_value.size(3)
+    row_nbytes = hidden_size * key_value.element_size()
+
+    is_mla = gpu_kv_format in (
+        GPUKVFormat.NL_X_NB_BS_HS,
+        GPUKVFormat.NL_X_NBBS_ONE_HS,
+    )
+    kv_size = 1 if is_mla else 2
+
+    if isinstance(key_value_ptrs, torch.Tensor):
+        pointer_values = [int(ptr) for ptr in key_value_ptrs.tolist()]
+    elif isinstance(key_value_ptrs, list) and _is_pointer_seq(key_value_ptrs):
+        pointer_values = [int(ptr) for ptr in key_value_ptrs]
+    else:
+        pointer_values = None
+
+    if pointer_values is None:
+        raise TypeError(
+            "non-pointer key_value_ptrs are not supported in non-CUDA fallback"
+        )
+
+    base_ptr = key_value.data_ptr()
+
+    for token_idx in range(num_tokens):
+        slot_idx = int(slot_mapping[token_idx].item())
+        if slot_idx < 0:
+            continue
+        for layer_idx in range(num_layers):
+            layer_ptr = pointer_values[layer_idx]
+            for kv_idx in range(kv_size):
+                src_ptr: int
+                dst_ptr: int
+                lmc_offset = (
+                    ((kv_idx * num_layers + layer_idx) * num_tokens + token_idx)
+                    * row_nbytes
+                )
+                lmc_ptr = base_ptr + lmc_offset
+
+                if gpu_kv_format in (
+                    GPUKVFormat.NB_NL_TWO_BS_NH_HS,
+                    GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+                    GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
+                ):
+                    paged_ptr = layer_ptr + (
+                        (kv_idx * page_buffer_size + slot_idx) * row_nbytes
+                    )
+                elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+                    block_idx = slot_idx // block_size
+                    block_offset = slot_idx % block_size
+                    paged_ptr = layer_ptr + (
+                        ((block_idx * 2 + kv_idx) * block_size + block_offset)
+                        * row_nbytes
+                    )
+                elif gpu_kv_format in (
+                    GPUKVFormat.NL_X_NB_BS_HS,
+                    GPUKVFormat.NL_X_NBBS_ONE_HS,
+                ):
+                    paged_ptr = layer_ptr + slot_idx * row_nbytes
+                else:
+                    raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+
+                if direction == TransferDirection.H2D:
+                    src_ptr, dst_ptr = lmc_ptr, paged_ptr
+                else:
+                    src_ptr, dst_ptr = paged_ptr, lmc_ptr
+                _cuda_memcpy(dst_ptr, src_ptr, row_nbytes)
+
+
+def multi_layer_kv_transfer_unilateral(
+    key_value: torch.Tensor,
+    key_value_ptrs: torch.Tensor | list[torch.Tensor] | list[int],
+    slot_mapping: torch.Tensor,
+    paged_memory_device: torch.device,
+    page_buffer_size: int,
+    direction: TransferDirection,
+    gpu_kv_format: GPUKVFormat,
+) -> None:
+    if gpu_kv_format in (
+        GPUKVFormat.NL_X_NB_BS_HS,
+        GPUKVFormat.NL_X_NBBS_ONE_HS,
+    ):
+        multi_layer_kv_transfer(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            paged_memory_device,
+            page_buffer_size,
+            direction,
+            gpu_kv_format,
+        )
+        return
+
+    del paged_memory_device
+    num_layers = key_value.size(1)
+    num_tokens = key_value.size(2)
+    hidden_size = key_value.size(3)
+    row_nbytes = hidden_size * key_value.element_size()
+
+    if isinstance(key_value_ptrs, torch.Tensor):
+        pointer_values = [int(ptr) for ptr in key_value_ptrs.tolist()]
+    elif isinstance(key_value_ptrs, list) and _is_pointer_seq(key_value_ptrs):
+        pointer_values = [int(ptr) for ptr in key_value_ptrs]
+    else:
+        pointer_values = None
+
+    if pointer_values is None:
+        raise TypeError(
+            "non-pointer key_value_ptrs are not supported in non-CUDA fallback"
+        )
+
+    base_ptr = key_value.data_ptr()
+
+    for token_idx in range(num_tokens):
+        slot_idx = int(slot_mapping[token_idx].item())
+        if slot_idx < 0:
+            continue
+        for layer_idx in range(num_layers):
+            for kv_idx in range(2):
+                lmc_offset = (
+                    ((kv_idx * num_layers + layer_idx) * num_tokens + token_idx)
+                    * row_nbytes
+                )
+                lmc_ptr = base_ptr + lmc_offset
+                paged_base = pointer_values[layer_idx + kv_idx * num_layers]
+                paged_ptr = paged_base + slot_idx * row_nbytes
+                if direction == TransferDirection.H2D:
+                    _cuda_memcpy(paged_ptr, lmc_ptr, row_nbytes)
+                else:
+                    _cuda_memcpy(lmc_ptr, paged_ptr, row_nbytes)
