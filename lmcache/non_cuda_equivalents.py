@@ -164,7 +164,7 @@ def _tensor_from_cuda_ptr(
         pass
     '''
     # Strategy 2: __cuda_array_interface__ (Fixed & Working)
-    """
+ 
     try:
         _DTYPE_TO_TYPESTR = {
             torch.float16: "<f2",
@@ -196,12 +196,13 @@ def _tensor_from_cuda_ptr(
             t = t.view(torch.bfloat16)
         
         logger.error(" 2  _tensor_from_cuda_ptr")
+        torch.cuda.synchronize()
 
         return t.view(*shape)
     except Exception as e:
         logger.debug(f"Strategy 2 (__cuda_array_interface__) failed: {e}")
         pass
-    """
+    
     # Strategy 3: cudaMemcpy Device-to-Device (Fallback)
     libcudart = _get_copy_lib()
     if libcudart is None:
@@ -273,6 +274,7 @@ def _copy_hidden_row_async(
 
     # Perform the pure PyTorch memory copy
     dest_tensor.copy_(src_tensor)
+    torch.cuda.synchronize()
 
 
 def _get_multi_layer_paged_row(
@@ -575,7 +577,7 @@ def multi_layer_kv_transfer(
             else:
                 gathered = paged_tensor.index_select(1, valid_slots)
                 key_value[:, layer_id, valid_mask, :] = gathered
-
+        torch.cuda.synchronize()
 
 def multi_layer_kv_transfer_unilateral(
     key_value: torch.Tensor,
