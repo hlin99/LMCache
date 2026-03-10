@@ -443,7 +443,7 @@ def multi_layer_kv_transfer(
     device = key_value.device
 
     slots = slot_mapping.to(dtype=torch.long)
-    valid_mask = slots >= 0
+    valid_mask = (slots >= 0) & (slots < page_buffer_size)
     if not torch.any(valid_mask):
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
@@ -600,7 +600,7 @@ def multi_layer_kv_transfer_unilateral(
     hidden_size = key_value.size(3)
 
     slots = slot_mapping.to(dtype=torch.long)
-    valid_mask = slots >= 0
+    valid_mask = (slots >= 0) & (slots < page_buffer_size)
     if not torch.any(valid_mask):
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]

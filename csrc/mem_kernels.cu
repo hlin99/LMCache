@@ -317,7 +317,8 @@ __global__ void load_and_reshape_multi_layer_kernel(
   const int64_t slot_idx = slot_mapping[kv_token_id];
   scalar_t* paged_buffer_ptr = paged_buffer_ptrs[layer_id];
 
-  if (slot_idx < 0) {
+  // Bounds checking: slot_idx must be in valid range [0, page_buffer_size)
+  if (slot_idx < 0 || slot_idx >= page_buffer_size) {
     return;
   }
 
@@ -362,7 +363,8 @@ __global__ void load_and_reshape_multi_layer_kernel_unilateral(
   scalar_t* key_ptr = paged_buffer_ptrs[layer_id];
   scalar_t* value_ptr = paged_buffer_ptrs[layer_id + num_layers];
 
-  if (slot_idx < 0) {
+  // Bounds checking: slot_idx must be in valid range [0, page_buffer_size)
+  if (slot_idx < 0 || slot_idx >= page_buffer_size) {
     return;
   }
 
