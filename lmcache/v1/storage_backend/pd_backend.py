@@ -251,7 +251,7 @@ class PDBackend(AllocatorBackendInterface):
             logger.info(
                 f"Auto align pd_buffer_size, origin: {origin_buffer_size}, "
                 f"aligned: {aligned_buffer_size}, chunk size: {chunk_size_bytes}. "
-                f"Excess buffer of {origin_buffer_size - aligned_buffer_size}"
+                f"Excess buffer of {origin_buffer_size - aligned_buffer_size} "
                 f"bytes will be released."
             )
 

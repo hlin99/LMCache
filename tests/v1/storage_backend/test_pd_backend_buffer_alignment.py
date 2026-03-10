@@ -49,12 +49,14 @@ def test_buffer_size_alignment_cpu():
 
     # Calculate expected chunk size:
     # 28 * 2 * 256 * 8 * 128 * 2 (bfloat16) = 29360128 bytes
+    expected_chunk_size = 28 * 2 * 256 * 8 * 128 * 2  # 29360128
 
     # Create a config with a buffer size that is NOT a multiple of chunk size
     # This should trigger the alignment logic
+    origin_buffer_size = 4317511681
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
-        pd_buffer_size=4317511681,  # NOT a multiple of 29360128
+        pd_buffer_size=origin_buffer_size,  # NOT a multiple of 29360128
         pd_buffer_device="cpu",
         pd_role="receiver",
         pd_peer_host="localhost",
@@ -62,6 +64,9 @@ def test_buffer_size_alignment_cpu():
         pd_peer_alloc_port=[12346],
         transfer_channel="mock_memory",
     )
+
+    # Calculate the expected aligned size
+    expected_aligned_size = (origin_buffer_size // expected_chunk_size) * expected_chunk_size
 
     # This should NOT raise an assertion error anymore
     # The buffer size should be automatically aligned
@@ -86,6 +91,13 @@ def test_buffer_size_alignment_cpu():
         assert actual_buffer_size <= config.pd_buffer_size, (
             f"Aligned buffer size {actual_buffer_size} is greater than "
             f"original size {config.pd_buffer_size}"
+        )
+
+        # Assert the exact aligned size, not just divisibility
+        assert actual_buffer_size == expected_aligned_size, (
+            f"Aligned buffer size {actual_buffer_size} does not match "
+            f"expected aligned size {expected_aligned_size}. "
+            f"Origin: {origin_buffer_size}, chunk size: {expected_chunk_size}"
         )
 
         # Signal shutdown without joining blocked threads
