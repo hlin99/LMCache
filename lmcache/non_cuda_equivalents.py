@@ -25,6 +25,8 @@ _buf_registry: dict[int, ctypes.Array] = {}
 # Cached copy library for lmcache_memcpy_async (lazy-initialized)
 _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
+_DEFAULT_HOST_BUFFER_OFFSET = 0
+_MIN_HOST_BUFFER_ALIGNMENT = 1
 
 
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
@@ -269,21 +271,51 @@ def _copy_tensor_with_ptr(
     ptr: int,
     direction: "TransferDirection",
 ) -> None:
-    """Copy one contiguous tensor row to or from a raw pointer."""
+    """Copy one tensor row to or from a raw memory address.
+
+    Args:
+        tensor: Tensor view to copy from or into.
+        ptr: Raw source or destination pointer address.
+        direction: Transfer direction. H2D copies ``tensor -> ptr`` and D2H
+            copies ``ptr -> tensor``.
+
+    Notes:
+        If ``tensor`` is non-contiguous, this helper uses a temporary
+        contiguous tensor for the raw memcpy. For H2D, the temporary is used
+        only as the memcpy source. For D2H, data is copied into the temporary
+        first and then copied back into the original tensor.
+
+    Raises:
+        RuntimeError: If the underlying raw-memory copy fails.
+    """
     num_bytes = tensor.numel() * tensor.element_size()
-    if num_bytes <= 0:
+    if num_bytes == 0:
         return
 
     if direction == TransferDirection.H2D:
         src_tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
-        lmcache_memcpy_async(ptr, src_tensor.data_ptr(), num_bytes, direction, 0, 1)
+        lmcache_memcpy_async(
+            ptr,
+            src_tensor.data_ptr(),
+            num_bytes,
+            direction,
+            _DEFAULT_HOST_BUFFER_OFFSET,
+            _MIN_HOST_BUFFER_ALIGNMENT,
+        )
         return
 
     dst_tensor = tensor
     if not dst_tensor.is_contiguous():
         dst_tensor = torch.empty_like(tensor, memory_format=torch.contiguous_format)
 
-    lmcache_memcpy_async(dst_tensor.data_ptr(), ptr, num_bytes, direction, 0, 1)
+    lmcache_memcpy_async(
+        dst_tensor.data_ptr(),
+        ptr,
+        num_bytes,
+        direction,
+        _DEFAULT_HOST_BUFFER_OFFSET,
+        _MIN_HOST_BUFFER_ALIGNMENT,
+    )
 
     if dst_tensor.data_ptr() != tensor.data_ptr():
         tensor.copy_(dst_tensor)
@@ -299,7 +331,29 @@ def _multi_layer_slot_ptr(
     gpu_kv_format: "GPUKVFormat",
     block_size: int,
 ) -> int:
-    """Return the raw pointer for one KV row inside a paged buffer."""
+    """Return the raw pointer for one KV row inside a paged buffer.
+
+    Args:
+        base_ptr: Base address of the layer paged buffer.
+        slot_idx: Logical slot index inside the paged buffer.
+        kv_idx: Key/value index within the LMCache tensor.
+        page_buffer_size: Number of slots in the paged buffer for flat formats.
+        hidden_size: Number of elements in one KV row.
+        element_size: Size in bytes of a single element.
+        gpu_kv_format: Layout of the paged buffer.
+        block_size: Block size for block-structured formats.
+
+    Returns:
+        The raw pointer for the selected KV row.
+
+    Notes:
+        Flat paged formats index rows as ``[kv, slot, hidden]``. The
+        block-structured format indexes rows as ``[block, kv, block_offset,
+        hidden]`` before converting that logical index into a byte offset.
+
+    Raises:
+        ValueError: If ``gpu_kv_format`` is unsupported.
+    """
     if gpu_kv_format in (
         GPUKVFormat.NB_NL_TWO_BS_NH_HS,
         GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
@@ -335,7 +389,25 @@ def _multi_layer_ptr_transfer(
     gpu_kv_format: "GPUKVFormat",
     block_size: int,
 ) -> None:
-    """Copy multi-layer KV rows between tensors and raw pointers."""
+    """Copy multi-layer KV rows between LMCache tensors and raw pointers.
+
+    Args:
+        key_value: LMCache tensor with shape ``[K/V, layer, token, hidden]``.
+        key_value_ptrs: Int64 tensor containing one raw paged-buffer pointer
+            per layer.
+        valid_tokens: Token indices to copy within ``key_value``.
+        valid_slots: Slot indices corresponding to ``valid_tokens``.
+        page_buffer_size: Number of slots in the paged buffer.
+        direction: Transfer direction between LMCache and paged memory.
+        gpu_kv_format: Layout of the target paged buffer.
+        block_size: Block size for block-structured paged formats.
+
+    Raises:
+        IndexError: If a bounded ``page_buffer_size`` is provided and a slot is
+            out of range.
+        RuntimeError: If the underlying raw-memory copy fails.
+        ValueError: If ``gpu_kv_format`` is unsupported.
+    """
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
@@ -349,13 +421,9 @@ def _multi_layer_ptr_transfer(
     for token_idx, slot_idx in zip(
         valid_tokens.tolist(),
         valid_slots.tolist(),
-        strict=False,
+        strict=True,
     ):
-        if page_buffer_size > 0 and slot_idx >= page_buffer_size:
-            raise IndexError(
-                f"slot index {slot_idx} is out of range for page_buffer_size "
-                f"{page_buffer_size}"
-            )
+        _validate_slot_idx(int(slot_idx), page_buffer_size)
 
         for layer_id in range(num_layers):
             base_ptr = int(ptr_list[layer_id])
@@ -385,7 +453,22 @@ def _unilateral_ptr_transfer(
     page_buffer_size: int,
     direction: "TransferDirection",
 ) -> None:
-    """Copy unilateral KV rows between tensors and raw pointers."""
+    """Copy unilateral KV rows between LMCache tensors and raw pointers.
+
+    Args:
+        key_value: LMCache tensor with shape ``[2, layer, token, hidden]``.
+        key_value_ptrs: Int64 tensor of raw pointers laid out as
+            ``[K_layer0, ..., K_layerN, V_layer0, ..., V_layerN]``.
+        valid_tokens: Token indices to copy within ``key_value``.
+        valid_slots: Slot indices corresponding to ``valid_tokens``.
+        page_buffer_size: Number of slots in each unilateral K/V buffer.
+        direction: Transfer direction between LMCache and paged memory.
+
+    Raises:
+        IndexError: If a bounded ``page_buffer_size`` is provided and a slot is
+            out of range.
+        RuntimeError: If the underlying raw-memory copy fails.
+    """
     num_layers = key_value.size(1)
     row_bytes = key_value.size(3) * key_value.element_size()
     ptr_list = key_value_ptrs.tolist()
@@ -393,13 +476,9 @@ def _unilateral_ptr_transfer(
     for token_idx, slot_idx in zip(
         valid_tokens.tolist(),
         valid_slots.tolist(),
-        strict=False,
+        strict=True,
     ):
-        if page_buffer_size > 0 and slot_idx >= page_buffer_size:
-            raise IndexError(
-                f"slot index {slot_idx} is out of range for page_buffer_size "
-                f"{page_buffer_size}"
-            )
+        _validate_slot_idx(int(slot_idx), page_buffer_size)
 
         slot_offset = int(slot_idx) * row_bytes
         for layer_id in range(num_layers):
@@ -407,6 +486,25 @@ def _unilateral_ptr_transfer(
             v_ptr = int(ptr_list[layer_id + num_layers]) + slot_offset
             _copy_tensor_with_ptr(key_value[0, layer_id, token_idx], k_ptr, direction)
             _copy_tensor_with_ptr(key_value[1, layer_id, token_idx], v_ptr, direction)
+
+
+def _validate_slot_idx(slot_idx: int, page_buffer_size: int) -> None:
+    """Validate a slot index when the caller provides a bounded page buffer size.
+
+    A non-positive ``page_buffer_size`` means the caller did not provide a
+    usable bound, so validation is skipped.
+
+    Raises:
+        IndexError: If ``slot_idx`` is outside the provided bounded range.
+    """
+    if page_buffer_size <= 0:
+        return
+
+    if slot_idx >= page_buffer_size:
+        raise IndexError(
+            f"slot index {slot_idx} is out of range for page_buffer_size "
+            f"{page_buffer_size}"
+        )
 
 
 class TransferDirection(Enum):

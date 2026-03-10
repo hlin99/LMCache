@@ -1889,7 +1889,7 @@ def test_multi_layer_kv_transfer_pointer_mode_uses_memcpy(
         unittest.mock.patch.object(
             _py_ops,
             "_tensor_from_ptr",
-            side_effect=AssertionError("pointer mode should not build tensor views"),
+            side_effect=AssertionError("pointer mode should not create tensor views"),
         ),
         unittest.mock.patch.object(
             _py_ops,
@@ -1970,7 +1970,7 @@ def test_multi_layer_kv_transfer_unilateral_pointer_mode_uses_memcpy(
         unittest.mock.patch.object(
             _py_ops,
             "_tensor_from_ptr",
-            side_effect=AssertionError("pointer mode should not build tensor views"),
+            side_effect=AssertionError("pointer mode should not create tensor views"),
         ),
         unittest.mock.patch.object(
             _py_ops,
