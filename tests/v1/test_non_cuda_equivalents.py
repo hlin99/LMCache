@@ -10,7 +10,7 @@ import torch
 # First Party
 import lmcache.non_cuda_equivalents as _py_ops
 
-import habana_frameworks.torch
+import habana_frameworks.torch as htorch
 # ==========================================
 # 0. utils functions.
 # ==========================================
@@ -34,8 +34,10 @@ def device_sync(device: str) -> None:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.synchronize()
     elif device == "hpu":
+        htorch.core.mark_step()
         if hasattr(torch, "hpu") and torch.hpu.is_available():
             torch.hpu.synchronize()
+
     else:
         pass
     # CPU requires no synchronization
@@ -786,6 +788,7 @@ def scenario_decode_fast_prefsum(ops: Any, device: str) -> dict[str, torch.Tenso
 def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.Tensor]:
     """Test single_layer_kv_transfer for multiple KV formats and directions."""
     torch.manual_seed(42)
+    torch.hpu.synchronize()
 
     num_tokens = 64
     num_blocks = 256
@@ -816,6 +819,7 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
         (ops.GPUKVFormat.NL_X_NB_BS_HS, True, True, False),
         (ops.GPUKVFormat.NL_X_NB_BS_HS, True, True, True),
     ]
+    torch.hpu.synchronize()
 
     for gpu_kv_format, is_mla, token_major, direction in test_cases:
         dir_tag = "v2l" if direction else "l2v"
@@ -823,6 +827,7 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
         case_desc = (
             f"fmt={gpu_kv_format}, MLA={is_mla}, TM={token_major}, Dir={dir_tag}"
         )
+        torch.hpu.synchronize()
 
         # ── 1. Setup Shapes ──
         lmc_shape: tuple[int, ...] = ()
@@ -861,12 +866,14 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
             .to(torch.float16)
             .reshape(vllm_shape)
         )
+        torch.hpu.synchronize()
 
         # ── 3. Golden Reference ──
         lmc_ref = lmc_tensor.clone()
         vllm_ref = vllm_tensor.clone()
         block_indices = slot_mapping // block_size
         block_offsets = slot_mapping % block_size
+        torch.hpu.synchronize()
 
         if not direction:  # LMC → vLLM
             if is_mla:
@@ -897,6 +904,7 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
                     dim=1,
                 ).view(num_tokens, 2, hidden_size)
                 lmc_ref = combined if token_major else combined.permute(1, 0, 2)
+        torch.hpu.synchronize()
 
         # ── 4. Execute ──
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
@@ -909,6 +917,7 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
             token_major,
         )
         device_sync(device)
+        torch.hpu.synchronize()
 
         # ── 5. Verify ──
         if not direction:
@@ -1708,6 +1717,7 @@ SCENARIO_REGISTRY = {
     "transfer_direction_enum": scenario_transfer_direction_enum,
 #    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
     "multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
+    "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
     "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
     "single_layer_kv_transfer_sgl": scenario_single_layer_kv_transfer_sgl,
     "load_and_reshape_flash": scenario_load_and_reshape_flash,
