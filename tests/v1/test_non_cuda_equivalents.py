@@ -141,6 +141,8 @@ def scenario_calculate_cdf(ops: Any, device: str) -> dict[str, torch.Tensor]:
         )
 
         raw_output = ops.calculate_cdf(input_tensor, num_bins)
+        assert raw_output.ndim == 3
+        assert raw_output.shape == (1, 1, num_bins + 1)
         out_cpu = raw_output.flatten().cpu()
 
         if torch.is_floating_point(out_cpu):
@@ -154,6 +156,51 @@ def scenario_calculate_cdf(ops: Any, device: str) -> dict[str, torch.Tensor]:
         results[f"calculate_cdf_bins{num_bins}"] = final_result
 
     return results
+
+
+def scenario_calculate_cdf_encode_fast_new_compat(
+    ops: Any, device: str
+) -> dict[str, torch.Tensor]:
+    """Test calculate_cdf output can be consumed by encode_fast_new."""
+    torch.manual_seed(42)
+    nlayers = 2
+    nchannels = 4
+    ntokens = 64
+    num_bins = 16
+    max_buf_len = ntokens * 2
+
+    input_sym = torch.randint(
+        0,
+        num_bins,
+        (nlayers, ntokens, nchannels),
+        dtype=torch.int8,
+        device=device,
+    ).contiguous()
+    cdf = ops.calculate_cdf(input_sym, num_bins)
+
+    output_buffer = torch.zeros(
+        (nlayers, nchannels, max_buf_len),
+        dtype=torch.uint8,
+        device=device,
+    )
+    output_lengths = torch.zeros(
+        (nlayers, nchannels),
+        dtype=torch.int32,
+        device=device,
+    )
+
+    ops.encode_fast_new(cdf, input_sym, output_buffer, output_lengths)
+    device_sync(device)
+
+    lengths_cpu = output_lengths.cpu()
+    assert (lengths_cpu > 0).all()
+    assert (lengths_cpu <= max_buf_len).all()
+
+    return {
+        "calculate_cdf_encode_fast_new_compat": output_lengths[0, : min(2, nchannels)]
+        .clone()
+        .cpu()
+    }
 
 
 def scenario_rotary_embedding_k_fused(ops: Any, device: str) -> dict[str, torch.Tensor]:
@@ -1711,6 +1758,9 @@ SCENARIO_REGISTRY = {
     "decode_fast_new": scenario_decode_fast_new,
     "decode_fast_prefsum": scenario_decode_fast_prefsum,
     "calculate_cdf": scenario_calculate_cdf,
+    "calculate_cdf_encode_fast_new_compat": (
+        scenario_calculate_cdf_encode_fast_new_compat
+    ),
     "rotary_embedding_k_fused": scenario_rotary_embedding_k_fused,
     "alloc_free_pinned_ptr": scenario_alloc_free_pinned_ptr,
     "alloc_free_pinned_numa_ptr": scenario_alloc_free_pinned_numa_ptr,
@@ -1836,5 +1886,3 @@ class TestScenarios:
                         pytest.fail(
                             f"{name}/{key}: '{bid}'={val} != '{base_bid}'={base_val}"
                         )
-
-

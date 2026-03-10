@@ -1079,6 +1079,12 @@ def encode_fast_new(cdf, input_sym, output_buffer, output_lengths):
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
     sym_np = input_sym.cpu().numpy().astype(np.uint8)
 
+    if cdf_np.ndim != 3:
+        raise ValueError(
+            "cdf must be a 3D tensor with shape [nlayers, nchannels, lp], "
+            f"got shape {tuple(cdf_np.shape)}"
+        )
+
     n_layers, n_tokens, n_channels = sym_np.shape
     lp = cdf_np.shape[2]
     max_symbol = lp - 2
@@ -1387,27 +1393,68 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
 def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
     """
     Equivalent to CUDA calculate_cdf.
-    Input: Expects a 3D tensor (e.g., [1, N, 1]).
-    num_bins: Total number of bins (max_val + 1).
-    Returns: Tensor of length (num_bins + 1) with CDF values.
+
+    Args:
+        input_tensor: Int tensor with shape [nlayers, ntokens, nchannels].
+        num_bins: Maximum symbol value (returns num_bins + 1 CDF entries).
+
+    Returns:
+        Int16 tensor with shape [nlayers, nchannels, num_bins + 1].
     """
-    # Force flattening to match bincount expectation
-    flat_input = input_tensor.flatten().long()
+    if input_tensor.ndim != 3:
+        raise ValueError(
+            "input_tensor must be a 3D tensor with shape "
+            "[nlayers, ntokens, nchannels], "
+            f"got shape {tuple(input_tensor.shape)}"
+        )
+    if num_bins <= 0:
+        raise ValueError(f"num_bins must be positive, got {num_bins}")
 
-    # Use num_bins directly to match the CUDA kernel's 'Alphabet Size'
-    counts = torch.bincount(flat_input, minlength=num_bins)
+    input_long = input_tensor.to(torch.int64)
+    if input_long.numel() > 0 and (
+        input_long.min().item() < 0 or input_long.max().item() >= num_bins
+    ):
+        raise ValueError(
+            "input_tensor contains out-of-range symbols for num_bins="
+            f"{num_bins}: min={input_long.min().item()}, max={input_long.max().item()}"
+        )
 
-    # Slice to ensure output length is exactly num_bins
-    counts = counts[:num_bins]
+    nlayers, _, nchannels = input_tensor.shape
+    output = torch.zeros(
+        (nlayers, nchannels, num_bins + 1),
+        dtype=torch.int16,
+        device=input_tensor.device,
+    )
+    max_uint16_minus_bins = 0xFFFF - num_bins
 
-    cdf = torch.cumsum(counts, dim=0).float()
+    for layer_idx in range(nlayers):
+        layer_data = input_long[layer_idx].transpose(0, 1)
+        for channel_idx in range(nchannels):
+            symbols = layer_data[channel_idx]
+            counts = torch.bincount(symbols, minlength=num_bins)[:num_bins]
+            cumulative = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int64, device=input_tensor.device),
+                    torch.cumsum(counts, dim=0),
+                ]
+            )
+            total = int(cumulative[-1].item())
+            if total > 0:
+                normalized = (max_uint16_minus_bins * cumulative) // total
+                normalized = normalized + torch.arange(
+                    num_bins + 1,
+                    device=input_tensor.device,
+                    dtype=torch.int64,
+                )
+            else:
+                normalized = torch.arange(
+                    num_bins + 1,
+                    device=input_tensor.device,
+                    dtype=torch.int64,
+                )
+            output[layer_idx, channel_idx] = normalized.to(torch.int16)
 
-    if cdf[-1] > 0:
-        cdf = cdf / cdf[-1]
-
-    cdf = torch.cat([torch.tensor([0.0], device=cdf.device), cdf])
-
-    return cdf
+    return output
 
 
 def rotary_embedding_k_fused(
