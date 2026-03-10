@@ -1385,29 +1385,53 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
 
 
 def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
+    """Equivalent to CUDA calculate_cdf.
+
+    Calculates the CDF across tokens for each (layer, channel) pair.
+
+    Args:
+        input_tensor: 3D tensor with shape [nlayers, ntokens, nchannels].
+        num_bins: Maximum number of bins (i.e., Lp - 1).
+
+    Returns:
+        int16 tensor with shape [nlayers, nchannels, num_bins + 1]
+        containing normalized CDF values.
     """
-    Equivalent to CUDA calculate_cdf.
-    Input: Expects a 3D tensor (e.g., [1, N, 1]).
-    num_bins: Total number of bins (max_val + 1).
-    Returns: Tensor of length (num_bins + 1) with CDF values.
-    """
-    # Force flattening to match bincount expectation
-    flat_input = input_tensor.flatten().long()
+    nlayers, ntokens, nchannels = input_tensor.shape
+    device = input_tensor.device
 
-    # Use num_bins directly to match the CUDA kernel's 'Alphabet Size'
-    counts = torch.bincount(flat_input, minlength=num_bins)
+    # Compute per-(layer, channel) histogram via scatter_add.
+    # Permute to [nlayers, nchannels, ntokens] then flatten first two dims.
+    input_perm = input_tensor.permute(0, 2, 1).reshape(-1, ntokens).long()
+    src = torch.ones_like(input_perm)
+    counts = torch.zeros(
+        nlayers * nchannels, num_bins, dtype=torch.long, device=device
+    )
+    counts.scatter_add_(1, input_perm.clamp(0, num_bins - 1), src)
+    counts = counts.reshape(nlayers, nchannels, num_bins)
 
-    # Slice to ensure output length is exactly num_bins
-    counts = counts[:num_bins]
+    # Build CDF: cdf[..., 0] = 0, cdf[..., i] = sum(counts[..., 0:i])
+    cdf = torch.zeros(
+        nlayers, nchannels, num_bins + 1, dtype=torch.long, device=device
+    )
+    cdf[:, :, 1:] = torch.cumsum(counts, dim=2)
 
-    cdf = torch.cumsum(counts, dim=0).float()
+    # Total count per (layer, channel)
+    total = cdf[:, :, -1:]  # [nlayers, nchannels, 1]
 
-    if cdf[-1] > 0:
-        cdf = cdf / cdf[-1]
+    # Normalize: (0xFFFF - num_bins) * cdf / total + bin_index
+    max_uint16_value = 0xFFFF - num_bins
+    bin_offsets = torch.arange(num_bins + 1, dtype=torch.long, device=device)
 
-    cdf = torch.cat([torch.tensor([0.0], device=cdf.device), cdf])
+    safe_total = total.clamp(min=1)
+    normalized = (max_uint16_value * cdf) // safe_total + bin_offsets
 
-    return cdf
+    # Where total is 0, use just the bin offsets
+    normalized = torch.where(
+        total > 0, normalized, bin_offsets.unsqueeze(0).unsqueeze(0)
+    )
+
+    return normalized.to(torch.int16)
 
 
 def rotary_embedding_k_fused(

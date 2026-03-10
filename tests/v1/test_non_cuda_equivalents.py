@@ -141,15 +141,19 @@ def scenario_calculate_cdf(ops: Any, device: str) -> dict[str, torch.Tensor]:
         )
 
         raw_output = ops.calculate_cdf(input_tensor, num_bins)
-        out_cpu = raw_output.flatten().cpu()
 
-        if torch.is_floating_point(out_cpu):
-            # non-cuda equivalents return normalized floats; use directly
-            final_result = out_cpu.float()
-        else:
-            out_int32 = out_cpu.to(torch.int32)
-            out_uint16 = torch.where(out_int32 < 0, out_int32 + 65536, out_int32)
-            final_result = out_uint16.float() / 65536.0
+        # Both CUDA and non-CUDA return int16 with shape
+        # [nlayers, nchannels, num_bins + 1]
+        nlayers, _, nchannels = input_tensor.shape
+        assert raw_output.shape == (nlayers, nchannels, num_bins + 1), (
+            f"Expected shape ({nlayers}, {nchannels}, {num_bins + 1}), "
+            f"got {raw_output.shape}"
+        )
+
+        out_cpu = raw_output.flatten().cpu()
+        out_int32 = out_cpu.to(torch.int32)
+        out_uint16 = torch.where(out_int32 < 0, out_int32 + 65536, out_int32)
+        final_result = out_uint16.float() / 65536.0
 
         results[f"calculate_cdf_bins{num_bins}"] = final_result
 
