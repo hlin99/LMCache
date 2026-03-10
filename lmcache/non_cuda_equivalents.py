@@ -264,6 +264,27 @@ def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
     dst_tensor.copy_(src_tensor)
 
 
+def _copy_hidden_row_async(
+    dest: torch.Tensor,
+    src: torch.Tensor,
+    direction: "TransferDirection",
+) -> None:
+    """Copy one contiguous hidden-state row via lmcache_memcpy_async."""
+    if dest.numel() != src.numel():
+        raise ValueError("dest and src must have the same number of elements")
+    if not dest.is_contiguous() or not src.is_contiguous():
+        raise ValueError("dest and src must be contiguous tensor rows")
+
+    lmcache_memcpy_async(
+        dest,
+        src,
+        dest.numel() * dest.element_size(),
+        direction,
+        0,
+        1,
+    )
+
+
 class TransferDirection(Enum):
     H2D = 0
     D2H = 1
@@ -448,6 +469,7 @@ def multi_layer_kv_transfer(
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
+    valid_pairs = list(zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True))
 
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
@@ -501,32 +523,56 @@ def multi_layer_kv_transfer(
             GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
             GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
         ):
-            src = key_value[:, layer_id, valid_tokens]
-            if direction == TransferDirection.H2D:
-                paged.index_copy_(1, valid_slots, src)
-            else:
-                gathered = paged.index_select(1, valid_slots)
-                key_value[:, layer_id, valid_tokens] = gathered
+            for token_idx, slot_idx in valid_pairs:
+                for kv_idx in range(k_or_v_size):
+                    if direction == TransferDirection.H2D:
+                        _copy_hidden_row_async(
+                            paged[kv_idx, slot_idx],
+                            key_value[kv_idx, layer_id, token_idx],
+                            direction,
+                        )
+                    else:
+                        _copy_hidden_row_async(
+                            key_value[kv_idx, layer_id, token_idx],
+                            paged[kv_idx, slot_idx],
+                            direction,
+                        )
 
         elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-            blk_idx = torch.div(valid_slots, block_size, rounding_mode="floor")
-            blk_off = valid_slots % block_size
-
-            if direction == TransferDirection.H2D:
-                src = key_value[:, layer_id, valid_tokens].permute(1, 0, 2)
-                paged[blk_idx, :, blk_off] = src
-            else:
-                fetched = paged[blk_idx, :, blk_off].permute(1, 0, 2)
-                key_value[:, layer_id, valid_tokens] = fetched
+            for token_idx, slot_idx in valid_pairs:
+                blk_idx = slot_idx // block_size
+                blk_off = slot_idx % block_size
+                for kv_idx in range(k_or_v_size):
+                    if direction == TransferDirection.H2D:
+                        _copy_hidden_row_async(
+                            paged[blk_idx, kv_idx, blk_off],
+                            key_value[kv_idx, layer_id, token_idx],
+                            direction,
+                        )
+                    else:
+                        _copy_hidden_row_async(
+                            key_value[kv_idx, layer_id, token_idx],
+                            paged[blk_idx, kv_idx, blk_off],
+                            direction,
+                        )
 
         elif gpu_kv_format in (
             GPUKVFormat.NL_X_NB_BS_HS,
             GPUKVFormat.NL_X_NBBS_ONE_HS,
         ):
-            if direction == TransferDirection.H2D:
-                paged[valid_slots] = key_value[0, layer_id, valid_tokens]
-            else:
-                key_value[0, layer_id, valid_tokens] = paged[valid_slots]
+            for token_idx, slot_idx in valid_pairs:
+                if direction == TransferDirection.H2D:
+                    _copy_hidden_row_async(
+                        paged[slot_idx],
+                        key_value[0, layer_id, token_idx],
+                        direction,
+                    )
+                else:
+                    _copy_hidden_row_async(
+                        key_value[0, layer_id, token_idx],
+                        paged[slot_idx],
+                        direction,
+                    )
 
         else:
             raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
@@ -593,6 +639,7 @@ def multi_layer_kv_transfer_unilateral(
         return
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
+    valid_pairs = list(zip(valid_tokens.tolist(), valid_slots.tolist(), strict=True))
 
     # Handle both tensor (pointer) mode and list (tensor) mode
     use_tensor_mode = isinstance(key_value_ptrs, list)
@@ -618,12 +665,29 @@ def multi_layer_kv_transfer_unilateral(
                 v_ptr, (page_buffer_size, hidden_size), key_value.dtype, device
             )
 
-        if direction == TransferDirection.H2D:
-            k_buf[valid_slots] = key_value[0, layer_id, valid_tokens]
-            v_buf[valid_slots] = key_value[1, layer_id, valid_tokens]
-        else:
-            key_value[0, layer_id, valid_tokens] = k_buf[valid_slots]
-            key_value[1, layer_id, valid_tokens] = v_buf[valid_slots]
+        for token_idx, slot_idx in valid_pairs:
+            if direction == TransferDirection.H2D:
+                _copy_hidden_row_async(
+                    k_buf[slot_idx],
+                    key_value[0, layer_id, token_idx],
+                    direction,
+                )
+                _copy_hidden_row_async(
+                    v_buf[slot_idx],
+                    key_value[1, layer_id, token_idx],
+                    direction,
+                )
+            else:
+                _copy_hidden_row_async(
+                    key_value[0, layer_id, token_idx],
+                    k_buf[slot_idx],
+                    direction,
+                )
+                _copy_hidden_row_async(
+                    key_value[1, layer_id, token_idx],
+                    v_buf[slot_idx],
+                    direction,
+                )
 
 
 def single_layer_kv_transfer(

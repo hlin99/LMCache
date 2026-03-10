@@ -1836,3 +1836,126 @@ class TestScenarios:
                         pytest.fail(
                             f"{name}/{key}: '{bid}'={val} != '{base_bid}'={base_val}"
                         )
+
+
+@pytest.mark.parametrize(
+    ("gpu_kv_format", "block_size", "k_or_v_size"),
+    [
+        (_py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS, 1, 2),
+        (_py_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS, 4, 2),
+        (_py_ops.GPUKVFormat.NL_X_NB_BS_HS, 1, 1),
+    ],
+)
+@pytest.mark.parametrize("use_tensor_list", [False, True])
+def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
+    gpu_kv_format: _py_ops.GPUKVFormat,
+    block_size: int,
+    k_or_v_size: int,
+    use_tensor_list: bool,
+) -> None:
+    """Ensure the Python fallback copy path delegates row copies to memcpy."""
+    num_layers = 2
+    num_tokens = 4
+    hidden_size = 8
+    page_buffer_size = 8
+    valid_token_count = 3
+    slot_mapping = torch.tensor([0, 3, -1, 6], dtype=torch.int64)
+
+    key_value = torch.arange(
+        k_or_v_size * num_layers * num_tokens * hidden_size,
+        dtype=torch.float32,
+    ).view(k_or_v_size, num_layers, num_tokens, hidden_size)
+
+    page_buffers = []
+    for _ in range(num_layers):
+        if gpu_kv_format == _py_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+            page_buffers.append(
+                torch.zeros(
+                    (page_buffer_size // block_size, 2, block_size, hidden_size),
+                    dtype=key_value.dtype,
+                )
+            )
+        elif k_or_v_size == 1:
+            page_buffers.append(
+                torch.zeros((page_buffer_size, hidden_size), dtype=key_value.dtype)
+            )
+        else:
+            page_buffers.append(
+                torch.zeros((2, page_buffer_size, hidden_size), dtype=key_value.dtype)
+            )
+
+    key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]
+    if use_tensor_list:
+        key_value_ptrs = page_buffers
+    else:
+        key_value_ptrs = torch.tensor(
+            [buffer.data_ptr() for buffer in page_buffers],
+            dtype=torch.int64,
+        )
+
+    with unittest.mock.patch.object(
+        _py_ops,
+        "lmcache_memcpy_async",
+        wraps=_py_ops.lmcache_memcpy_async,
+    ) as copy_spy:
+        _py_ops.multi_layer_kv_transfer(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            _py_ops.TransferDirection.H2D,
+            gpu_kv_format,
+            block_size,
+        )
+
+    assert copy_spy.call_count == num_layers * valid_token_count * k_or_v_size
+
+
+@pytest.mark.parametrize("use_tensor_list", [False, True])
+def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
+    use_tensor_list: bool,
+) -> None:
+    """Ensure unilateral row copies also delegate to lmcache_memcpy_async."""
+    num_layers = 2
+    num_tokens = 4
+    hidden_size = 8
+    page_buffer_size = 8
+    valid_token_count = 3
+    slot_mapping = torch.tensor([1, -1, 4, 6], dtype=torch.int64)
+
+    key_value = torch.arange(
+        2 * num_layers * num_tokens * hidden_size,
+        dtype=torch.float32,
+    ).view(2, num_layers, num_tokens, hidden_size)
+
+    buffers = [
+        torch.zeros((page_buffer_size, hidden_size), dtype=key_value.dtype)
+        for _ in range(num_layers * 2)
+    ]
+
+    key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]
+    if use_tensor_list:
+        key_value_ptrs = buffers
+    else:
+        key_value_ptrs = torch.tensor(
+            [buffer.data_ptr() for buffer in buffers],
+            dtype=torch.int64,
+        )
+
+    with unittest.mock.patch.object(
+        _py_ops,
+        "lmcache_memcpy_async",
+        wraps=_py_ops.lmcache_memcpy_async,
+    ) as copy_spy:
+        _py_ops.multi_layer_kv_transfer_unilateral(
+            key_value,
+            key_value_ptrs,
+            slot_mapping,
+            torch.device("cpu"),
+            page_buffer_size,
+            _py_ops.TransferDirection.H2D,
+            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        )
+
+    assert copy_spy.call_count == num_layers * valid_token_count * 2
