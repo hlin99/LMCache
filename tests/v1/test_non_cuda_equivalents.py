@@ -1715,14 +1715,14 @@ def test_multi_layer_kv_transfer_pointer_mode_uses_lmcache_memcpy_async() -> Non
         dtype=torch.int64,
     )
 
-    memcpy_calls: list[tuple[int, int, int, Any]] = []
+    memcpy_calls: list[tuple[int, int, int, _py_ops.TransferDirection]] = []
     original_memcpy_async = _py_ops.lmcache_memcpy_async
 
     def tracked_memcpy_async(
         dest: int | torch.Tensor,
         src: int | torch.Tensor,
         nbytes: int,
-        direction: Any,
+        direction: _py_ops.TransferDirection,
         host_buffer_offset: int,
         host_buffer_alignments: int,
     ) -> None:
@@ -1786,14 +1786,14 @@ def test_multi_layer_kv_transfer_unilateral_pointer_mode_uses_lmcache_memcpy_asy
         dtype=torch.int64,
     )
 
-    memcpy_calls: list[tuple[int, int, int, Any]] = []
+    memcpy_calls: list[tuple[int, int, int, _py_ops.TransferDirection]] = []
     original_memcpy_async = _py_ops.lmcache_memcpy_async
 
     def tracked_memcpy_async(
         dest: int | torch.Tensor,
         src: int | torch.Tensor,
         nbytes: int,
-        direction: Any,
+        direction: _py_ops.TransferDirection,
         host_buffer_offset: int,
         host_buffer_alignments: int,
     ) -> None:

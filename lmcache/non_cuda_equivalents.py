@@ -275,7 +275,12 @@ def _copy_kv_row_with_memcpy(
     row_nbytes: int,
     direction: "TransferDirection",
 ) -> None:
-    """Copy one contiguous KV row using the raw-pointer memcpy helper."""
+    """Copy one contiguous KV row using the raw-pointer memcpy helper.
+
+    The Python fallback does not need chunk splitting at host-registration
+    boundaries, so it always uses ``host_buffer_offset=0`` and
+    ``host_buffer_alignments=1``.
+    """
     if direction == TransferDirection.H2D:
         dest, src = paged_ptr, key_value_ptr
     else:
@@ -517,7 +522,7 @@ def multi_layer_kv_transfer(
                 zip(
                     valid_tokens.tolist(),
                     valid_slots.tolist(),
-                    strict=False,
+                    strict=True,
                 )
             )
 
@@ -700,7 +705,7 @@ def multi_layer_kv_transfer_unilateral(
                 zip(
                     valid_tokens.tolist(),
                     valid_slots.tolist(),
-                    strict=False,
+                    strict=True,
                 )
             )
 
