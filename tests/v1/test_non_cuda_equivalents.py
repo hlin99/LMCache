@@ -1838,11 +1838,6 @@ class TestScenarios:
                         )
 
 
-def _uses_mixed_pointer_tensor_operands(call: unittest.mock._Call) -> bool:
-    """Return whether a memcpy spy call used one pointer and one tensor operand."""
-    return isinstance(call.args[0], int) != isinstance(call.args[1], int)
-
-
 @pytest.mark.parametrize(
     ("gpu_kv_format", "block_size", "k_or_v_size"),
     [
@@ -1852,18 +1847,22 @@ def _uses_mixed_pointer_tensor_operands(call: unittest.mock._Call) -> bool:
     ],
 )
 @pytest.mark.parametrize("use_tensor_list", [False, True])
-def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
+def test_multi_layer_kv_transfer_batch_operations(
     gpu_kv_format: _py_ops.GPUKVFormat,
     block_size: int,
     k_or_v_size: int,
     use_tensor_list: bool,
 ) -> None:
-    """Ensure the Python fallback copy path delegates row copies to memcpy."""
+    """Ensure the Python fallback uses batch tensor operations per layer.
+
+    For pointer mode (tensor), _tensor_from_ptr is called to create tensor
+    views from extracted pointer values for each layer.
+    For list mode, tensors are used directly for batch operations.
+    """
     num_layers = 2
     num_tokens = 4
     hidden_size = 8
     page_buffer_size = 8
-    valid_token_count = 3
     slot_mapping = torch.tensor([0, 3, -1, 6], dtype=torch.int64)
 
     key_value = torch.arange(
@@ -1898,48 +1897,53 @@ def test_multi_layer_kv_transfer_uses_lmcache_memcpy_async(
             dtype=torch.int64,
         )
 
-    with unittest.mock.patch.object(
-        _py_ops,
-        "lmcache_memcpy_async",
-        wraps=_py_ops.lmcache_memcpy_async,
-    ) as copy_spy:
-        _py_ops.multi_layer_kv_transfer(
-            key_value,
-            key_value_ptrs,
-            slot_mapping,
-            torch.device("cpu"),
-            page_buffer_size,
-            _py_ops.TransferDirection.H2D,
-            gpu_kv_format,
-            block_size,
-        )
+    _py_ops.multi_layer_kv_transfer(
+        key_value,
+        key_value_ptrs,
+        slot_mapping,
+        torch.device("cpu"),
+        page_buffer_size,
+        _py_ops.TransferDirection.H2D,
+        gpu_kv_format,
+        block_size,
+    )
 
-    assert copy_spy.call_count == num_layers * valid_token_count * k_or_v_size
-    if use_tensor_list:
-        assert all(
-            isinstance(call.args[0], torch.Tensor)
-            and isinstance(call.args[1], torch.Tensor)
-            for call in copy_spy.call_args_list
-        )
-    else:
-        assert all(
-            isinstance(call.args[0], (int, torch.Tensor))
-            and isinstance(call.args[1], (int, torch.Tensor))
-            and _uses_mixed_pointer_tensor_operands(call)
-            for call in copy_spy.call_args_list
-        )
+    # Verify data was actually transferred to the paged buffers
+    valid_mask = slot_mapping >= 0
+    valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
+    valid_slots = slot_mapping[valid_tokens].to(dtype=torch.long)
+
+    for ly in range(num_layers):
+        for i, (tok, slot) in enumerate(zip(valid_tokens, valid_slots, strict=True)):
+            slot_val = int(slot.item())
+            tok_val = int(tok.item())
+            for kv in range(k_or_v_size):
+                expected = key_value[kv, ly, tok_val]
+                if gpu_kv_format == _py_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+                    blk = slot_val // block_size
+                    off = slot_val % block_size
+                    actual = page_buffers[ly][blk, kv, off]
+                elif k_or_v_size == 1:
+                    actual = page_buffers[ly][slot_val]
+                else:
+                    actual = page_buffers[ly][kv, slot_val]
+                torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("use_tensor_list", [False, True])
-def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
+def test_multi_layer_kv_transfer_unilateral_batch_operations(
     use_tensor_list: bool,
 ) -> None:
-    """Ensure unilateral row copies also delegate to lmcache_memcpy_async."""
+    """Ensure unilateral transfer uses batch tensor operations per layer.
+
+    For pointer mode (tensor), _tensor_from_ptr is called to create tensor
+    views from extracted pointer values for each K/V buffer.
+    For list mode, tensors are used directly for batch operations.
+    """
     num_layers = 2
     num_tokens = 4
     hidden_size = 8
     page_buffer_size = 8
-    valid_token_count = 3
     slot_mapping = torch.tensor([1, -1, 4, 6], dtype=torch.int64)
 
     key_value = torch.arange(
@@ -1961,35 +1965,29 @@ def test_multi_layer_kv_transfer_unilateral_uses_lmcache_memcpy_async(
             dtype=torch.int64,
         )
 
-    with unittest.mock.patch.object(
-        _py_ops,
-        "lmcache_memcpy_async",
-        wraps=_py_ops.lmcache_memcpy_async,
-    ) as copy_spy:
-        _py_ops.multi_layer_kv_transfer_unilateral(
-            key_value,
-            key_value_ptrs,
-            slot_mapping,
-            torch.device("cpu"),
-            page_buffer_size,
-            _py_ops.TransferDirection.H2D,
-            _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
-        )
+    _py_ops.multi_layer_kv_transfer_unilateral(
+        key_value,
+        key_value_ptrs,
+        slot_mapping,
+        torch.device("cpu"),
+        page_buffer_size,
+        _py_ops.TransferDirection.H2D,
+        _py_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+    )
 
-    assert copy_spy.call_count == num_layers * valid_token_count * 2
-    if use_tensor_list:
-        assert all(
-            isinstance(call.args[0], torch.Tensor)
-            and isinstance(call.args[1], torch.Tensor)
-            for call in copy_spy.call_args_list
-        )
-    else:
-        assert all(
-            isinstance(call.args[0], (int, torch.Tensor))
-            and isinstance(call.args[1], (int, torch.Tensor))
-            and _uses_mixed_pointer_tensor_operands(call)
-            for call in copy_spy.call_args_list
-        )
+    # Verify data was actually transferred to the K/V buffers
+    valid_mask = slot_mapping >= 0
+    valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
+    valid_slots = slot_mapping[valid_tokens].to(dtype=torch.long)
+
+    for ly in range(num_layers):
+        k_buf = buffers[ly]
+        v_buf = buffers[ly + num_layers]
+        for tok, slot in zip(valid_tokens, valid_slots, strict=True):
+            tok_val = int(tok.item())
+            slot_val = int(slot.item())
+            torch.testing.assert_close(k_buf[slot_val], key_value[0, ly, tok_val])
+            torch.testing.assert_close(v_buf[slot_val], key_value[1, ly, tok_val])
 
 
 @pytest.mark.parametrize("pointer_operand", ["dest", "src"])
