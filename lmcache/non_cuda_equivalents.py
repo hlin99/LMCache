@@ -141,8 +141,6 @@ def _tensor_from_cpu_ptr(
 # ====================================================================== #
 #  CUDA implementation                                                   #
 # ====================================================================== #
-
-
 def _tensor_from_cuda_ptr(
     ptr: int,
     shape: tuple[int, ...],
@@ -151,89 +149,70 @@ def _tensor_from_cuda_ptr(
     numel: int,
     total_bytes: int,
 ) -> torch.Tensor:
-    """
-    Zero-copy CUDA tensor from a raw device pointer.
-
-    Tries three strategies in order of preference:
-      1. torch._C._construct_storage_from_data_pointer  (PyTorch >= 2.0)
-      2. __cuda_array_interface__ protocol               (any modern PyTorch)
-      3. cudaMemcpy D2D fallback                         (always correct, copies)
-    """
-    # ------------------------------------------------------------------ #
-    # Strategy 1: torch._C._construct_storage_from_data_pointer          #
-    # Used internally by PyTorch's cudagraph_trees. Zero-copy.           #
-    # ------------------------------------------------------------------ #
+    """Zero-copy CUDA tensor from a raw device pointer."""
+    # Strategy 1: torch._C._construct_storage_from_data_pointer
+    '''
     try:
         storage = torch._C._construct_storage_from_data_pointer(
             ptr, device, total_bytes
         )
         t = torch.empty(0, dtype=dtype, device=device)
         t.set_(storage, storage_offset=0, size=(numel,), stride=(1,))
+        logger.error(" 1  _tensor_from_cuda_ptr")
         return t.view(*shape)
     except (AttributeError, RuntimeError, TypeError):
         pass
-
-    # ------------------------------------------------------------------ #
-    # Strategy 2: __cuda_array_interface__                               #
-    # Standard CUDA array interchange protocol. Zero-copy.               #
-    # bfloat16 is not a valid numpy dtype, so we smuggle it as int16 and #
-    # view back.                                                         #
-    # ------------------------------------------------------------------ #
+    '''
+    # Strategy 2: __cuda_array_interface__ (Fixed & Working)
+    """
     try:
-        # Third Party
-
-        _DTYPE_TO_NUMPY: dict[torch.dtype, str] = {
-            torch.float16: "float16",
-            torch.float32: "float32",
-            torch.float64: "float64",
-            torch.int8: "int8",
-            torch.int16: "int16",
-            torch.int32: "int32",
-            torch.int64: "int64",
-            torch.uint8: "uint8",
-            torch.bool: "bool",
+        _DTYPE_TO_TYPESTR = {
+            torch.float16: "<f2",
+            torch.float32: "<f4",
+            torch.float64: "<f8",
+            torch.int8: "|i1",
+            torch.int16: "<i2",
+            torch.int32: "<i4",
+            torch.int64: "<i8",
+            torch.uint8: "|u1",
+            torch.bool: "|b1",
         }
         is_bf16 = dtype == torch.bfloat16
+        
+        # Determine the correct typestr, smuggle bfloat16 as int16
+        typestr = "<i2" if is_bf16 else _DTYPE_TO_TYPESTR.get(dtype, "|u1")
 
         class _CudaArrayWrapper:
-            """Minimal __cuda_array_interface__ carrier."""
+            def __init__(self, ptr_int: int, shape_tuple: tuple, type_str: str):
+                self.__cuda_array_interface__ = {
+                    "data": (ptr_int, False),
+                    "shape": shape_tuple,
+                    "typestr": type_str,
+                    "version": 3
+                }
 
-            __cuda_array_interface__: Dict[str, Any] = {}
-
-        t = torch.as_tensor(_CudaArrayWrapper(), device=device)
+        t = torch.as_tensor(_CudaArrayWrapper(ptr, (numel,), typestr), device=device)
         if is_bf16:
             t = t.view(torch.bfloat16)
+        
+        logger.error(" 2  _tensor_from_cuda_ptr")
+
         return t.view(*shape)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Strategy 2 (__cuda_array_interface__) failed: {e}")
         pass
-
-    # ------------------------------------------------------------------ #
-    # Strategy 3: cudaMemcpy Device-to-Device (fallback, copies data)    #
-    # Used when neither internal API nor the array interface is available. #
-    # ------------------------------------------------------------------ #
-
-    # load libcudart with fallback mechanisms
+    """
+    # Strategy 3: cudaMemcpy Device-to-Device (Fallback)
     libcudart = _get_copy_lib()
-
     if libcudart is None:
-        raise RuntimeError(
-            "Failed to load libcudart. All three strategies for "
-            "wrapping a CUDA pointer failed."
-        )
+        raise RuntimeError("Failed to load libcudart and zero-copy strategies failed.")
 
     cudaMemcpy = libcudart.cudaMemcpy
     cudaMemcpy.restype = ctypes.c_int
-    cudaMemcpy.argtypes = [
-        ctypes.c_void_p,  # dst
-        ctypes.c_void_p,  # src
-        ctypes.c_size_t,  # count
-        ctypes.c_int,  # kind
-    ]
+    cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
     _MEMCPY_D2D = 3
 
     dst = torch.empty(numel, dtype=dtype, device=device)
-
-    # Synchronize the stream to prevent race conditions during raw memcpy
     torch.cuda.synchronize(device)
 
     err = cudaMemcpy(
@@ -243,11 +222,11 @@ def _tensor_from_cuda_ptr(
         ctypes.c_int(_MEMCPY_D2D),
     )
     if err != 0:
-        raise RuntimeError(
-            f"cudaMemcpy D2D failed with error code {err}. "
-            "All three strategies for wrapping a CUDA pointer failed."
-        )
+        raise RuntimeError(f"cudaMemcpy D2D failed with error code {err}.")
+    logger.error(" 3  _tensor_from_cuda_ptr")
+
     return dst.view(*shape)
+
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
@@ -272,30 +251,28 @@ def _copy_hidden_row_async(
     nbytes: int,
     direction: "TransferDirection",
 ) -> None:
-    """Copy one contiguous hidden-state row via ``lmcache_memcpy_async``.
-
-    Args:
-        dest: Destination row as either a raw pointer or tensor view. Raw
-            pointers must remain valid for at least ``nbytes`` bytes.
-        src: Source row as either a raw pointer or tensor view. Raw pointers
-            must remain valid for at least ``nbytes`` bytes.
-        nbytes: Number of bytes to copy for the row.
-        direction: Transfer direction passed through to
-            ``lmcache_memcpy_async`` for API compatibility.
-
-    Notes:
-        The multi-layer KV transfer fallbacks pass either tensor rows or raw
-        pointers here and let ``lmcache_memcpy_async`` normalize the operands.
-    """
-    logger.error("_copy_hidden_row_async")
-    lmcache_memcpy_async(
-        dest,
-        src,
-        nbytes,
-        direction,
-        0,
-        1,
+    """Copy one contiguous hidden-state row via pure PyTorch native API."""
+    
+    # Extract the target device based on whichever operand is a Tensor
+    target_device = (
+        src.device if isinstance(src, torch.Tensor) 
+        else (dest.device if isinstance(dest, torch.Tensor) else "cuda")
     )
+
+    # Normalize dest to a 1D uint8 tensor
+    if isinstance(dest, int):
+        dest_tensor = _tensor_from_ptr(dest, (nbytes,), torch.uint8, device=target_device)
+    else:
+        dest_tensor = dest.view(-1).view(torch.uint8)[:nbytes]
+
+    # Normalize src to a 1D uint8 tensor
+    if isinstance(src, int):
+        src_tensor = _tensor_from_ptr(src, (nbytes,), torch.uint8, device=target_device)
+    else:
+        src_tensor = src.view(-1).view(torch.uint8)[:nbytes]
+
+    # Perform the pure PyTorch memory copy
+    dest_tensor.copy_(src_tensor)
 
 
 def _get_multi_layer_paged_row(
@@ -338,7 +315,6 @@ def _get_multi_layer_paged_row(
     else:
         row_offset = (kv_idx * page_buffer_size + slot_idx) * hidden_size
     return base_ptr + row_offset * element_size
-
 
 def _get_unilateral_paged_row(
     key_value_ptrs: torch.Tensor | list[torch.Tensor],
@@ -502,51 +478,23 @@ def multi_layer_kv_transfer(
     gpu_kv_format: GPUKVFormat,
     block_size: int,
 ):
-    """
-    Python fallback for multi_layer_kv_transfer.
-
-    key_value layout:
-        - Standard: [2, num_layers, num_tokens, hidden_size]
-        - MLA:      [1, num_layers, num_tokens, hidden_size]
-
-    key_value_ptrs:
-        - If torch.Tensor: int64 tensor containing raw memory pointers (one per layer).
-          Used for CUDA/CPU devices where we create tensor views from pointers.
-        - If list[torch.Tensor]: list of tensor objects (one per layer).
-          Used for non-CUDA/CPU devices where we operate on tensor objects directly.
-
-    Each paged buffer (one per layer) layout depends on gpu_kv_format:
-        - NB_NL_TWO_BS_NH_HS / NL_X_TWO_NB_BS_NH_HS:
-              [2, page_buffer_size, hidden_size]
-        - NL_X_NB_TWO_BS_NH_HS (flash infer):
-              [num_blocks, 2, block_size, hidden_size]
-        - NL_X_NB_BS_HS / NL_X_NBBS_ONE_HS (MLA):
-              [page_buffer_size, hidden_size]
-
-    direction:
-        H2D  = LMCache  -> PagedBuffer
-        D2H  = PagedBuffer -> LMCache
-    """
-    if isinstance(key_value_ptrs, torch.Tensor):
-        logger.error(" key_value_ptrs is a tensor ")
-    elif isinstance(key_value_ptrs, list):
-        logger.error(" key_value_ptrs is a tensor list")
-
-    else:
+    if not isinstance(key_value_ptrs, (torch.Tensor, list)):
         raise TypeError(f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}")
 
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
         GPUKVFormat.NL_X_NBBS_ONE_HS,
     )
-    logger.error("1")
+    
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
     k_or_v_size = 1 if is_mla else 2
+    
     slots = slot_mapping.to(dtype=torch.long)
     valid_mask = slots >= 0
     if not torch.any(valid_mask):
         return
+        
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
     valid_pairs = tuple(
@@ -557,109 +505,58 @@ def multi_layer_kv_transfer(
     row_nbytes = hidden_size * key_value.element_size()
 
     for layer_id in range(num_layers):
+        
+        # Merge redundant loops for all non-MLA formats
         if gpu_kv_format in (
             GPUKVFormat.NB_NL_TWO_BS_NH_HS,
             GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
             GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS,
+            GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
         ):
-            logger.error("2")
-
-            for token_idx, slot_idx in valid_pairs:
-                for kv_idx in range(k_or_v_size):
-                    logger.error("2.1")
-                    paged_row = _get_multi_layer_paged_row(
-                        key_value_ptrs,
-                        layer_id,
-                        kv_idx,
-                        slot_idx,
-                        page_buffer_size,
-                        hidden_size,
-                        key_value.dtype,
-                        gpu_kv_format,
-                        block_size,
-                    )
-                    if direction == TransferDirection.H2D:
-                        _copy_hidden_row_async(
-                            paged_row,
-                            key_value[kv_idx, layer_id, token_idx],
-                            row_nbytes,
-                            direction,
-                        )
-                    else:
-                        _copy_hidden_row_async(
-                            key_value[kv_idx, layer_id, token_idx],
-                            paged_row,
-                            row_nbytes,
-                            direction,
-                        )
-
-        elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-            logger.error("3")
-
             for token_idx, slot_idx in valid_pairs:
                 for kv_idx in range(k_or_v_size):
                     paged_row = _get_multi_layer_paged_row(
-                        key_value_ptrs,
-                        layer_id,
-                        kv_idx,
-                        slot_idx,
-                        page_buffer_size,
-                        hidden_size,
-                        key_value.dtype,
-                        gpu_kv_format,
-                        block_size,
+                        key_value_ptrs, layer_id, kv_idx, slot_idx,
+                        page_buffer_size, hidden_size, key_value.dtype,
+                        gpu_kv_format, block_size,
                     )
+                    
                     if direction == TransferDirection.H2D:
                         _copy_hidden_row_async(
-                            paged_row,
-                            key_value[kv_idx, layer_id, token_idx],
-                            row_nbytes,
-                            direction,
+                            paged_row, key_value[kv_idx, layer_id, token_idx],
+                            row_nbytes, direction,
                         )
                     else:
                         _copy_hidden_row_async(
-                            key_value[kv_idx, layer_id, token_idx],
-                            paged_row,
-                            row_nbytes,
-                            direction,
+                            key_value[kv_idx, layer_id, token_idx], paged_row,
+                            row_nbytes, direction,
                         )
 
+        # MLA formats (kv_idx is fixed to 0)
         elif gpu_kv_format in (
             GPUKVFormat.NL_X_NB_BS_HS,
             GPUKVFormat.NL_X_NBBS_ONE_HS,
         ):
-            logger.error("5")
-
             for token_idx, slot_idx in valid_pairs:
                 paged_row = _get_multi_layer_paged_row(
-                    key_value_ptrs,
-                    layer_id,
-                    0,
-                    slot_idx,
-                    page_buffer_size,
-                    hidden_size,
-                    key_value.dtype,
-                    gpu_kv_format,
-                    block_size,
+                    key_value_ptrs, layer_id, 0, slot_idx,
+                    page_buffer_size, hidden_size, key_value.dtype,
+                    gpu_kv_format, block_size,
                 )
+                
                 if direction == TransferDirection.H2D:
                     _copy_hidden_row_async(
-                        paged_row,
-                        key_value[0, layer_id, token_idx],
-                        row_nbytes,
-                        direction,
+                        paged_row, key_value[0, layer_id, token_idx],
+                        row_nbytes, direction,
                     )
                 else:
                     _copy_hidden_row_async(
-                        key_value[0, layer_id, token_idx],
-                        paged_row,
-                        row_nbytes,
-                        direction,
+                        key_value[0, layer_id, token_idx], paged_row,
+                        row_nbytes, direction,
                     )
 
         else:
             raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
-
 
 def multi_layer_kv_transfer_unilateral(
     key_value: torch.Tensor,
