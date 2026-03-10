@@ -168,7 +168,10 @@ def _cuda_memcpy(dst: int, src: int, count: int) -> None:
         ctypes.c_int(_CUDA_MEMCPY_DEFAULT),
     )
     if ret != 0:
-        raise RuntimeError(f"cudaMemcpy failed with error code {ret}")
+        raise RuntimeError(
+            f"cudaMemcpy failed with error code {ret} "
+            f"(dst=0x{dst:x}, src=0x{src:x}, count={count})"
+        )
 
 
 def _is_mla(gpu_kv_format: GPUKVFormat) -> bool:
@@ -220,7 +223,11 @@ def _page_buffer_byte_offset(
         # MLA formats – no separate k/v dimension
         return slot_id * bytes_per_token
     else:
-        raise ValueError(f"Unsupported GPUKVFormat: {gpu_kv_format}")
+        supported = ", ".join(f.name for f in GPUKVFormat if f != gpu_kv_format)
+        raise ValueError(
+            f"Unsupported GPUKVFormat: {gpu_kv_format!r}. "
+            f"Supported formats: {supported}"
+        )
 
 
 def multi_layer_kv_transfer(
@@ -257,6 +264,10 @@ def multi_layer_kv_transfer(
         block_size: Block size used by ``NL_X_NB_TWO_BS_NH_HS`` format.
         skip_prefix_n_tokens: Number of leading tokens to skip during the
             transfer.
+
+    Raises:
+        RuntimeError: If ``cudaMemcpy`` fails.
+        ValueError: If *gpu_kv_format* is not supported.
     """
     k_or_v_size = key_value.size(0)
     num_layers = key_value.size(1)
@@ -334,6 +345,11 @@ def multi_layer_kv_transfer_unilateral(
         page_buffer_size: Number of slots in each paged buffer.
         direction: ``TransferDirection.H2D`` or ``D2H``.
         gpu_kv_format: Layout format of the GPU KV caches.
+
+    Raises:
+        RuntimeError: If ``cudaMemcpy`` fails.
+        ValueError: If *gpu_kv_format* is not supported (propagated from
+            :func:`multi_layer_kv_transfer` for MLA formats).
     """
     if _is_mla(gpu_kv_format):
         return multi_layer_kv_transfer(
