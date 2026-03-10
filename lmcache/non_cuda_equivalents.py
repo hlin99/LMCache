@@ -449,6 +449,15 @@ def multi_layer_kv_transfer(
     valid_tokens = torch.nonzero(valid_mask, as_tuple=True)[0]
     valid_slots = slots[valid_tokens]
 
+    # Calculate num_blocks for NL_X_NB_TWO_BS_NH_HS format before moving to device
+    # This must be done before valid_slots is moved to potentially different device
+    # to avoid device-to-host synchronization issues in the loop
+    num_blocks_flash_infer = None
+    if gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+        # Keep valid_slots on original device (likely CPU) for .item() call
+        max_slot = int(torch.max(valid_slots).item())
+        num_blocks_flash_infer = max(max_slot // block_size + 1, 1)
+
     # Ensure valid_tokens and valid_slots are on the same device as key_value
     # to avoid device mismatch when indexing
     valid_tokens = valid_tokens.to(device)
@@ -481,12 +490,10 @@ def multi_layer_kv_transfer(
                     device,
                 )
             elif gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-                num_blocks = max(
-                    int(torch.max(valid_slots).item() // block_size + 1), 1
-                )
+                # Use pre-calculated num_blocks to avoid device synchronization in loop
                 paged = _tensor_from_ptr(
                     paged_ptr,
-                    (num_blocks, 2, block_size, hidden_size),
+                    (num_blocks_flash_infer, 2, block_size, hidden_size),
                     key_value.dtype,
                     device,
                 )
