@@ -20,11 +20,12 @@ def device_sync(device: str) -> None:
     """Synchronize device operations.
 
     Args:
-        device: Device string ("cuda", "xpu", or "cpu")
+        device: Device string ("cuda", "xpu", "hpu", or "cpu")
 
     This function synchronizes operations for GPU devices:
     - For CUDA devices, calls torch.cuda.synchronize()
     - For XPU devices, calls torch.xpu.synchronize()
+    - For HPU devices, calls torch.hpu.synchronize()
     - For CPU, no synchronization is needed (returns immediately)
     """
     if device == "cuda":
@@ -32,10 +33,12 @@ def device_sync(device: str) -> None:
     elif device == "xpu":
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.synchronize()
+    elif device == "hpu":
+        if hasattr(torch, "hpu") and torch.hpu.is_available():
+            torch.hpu.synchronize()
     else:
-        # TODO: add more device here
+        # CPU requires no synchronization
         pass
-    # CPU requires no synchronization
 
 
 # ==========================================
@@ -51,6 +54,7 @@ def _build_backend_params() -> list:
     - cuda_py_ops: uses lmcache.non_cuda_equivalents with GPU visible
     - cpy_py_ops: uses lmcache.non_cuda_equivalents with GPU mocked away
     - xpu_py_ops: uses lmcache.non_cuda_equivalents with XPU visible
+    - hpu_py_ops: uses lmcache.non_cuda_equivalents with HPU visible
     """
     params = []
     cuda_available = torch.cuda.is_available()
@@ -79,6 +83,9 @@ def _build_backend_params() -> list:
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         params.append(pytest.param(("xpu_py_ops", _py_ops, "xpu"), id="xpu_py_ops"))
+
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        params.append(pytest.param(("hpu_py_ops", _py_ops, "hpu"), id="hpu_py_ops"))
 
     return params
 

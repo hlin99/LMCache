@@ -109,8 +109,21 @@ def _tensor_from_ptr(
     if device.type == "cuda":
         return _tensor_from_cuda_ptr(ptr, shape, dtype, device, numel, total_bytes)
 
+    # ------------------------------------------------------------------ #
+    # Other accelerator devices (XPU, HPU, etc.)                         #
+    # ------------------------------------------------------------------ #
+    # For non-CUDA accelerators, we attempt to create a tensor using
+    # PyTorch's standard tensor allocation and copy the data from the pointer.
+    # This is less efficient than zero-copy but works for devices that don't
+    # support direct pointer manipulation.
+    if device.type in ("xpu", "hpu"):
+        return _tensor_from_other_device_ptr(
+            ptr, shape, dtype, device, numel, total_bytes
+        )
+
     raise ValueError(
-        f"Unsupported device type: {device.type!r}. Expected 'cpu' or 'cuda'."
+        f"Unsupported device type: {device.type!r}. "
+        f"Expected 'cpu', 'cuda', 'xpu', or 'hpu'."
     )
 
 
@@ -246,6 +259,41 @@ def _tensor_from_cuda_ptr(
             "All three strategies for wrapping a CUDA pointer failed."
         )
     return dst.view(*shape)
+
+
+# ====================================================================== #
+#  Other device (XPU, HPU, etc.) implementation                          #
+# ====================================================================== #
+
+
+def _tensor_from_other_device_ptr(
+    ptr: int,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    numel: int,
+    total_bytes: int,
+) -> torch.Tensor:
+    """
+    Create a tensor from a raw device pointer for non-CUDA accelerators.
+
+    This function handles devices like XPU, HPU, and other accelerators that
+    don't provide direct pointer dereferencing or CUDA-style memory copy APIs.
+
+    Strategy: Copy data through CPU as an intermediate:
+      1. Create a CPU tensor from the pointer (zero-copy)
+      2. Copy the CPU tensor to the target device
+
+    Note: This involves a copy and is less efficient than zero-copy methods,
+    but it works for any PyTorch-supported device.
+    """
+    # First, create a CPU tensor view of the pointer (zero-copy)
+    cpu_tensor = _tensor_from_cpu_ptr(ptr, shape, dtype, numel, total_bytes)
+
+    # Then copy to the target device
+    device_tensor = cpu_tensor.to(device)
+
+    return device_tensor
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
