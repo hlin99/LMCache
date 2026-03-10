@@ -116,18 +116,24 @@ def scenario_get_gpu_pci_bus_id(ops: Any, device: str) -> dict[str, torch.Tensor
     """Test get_gpu_pci_bus_id returns a valid string on CUDA backends."""
     res = ops.get_gpu_pci_bus_id(0)
 
-    if device == "cuda" and torch.cuda.is_available():
-        assert res is not None, "get_gpu_pci_bus_id returned None"
-        assert isinstance(res, str) and len(res) > 0
+    is_valid = isinstance(res, str) and len(res) > 0
 
     # 1 = PASS (call succeeded without crash)
-    return {"get_gpu_pci_bus_id": torch.tensor([1], dtype=torch.int32)}
+    # 0 = FAIL
+    return {
+        "get_gpu_pci_bus_id": torch.tensor([1 if is_valid else 0], dtype=torch.int32)
+    }
 
 
 def scenario_calculate_cdf(ops: Any, device: str) -> dict[str, torch.Tensor]:
     """Test calculate_cdf for multiple bin counts."""
     num_bins_list = [1, 2, 5, 11, 15, 31, 32, 63]
     results: dict[str, torch.Tensor] = {}
+
+    # all bins should be smaller than 64 -> align with C ops
+    assert all(n < 64 for n in num_bins_list), (
+        f"All num_bins must be < 64, got {[n for n in num_bins_list if n >= 64]}"
+    )
 
     for num_bins in num_bins_list:
         torch.manual_seed(42)
@@ -414,9 +420,7 @@ def scenario_load_and_reshape_flash(ops: Any, device: str) -> dict[str, torch.Te
 
     # 5. Return ALL extracted chunks concatenated for cross-backend comparison
     return {
-        "load_and_reshape_flash": torch.cat(
-            [c.cpu() for c in extracted_chunks], dim=2
-        )
+        "load_and_reshape_flash": torch.cat([c.cpu() for c in extracted_chunks], dim=2)
     }
 
 
