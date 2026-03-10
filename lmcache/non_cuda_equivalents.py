@@ -478,7 +478,29 @@ def multi_layer_kv_transfer(
     gpu_kv_format: GPUKVFormat,
     block_size: int,
 ):
-    """Python fallback for copying multi-layer KV rows between LMCache and paged buffers."""
+    """Copy multi-layer KV cache rows bidirectionally between LMCache and paged buffers.
+
+    This is the non-CUDA fallback used when CUDA kernels are unavailable.
+    It transfers rows according to ``slot_mapping`` for both H2D and D2H
+    directions, skipping tokens mapped to negative slot ids.
+
+    Args:
+        key_value (torch.Tensor): Source/destination KV tensor in LMCache layout.
+        key_value_ptrs (torch.Tensor | list[torch.Tensor]): Per-layer paged KV
+            pointers or tensors.
+        slot_mapping (torch.Tensor): Slot mapping (shape: ``[num_tokens]``) from
+            token index to physical slot id. Negative values indicate slots to
+            skip during transfer.
+        paged_memory_device (torch.device): Device where paged buffers reside.
+        page_buffer_size (int): Number of slots in each paged buffer layer.
+        direction (TransferDirection): Transfer direction (H2D or D2H).
+        gpu_kv_format (GPUKVFormat): Paged buffer layout format.
+        block_size (int): Block size used by block-based paged formats.
+
+    Raises:
+        TypeError: If ``key_value_ptrs`` is not a tensor or list of tensors.
+        ValueError: If ``gpu_kv_format`` is unsupported.
+    """
     if not isinstance(key_value_ptrs, (torch.Tensor, list)):
         raise TypeError(
             f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
