@@ -1163,36 +1163,34 @@ def uint32_val(val):
     return int(val & 0xFFFFFFFF)
 
 
+from numba import njit
+
+@njit(cache=True)
 def _decode_single_channel(
-    cdf_layer_c: np.ndarray,
-    bs_np: np.ndarray,    # full 1D bytestream (padded)
-    start_off: int,       # start offset of this channel in bs_np
-    end_off: int,         # end offset of this channel in bs_np
-    n_tokens: int,
-    out_layer_c: np.ndarray,
-) -> None:
-    """Core arithmetic decoding for a single (layer, channel)."""
+    cdf_layer_c,
+    bs_np,
+    start_off,
+    end_off,
+    n_tokens,
+    out_layer_c,
+):
     MASK32 = 0xFFFFFFFF
     precision = 16
     max_symbol = len(cdf_layer_c) - 2
 
-    # Read 4 bytes from start_off in the global bytestream (may cross channel
-    # boundary), matching CUDA kernel behavior
     v_val = 0
-    if start_off + 4 <= bs_np.size:
+    if start_off + 4 <= len(bs_np):
         v_val = (
-            int(bs_np[start_off]) << 24
-            | int(bs_np[start_off + 1]) << 16
-            | int(bs_np[start_off + 2]) << 8
+            (int(bs_np[start_off]) << 24)
+            | (int(bs_np[start_off + 1]) << 16)
+            | (int(bs_np[start_off + 2]) << 8)
             | int(bs_np[start_off + 3])
         ) & MASK32
 
     low, high = 0, MASK32
     byte_buffer_offset = start_off + 4
     bit_idx = 1
-    byte_buffer = (
-        int(bs_np[byte_buffer_offset]) if byte_buffer_offset < end_off else 0
-    )
+    byte_buffer = int(bs_np[byte_buffer_offset]) if byte_buffer_offset < end_off else 0
 
     for i in range(n_tokens):
         span = (high - low + 1) & MASK32
@@ -1201,9 +1199,10 @@ def _decode_single_channel(
 
         v_minus_l = (v_val - low) & MASK32
         count = ((v_minus_l + 1) * 0x10000 - 1) // span
-        count = int(count & 0xFFFF)
+        count = count & 0xFFFF
 
-        left, right = 0, max_symbol + 1
+        left = 0
+        right = max_symbol + 1
         while left + 1 < right:
             m = (left + right) // 2
             if int(cdf_layer_c[m]) < count:
@@ -1214,12 +1213,12 @@ def _decode_single_channel(
                 left = m
                 break
 
-        sym_i = left
-        out_layer_c[i] = sym_i
+        out_layer_c[i] = left
 
         if i == n_tokens - 1:
             break
 
+        sym_i = left
         c_low = int(cdf_layer_c[sym_i])
         c_high = 0x10000 if sym_i == max_symbol else int(cdf_layer_c[sym_i + 1])
 
@@ -1244,12 +1243,7 @@ def _decode_single_channel(
             if bit_idx == 9:
                 bit_idx = 1
                 byte_buffer_offset += 1
-                byte_buffer = (
-                    int(bs_np[byte_buffer_offset])
-                    if byte_buffer_offset < end_off
-                    else 0
-                )
-
+                byte_buffer = int(bs_np[byte_buffer_offset]) if byte_buffer_offset < end_off else 0
 
 def decode_fast_new(cdf, bytestreams, lengths, output):
     """
