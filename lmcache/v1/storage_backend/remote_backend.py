@@ -137,6 +137,7 @@ class RemoteBackend(StorageBackendInterface):
             self.connection = None
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        logger.error(" remote backend contains")
         if self.connection is None:
             logger.warning("Connection is None in contains, returning False")
             return False
@@ -155,6 +156,7 @@ class RemoteBackend(StorageBackendInterface):
                     self.connection.exists(key), self.loop
                 )
                 res = future.result()
+                logger.error(" remote backend contains res=%s", res)
                 return res
         except Exception as e:
             logger.warning(f"Remote connection failed in contains: {e}")
@@ -166,6 +168,8 @@ class RemoteBackend(StorageBackendInterface):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
+        logger.error(" remote backend batched contains")
+
         if self.connection is None:
             logger.warning("Connection is None in batched_contains, returning 0")
             return 0
@@ -207,7 +211,7 @@ class RemoteBackend(StorageBackendInterface):
         :param on_complete_callback: Optional callback invoked after the remote
             write completes. Callback exceptions are caught and logged.
         """
-
+        logger.error("remote submit_put_task ")
         def create_immediate_empty_future() -> Future:
             f: Future = Future()
             f.set_result(None)
@@ -268,6 +272,7 @@ class RemoteBackend(StorageBackendInterface):
         :param on_complete_callback: Optional callback invoked once per key
             after that key's write completes (not once per batch).
         """
+        logger.error("remote batched_submit_put_task ")
         if self.connection is None:
             logger.warning(
                 "Connection is None in batched_submit_put_task, returning None"
@@ -322,6 +327,7 @@ class RemoteBackend(StorageBackendInterface):
         """
         Blocking get function.
         """
+        logger.error(" remote backend get_blocking ")
         # Check if local_cpu_backend is available (required for memory allocation)
         if self.local_cpu_backend is None:
             logger.warning(
@@ -374,6 +380,7 @@ class RemoteBackend(StorageBackendInterface):
         self,
         keys: List[CacheEngineKey],
     ) -> List[Optional[MemoryObj]]:
+        logger.error(" remote backend batched_get_blocking ")
         # Check if local_cpu_backend is available (required for memory allocation)
         if self.local_cpu_backend is None:
             logger.warning(

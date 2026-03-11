@@ -1291,8 +1291,21 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
     """
     logger.error("decode_fast_prefsum")
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
-    bs_np = bytestreams.cpu().numpy().astype(np.uint8)
     pref_np = lengths_prefsum.cpu().numpy().astype(np.int64).flatten()
+
+    # WA: mirror the padding applied before calling lmc_ops.decode_fast_prefsum.
+    # The CUDA kernel reads out-of-bound in two ways:
+    # 1. Uses prefsum as exclusive-end: max(prefsum) may == len(bytestreams)
+    # 2. Reads 4 bytes to init v_val: start_off+4 may exceed len(bytestreams)
+    # Pad with zeros here so py_ops matches lmc_ops behavior exactly.
+    max_prefsum = int(pref_np.max())
+    target_len = max_prefsum + 4
+    pad_size = max(0, target_len - bytestreams.shape[0])
+    if pad_size > 0:
+        bytestreams = torch.nn.functional.pad(bytestreams, (0, pad_size), value=0)
+
+    # NOTE: bs_np must be created AFTER padding
+    bs_np = bytestreams.cpu().numpy().astype(np.uint8)
 
     n_layers, n_tokens, n_channels = output.shape
     max_symbol = cdf_np.shape[2] - 2
@@ -1303,6 +1316,7 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
         for c in range(n_channels):
             cid = layer_idx * n_channels + c
             start_off = 0 if cid == 0 else int(pref_np[cid - 1])
+            end_off = int(pref_np[cid])
 
             v_val = 0
             if start_off + 4 <= bs_np.size:
@@ -1316,7 +1330,7 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
             low, high = 0, MASK32
             byte_buffer_offset, bit_idx = start_off + 4, 1
             byte_buffer = (
-                int(bs_np[byte_buffer_offset]) if byte_buffer_offset < bs_np.size else 0
+                int(bs_np[byte_buffer_offset]) if byte_buffer_offset < end_off else 0
             )
 
             for i in range(n_tokens):
@@ -1380,7 +1394,7 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
                         bit_idx, byte_buffer_offset = 1, byte_buffer_offset + 1
                         byte_buffer = (
                             int(bs_np[byte_buffer_offset])
-                            if byte_buffer_offset < bs_np.size
+                            if byte_buffer_offset < end_off
                             else 0
                         )
 

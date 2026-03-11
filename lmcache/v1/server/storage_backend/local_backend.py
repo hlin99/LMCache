@@ -33,6 +33,7 @@ class LMSLocalBackend(LMSBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> bool:
+        logger.error(" LMSLocalBackend contains %s", key)
         with self.lock:
             return key in self.dict
 
@@ -41,6 +42,8 @@ class LMSLocalBackend(LMSBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> None:
+        logger.error(" LMSLocalBackend remove %s", key)
+
         with self.lock:
             self.dict.pop(key)
 
@@ -49,6 +52,8 @@ class LMSLocalBackend(LMSBackendInterface):
         client_meta: ClientMetaMessage,
         kv_chunk_bytes: bytearray,
     ) -> None:
+        logger.error(" LMSLocalBackend put %s", client_meta.key)
+
         with self.lock:
             self.dict[client_meta.key] = LMSMemoryObj(
                 kv_chunk_bytes,
@@ -63,6 +68,8 @@ class LMSLocalBackend(LMSBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> Optional[LMSMemoryObj]:
+        logger.error(" LMSLocalBackend get %s", key)
+
         with self.lock:
             return self.dict.get(key, None)
 
