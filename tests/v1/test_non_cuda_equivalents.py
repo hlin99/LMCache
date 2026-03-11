@@ -1400,7 +1400,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
 
             # ── 1. LMCache Tensor ──
             lmc_shape = (k_or_v_size, num_layers, num_tokens, head_size)
-            lmc_tensor = torch.zeros(lmc_shape, dtype=dtype, device="cpu")
+            lmc_tensor = torch.zeros(lmc_shape, dtype=dtype, device="cpu").pin_memory()
 
             if not direction:  # LMC → Paged
                 for kv in range(k_or_v_size):
