@@ -1163,123 +1163,123 @@ def uint32_val(val):
     return int(val & 0xFFFFFFFF)
 
 
+def _decode_single_channel(
+    cdf_layer_c: np.ndarray,
+    bs_np: np.ndarray,    # full 1D bytestream (padded)
+    start_off: int,       # start offset of this channel in bs_np
+    end_off: int,         # end offset of this channel in bs_np
+    n_tokens: int,
+    out_layer_c: np.ndarray,
+) -> None:
+    """Core arithmetic decoding for a single (layer, channel)."""
+    MASK32 = 0xFFFFFFFF
+    precision = 16
+    max_symbol = len(cdf_layer_c) - 2
+
+    # Read 4 bytes from start_off in the global bytestream (may cross channel
+    # boundary), matching CUDA kernel behavior
+    v_val = 0
+    if start_off + 4 <= bs_np.size:
+        v_val = (
+            int(bs_np[start_off]) << 24
+            | int(bs_np[start_off + 1]) << 16
+            | int(bs_np[start_off + 2]) << 8
+            | int(bs_np[start_off + 3])
+        ) & MASK32
+
+    low, high = 0, MASK32
+    byte_buffer_offset = start_off + 4
+    bit_idx = 1
+    byte_buffer = (
+        int(bs_np[byte_buffer_offset]) if byte_buffer_offset < end_off else 0
+    )
+
+    for i in range(n_tokens):
+        span = (high - low + 1) & MASK32
+        if span == 0:
+            span = 0x100000000
+
+        v_minus_l = (v_val - low) & MASK32
+        count = ((v_minus_l + 1) * 0x10000 - 1) // span
+        count = int(count & 0xFFFF)
+
+        left, right = 0, max_symbol + 1
+        while left + 1 < right:
+            m = (left + right) // 2
+            if int(cdf_layer_c[m]) < count:
+                left = m
+            elif int(cdf_layer_c[m]) > count:
+                right = m
+            else:
+                left = m
+                break
+
+        sym_i = left
+        out_layer_c[i] = sym_i
+
+        if i == n_tokens - 1:
+            break
+
+        c_low = int(cdf_layer_c[sym_i])
+        c_high = 0x10000 if sym_i == max_symbol else int(cdf_layer_c[sym_i + 1])
+
+        high = (low + ((span * c_high) >> precision) - 1) & MASK32
+        low = (low + ((span * c_low) >> precision)) & MASK32
+
+        while True:
+            if low >= 0x80000000 or high < 0x80000000:
+                v_val = ((v_val << 1) | ((byte_buffer >> (8 - bit_idx)) & 1)) & MASK32
+                low = (low << 1) & MASK32
+                high = ((high << 1) | 1) & MASK32
+                bit_idx += 1
+            elif low >= 0x40000000 and high < 0xC0000000:
+                v_val = (v_val - 0x40000000) & MASK32
+                v_val = ((v_val << 1) | ((byte_buffer >> (8 - bit_idx)) & 1)) & MASK32
+                low = (low << 1) & 0x7FFFFFFF
+                high = ((high << 1) | 0x80000001) & MASK32
+                bit_idx += 1
+            else:
+                break
+
+            if bit_idx == 9:
+                bit_idx = 1
+                byte_buffer_offset += 1
+                byte_buffer = (
+                    int(bs_np[byte_buffer_offset])
+                    if byte_buffer_offset < end_off
+                    else 0
+                )
+
+
 def decode_fast_new(cdf, bytestreams, lengths, output):
     """
     Python implementation of Arithmetic Decoding.
     Strictly aligned with CUDA decode_with_accessor_kernel.
+    bytestreams shape: [nlayers, nchannels, buffer_size]
     """
     logger.error("decode_fast_new")
-    # Reinterpret raw bytes of cdf as uint16 bit-patterns, then widen to uint32
-    # for arithmetic. This matches encode_fast_new and decode_fast_prefsum.
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
     bs_np = bytestreams.cpu().numpy().astype(np.uint8)
     len_np = lengths.cpu().numpy().astype(np.int32)
 
     n_layers, n_tokens, n_channels = output.shape
-    _, _, lp = cdf_np.shape
-    max_symbol = lp - 2
-    precision = 16
-
     out_np = np.zeros(output.shape, dtype=np.uint8)
 
-    # Use layer_idx to avoid Ruff E741
     for layer_idx in range(n_layers):
         for c in range(n_channels):
             curr_len = int(len_np[layer_idx, c])
-            channel_bs = bs_np[layer_idx, c]
-
-            v_val = 0
-            if curr_len >= 4:
-                v_val = (
-                    int(channel_bs[0]) << 24
-                    | int(channel_bs[1]) << 16
-                    | int(channel_bs[2]) << 8
-                    | int(channel_bs[3])
-                )
-                v_val = uint32_val(v_val)
-
-            byte_buffer_offset = 4
-            byte_buffer = (
-                int(channel_bs[byte_buffer_offset])
-                if byte_buffer_offset < curr_len
-                else 0
+            # For decode_fast_new, each channel has its own contiguous buffer,
+            # so start_off=0 and end_off=curr_len within channel_bs
+            channel_bs = bs_np[layer_idx, c]  # shape [buffer_size]
+            _decode_single_channel(
+                cdf_np[layer_idx, c],
+                channel_bs,
+                0,
+                curr_len,
+                n_tokens,
+                out_np[layer_idx, :, c],
             )
-            bit_idx = 1
 
-            l_val = 0
-            h_val = 0xFFFFFFFF
-
-            current_cdf_slice = cdf_np[layer_idx, c]
-            for i in range(n_tokens):
-                # Calculate span and count for symbol search
-                MASK32 = 0xFFFFFFFF
-                span = (int(h_val) - int(l_val) + 1) & MASK32
-                if span == 0:
-                    span = 0x100000000  # 2^32
-                v_minus_l = uint32_val(v_val - l_val)
-                count = ((int(v_minus_l) + 1) * 65536 - 1) // span
-                count = int(count & 0xFFFF)
-
-                # Binary search for the symbol in CDF
-                left, right = 0, max_symbol + 1
-                while left + 1 < right:
-                    m = (left + right) // 2
-                    if int(current_cdf_slice[m]) < count:
-                        left = m
-                    elif int(current_cdf_slice[m]) > count:
-                        right = m
-                    else:
-                        left = m
-                        break
-
-                sym_i = left
-                out_np[layer_idx, i, c] = sym_i
-
-                if i == n_tokens - 1:
-                    break
-
-                c_low = int(current_cdf_slice[sym_i])
-                c_high = (
-                    0x10000
-                    if sym_i == max_symbol
-                    else int(current_cdf_slice[sym_i + 1])
-                )
-
-                # Update range
-                h_val = uint32_val((l_val - 1) + ((span * c_high) >> precision))
-                l_val = uint32_val(l_val + ((span * c_low) >> precision))
-
-                # Renormalization
-                while True:
-                    if (l_val >= 0x80000000) or (h_val < 0x80000000):
-                        l_val = uint32_val(l_val << 1)
-                        h_val = uint32_val((h_val << 1) | 1)
-
-                        v_val = uint32_val(v_val << 1)
-                        v_val |= (byte_buffer >> (8 - bit_idx)) & 1
-                        bit_idx += 1
-
-                    elif (l_val >= 0x40000000) and (h_val < 0xC0000000):
-                        l_val = uint32_val((l_val << 1) & 0x7FFFFFFF)
-                        h_val = uint32_val((h_val << 1) | 0x80000001)
-                        v_val = uint32_val(v_val - 0x40000000)
-
-                        v_val = uint32_val(v_val << 1)
-                        v_val |= (byte_buffer >> (8 - bit_idx)) & 1
-                        bit_idx += 1
-                    else:
-                        break
-
-                    # Update bit index and byte buffer
-                    if bit_idx == 9:
-                        bit_idx = 1
-                        byte_buffer_offset += 1
-                        if byte_buffer_offset < curr_len:
-                            byte_buffer = int(channel_bs[byte_buffer_offset])
-                        else:
-                            byte_buffer = 0
-
-    # Mypy: Validate output is not None before copying
     if output is not None:
         output.copy_(torch.from_numpy(out_np))
 
@@ -1287,29 +1287,24 @@ def decode_fast_new(cdf, bytestreams, lengths, output):
 def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
     """
     Python equivalent of C++ decode_fast_prefsum.
-    Fixed: Range calculation and ZeroDivisionError handling to match CUDA kernel.
+    bytestreams shape: [total_bytes] (1D, all channels packed)
     """
     logger.error("decode_fast_prefsum")
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
     pref_np = lengths_prefsum.cpu().numpy().astype(np.int64).flatten()
 
-    # WA: mirror the padding applied before calling lmc_ops.decode_fast_prefsum.
-    # The CUDA kernel reads out-of-bound in two ways:
-    # 1. Uses prefsum as exclusive-end: max(prefsum) may == len(bytestreams)
-    # 2. Reads 4 bytes to init v_val: start_off+4 may exceed len(bytestreams)
-    # Pad with zeros here so py_ops matches lmc_ops behavior exactly.
+    # WA: CUDA kernel reads out-of-bound in two ways:
+    # 1. max(prefsum) may equal len(bytestreams) (off-by-one on exclusive-end)
+    # 2. v_val init reads 4 bytes starting at start_off, may exceed bytestreams
+    # Pad with zeros to make all reads safe.
     max_prefsum = int(pref_np.max())
-    target_len = max_prefsum + 4
-    pad_size = max(0, target_len - bytestreams.shape[0])
+    pad_size = max(0, max_prefsum + 4 - bytestreams.shape[0])
     if pad_size > 0:
         bytestreams = torch.nn.functional.pad(bytestreams, (0, pad_size), value=0)
 
-    # NOTE: bs_np must be created AFTER padding
-    bs_np = bytestreams.cpu().numpy().astype(np.uint8)
+    bs_np = bytestreams.cpu().numpy().astype(np.uint8)  # must be after padding
 
     n_layers, n_tokens, n_channels = output.shape
-    max_symbol = cdf_np.shape[2] - 2
-    precision, c_count, MASK32 = 16, 0x10000, 0xFFFFFFFF
     out_np = np.zeros(output.shape, dtype=np.uint8)
 
     for layer_idx in range(n_layers):
@@ -1317,88 +1312,17 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
             cid = layer_idx * n_channels + c
             start_off = 0 if cid == 0 else int(pref_np[cid - 1])
             end_off = int(pref_np[cid])
-
-            v_val = 0
-            if start_off + 4 <= bs_np.size:
-                v_val = (
-                    int(bs_np[start_off]) << 24
-                    | int(bs_np[start_off + 1]) << 16
-                    | int(bs_np[start_off + 2]) << 8
-                    | int(bs_np[start_off + 3])
-                ) & MASK32
-
-            low, high = 0, MASK32
-            byte_buffer_offset, bit_idx = start_off + 4, 1
-            byte_buffer = (
-                int(bs_np[byte_buffer_offset]) if byte_buffer_offset < end_off else 0
+            _decode_single_channel(
+                cdf_np[layer_idx, c],
+                bs_np,
+                start_off,
+                end_off,
+                n_tokens,
+                out_np[layer_idx, :, c],
             )
 
-            for i in range(n_tokens):
-                # 💡 FIX: Emulate 32-bit overflow for span.
-                # In C++, 0xFFFFFFFF - 0 + 1 == 0.
-                # But for division, we must treat it as 2^32.
-                span = (high - low + 1) & MASK32
-                if span == 0:
-                    span = 0x100000000  # 2^32
-
-                v_minus_l = (v_val - low) & MASK32
-                count = ((v_minus_l + 1) * c_count - 1) // span
-                count = int(count & 0xFFFF)
-
-                left, right = 0, max_symbol + 1
-                current_cdf = cdf_np[layer_idx, c]
-                while left + 1 < right:
-                    m = (left + right) // 2
-                    if int(current_cdf[m]) < count:
-                        left = m
-                    elif int(current_cdf[m]) > count:
-                        right = m
-                    else:
-                        left = m
-                        break
-
-                sym_i = left
-                out_np[layer_idx, i, c] = sym_i
-                if i == n_tokens - 1:
-                    break
-
-                c_low = int(current_cdf[sym_i])
-                c_high = 0x10000 if sym_i == max_symbol else int(current_cdf[sym_i + 1])
-
-                # Update interval
-                high = (low + ((span * c_high) >> precision) - 1) & MASK32
-                low = (low + ((span * c_low) >> precision)) & MASK32
-
-                # Renormalization
-                while True:
-                    if low >= 0x80000000 or high < 0x80000000:
-                        v_val = (
-                            (v_val << 1) | ((byte_buffer >> (8 - bit_idx)) & 1)
-                        ) & MASK32
-                        low, high = (low << 1) & MASK32, ((high << 1) | 1) & MASK32
-                        bit_idx += 1
-                    elif low >= 0x40000000 and high < 0xC0000000:
-                        v_val = (v_val - 0x40000000) & MASK32
-                        v_val = (
-                            (v_val << 1) | ((byte_buffer >> (8 - bit_idx)) & 1)
-                        ) & MASK32
-                        low, high = (
-                            (low << 1) & 0x7FFFFFFF,
-                            ((high << 1) | 0x80000001) & MASK32,
-                        )
-                        bit_idx += 1
-                    else:
-                        break
-
-                    if bit_idx == 9:
-                        bit_idx, byte_buffer_offset = 1, byte_buffer_offset + 1
-                        byte_buffer = (
-                            int(bs_np[byte_buffer_offset])
-                            if byte_buffer_offset < end_off
-                            else 0
-                        )
-
     output.copy_(torch.from_numpy(out_np))
+
 
 
 def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
