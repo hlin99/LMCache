@@ -1294,32 +1294,6 @@ def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
     return normalized.to(torch.int16)
 
 
-def calculate_cdf1(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
-    """
-    Equivalent to CUDA calculate_cdf.
-    Input: Expects a 3D tensor (e.g., [1, N, 1]).
-    num_bins: Total number of bins (max_val + 1).
-    Returns: Tensor of length (num_bins + 1) with CDF values.
-    """
-    # Force flattening to match bincount expectation
-    flat_input = input_tensor.flatten().long()
-
-    # Use num_bins directly to match the CUDA kernel's 'Alphabet Size'
-    counts = torch.bincount(flat_input, minlength=num_bins)
-
-    # Slice to ensure output length is exactly num_bins
-    counts = counts[:num_bins]
-
-    cdf = torch.cumsum(counts, dim=0).float()
-
-    if cdf[-1] > 0:
-        cdf = cdf / cdf[-1]
-
-    cdf = torch.cat([torch.tensor([0.0], device=cdf.device), cdf])
-
-    return cdf
-
-
 def rotary_embedding_k_fused(
     old_positions: torch.Tensor,
     new_positions: torch.Tensor,
