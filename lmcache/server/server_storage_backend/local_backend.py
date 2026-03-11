@@ -38,7 +38,6 @@ class LMSLocalBackend(LMSBackendInterface):
         self.update_lock = threading.Lock()
 
         self.evictor = DummyEvictor()
-        logger.error(" LMSLocalBackend __init__ ")
 
     def list_keys(self) -> List[str]:
         with self.update_lock:
@@ -57,7 +56,6 @@ class LMSLocalBackend(LMSBackendInterface):
         Returns:
             True if the cache engine contains the key, False otherwise
         """
-        logger.error(" contains key=%s", key)
         return key in self.dict
 
     def remove(
@@ -71,8 +69,6 @@ class LMSLocalBackend(LMSBackendInterface):
             key: the key of the token chunk, including prefix hash and format
 
         """
-        logger.error(" remove key=%s", key)
-
         self.dict.pop(key)
 
     def put(
@@ -95,8 +91,6 @@ class LMSLocalBackend(LMSBackendInterface):
         Note:
             The KV cache should NOT have the "batch" dimension.
         """
-        logger.error(" put key=%s", key)
-
         if not blocking:
             logger.warn("Non-blocking is not implemented for local backend")
 
@@ -118,8 +112,6 @@ class LMSLocalBackend(LMSBackendInterface):
         # Store new chunk
         self.dict[key] = kv_chunk_bytes
         self.update_lock.release()
-        logger.error(" put --- ")
-
 
     @_lmcache_nvtx_annotate
     def get(

@@ -16,8 +16,6 @@ from lmcache.storage_backend.serde.serde import Serializer
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
-import lmcache.c_ops as lmc_ops1
-import lmcache.non_cuda_equivalents as py_ops
 import lmcache.c_ops as lmc_ops
 import lmcache.storage_backend.serde.cachegen_basics as CGBasics
 
@@ -248,55 +246,6 @@ def collect_bytes(output_buffer, output_lengths) -> torch.Tensor:
     return flattened_buffer[indexes]
 
 
-def compare_encodings(cpp_out, cpp_len, py_out, py_len):
-    """
-    严格对比 C++ 和 Python 的编码输出
-    cpp_out: output_buffer (Tensor)
-    cpp_len: output_lengths (Tensor)
-    py_out:  test_buffer (Tensor)
-    py_len:  test_lengths (Tensor)
-    """
-    print("\n" + "="*20 + " 编码对齐检查 " + "="*20)
-
-    # 1. 检查有效长度是否一致
-    # output_lengths 的 shape 通常是 [n_layers, n_channels]
-    if not torch.equal(cpp_len, py_len):
-        print("❌ [长度不匹配]")
-        # 找出第一个不匹配的层和通道
-        diff_idx = (cpp_len != py_len).nonzero(as_tuple=True)
-        l, c = diff_idx[0][0].item(), diff_idx[1][0].item()
-        print(f"   在 Layer {l}, Channel {c} 处: C++ len={cpp_len[l,c]}, Py len={py_len[l,c]}")
-        # 即使长度不匹配，我们也可以继续对比内容
-    else:
-        print("✅ [长度对齐] 所有通道的输出字节数完全一致")
-
-    # 2. 检查编码内容 (逐字节对比有效区域)
-    # 我们只对比到每个通道各自的有效长度 (output_lengths)
-    n_layers, n_channels = cpp_len.shape
-    all_content_match = True
-
-    for l in range(n_layers):
-        for c in range(n_channels):
-            l_len = cpp_len[l, c].item()
-            # 截取有效编码段
-            cpp_seg = cpp_out[l, c, :l_len]
-            py_seg = py_out[l, c, :l_len]
-
-            if not torch.equal(cpp_seg, py_seg):
-                all_content_match = False
-                # 寻找该通道内第一个不一致的字节
-                byte_diff = (cpp_seg != py_seg).nonzero(as_tuple=True)[0][0].item()
-                print(f"❌ [内容不匹配] Layer {l}, Channel {c}")
-                print(f"   首次差异点: Byte {byte_diff}")
-                print(f"   C++ Byte (hex): {cpp_seg[byte_diff].item():02x}")
-                print(f"   Py  Byte (hex): {py_seg[byte_diff].item():02x}")
-                return False # 发现一个错误就停止，方便调试
-
-    if all_content_match:
-        print("✅ [内容对齐] 编码后的比特流完全一致 (Bit-identical)")
-        return True
-    return False
-
 @_lmcache_nvtx_annotate
 def encode_ntokens(
     cdf_int, encode_input, output_buffer, output_lengths
@@ -312,23 +261,12 @@ def encode_ntokens(
 
     :return byte_tensor: the byte tensor
     """
-    test_buffer = torch.zeros_like(output_buffer)
-    test_lengths = torch.zeros_like(output_lengths)
-    
     lmc_ops.encode_fast_new(
         cdf_int,
         encode_input,
         output_buffer,
         output_lengths,
     )
-
-    py_ops.encode_fast_new(
-        cdf_int,
-        encode_input,
-        test_buffer,
-        test_lengths,
-    )
-    compare_encodings(output_buffer, output_lengths, test_buffer, test_lengths)
     byte_tensor = collect_bytes(output_buffer, output_lengths)
     return byte_tensor
     # return byte_tensor.cpu().numpy().tobytes()
@@ -356,28 +294,8 @@ def encode_function(
         nlayers, chunk_size, nchannels
     )
 
-    new_cdf_key = lmc_ops1.calculate_cdf(new_key, int(key_bins.max()))
-    new_cdf_value = lmc_ops1.calculate_cdf(new_value, int(value_bins.max()))
-
-    hlin = py_ops.calculate_cdf(new_key, int(key_bins.max()))
-    hlin99 = py_ops.calculate_cdf(new_value, int(value_bins.max()))
-
-    key_match = torch.allclose(new_cdf_key, hlin, atol=0, rtol=0)
-    value_match = torch.allclose(new_cdf_value, hlin99, atol=0, rtol=0)
-    if key_match and value_match:
-        print("✅ 结果完全一致！C++ 和 Python 逻辑对齐。")
-    else:
-        # 如果不一致，计算最大偏差
-        key_diff = (new_cdf_key - hlin).abs().max()
-        print(f"❌ 结果不一致！Key 最大偏差: {key_diff.item()}")
-
-    aaa = torch.allclose(new_cdf_value, hlin, atol=0, rtol=0)
-    print("aaa=",aaa)
-    torch.set_printoptions(threshold=float('inf'), profile="full")
-    #logger.error("new_key.shape=%s,new_key=%s",new_key.shape,new_key)
-
-    #logger.error("new_cdf_key.shape=%s, new_cdf_key=%s",new_cdf_key.shape,new_cdf_key)
-    
+    new_cdf_key = lmc_ops.calculate_cdf(new_key, int(key_bins.max()))
+    new_cdf_value = lmc_ops.calculate_cdf(new_value, int(value_bins.max()))
     cdf_int = torch.cat([new_cdf_key, new_cdf_value])
 
     output_buffer = torch.zeros(

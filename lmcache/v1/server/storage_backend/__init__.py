@@ -11,7 +11,7 @@ def CreateStorageBackend(device: str) -> LMSBackendInterface:
     match device:
         case "cpu":
             # cpu only
-            logger.info("Initializing v1 cpu-only cache server")
+            logger.info("Initializing cpu-only cache server")
             return LMSLocalBackend()
         case _:
             raise ValueError(f"Unsupported device: {device}")
