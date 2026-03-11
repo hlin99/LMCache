@@ -610,7 +610,7 @@ def single_layer_kv_transfer(
             # LMCache -> vLLM
             vllm_key_value_cache[block_indices, block_offsets] = lmc_key_value_cache[
                 valid_token_indices
-            ].to(lmc_key_value_cache.device)
+            ].to(paged_memory_device)
 
     else:
         # ── Non-MLA format ──
