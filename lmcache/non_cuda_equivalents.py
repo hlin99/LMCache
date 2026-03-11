@@ -258,47 +258,6 @@ def _copy_hidden_row_async(
     dest_tensor.copy_(src_tensor)
 
 
-def _get_multi_layer_paged_row(
-    key_value_ptrs: torch.Tensor | list[torch.Tensor],
-    layer_id: int,
-    kv_idx: int,
-    slot_idx: int,
-    page_buffer_size: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    gpu_kv_format: "GPUKVFormat",
-    block_size: int,
-) -> int | torch.Tensor:
-    """Return one paged-buffer row as a pointer or tensor view."""
-    element_size = torch.empty((), dtype=dtype).element_size()
-
-    if isinstance(key_value_ptrs, list):
-        buffer = key_value_ptrs[layer_id]
-        if gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-            blk_idx = slot_idx // block_size
-            blk_off = slot_idx % block_size
-            return buffer[blk_idx, kv_idx, blk_off]
-        if gpu_kv_format in (
-            GPUKVFormat.NL_X_NB_BS_HS,
-            GPUKVFormat.NL_X_NBBS_ONE_HS,
-        ):
-            return buffer[slot_idx]
-        return buffer[kv_idx, slot_idx]
-
-    base_ptr = int(key_value_ptrs[layer_id].item())
-    if gpu_kv_format == GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
-        blk_idx = slot_idx // block_size
-        blk_off = slot_idx % block_size
-        row_offset = ((blk_idx * 2 + kv_idx) * block_size + blk_off) * hidden_size
-    elif gpu_kv_format in (
-        GPUKVFormat.NL_X_NB_BS_HS,
-        GPUKVFormat.NL_X_NBBS_ONE_HS,
-    ):
-        row_offset = slot_idx * hidden_size
-    else:
-        row_offset = (kv_idx * page_buffer_size + slot_idx) * hidden_size
-    return base_ptr + row_offset * element_size
-
 def _get_unilateral_paged_row(
     key_value_ptrs: torch.Tensor | list[torch.Tensor],
     layer_id: int,
@@ -469,9 +428,8 @@ def multi_layer_kv_transfer(
         raise TypeError(
             f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
         )
-    logger.error("page_buffer_size=%s, direction=%s, gpu_kv_format=%s, key_value.device=%s, slot_mapping.device=%s, paged_memory_device=%s", page_buffer_size, direction, gpu_kv_format,key_value.device,slot_mapping.device,paged_memory_device)
     # 1. Filter out invalid slots and obtain a clean 1-D index tensor.
-    slots = slot_mapping.to(dtype=torch.long)
+    slots = slot_mapping.to(dtype=torch.long).(paged_memory_device)
     valid_mask = slots >= 0
     if not valid_mask.any():
         return
@@ -616,7 +574,7 @@ def multi_layer_kv_transfer_unilateral(
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
 
-    slots = slot_mapping.to(dtype=torch.long)
+    slots = slot_mapping.to(dtype=torch.long).to(paged_memory_device)
     valid_mask = slots >= 0
     if not torch.any(valid_mask):
         return
@@ -709,7 +667,7 @@ def single_layer_kv_transfer(
         H2D = LMCache  -> vLLM GPU
         D2H = vLLM GPU -> LMCache
     """
-    slots = slot_mapping.to(dtype=torch.long)
+    slots = slot_mapping.to(dtype=torch.long).to(vllm_key_value_cache.device)
     valid_mask = slots >= 0
 
     if not valid_mask.any():
@@ -735,12 +693,12 @@ def single_layer_kv_transfer(
             # vLLM -> LMCache
             lmc_key_value_cache[valid_token_indices] = vllm_key_value_cache[
                 block_indices, block_offsets
-            ]
+            ].to(lmc_key_value_cache.device)
         else:
             # LMCache -> vLLM
             vllm_key_value_cache[block_indices, block_offsets] = lmc_key_value_cache[
                 valid_token_indices
-            ]
+            ].to(lmc_key_value_cache.device)
 
     else:
         # ── Non-MLA format ──
@@ -765,7 +723,7 @@ def single_layer_kv_transfer(
                 else:
                     gathered = vllm_key_value_cache[block_indices, kv, block_offsets]
 
-                gathered_flat = gathered.reshape(-1, num_heads * head_size)
+                gathered_flat = gathered.reshape(-1, num_heads * head_size).to(lmc_key_value_cache.device)
                 if token_major:
                     lmc_key_value_cache[valid_token_indices, kv] = gathered_flat
                 else:
@@ -775,7 +733,7 @@ def single_layer_kv_transfer(
                     lmc_src = lmc_key_value_cache[valid_token_indices, kv]
                 else:
                     lmc_src = lmc_key_value_cache[kv, valid_token_indices]
-                lmc_reshaped = lmc_src.reshape(-1, num_heads, head_size)
+                lmc_reshaped = lmc_src.reshape(-1, num_heads, head_size).to(vllm_key_value_cache.device)
 
                 if is_two_major:
                     vllm_key_value_cache[kv, block_indices, block_offsets] = lmc_reshaped
@@ -804,7 +762,7 @@ def single_layer_kv_transfer_sgl(
         direction: False for LMCache -> SGLang, True for SGLang -> LMCache
         token_major: Boolean to determine the layout of lmc_key_value_cache
     """
-    slot_mapping = slot_mapping.to(dtype=torch.long)
+    slot_mapping = slot_mapping.to(dtype=torch.long).to(sgl_key_cache.device)
     valid_mask = slot_mapping >= 0
     if not valid_mask.any():
         return
@@ -834,8 +792,8 @@ def single_layer_kv_transfer_sgl(
     if direction == TransferDirection.H2D:
         # --- Direction: LMCache to SGLang (Paged Buffer) ---
         # Reshape LMC flat tensors to match SGL [num_heads, head_size]
-        src_k_reshaped = lmc_k[valid_mask].reshape(-1, num_heads, head_size)
-        src_v_reshaped = lmc_v[valid_mask].reshape(-1, num_heads, head_size)
+        src_k_reshaped = lmc_k[valid_mask].reshape(-1, num_heads, head_size).to(sgl_key_cache.device)
+        src_v_reshaped = lmc_v[valid_mask].reshape(-1, num_heads, head_size).to(sgl_value_cache.device)
 
         # Advanced indexing: update specific slots in the paged cache
         sgl_key_cache[block_indices, block_offsets] = src_k_reshaped
@@ -844,8 +802,8 @@ def single_layer_kv_transfer_sgl(
     else:
         # --- Direction: SGLang (Paged Buffer) to LMCache ---
         # Gather tensors from paged cache based on mapping
-        sampled_k = sgl_key_cache[block_indices, block_offsets]
-        sampled_v = sgl_value_cache[block_indices, block_offsets]
+        sampled_k = sgl_key_cache[block_indices, block_offsets].to(lmc_k.device)
+        sampled_v = sgl_value_cache[block_indices, block_offsets].to(lmc_v.device)
 
         # Flatten the head dimensions and copy into LMC tensors
         lmc_k[valid_mask] = sampled_k.reshape(-1, num_heads * head_size)

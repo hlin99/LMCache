@@ -1737,26 +1737,6 @@ class TestScenarios:
     (test_1_scenario, test_2_compare), pytest will execute all scenario tests
     before any compare tests, ensuring _results dict is fully populated.
 
-    **Why this is necessary:**
-    - test_1_scenario: runs each scenario function with each backend and stores
-      results in the module-level _results dictionary
-    - test_2_compare: reads from _results to compare outputs across backends
-
-    Without explicit ordering, pytest might interleave test_1_scenario and
-    test_2_compare executions, causing test_2_compare to fail when it tries to
-    access results that haven't been stored yet.
-
-    **How pytest ordering works:**
-    Within a test class, pytest collects and executes test methods in the order
-    they appear in the class definition. By naming them test_1_* and test_2_*,
-    we ensure that all test_1_scenario parametrized tests complete before any
-    test_2_compare tests begin.
-
-    **Alternative solutions considered:**
-    - pytest-ordering plugin: requires external dependency
-    - pytest-dependency plugin: requires external dependency
-    - Single test function: would lose per-scenario test granularity
-    - Fixtures: cannot easily guarantee ordering across parametrized tests
     """
 
     @pytest.mark.parametrize("name,fn", list(SCENARIO_REGISTRY.items()))
