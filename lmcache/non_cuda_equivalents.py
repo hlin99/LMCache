@@ -577,14 +577,16 @@ def single_layer_kv_transfer(
         H2D = LMCache  -> vLLM GPU
         D2H = vLLM GPU -> LMCache
     """
-    slots = slot_mapping.to(dtype=torch.long).to(vllm_key_value_cache.device)
-    valid_mask = slots >= 0
+    kv_device = lmc_key_value_cache.device
+    paged_memory_device = vllm_key_value_cache.device
+    slots_kv = slot_mapping.to(dtype=torch.long).to(kv_device)
+    valid_mask_kv = slots_kv >= 0
 
-    if not valid_mask.any():
+    if not valid_mask_kv.any():
         return
 
-    valid_token_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
-    valid_slots = slots[valid_token_indices]
+    valid_token_indices = torch.nonzero(valid_mask_kv, as_tuple=True)[0]
+    valid_slots = slots_kv[valid_mask_kv].to(paged_memory_device)
 
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
@@ -672,9 +674,11 @@ def single_layer_kv_transfer_sgl(
         direction: False for LMCache -> SGLang, True for SGLang -> LMCache
         token_major: Boolean to determine the layout of lmc_key_value_cache
     """
-    slot_mapping = slot_mapping.to(dtype=torch.long).to(sgl_key_cache.device)
-    valid_mask = slot_mapping >= 0
-    if not valid_mask.any():
+    kv_device = lmc_key_value_cache.device
+    paged_memory_device = sgl_key_cache.device
+    slots_kv = slot_mapping.to(dtype=torch.long).to(kv_device)
+    valid_mask_kv = slots_kv >= 0
+    if not valid_mask_kv.any():
         return
 
     # 1. Get basic dimensions
@@ -684,7 +688,7 @@ def single_layer_kv_transfer_sgl(
 
     # 2. Calculate block indices and offsets within the blocks from slot_mapping
     # In SGLang/vLLM, slot_idx = block_idx * block_size + block_offset
-    valid_slots = slot_mapping[valid_mask]
+    valid_slots = slots_kv[valid_mask_kv].to(paged_memory_device)
     block_indices = valid_slots // block_size
     block_offsets = valid_slots % block_size
 
@@ -702,8 +706,8 @@ def single_layer_kv_transfer_sgl(
     if direction == TransferDirection.H2D:
         # --- Direction: LMCache to SGLang (Paged Buffer) ---
         # Reshape LMC flat tensors to match SGL [num_heads, head_size]
-        src_k_reshaped = lmc_k[valid_mask].reshape(-1, num_heads, head_size).to(sgl_key_cache.device)
-        src_v_reshaped = lmc_v[valid_mask].reshape(-1, num_heads, head_size).to(sgl_value_cache.device)
+        src_k_reshaped = lmc_k[valid_mask_kv].reshape(-1, num_heads, head_size).to(paged_memory_device)
+        src_v_reshaped = lmc_v[valid_mask_kv].reshape(-1, num_heads, head_size).to(paged_memory_device)
 
         # Advanced indexing: update specific slots in the paged cache
         sgl_key_cache[block_indices, block_offsets] = src_k_reshaped
@@ -712,12 +716,12 @@ def single_layer_kv_transfer_sgl(
     else:
         # --- Direction: SGLang (Paged Buffer) to LMCache ---
         # Gather tensors from paged cache based on mapping
-        sampled_k = sgl_key_cache[block_indices, block_offsets].to(lmc_k.device)
-        sampled_v = sgl_value_cache[block_indices, block_offsets].to(lmc_v.device)
+        sampled_k = sgl_key_cache[block_indices, block_offsets].to(kv_device)
+        sampled_v = sgl_value_cache[block_indices, block_offsets].to(kv_device)
 
         # Flatten the head dimensions and copy into LMC tensors
-        lmc_k[valid_mask] = sampled_k.reshape(-1, num_heads * head_size)
-        lmc_v[valid_mask] = sampled_v.reshape(-1, num_heads * head_size)
+        lmc_k[valid_mask_kv] = sampled_k.reshape(-1, num_heads * head_size)
+        lmc_v[valid_mask_kv] = sampled_v.reshape(-1, num_heads * head_size)
 
 
 def load_and_reshape_flash(
