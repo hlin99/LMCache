@@ -1067,97 +1067,132 @@ def lmcache_memcpy_async(
         _copy_bytes_with_tensor(dest, src, nbytes)
 
 
+from concurrent.futures import ThreadPoolExecutor
+from numba import njit
+
+@njit(cache=True)
+def _encode_single_channel(
+    cdf_layer_c,     # np.uint32 [lp]
+    sym_channel,     # np.uint8 [n_tokens]
+    out_buf_lc,      # np.uint8 [buffer_size]
+):
+    """Core arithmetic encoding for a single (layer, channel).
+    Returns number of bytes written."""
+    MASK32 = 0xFFFFFFFF
+    precision = 16
+    max_symbol = len(cdf_layer_c) - 2
+    n_tokens = len(sym_channel)
+
+    low, high = 0, MASK32
+    pending_bits = 0
+    output_reg, output_reg_len = 0, 0
+    ptr = 0
+    buf_size = len(out_buf_lc)
+
+    # Inline flush_bit to avoid closure (numba does not support nonlocal)
+    for token_idx in range(n_tokens):
+        sym = int(sym_channel[token_idx])
+        c_low = int(cdf_layer_c[sym])
+        c_high = 0x10000 if sym == max_symbol else int(cdf_layer_c[sym + 1])
+
+        span = (high - low + 1) & MASK32
+        if span == 0:
+            span = 0x100000000
+
+        high = (low + ((span * c_high) >> precision) - 1) & MASK32
+        low = (low + ((span * c_low) >> precision)) & MASK32
+
+        while True:
+            if (high & 0x80000000) == (low & 0x80000000):
+                # flush_bit(bit)
+                bit = (high >> 31) & 1
+                output_reg = (output_reg << 1) | bit
+                output_reg_len += 1
+                if output_reg_len == 8:
+                    if ptr < buf_size:
+                        out_buf_lc[ptr] = output_reg & 0xFF
+                        ptr += 1
+                    output_reg, output_reg_len = 0, 0
+                # flush pending bits
+                for _ in range(pending_bits):
+                    output_reg = (output_reg << 1) | (1 - bit)
+                    output_reg_len += 1
+                    if output_reg_len == 8:
+                        if ptr < buf_size:
+                            out_buf_lc[ptr] = output_reg & 0xFF
+                            ptr += 1
+                        output_reg, output_reg_len = 0, 0
+                pending_bits = 0
+                low = (low << 1) & MASK32
+                high = ((high << 1) | 1) & MASK32
+            elif (low & 0x40000000) != 0 and (high & 0x40000000) == 0:
+                pending_bits += 1
+                low = (low << 1) & 0x7FFFFFFF
+                high = ((high << 1) | 0x80000001) & MASK32
+            else:
+                break
+
+    # Final flushing sequence
+    pending_bits += 1
+    bit = 1 if (low & 0x40000000) != 0 else 0
+    output_reg = (output_reg << 1) | bit
+    output_reg_len += 1
+    if output_reg_len == 8:
+        if ptr < buf_size:
+            out_buf_lc[ptr] = output_reg & 0xFF
+            ptr += 1
+        output_reg, output_reg_len = 0, 0
+    for _ in range(pending_bits):
+        output_reg = (output_reg << 1) | (1 - bit)
+        output_reg_len += 1
+        if output_reg_len == 8:
+            if ptr < buf_size:
+                out_buf_lc[ptr] = output_reg & 0xFF
+                ptr += 1
+            output_reg, output_reg_len = 0, 0
+    pending_bits = 0  # noqa: F841
+
+    if output_reg_len > 0:
+        if ptr < buf_size:
+            out_buf_lc[ptr] = (output_reg << (8 - output_reg_len)) & 0xFF
+            ptr += 1
+
+    return ptr
+
+
 def encode_fast_new(cdf, input_sym, output_buffer, output_lengths):
     """
     Python equivalent of C++ Arithmetic Encoder.
-    FIXED:
-    1. Renamed 'l' to 'layer_idx' to fix Ruff E741.
-    2. Used default arguments in flush_bit to fix Ruff B023 (Late Binding).
-    3. Strictly emulates 32-bit unsigned overflow for high/low.
+    Strictly emulates 32-bit unsigned overflow for high/low.
     """
-    logger.error("encode_fast_new, cdf.shape=%s",cdf.shape)
-    # 💡 View as uint16 to treat bit-patterns correctly
+    logger.error("encode_fast_new, cdf.shape=%s", cdf.shape)
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
     sym_np = input_sym.cpu().numpy().astype(np.uint8)
 
     n_layers, n_tokens, n_channels = sym_np.shape
-    lp = cdf_np.shape[2]
-    max_symbol = lp - 2
-    precision = 16
-    MASK32 = 0xFFFFFFFF
-
     out_buf_np = np.zeros(output_buffer.shape, dtype=np.uint8)
     out_len_np = np.zeros(output_lengths.shape, dtype=np.int32)
 
-    for layer_idx in range(n_layers):
-        for channel_idx in range(n_channels):
-            low, high = 0, MASK32
-            pending_bits = 0
-            output_reg, output_reg_len = 0, 0
-            ptr = 0
+    def encode_one(args):
+        layer_idx, c = args
+        length = _encode_single_channel(
+            cdf_np[layer_idx, c],
+            sym_np[layer_idx, :, c],
+            out_buf_np[layer_idx, c],
+        )
+        out_len_np[layer_idx, c] = length
 
-            def flush_bit(bit, l_idx=layer_idx, c_idx=channel_idx):
-                nonlocal output_reg, output_reg_len, ptr
-                output_reg = (output_reg << 1) | (int(bit) & 1)
-                output_reg_len += 1
-                if output_reg_len == 8:
-                    if ptr < out_buf_np.shape[2]:
-                        out_buf_np[l_idx, c_idx, ptr] = output_reg & 0xFF
-                        ptr += 1
-                    output_reg, output_reg_len = 0, 0
+    tasks = [
+        (layer_idx, c)
+        for layer_idx in range(n_layers)
+        for c in range(n_channels)
+    ]
 
-            for token_idx in range(n_tokens):
-                sym = sym_np[layer_idx, token_idx, channel_idx]
-                c_low = int(cdf_np[layer_idx, channel_idx, sym])
-                c_high = (
-                    0x10000
-                    if sym == max_symbol
-                    else int(cdf_np[layer_idx, channel_idx, sym + 1])
-                )
-
-                # 💡 CRITICAL: Span must be uint64 equivalent in Python
-                span = (high - low + 1) & MASK32
-                if span == 0:
-                    span = 0x100000000  # 2^32
-
-                high = (low + ((span * c_high) >> precision) - 1) & MASK32
-                low = (low + ((span * c_low) >> precision)) & MASK32
-
-                # Renormalization loop (32-bit state machine)
-                while True:
-                    if (high & 0x80000000) == (low & 0x80000000):
-                        bit = (high >> 31) & 1
-                        flush_bit(bit)
-                        while pending_bits > 0:
-                            flush_bit(1 - bit)
-                            pending_bits -= 1
-                        low = (low << 1) & MASK32
-                        high = ((high << 1) | 1) & MASK32
-                    elif (low & 0x40000000) and not (high & 0x40000000):
-                        pending_bits += 1
-                        low = (low << 1) & 0x7FFFFFFF
-                        high = ((high << 1) | 0x80000001) & MASK32
-                    else:
-                        break
-
-            # Final flushing sequence
-            pending_bits += 1
-            bit = 1 if (low & 0x40000000) else 0
-            flush_bit(bit)
-            while pending_bits > 0:
-                flush_bit(1 - bit)
-                pending_bits -= 1
-
-            if output_reg_len > 0:
-                out_buf_np[layer_idx, channel_idx, ptr] = (
-                    output_reg << (8 - output_reg_len)
-                ) & 0xFF
-                ptr += 1
-            out_len_np[layer_idx, channel_idx] = ptr
+    with ThreadPoolExecutor() as executor:
+        executor.map(encode_one, tasks)
 
     output_buffer.copy_(torch.from_numpy(out_buf_np))
     output_lengths.copy_(torch.from_numpy(out_len_np))
-
 
 def uint32_val(val):
     return int(val & 0xFFFFFFFF)
@@ -1245,6 +1280,9 @@ def _decode_single_channel(
                 byte_buffer_offset += 1
                 byte_buffer = int(bs_np[byte_buffer_offset]) if byte_buffer_offset < end_off else 0
 
+
+from concurrent.futures import ThreadPoolExecutor
+
 def decode_fast_new(cdf, bytestreams, lengths, output):
     """
     Python implementation of Arithmetic Decoding.
@@ -1259,20 +1297,29 @@ def decode_fast_new(cdf, bytestreams, lengths, output):
     n_layers, n_tokens, n_channels = output.shape
     out_np = np.zeros(output.shape, dtype=np.uint8)
 
-    for layer_idx in range(n_layers):
-        for c in range(n_channels):
-            curr_len = int(len_np[layer_idx, c])
-            # For decode_fast_new, each channel has its own contiguous buffer,
-            # so start_off=0 and end_off=curr_len within channel_bs
-            channel_bs = bs_np[layer_idx, c]  # shape [buffer_size]
-            _decode_single_channel(
-                cdf_np[layer_idx, c],
-                channel_bs,
-                0,
-                curr_len,
-                n_tokens,
-                out_np[layer_idx, :, c],
-            )
+    def decode_one(args):
+        layer_idx, c = args
+        curr_len = int(len_np[layer_idx, c])
+        # For decode_fast_new, each channel has its own contiguous buffer,
+        # so start_off=0 and end_off=curr_len within channel_bs
+        channel_bs = bs_np[layer_idx, c]  # shape [buffer_size]
+        _decode_single_channel(
+            cdf_np[layer_idx, c],
+            channel_bs,
+            0,
+            curr_len,
+            n_tokens,
+            out_np[layer_idx, :, c],
+        )
+
+    tasks = [
+        (layer_idx, c)
+        for layer_idx in range(n_layers)
+        for c in range(n_channels)
+    ]
+
+    with ThreadPoolExecutor() as executor:
+        executor.map(decode_one, tasks)
 
     if output is not None:
         output.copy_(torch.from_numpy(out_np))
@@ -1301,22 +1348,30 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
     n_layers, n_tokens, n_channels = output.shape
     out_np = np.zeros(output.shape, dtype=np.uint8)
 
-    for layer_idx in range(n_layers):
-        for c in range(n_channels):
-            cid = layer_idx * n_channels + c
-            start_off = 0 if cid == 0 else int(pref_np[cid - 1])
-            end_off = int(pref_np[cid])
-            _decode_single_channel(
-                cdf_np[layer_idx, c],
-                bs_np,
-                start_off,
-                end_off,
-                n_tokens,
-                out_np[layer_idx, :, c],
-            )
+    def decode_one(args):
+        layer_idx, c = args
+        cid = layer_idx * n_channels + c
+        start_off = 0 if cid == 0 else int(pref_np[cid - 1])
+        end_off = int(pref_np[cid])
+        _decode_single_channel(
+            cdf_np[layer_idx, c],
+            bs_np,
+            start_off,
+            end_off,
+            n_tokens,
+            out_np[layer_idx, :, c],
+        )
+
+    tasks = [
+        (layer_idx, c)
+        for layer_idx in range(n_layers)
+        for c in range(n_channels)
+    ]
+
+    with ThreadPoolExecutor() as executor:
+        executor.map(decode_one, tasks)
 
     output.copy_(torch.from_numpy(out_np))
-
 
 
 def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
