@@ -428,17 +428,18 @@ def multi_layer_kv_transfer(
         raise TypeError(
             f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
         )
-    # 1. Filter out invalid slots and obtain a clean 1-D index tensor.
-    slots = slot_mapping.to(dtype=torch.long).(paged_memory_device)
-    valid_mask = slots >= 0
-    if not valid_mask.any():
+
+    # 1. Filter out invalid slots.
+    #    valid_mask_kv:  on key_value.device, used to index key_value
+    #    valid_slots:    on paged_memory_device, used to index paged_tensor
+    kv_device = key_value.device
+    slots_kv = slot_mapping.to(dtype=torch.long).to(kv_device)
+    valid_mask_kv = slots_kv >= 0
+    if not valid_mask_kv.any():
         return
 
-    valid_slots = slots[valid_mask]
+    valid_slots = slots_kv[valid_mask_kv].to(paged_memory_device)
 
-    valid_slots = valid_slots.to(paged_memory_device)
-    valid_mask = valid_mask.to(paged_memory_device)
-    key_value = key_value.to(paged_memory_device)
     # 2. Determine architecture variant and tensor dimensions.
     is_mla = gpu_kv_format in (
         GPUKVFormat.NL_X_NB_BS_HS,
@@ -466,7 +467,6 @@ def multi_layer_kv_transfer(
 
     # 3. Iterate over layers — the only remaining Python-level loop.
     for layer_id in range(num_layers):
-
         # --- A. Obtain the physical device-memory view for this layer. ---
         if isinstance(key_value_ptrs, list):
             paged_tensor = key_value_ptrs[layer_id]
@@ -480,46 +480,38 @@ def multi_layer_kv_transfer(
         # --- B. Vectorized bulk data transfer. ---
         if is_mla:
             # Paged layout : [page_buffer_size, hidden_size]
-            # LMCache source (MLA has a single merged head, so dim-0 is indexed
-            # with 0 directly): [num_valid, hidden_size]
-            lmc_valid = key_value[0, layer_id, valid_mask, :]
-
+            # key_value layout: [1, num_layers, num_tokens, hidden_size]
             if direction == TransferDirection.H2D:
-                # LMCache -> GPU (scatter into paged memory)
-                paged_tensor.index_copy_(0, valid_slots, lmc_valid)
+                lmc_valid = key_value[0, layer_id, valid_mask_kv, :]
+                paged_tensor.index_copy_(0, valid_slots, lmc_valid.to(paged_tensor.device))
             else:
-                # GPU -> LMCache (gather from paged memory)
                 gathered = paged_tensor.index_select(0, valid_slots)
-                key_value[0, layer_id, valid_mask, :] = gathered
-
+                key_value[0, layer_id, valid_mask_kv, :] = gathered.to(kv_device, non_blocking=False)
         elif is_flash_infer:
             # Paged layout : [num_blocks, 2, block_size, hidden_size]
-            # LMCache source: [2, num_valid, hidden_size]
-            lmc_valid = key_value[:, layer_id, valid_mask, :]
-
+            # key_value layout: [2, num_layers, num_tokens, hidden_size]
             if direction == TransferDirection.H2D:
-                # Transpose so the shape becomes [num_valid, 2, hidden_size],
-                # matching the advanced-indexing slice of paged_tensor.
-                src_data = lmc_valid.transpose(0, 1)
-                # Multi-dimensional scatter — guaranteed in-place write.
+                lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
+                src_data = lmc_valid.transpose(0, 1).to(paged_memory_device)
+                # src_data: [num_valid, 2, hidden_size]
                 paged_tensor[block_indices, :, block_offsets, :] = src_data
             else:
-                # Multi-dimensional gather.
                 gathered = paged_tensor[block_indices, :, block_offsets, :]
-                key_value[:, layer_id, valid_mask, :] = gathered.transpose(0, 1)
-
+                # gathered: [num_valid, 2, hidden_size]
+                key_value[:, layer_id, valid_mask_kv, :] = gathered.to(kv_device, non_blocking=False).transpose(0, 1)
         else:
             # Paged layout : [2, page_buffer_size, hidden_size]
-            # LMCache source: [2, num_valid, hidden_size]
-            lmc_valid = key_value[:, layer_id, valid_mask, :]
-
+            # key_value layout: [2, num_layers, num_tokens, hidden_size]
             if direction == TransferDirection.H2D:
-                # Batch scatter along dim=1 (the page_buffer_size dimension).
-                paged_tensor.index_copy_(1, valid_slots, lmc_valid)
+                lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
+                paged_tensor.index_copy_(1, valid_slots, lmc_valid.to(paged_memory_device))
             else:
                 logger.error("hlin, here, paged_tensor.device=%s", paged_tensor.device)
+                logger.error("hlin, here, key_value.device=%s", key_value.device)
+
                 gathered = paged_tensor.index_select(1, valid_slots)
-                key_value[:, layer_id, valid_mask, :] = gathered
+
+                key_value[:, layer_id, valid_mask_kv, :] = gathered.to(kv_device, non_blocking=False)
 
 def multi_layer_kv_transfer_unilateral(
     key_value: torch.Tensor,
