@@ -195,7 +195,7 @@ def _tensor_from_cuda_ptr(
         if is_bf16:
             t = t.view(torch.bfloat16)
         
-        logger.error(" 2  _tensor_from_cuda_ptr")
+        # logger.error(" 2  _tensor_from_cuda_ptr")
         torch.cuda.synchronize()
 
         return t.view(*shape)
@@ -1075,6 +1075,7 @@ def encode_fast_new(cdf, input_sym, output_buffer, output_lengths):
     2. Used default arguments in flush_bit to fix Ruff B023 (Late Binding).
     3. Strictly emulates 32-bit unsigned overflow for high/low.
     """
+    logger.error("encode_fast_new, cdf.shape=%s",cdf.shape)
     # 💡 View as uint16 to treat bit-patterns correctly
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
     sym_np = input_sym.cpu().numpy().astype(np.uint8)
@@ -1167,6 +1168,7 @@ def decode_fast_new(cdf, bytestreams, lengths, output):
     Python implementation of Arithmetic Decoding.
     Strictly aligned with CUDA decode_with_accessor_kernel.
     """
+    logger.error("decode_fast_new")
     # Reinterpret raw bytes of cdf as uint16 bit-patterns, then widen to uint32
     # for arithmetic. This matches encode_fast_new and decode_fast_prefsum.
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
@@ -1287,6 +1289,7 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
     Python equivalent of C++ decode_fast_prefsum.
     Fixed: Range calculation and ZeroDivisionError handling to match CUDA kernel.
     """
+    logger.error("decode_fast_prefsum")
     cdf_np = cdf.cpu().numpy().view(np.uint16).astype(np.uint32)
     bs_np = bytestreams.cpu().numpy().astype(np.uint8)
     pref_np = lengths_prefsum.cpu().numpy().astype(np.int64).flatten()
@@ -1385,6 +1388,56 @@ def decode_fast_prefsum(cdf, bytestreams, lengths_prefsum, output):
 
 
 def calculate_cdf(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
+    """Equivalent to CUDA calculate_cdf.
+
+    Calculates the CDF across tokens for each (layer, channel) pair.
+
+    Args:
+        input_tensor: 3D tensor with shape [nlayers, ntokens, nchannels].
+        num_bins: Maximum number of bins (i.e., Lp - 1).
+
+    Returns:
+        int16 tensor with shape [nlayers, nchannels, num_bins + 1]
+        containing normalized CDF values.
+    """
+    nlayers, ntokens, nchannels = input_tensor.shape
+    device = input_tensor.device
+
+    # Compute per-(layer, channel) histogram via scatter_add.
+    # Permute to [nlayers, nchannels, ntokens] then flatten first two dims.
+    input_perm = input_tensor.permute(0, 2, 1).reshape(-1, ntokens).long()
+    src = torch.ones_like(input_perm)
+    counts = torch.zeros(
+        nlayers * nchannels, num_bins, dtype=torch.long, device=device
+    )
+    counts.scatter_add_(1, input_perm.clamp(0, num_bins - 1), src)
+    counts = counts.reshape(nlayers, nchannels, num_bins)
+
+    # Build CDF: cdf[..., 0] = 0, cdf[..., i] = sum(counts[..., 0:i])
+    cdf = torch.zeros(
+        nlayers, nchannels, num_bins + 1, dtype=torch.long, device=device
+    )
+    cdf[:, :, 1:] = torch.cumsum(counts, dim=2)
+
+    # Total count per (layer, channel)
+    total = cdf[:, :, -1:]  # [nlayers, nchannels, 1]
+
+    # Normalize: (0xFFFF - num_bins) * cdf / total + bin_index
+    max_uint16_value = 0xFFFF - num_bins
+    bin_offsets = torch.arange(num_bins + 1, dtype=torch.long, device=device)
+
+    safe_total = total.clamp(min=1)
+    normalized = (max_uint16_value * cdf) // safe_total + bin_offsets
+
+    # Where total is 0, use just the bin offsets
+    normalized = torch.where(
+        total > 0, normalized, bin_offsets.unsqueeze(0).unsqueeze(0)
+    )
+
+    return normalized.to(torch.int16)
+
+
+def calculate_cdf1(input_tensor: torch.Tensor, num_bins: int) -> torch.Tensor:
     """
     Equivalent to CUDA calculate_cdf.
     Input: Expects a 3D tensor (e.g., [1, N, 1]).

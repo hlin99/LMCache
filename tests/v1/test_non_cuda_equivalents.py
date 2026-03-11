@@ -141,6 +141,45 @@ def scenario_calculate_cdf(ops: Any, device: str) -> dict[str, torch.Tensor]:
         )
 
         raw_output = ops.calculate_cdf(input_tensor, num_bins)
+
+        # Both CUDA and non-CUDA return int16 with shape
+        # [nlayers, nchannels, num_bins + 1]
+        nlayers, _, nchannels = input_tensor.shape
+        assert raw_output.shape == (nlayers, nchannels, num_bins + 1), (
+            f"Expected shape ({nlayers}, {nchannels}, {num_bins + 1}), "
+            f"got {raw_output.shape}"
+        )
+
+        out_cpu = raw_output.flatten().cpu()
+        out_int32 = out_cpu.to(torch.int32)
+        out_uint16 = torch.where(out_int32 < 0, out_int32 + 65536, out_int32)
+        final_result = out_uint16.float() / 65536.0
+
+        results[f"calculate_cdf_bins{num_bins}"] = final_result
+
+    return results
+
+
+
+def scenario_calculate_cdf1(ops: Any, device: str) -> dict[str, torch.Tensor]:
+    """Test calculate_cdf for multiple bin counts."""
+    num_bins_list = [1, 2, 5, 11, 15, 31, 32, 63]
+    results: dict[str, torch.Tensor] = {}
+
+    # all bins should be smaller than 64 -> align with C ops
+    assert all(n < 64 for n in num_bins_list), (
+        f"All num_bins must be < 64, got {[n for n in num_bins_list if n >= 64]}"
+    )
+
+    for num_bins in num_bins_list:
+        torch.manual_seed(42)
+
+        # Create on CPU first for consistent RNG across backends
+        input_tensor = torch.randint(0, num_bins, (1, 1000, 1), dtype=torch.int8).to(
+            device
+        )
+
+        raw_output = ops.calculate_cdf(input_tensor, num_bins)
         out_cpu = raw_output.flatten().cpu()
 
         if torch.is_floating_point(out_cpu):

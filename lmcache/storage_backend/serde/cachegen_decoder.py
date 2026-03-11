@@ -70,6 +70,7 @@ def decode_chunk(
         .cumsum(0)
         .reshape(data_chunk.bytestream_lengths.shape)
     )
+    logger.error("decode_fast_prefsum")
     lmc_ops.decode_fast_prefsum(cdf, bytes_tensor, length_prefsum, target_buffer)
 
 
