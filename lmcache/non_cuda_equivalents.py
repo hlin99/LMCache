@@ -150,20 +150,6 @@ def _tensor_from_cuda_ptr(
     total_bytes: int,
 ) -> torch.Tensor:
     """Zero-copy CUDA tensor from a raw device pointer."""
-    # Strategy 1: torch._C._construct_storage_from_data_pointer
-    '''
-    try:
-        storage = torch._C._construct_storage_from_data_pointer(
-            ptr, device, total_bytes
-        )
-        t = torch.empty(0, dtype=dtype, device=device)
-        t.set_(storage, storage_offset=0, size=(numel,), stride=(1,))
-        logger.error(" 1  _tensor_from_cuda_ptr")
-        return t.view(*shape)
-    except (AttributeError, RuntimeError, TypeError):
-        pass
-    '''
-    # Strategy 2: __cuda_array_interface__ (Fixed & Working)
  
     try:
         _DTYPE_TO_TYPESTR = {
@@ -195,15 +181,12 @@ def _tensor_from_cuda_ptr(
         if is_bf16:
             t = t.view(torch.bfloat16)
         
-        # logger.error(" 2  _tensor_from_cuda_ptr")
-        torch.cuda.synchronize()
-
         return t.view(*shape)
     except Exception as e:
         logger.debug(f"Strategy 2 (__cuda_array_interface__) failed: {e}")
         pass
     
-    # Strategy 3: cudaMemcpy Device-to-Device (Fallback)
+    # Strategy 2: cudaMemcpy Device-to-Device (Fallback)
     libcudart = _get_copy_lib()
     if libcudart is None:
         raise RuntimeError("Failed to load libcudart and zero-copy strategies failed.")
@@ -214,7 +197,6 @@ def _tensor_from_cuda_ptr(
     _MEMCPY_D2D = 3
 
     dst = torch.empty(numel, dtype=dtype, device=device)
-    torch.cuda.synchronize(device)
 
     err = cudaMemcpy(
         ctypes.c_void_p(dst.data_ptr()),
@@ -274,7 +256,6 @@ def _copy_hidden_row_async(
 
     # Perform the pure PyTorch memory copy
     dest_tensor.copy_(src_tensor)
-    torch.cuda.synchronize()
 
 
 def _get_multi_layer_paged_row(
@@ -581,7 +562,6 @@ def multi_layer_kv_transfer(
                 logger.error("hlin, here, paged_tensor.device=%s", paged_tensor.device)
                 gathered = paged_tensor.index_select(1, valid_slots)
                 key_value[:, layer_id, valid_mask, :] = gathered
-        torch.cuda.synchronize()
 
 def multi_layer_kv_transfer_unilateral(
     key_value: torch.Tensor,
