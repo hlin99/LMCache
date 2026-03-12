@@ -16,7 +16,6 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import _free_cpu_memory
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.pd_backend import PDBackend
 
@@ -60,28 +59,22 @@ def _cleanup_backend(backend):
     """Clean up PDBackend resources safely.
 
     Calls the backend's own close() method (which now closes side
-    channels before joining threads), then frees the underlying CPU/GPU
-    buffer so that pinned-memory entries in the global tensor registry
-    are released immediately instead of leaking for the rest of the
-    test session.
+    channels before joining threads), then closes the paged allocators
+    so that free-block MemoryObj instances are cleaned up immediately.
     """
     try:
         backend.close()
     except Exception as e:
         logger.warning("Error during backend close: %s", e)
 
-    # Free the underlying memory buffer that PagedCpuGpuMemoryAllocator
-    # does not release on its own.
     try:
         mem = backend.memory_allocator
         if hasattr(mem, "cpu_allocator"):
             mem.cpu_allocator.close()
-        if hasattr(mem, "cpu_buffer"):
-            _free_cpu_memory(mem.cpu_buffer)
         if hasattr(mem, "gpu_allocator"):
             mem.gpu_allocator.close()
     except Exception as e:
-        logger.warning("Error freeing allocator buffer: %s", e)
+        logger.warning("Error closing allocators: %s", e)
 
 
 @patch.object(PDBackend, "_init_receiver")

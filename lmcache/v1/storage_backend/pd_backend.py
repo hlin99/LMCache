@@ -33,6 +33,8 @@ from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
 
+THREAD_JOIN_TIMEOUT_SECONDS = 5
+
 
 class PDMsgBase(msgspec.Struct, tag=True):
     """Base class for all PD-related messages"""
@@ -629,7 +631,7 @@ class PDBackend(AllocatorBackendInterface):
                 logger.warning("Error closing side channel: %s", e)
 
         for thread in self.running_threads:
-            thread.join(timeout=5)
+            thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
 
         self.transfer_channel.close()
         self.zmq_context.term()
