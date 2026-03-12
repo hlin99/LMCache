@@ -627,9 +627,18 @@ class PDBackend(AllocatorBackendInterface):
         for thread in self.running_threads:
             thread.join()
         for channel in self.side_channels:
-            channel.close()
-        self.transfer_channel.close()
-        self.zmq_context.term()
+            try:
+                channel.close()
+            except Exception as e:
+                logger.warning("Error closing side channel: %s", e)
+        try:
+            self.transfer_channel.close()
+        except Exception as e:
+            logger.warning("Error closing transfer channel: %s", e)
+        try:
+            self.zmq_context.term()
+        except Exception as e:
+            logger.warning("Error terminating zmq context: %s", e)
 
     def pin(self, key: CacheEngineKey) -> bool:
         return True
