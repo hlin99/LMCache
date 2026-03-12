@@ -7,15 +7,19 @@ to be a multiple of align_bytes (chunk size).
 """
 
 # Standard
+import time
 from unittest.mock import MagicMock, patch
 
 # Third Party
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.pd_backend import PDBackend
+
+logger = init_logger(__name__)
 
 
 def create_test_metadata(kv_shape=(4, 2, 256, 8, 128)) -> LMCacheMetadata:
@@ -36,6 +40,47 @@ def _get_allocator(backend, config):
     if config.pd_buffer_device == "cpu":
         return backend.memory_allocator.cpu_allocator
     return backend.memory_allocator.gpu_allocator
+
+
+def _cleanup_backend(backend):
+    """Clean up PDBackend resources safely.
+
+    PDBackend.close() may hang if _mem_alloc_loop threads are blocked
+    on a recv() call without a timeout. This helper works around the
+    issue by closing the ZMQ side channels first (which unblocks any
+    pending recv), then joining threads with a timeout, and finally
+    closing the remaining resources.
+    """
+    try:
+        backend.running = False
+
+        # Close side channels to unblock any threads stuck on recv()
+        for channel in backend.side_channels:
+            try:
+                channel.close()
+            except Exception as e:
+                logger.warning("Error closing side channel: %s", e)
+
+        # Join threads with a timeout to prevent hanging
+        for thread in backend.running_threads:
+            thread.join(timeout=5)
+
+        # Clean up remaining resources
+        try:
+            backend.transfer_channel.close()
+        except Exception as e:
+            logger.warning("Error closing transfer channel: %s", e)
+
+        try:
+            backend.zmq_context.term()
+        except Exception as e:
+            logger.warning("Error terminating zmq context: %s", e)
+
+    except Exception as e:
+        logger.warning("Error during backend cleanup: %s", e)
+
+    # Give some time for cleanup
+    time.sleep(0.1)
 
 
 @patch.object(PDBackend, "_init_receiver")
@@ -91,4 +136,4 @@ def test_buffer_size_exact_alignment(_mock_ctx, _mock_channel, _mock_receiver):
             f"but got {actual_buffer_size}"
         )
     finally:
-        backend.close()
+        _cleanup_backend(backend)
