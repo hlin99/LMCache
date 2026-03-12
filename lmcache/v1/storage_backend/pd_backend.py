@@ -237,7 +237,7 @@ class PDBackend(AllocatorBackendInterface):
         dtypes = [metadata.kv_dtype]
         chunk_size_bytes = get_size_bytes(shapes, dtypes)
         origin_buffer_size = config.pd_buffer_size
-        aligned_buffer_size = origin_buffer_size // chunk_size_bytes * chunk_size_bytes
+        aligned_buffer_size = origin_buffer_size // chunk_size_bytes * chunk_size_bytes if chunk_size_bytes > 0 else 0
 
         if aligned_buffer_size == 0 and origin_buffer_size > 0:
             raise ValueError(
