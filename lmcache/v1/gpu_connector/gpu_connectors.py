@@ -759,7 +759,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     slot_mapping_full,
                     lmc_ops.TransferDirection.H2D,
                     self.gpu_kv_format,
-                    token_major=False,  # shape is [2, num_tokens, hidden_dim]
+                    token_major=False,  # shape is [2, 1, num_tokens, hidden_dim]
                 )
                 del self.buffer_mapping[layer_id - 2]
 
@@ -778,15 +778,17 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.cache_positions:
                     assert compute_gpu_buffer_obj.tensor is not None
 
-                    compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
+                    compute_gpu_buffer_obj.tensor[0][0] = self.fused_rotary_emb(
                         old_positions_full,
                         new_positions_full,
-                        compute_gpu_buffer_obj.tensor[0],
+                        compute_gpu_buffer_obj.tensor[0][0],
                     )
 
                 # gap zeroing after RoPE
                 if self.current_gap_positions.numel():
-                    compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
+                    compute_gpu_buffer_obj.tensor[:, :, self.current_gap_positions] = (
+                        0.0
+                    )
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
@@ -802,13 +804,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     ):
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
                         assert load_gpu_buffer_obj.tensor is not None
-                        load_gpu_buffer_obj.tensor[0][
+                        load_gpu_buffer_obj.tensor[0][0][
                             start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[0], non_blocking=True)
+                        ].copy_(memory_obj.tensor[0][0], non_blocking=True)
 
-                        load_gpu_buffer_obj.tensor[1][
+                        load_gpu_buffer_obj.tensor[0][1][
                             start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[1], non_blocking=True)
+                        ].copy_(memory_obj.tensor[0][1], non_blocking=True)
 
                         if self.cache_positions and layer_id == 0:
                             old_positions_full[
@@ -919,7 +921,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     slot_mapping_full,
                     lmc_ops.TransferDirection.D2H,
                     self.gpu_kv_format,
-                    token_major=False,  # shape is [2, num_tokens, hidden_dim]
+                    token_major=False,  # shape is [2, 1, num_tokens, hidden_dim]
                 )
                 for (buf_start, buf_end), memory_obj, old_positions in zip(
                     buf_starts_ends,
@@ -928,12 +930,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     strict=False,
                 ):
                     assert memory_obj.tensor is not None
-                    memory_obj.tensor[0].copy_(
-                        tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
+                    memory_obj.tensor[0][0].copy_(
+                        tmp_gpu_buffer_obj.tensor[0][0][buf_start:buf_end],
                         non_blocking=True,
                     )
-                    memory_obj.tensor[1].copy_(
-                        tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
+                    memory_obj.tensor[0][1].copy_(
+                        tmp_gpu_buffer_obj.tensor[0][1][buf_start:buf_end],
                         non_blocking=True,
                     )
                     if self.cache_positions:
@@ -948,7 +950,9 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:
-        return torch.Size([2, num_tokens, self.hidden_dim_size])
+        # Return 4D shape with num_layers=1 for layerwise mode
+        # [2, 1, num_tokens, hidden_dim_size]
+        return torch.Size([2, 1, num_tokens, self.hidden_dim_size])
 
 
 class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
@@ -1299,11 +1303,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         if self.use_mla:
-            # MLA format: [num_tokens, hidden_dim_size]
-            return torch.Size([num_tokens, self.hidden_dim_size])
+            # MLA format: [1, num_tokens, hidden_dim_size]
+            # (4D with num_layers=1)
+            return torch.Size([1, 1, num_tokens, self.hidden_dim_size])
         else:
-            # Standard format: [num_tokens, 2, hidden_dim_size]
-            return torch.Size([num_tokens, 2, self.hidden_dim_size])
+            # Standard format: [num_tokens, 1, 2, hidden_dim_size]
+            # (4D with num_layers=1)
+            return torch.Size([num_tokens, 1, 2, self.hidden_dim_size])
 
 
 class SGLangGPUConnector(GPUConnectorInterface):
@@ -1807,5 +1813,6 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
         yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:
-        # TODO: support MLA
-        return torch.Size([num_tokens, 2, self.hidden_dim_size])
+        # Return 4D shape with num_layers=1 for layerwise mode
+        # [num_tokens, 1, 2, hidden_dim_size]
+        return torch.Size([num_tokens, 1, 2, self.hidden_dim_size])
