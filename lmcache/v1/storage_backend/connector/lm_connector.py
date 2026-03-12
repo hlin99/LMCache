@@ -58,6 +58,7 @@ class LMCServerConnector(RemoteConnector):
         received = 0
         n = meta.length
 
+        # Shape is already 4D from the GPU connectors
         # TODO(Jiayi): Format will be used once we support
         # compressed memory format
         memory_obj = self.local_cpu_backend.allocate(
@@ -120,6 +121,7 @@ class LMCServerConnector(RemoteConnector):
         kv_dtype = memory_obj.get_dtype()
         memory_format = memory_obj.get_memory_format()
 
+        # Shape is already 4D from the GPU connectors
         async with self.async_socket_lock:
             await self.loop.sock_sendall(
                 self.client_socket,
@@ -142,6 +144,7 @@ class LMCServerConnector(RemoteConnector):
         # we don't want to yield control to other tasks which could
         # sacrifice the performance loading to trade the performance of
         # saving
+
         async with self.async_socket_lock:
             self.client_socket.sendall(
                 ClientMetaMessage(
