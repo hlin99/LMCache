@@ -76,6 +76,15 @@ def _cleanup_backend(backend):
         except Exception as e:
             logger.warning("Error terminating zmq context: %s", e)
 
+        # Close memory allocators to properly clean up MemoryObj instances
+        try:
+            if hasattr(backend.memory_allocator, 'cpu_allocator'):
+                backend.memory_allocator.cpu_allocator.close()
+            if hasattr(backend.memory_allocator, 'gpu_allocator'):
+                backend.memory_allocator.gpu_allocator.close()
+        except Exception as e:
+            logger.warning("Error closing memory allocators: %s", e)
+
     except Exception as e:
         logger.warning("Error during backend cleanup: %s", e)
 

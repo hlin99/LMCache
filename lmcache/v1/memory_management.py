@@ -1714,6 +1714,19 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
 
         return True
 
+    def close(self):
+        """
+        Close the allocator and clean up all MemoryObj instances.
+        This properly decrements ref_counts to avoid garbage collection warnings.
+        """
+        # Clear all free blocks and decrement their ref_counts
+        while self.free_blocks:
+            mem_obj = self.free_blocks.popleft()
+            # Set ref_count to 0 to avoid the warning in __del__
+            mem_obj.meta.ref_count = 0
+            # Remove parent allocator to prevent free() call in __del__
+            mem_obj.parent_allocator = None
+
     def __str__(self):
         return "PagedTensorMemoryAllocator"
 
