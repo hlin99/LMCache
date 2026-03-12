@@ -23,6 +23,56 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 logger = init_logger(__name__)
 
 
+def _pad_shape_to_4d(shape: torch.Size) -> torch.Size:
+    """
+    Pad a shape to 4D by inserting 1 for missing dimensions.
+
+    This is needed because ClientMetaMessage/ServerMetaMessage protocol
+    requires exactly 4 dimensions, but layerwise cache uses 3D shapes.
+
+    Args:
+        shape: Input shape (3D or 4D)
+
+    Returns:
+        4D shape with padding if necessary
+
+    Examples:
+        [2, 128, 4096] -> [2, 1, 128, 4096]  # layerwise: insert num_layers=1
+        [2, 32, 128, 4096] -> [2, 32, 128, 4096]  # non-layerwise: no change
+    """
+    if len(shape) == 4:
+        return shape
+    elif len(shape) == 3:
+        # Insert num_layers=1 at dimension 1 for layerwise cache
+        # [2, num_tokens, hidden_dim] -> [2, 1, num_tokens, hidden_dim]
+        return torch.Size([shape[0], 1, shape[1], shape[2]])
+    else:
+        raise ValueError(
+            f"Unsupported shape dimension {len(shape)}. "
+            f"Expected 3D (layerwise) or 4D (non-layerwise), got {shape}"
+        )
+
+
+def _unpad_shape_from_4d(shape: torch.Size) -> torch.Size:
+    """
+    Unpad a 4D shape back to 3D if it was padded for layerwise cache.
+
+    Args:
+        shape: 4D shape from protocol
+
+    Returns:
+        Original shape (3D if layerwise, 4D if non-layerwise)
+
+    Examples:
+        [2, 1, 128, 4096] -> [2, 128, 4096]  # layerwise: remove num_layers=1
+        [2, 32, 128, 4096] -> [2, 32, 128, 4096]  # non-layerwise: no change
+    """
+    if len(shape) == 4 and shape[1] == 1:
+        # Remove the dummy num_layers dimension for layerwise cache
+        return torch.Size([shape[0], shape[2], shape[3]])
+    return shape
+
+
 # TODO: performance optimization for this class, consider using C/C++/Rust
 # for communication + deserialization
 class LMCServerConnector(RemoteConnector):
@@ -58,10 +108,13 @@ class LMCServerConnector(RemoteConnector):
         received = 0
         n = meta.length
 
+        # Unpad shape from 4D back to original dimensions
+        original_shape = _unpad_shape_from_4d(meta.shape)
+
         # TODO(Jiayi): Format will be used once we support
         # compressed memory format
         memory_obj = self.local_cpu_backend.allocate(
-            meta.shape,
+            original_shape,
             meta.dtype,
             meta.fmt,
         )
@@ -120,6 +173,9 @@ class LMCServerConnector(RemoteConnector):
         kv_dtype = memory_obj.get_dtype()
         memory_format = memory_obj.get_memory_format()
 
+        # Pad shape to 4D for protocol compatibility
+        kv_shape_4d = _pad_shape_to_4d(kv_shape)
+
         async with self.async_socket_lock:
             await self.loop.sock_sendall(
                 self.client_socket,
@@ -129,7 +185,7 @@ class LMCServerConnector(RemoteConnector):
                     len(kv_bytes),
                     memory_format,
                     kv_dtype,
-                    kv_shape,
+                    kv_shape_4d,
                 ).serialize(),
             )
 
