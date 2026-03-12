@@ -498,6 +498,7 @@ class PDBackend(AllocatorBackendInterface):
         self.alloc_side_channel = get_zmq_socket(
             self.zmq_context, receiver_alloc_url, "tcp", zmq.REP, "bind"
         )
+        self.alloc_side_channel.setsockopt(zmq.RCVTIMEO, 1000)
         self.side_channels.append(self.alloc_side_channel)
 
         # Start the memory allocation thread
@@ -571,6 +572,9 @@ class PDBackend(AllocatorBackendInterface):
                 # send back response
                 self.alloc_side_channel.send(msgspec.msgpack.encode(alloc_resp))
 
+            except zmq.Again:
+                # Receive timeout — loop back to check self.running
+                continue
             except Exception as e:
                 logger.error("Failed to process mem alloc loop: %s", str(e))
                 if self.running:
@@ -622,6 +626,8 @@ class PDBackend(AllocatorBackendInterface):
         self.running = False
         for thread in self.running_threads:
             thread.join()
+        for channel in self.side_channels:
+            channel.close()
         self.transfer_channel.close()
         self.zmq_context.term()
 

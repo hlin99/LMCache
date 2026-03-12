@@ -91,4 +91,7 @@ def test_buffer_size_exact_alignment(_mock_ctx, _mock_channel, _mock_receiver):
             f"but got {actual_buffer_size}"
         )
     finally:
-        backend.close()
+        try:
+            backend.close()
+        except Exception:
+            pass
