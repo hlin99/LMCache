@@ -9,7 +9,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.protocol import (
     ClientCommand,
@@ -23,7 +23,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 logger = init_logger(__name__)
 
 
-def _pad_shape_to_4d(shape: torch.Size) -> torch.Size:
+def _pad_shape_to_4d(shape: torch.Size, is_layerwise: bool) -> torch.Size:
     """
     Pad a shape to 4D by inserting 1 for missing dimensions.
 
@@ -32,42 +32,51 @@ def _pad_shape_to_4d(shape: torch.Size) -> torch.Size:
 
     Args:
         shape: Input shape (3D or 4D)
+        is_layerwise: Whether this is for layerwise cache (determined by key type)
 
     Returns:
         4D shape with padding if necessary
 
     Examples:
-        [2, 128, 4096] -> [2, 1, 128, 4096]  # layerwise: insert num_layers=1
-        [2, 32, 128, 4096] -> [2, 32, 128, 4096]  # non-layerwise: no change
+        With is_layerwise=True:
+            [2, 128, 4096] -> [2, 1, 128, 4096]  # pad 3D to 4D
+        With is_layerwise=False:
+            [2, 32, 128, 4096] -> [2, 32, 128, 4096]  # no change
+            [2, 1, 128, 4096] -> [2, 1, 128, 4096]  # no change (valid 4D)
     """
     if len(shape) == 4:
         return shape
-    elif len(shape) == 3:
+    elif len(shape) == 3 and is_layerwise:
         # Insert num_layers=1 at dimension 1 for layerwise cache
         # [2, num_tokens, hidden_dim] -> [2, 1, num_tokens, hidden_dim]
         return torch.Size([shape[0], 1, shape[1], shape[2]])
     else:
         raise ValueError(
-            f"Unsupported shape dimension {len(shape)}. "
-            f"Expected 3D (layerwise) or 4D (non-layerwise), got {shape}"
+            f"Unsupported shape dimension {len(shape)} for "
+            f"{'layerwise' if is_layerwise else 'non-layerwise'} cache. "
+            f"Expected 3D for layerwise or 4D for non-layerwise, got {shape}"
         )
 
 
-def _unpad_shape_from_4d(shape: torch.Size) -> torch.Size:
+def _unpad_shape_from_4d(shape: torch.Size, is_layerwise: bool) -> torch.Size:
     """
     Unpad a 4D shape back to 3D if it was padded for layerwise cache.
 
     Args:
         shape: 4D shape from protocol
+        is_layerwise: Whether this is for layerwise cache (determined by key type)
 
     Returns:
         Original shape (3D if layerwise, 4D if non-layerwise)
 
     Examples:
-        [2, 1, 128, 4096] -> [2, 128, 4096]  # layerwise: remove num_layers=1
-        [2, 32, 128, 4096] -> [2, 32, 128, 4096]  # non-layerwise: no change
+        With is_layerwise=True:
+            [2, 1, 128, 4096] -> [2, 128, 4096]  # unpad to 3D
+        With is_layerwise=False:
+            [2, 1, 128, 4096] -> [2, 1, 128, 4096]  # no change (valid 4D)
+            [2, 32, 128, 4096] -> [2, 32, 128, 4096]  # no change
     """
-    if len(shape) == 4 and shape[1] == 1:
+    if len(shape) == 4 and is_layerwise and shape[1] == 1:
         # Remove the dummy num_layers dimension for layerwise cache
         return torch.Size([shape[0], shape[2], shape[3]])
     return shape
@@ -104,12 +113,14 @@ class LMCServerConnector(RemoteConnector):
         self.async_socket_lock = asyncio.Lock()
 
     # TODO(Jiayi): This should be an async function
-    def receive_all(self, meta: ServerMetaMessage) -> Optional[MemoryObj]:
+    def receive_all(
+        self, meta: ServerMetaMessage, is_layerwise: bool
+    ) -> Optional[MemoryObj]:
         received = 0
         n = meta.length
 
         # Unpad shape from 4D back to original dimensions
-        original_shape = _unpad_shape_from_4d(meta.shape)
+        original_shape = _unpad_shape_from_4d(meta.shape, is_layerwise)
 
         # TODO(Jiayi): Format will be used once we support
         # compressed memory format
@@ -173,8 +184,11 @@ class LMCServerConnector(RemoteConnector):
         kv_dtype = memory_obj.get_dtype()
         memory_format = memory_obj.get_memory_format()
 
+        # Determine if this is layerwise cache by checking key type
+        is_layerwise = isinstance(key, LayerCacheEngineKey)
+
         # Pad shape to 4D for protocol compatibility
-        kv_shape_4d = _pad_shape_to_4d(kv_shape)
+        kv_shape_4d = _pad_shape_to_4d(kv_shape, is_layerwise)
 
         async with self.async_socket_lock:
             await self.loop.sock_sendall(
@@ -198,6 +212,10 @@ class LMCServerConnector(RemoteConnector):
         # we don't want to yield control to other tasks which could
         # sacrifice the performance loading to trade the performance of
         # saving
+
+        # Determine if this is layerwise cache by checking key type
+        is_layerwise = isinstance(key, LayerCacheEngineKey)
+
         async with self.async_socket_lock:
             self.client_socket.sendall(
                 ClientMetaMessage(
@@ -217,7 +235,7 @@ class LMCServerConnector(RemoteConnector):
             return None
 
         async with self.async_socket_lock:
-            memory_obj = self.receive_all(meta)
+            memory_obj = self.receive_all(meta, is_layerwise)
 
         return memory_obj
 
