@@ -1152,16 +1152,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             memory_obj.tensor, non_blocking=True
                         )
                     else:
-                        lmc_kv = (
-                            memory_obj.tensor.view(
-                                memory_obj.tensor.shape[-2],
-                                memory_obj.tensor.shape[-1],
-                            )
-                            if self.use_mla
-                            else memory_obj.tensor.squeeze(1)
-                        )
                         lmc_ops.single_layer_kv_transfer(
-                            lmc_kv,
+                            self._reshape_lmc_kv(memory_obj.tensor),
                             self.kvcaches[layer_id],
                             slot_mapping_full,
                             lmc_ops.TransferDirection.H2D,
@@ -1170,16 +1162,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         )
 
                 if self.use_gpu:
-                    lmc_kv = (
-                        tmp_gpu_buffer_obj.tensor.view(
-                            tmp_gpu_buffer_obj.tensor.shape[-2],
-                            tmp_gpu_buffer_obj.tensor.shape[-1],
-                        )
-                        if self.use_mla
-                        else tmp_gpu_buffer_obj.tensor.squeeze(1)
-                    )
                     lmc_ops.single_layer_kv_transfer(
-                        lmc_kv,
+                        self._reshape_lmc_kv(tmp_gpu_buffer_obj.tensor),
                         self.kvcaches[layer_id],
                         slot_mapping_full,
                         lmc_ops.TransferDirection.H2D,
@@ -1276,16 +1260,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
                 if self.use_gpu:
-                    lmc_kv = (
-                        tmp_gpu_buffer_obj.tensor.view(
-                            tmp_gpu_buffer_obj.tensor.shape[-2],
-                            tmp_gpu_buffer_obj.tensor.shape[-1],
-                        )
-                        if self.use_mla
-                        else tmp_gpu_buffer_obj.tensor.squeeze(1)
-                    )
                     lmc_ops.single_layer_kv_transfer(
-                        lmc_kv,
+                        self._reshape_lmc_kv(tmp_gpu_buffer_obj.tensor),
                         self.kvcaches[layer_id],
                         slot_mapping_full,
                         lmc_ops.TransferDirection.D2H,
@@ -1302,16 +1278,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             non_blocking=True,
                         )
                     else:
-                        lmc_kv = (
-                            memory_obj.tensor.view(
-                                memory_obj.tensor.shape[-2],
-                                memory_obj.tensor.shape[-1],
-                            )
-                            if self.use_mla
-                            else memory_obj.tensor.squeeze(1)
-                        )
                         lmc_ops.single_layer_kv_transfer(
-                            lmc_kv,
+                            self._reshape_lmc_kv(memory_obj.tensor),
                             self.kvcaches[layer_id],
                             slot_mapping[start:end],
                             lmc_ops.TransferDirection.D2H,
@@ -1342,6 +1310,25 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # Standard format: [num_tokens, 1, 2, hidden_dim_size]
             # (4D with num_layers=1)
             return torch.Size([num_tokens, 1, 2, self.hidden_dim_size])
+
+    def _reshape_lmc_kv(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Reshape a 4D layerwise tensor to the 3D/2D shape expected by
+        ``single_layer_kv_transfer``.
+
+        For non-MLA the num_layers=1 dimension (dim 1) is squeezed:
+        ``[T, 1, 2, D]`` → ``[T, 2, D]``.
+        For MLA both leading size-1 dimensions are collapsed:
+        ``[1, 1, T, D]`` → ``[T, D]``.
+
+        Args:
+            tensor: The 4D KV cache tensor to reshape.
+
+        Returns:
+            A view of *tensor* with the expected dimensionality.
+        """
+        if self.use_mla:
+            return tensor.view(tensor.shape[-2], tensor.shape[-1])
+        return tensor.squeeze(1)
 
 
 class SGLangGPUConnector(GPUConnectorInterface):
