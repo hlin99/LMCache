@@ -8,6 +8,7 @@ to be a multiple of align_bytes (chunk size).
 
 # Standard
 from unittest.mock import MagicMock, patch
+import socket
 import time
 
 # Third Party
@@ -20,6 +21,19 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.pd_backend import PDBackend
 
 logger = init_logger(__name__)
+
+
+def get_free_port() -> int:
+    """Get a free port on localhost by briefly binding to port 0.
+
+    The OS assigns a free ephemeral port; we immediately release it.
+    There is a small TOCTOU window, but this is the standard approach
+    for test helpers and is safe enough for CI / parallel Docker runs.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
 
 
 def create_test_metadata(kv_shape=(4, 2, 256, 8, 128)) -> LMCacheMetadata:
@@ -118,14 +132,19 @@ def test_buffer_size_exact_alignment(_mock_ctx, _mock_channel, _mock_receiver):
     # Expected aligned size: 147 * 29360128 = 4315938816 bytes
     expected_aligned_size = 4315938816
 
+    # Dynamically allocate free ports to avoid conflicts when tests run
+    # concurrently (e.g., multiple Docker containers on the same host).
+    init_port = get_free_port()
+    alloc_port = get_free_port()
+
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
         pd_buffer_size=4317511681,  # NOT a multiple of 29360128
         pd_buffer_device="cpu",
         pd_role="receiver",
         pd_peer_host="localhost",
-        pd_peer_init_port=[12345],
-        pd_peer_alloc_port=[12346],
+        pd_peer_init_port=[init_port],
+        pd_peer_alloc_port=[alloc_port],
         transfer_channel="mock_memory",
     )
 
