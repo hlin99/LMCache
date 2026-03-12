@@ -9,7 +9,6 @@ to be a multiple of align_bytes (chunk size).
 # Standard
 from unittest.mock import MagicMock, patch
 import socket
-import time
 
 # Third Party
 import torch
@@ -17,6 +16,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import _free_cpu_memory
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.pd_backend import PDBackend
 
@@ -59,51 +59,29 @@ def _get_allocator(backend, config):
 def _cleanup_backend(backend):
     """Clean up PDBackend resources safely.
 
-    PDBackend.close() may hang if _mem_alloc_loop threads are blocked
-    on a recv() call without a timeout. This helper works around the
-    issue by closing the ZMQ side channels first (which unblocks any
-    pending recv), then joining threads with a timeout, and finally
-    closing the remaining resources.
+    Calls the backend's own close() method (which now closes side
+    channels before joining threads), then frees the underlying CPU/GPU
+    buffer so that pinned-memory entries in the global tensor registry
+    are released immediately instead of leaking for the rest of the
+    test session.
     """
     try:
-        backend.running = False
-
-        # Close side channels to unblock any threads stuck on recv()
-        for channel in backend.side_channels:
-            try:
-                channel.close()
-            except Exception as e:
-                logger.warning("Error closing side channel: %s", e)
-
-        # Join threads with a timeout to prevent hanging
-        for thread in backend.running_threads:
-            thread.join(timeout=5)
-
-        # Clean up remaining resources
-        try:
-            backend.transfer_channel.close()
-        except Exception as e:
-            logger.warning("Error closing transfer channel: %s", e)
-
-        try:
-            backend.zmq_context.term()
-        except Exception as e:
-            logger.warning("Error terminating zmq context: %s", e)
-
-        # Close memory allocators to properly clean up MemoryObj instances
-        try:
-            if hasattr(backend.memory_allocator, "cpu_allocator"):
-                backend.memory_allocator.cpu_allocator.close()
-            if hasattr(backend.memory_allocator, "gpu_allocator"):
-                backend.memory_allocator.gpu_allocator.close()
-        except Exception as e:
-            logger.warning("Error closing memory allocators: %s", e)
-
+        backend.close()
     except Exception as e:
-        logger.warning("Error during backend cleanup: %s", e)
+        logger.warning("Error during backend close: %s", e)
 
-    # Give some time for cleanup
-    time.sleep(0.1)
+    # Free the underlying memory buffer that PagedCpuGpuMemoryAllocator
+    # does not release on its own.
+    try:
+        mem = backend.memory_allocator
+        if hasattr(mem, "cpu_allocator"):
+            mem.cpu_allocator.close()
+        if hasattr(mem, "cpu_buffer"):
+            _free_cpu_memory(mem.cpu_buffer)
+        if hasattr(mem, "gpu_allocator"):
+            mem.gpu_allocator.close()
+    except Exception as e:
+        logger.warning("Error freeing allocator buffer: %s", e)
 
 
 @patch.object(PDBackend, "_init_receiver")
@@ -120,17 +98,17 @@ def test_buffer_size_exact_alignment(_mock_ctx, _mock_channel, _mock_receiver):
     """
 
     # Create a metadata with KV shape that results in a specific chunk size
-    metadata = create_test_metadata(kv_shape=(28, 2, 256, 8, 128))
+    metadata = create_test_metadata(kv_shape=(4, 2, 256, 8, 128))
 
     # Calculate expected chunk size:
-    # 28 * 2 * 256 * 8 * 128 * 2 (bfloat16) = 29360128 bytes
-    expected_chunk_size = 29360128
+    # 4 * 2 * 256 * 8 * 128 * 2 (bfloat16) = 4194304 bytes
+    expected_chunk_size = 4194304
 
     # Create a config with a buffer size that is NOT a multiple of chunk size
-    # Original size: 4317511681 bytes
-    # Chunks count: 4317511681 // 29360128 = 147 chunks
-    # Expected aligned size: 147 * 29360128 = 4315938816 bytes
-    expected_aligned_size = 4315938816
+    # Original size: 13000000 bytes
+    # Chunks count: 13000000 // 4194304 = 3 chunks
+    # Expected aligned size: 3 * 4194304 = 12582912 bytes
+    expected_aligned_size = 12582912
 
     # Dynamically allocate free ports to avoid conflicts when tests run
     # concurrently (e.g., multiple Docker containers on the same host).
@@ -139,7 +117,7 @@ def test_buffer_size_exact_alignment(_mock_ctx, _mock_channel, _mock_receiver):
 
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
-        pd_buffer_size=4317511681,  # NOT a multiple of 29360128
+        pd_buffer_size=13000000,  # NOT a multiple of 4194304
         pd_buffer_device="cpu",
         pd_role="receiver",
         pd_peer_host="localhost",

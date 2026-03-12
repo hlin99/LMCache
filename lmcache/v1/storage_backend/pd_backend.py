@@ -620,8 +620,17 @@ class PDBackend(AllocatorBackendInterface):
         Close the storage backend.
         """
         self.running = False
+
+        # Close side channels first to unblock any threads stuck on recv()
+        for channel in self.side_channels:
+            try:
+                channel.close()
+            except Exception as e:
+                logger.warning("Error closing side channel: %s", e)
+
         for thread in self.running_threads:
-            thread.join()
+            thread.join(timeout=5)
+
         self.transfer_channel.close()
         self.zmq_context.term()
 
