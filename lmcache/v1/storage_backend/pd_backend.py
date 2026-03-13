@@ -33,6 +33,8 @@ from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
 
+THREAD_JOIN_TIMEOUT_SECONDS = 5
+
 
 class PDMsgBase(msgspec.Struct, tag=True):
     """Base class for all PD-related messages"""
@@ -237,7 +239,11 @@ class PDBackend(AllocatorBackendInterface):
         dtypes = [metadata.kv_dtype]
         chunk_size_bytes = get_size_bytes(shapes, dtypes)
         origin_buffer_size = config.pd_buffer_size
-        aligned_buffer_size = origin_buffer_size // chunk_size_bytes * chunk_size_bytes if chunk_size_bytes > 0 else 0
+        aligned_buffer_size = (
+            origin_buffer_size // chunk_size_bytes * chunk_size_bytes
+            if chunk_size_bytes > 0
+            else 0
+        )
 
         if aligned_buffer_size == 0 and origin_buffer_size > 0:
             raise ValueError(
@@ -620,8 +626,17 @@ class PDBackend(AllocatorBackendInterface):
         Close the storage backend.
         """
         self.running = False
+
+        # Close side channels first to unblock any threads stuck on recv()
+        for channel in self.side_channels:
+            try:
+                channel.close()
+            except Exception as e:
+                logger.warning("Error closing side channel: %s", e)
+
         for thread in self.running_threads:
-            thread.join()
+            thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+
         self.transfer_channel.close()
         self.zmq_context.term()
 
