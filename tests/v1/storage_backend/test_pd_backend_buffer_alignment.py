@@ -2,6 +2,7 @@
 """Tests for PD backend buffer-size alignment."""
 
 # Standard
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # Third Party
@@ -30,10 +31,15 @@ def create_test_metadata(kv_shape=(4, 2, 256, 8, 128)) -> LMCacheMetadata:
 @patch("lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator")
 def test_buffer_size_exact_alignment(mock_allocator_cls):
     """
-    Test that buffer size is aligned before allocator initialization.
+    Test that PD buffer size is rounded down to the nearest chunk multiple.
+
+    Args:
+        mock_allocator_cls: Mocked paged allocator class injected by patch.
     """
     metadata = create_test_metadata(kv_shape=(4, 2, 256, 8, 128))
+    # 4 * 2 * 256 * 8 * 128 * 2 bytes (bfloat16) = 4194304 bytes per chunk.
     expected_chunk_size = 4194304
+    # (13000000 // 4194304) * 4194304 = 12582912 bytes.
     expected_aligned_size = 12582912
 
     config = LMCacheEngineConfig.from_defaults(
@@ -44,10 +50,11 @@ def test_buffer_size_exact_alignment(mock_allocator_cls):
     allocator = MagicMock()
     mock_allocator_cls.return_value = allocator
 
-    backend = PDBackend.__new__(PDBackend)
-    backend.corrected_device = "cpu"
+    backend_context = SimpleNamespace(corrected_device="cpu")
 
-    returned_allocator = PDBackend.initialize_allocator(backend, config, metadata)
+    returned_allocator = PDBackend.initialize_allocator(
+        backend_context, config, metadata
+    )
 
     assert returned_allocator is allocator
     allocator.init_gpu_memory_allocator.assert_not_called()
@@ -56,7 +63,4 @@ def test_buffer_size_exact_alignment(mock_allocator_cls):
         [torch.Size(metadata.kv_shape)],
         [metadata.kv_dtype],
         MemoryFormat.KV_2LTD,
-    )
-    assert (
-        allocator.init_cpu_memory_allocator.call_args.args[0] % expected_chunk_size == 0
     )
