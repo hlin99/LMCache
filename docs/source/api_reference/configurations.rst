@@ -154,6 +154,35 @@ Settings related to cache blending functionality.
      - LMCACHE_BLEND_SPECIAL_STR
      - Separator string for blending. Default: " # # "
 
+Asymmetric Store/Retrieve Configurations
+----------------------------------------
+
+Settings for controlling which storage backends are used for storing and retrieving KV caches independently.
+This is typically used (but not limited to) disaggregated prefill-decode (PD) setups where the store and retrieve paths may target different backends.
+
+When these options are ``null`` (default), all active backends are used for both storing and retrieving.
+
+.. note::
+
+    For example, in a PD setup:
+
+    - A **decoder** may set ``retrieve_locations: ["PDBackend"]`` and ``store_location: "RemoteBackend"`` to retrieve KV caches from the prefiller via PD and store them to a remote backend.
+    - A **prefiller** may set ``retrieve_locations: ["LocalCPUBackend", "RemoteBackend"]`` to first look up the local CPU cache and then the remote backend.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - YAML Config Name
+     - Environment Variable
+     - Description
+   * - retrieve_locations
+     - LMCACHE_RETRIEVE_LOCATIONS
+     - List of storage backend names to search when retrieving or looking up KV caches. When specified, only the listed backends are searched (in order). Valid values are the backend class names registered in the storage manager, including: ``"LocalCPUBackend"``, ``"LocalDiskBackend"``, ``"RemoteBackend"``, ``"PDBackend"``, ``"P2PBackend"``, ``"GdsBackend"``, and any storage plugin backends. Default: null (search all active backends)
+   * - store_location
+     - LMCACHE_STORE_LOCATION
+     - A single storage backend name to store KV caches into. When specified, only the matching backend receives store operations. Valid values are the backend class names registered in the storage manager, including: ``"LocalCPUBackend"``, ``"LocalDiskBackend"``, ``"RemoteBackend"``, ``"PDBackend"``, ``"P2PBackend"``, ``"GdsBackend"``, and any storage plugin backends. Note: ``"PDBackend"`` cannot be used as a store location for a decoder instance in a PD setup, since PDBackend is one-way from prefiller to decoder only. Default: null (store to all active backends)
+
 Peer-to-Peer Sharing Configurations
 -----------------------------------
 
