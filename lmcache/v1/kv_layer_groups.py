@@ -173,10 +173,32 @@ class KVLayerGroupsManager:
         )
 
         for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
-            shape = kv_cache.shape
-            dtype = kv_cache.dtype
-            key = (shape, dtype)
-            groups_dict[key].append((layer_name, idx))
+            # Normalize kv_cache to an iterable. Supports two KV cache formats:
+            # - Single-tensor format: a single tensor with shape
+            #   [2, num_blocks, block_size, num_heads, head_size].
+            # - List/tuple format (e.g., TPU/HPU): [k_tensor, v_tensor],
+            #   where each tensor has shape
+            #   [num_blocks, block_size, num_heads, head_size].
+            tensors = kv_cache if isinstance(kv_cache, (tuple, list)) else [kv_cache]
+            # Find the first non-None tensor to get shape/dtype info
+            first_valid_tensor = next(
+                (tensor for tensor in tensors if tensor is not None), None
+            )
+            if first_valid_tensor is not None:
+                # Count valid (non-None) tensors in the list/tuple
+                num_valid_tensors = sum(1 for t in tensors if t is not None)
+                # For list/tuple format with multiple tensors, prepend the count
+                # as a leading dimension to produce the same canonical shape as
+                # the single-tensor format (e.g., [2, num_blocks, ...] for k+v),
+                # so downstream indexing (e.g., hidden_dim_size) is unaffected.
+                if isinstance(kv_cache, (tuple, list)) and num_valid_tensors == 2:
+                    shape = torch.Size(
+                        [num_valid_tensors] + list(first_valid_tensor.shape)
+                    )
+                else:
+                    shape = first_valid_tensor.shape
+                key = (shape, first_valid_tensor.dtype)
+                groups_dict[key].append((layer_name, idx))
 
         # Build KVLayerGroupInfo list
         # Sort groups by the first layer index to maintain order
