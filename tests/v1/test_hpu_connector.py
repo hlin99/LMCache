@@ -78,6 +78,10 @@ def _make_fake_torch_module():
     return torch_module
 
 
+def _noop_logger(*args, **kwargs):
+    return None
+
+
 def _load_hpu_connector_module():
     fake_torch = _make_fake_torch_module()
     fake_habana_torch = ModuleType("habana_frameworks.torch")
@@ -100,7 +104,7 @@ def _load_hpu_connector_module():
         "lmcache.v1.metadata": ModuleType("lmcache.v1.metadata"),
     }
     fake_modules["lmcache.logging"].init_logger = lambda name: SimpleNamespace(
-        error=lambda *args, **kwargs: None
+        error=_noop_logger
     )
     fake_modules["lmcache.utils"]._lmcache_nvtx_annotate = lambda func: func
     fake_modules["lmcache.v1.gpu_connector"].GPUConnectorInterface = object
@@ -118,7 +122,7 @@ def _load_hpu_connector_module():
             / "gpu_connector"
             / "hpu_connector.py"
         )
-        spec = importlib.util.spec_from_file_location("test_hpu_connector_module", module_path)
+        spec = importlib.util.spec_from_file_location("hpu_connector_under_test", module_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -131,11 +135,12 @@ def _load_hpu_connector_module():
                 sys.modules[name] = original
 
 
-HPU_CONNECTOR_MODULE = _load_hpu_connector_module()
-VLLMPagedMemHPUConnectorV2 = HPU_CONNECTOR_MODULE.VLLMPagedMemHPUConnectorV2
+@pytest.fixture(scope="module")
+def hpu_connector_cls():
+    return _load_hpu_connector_module().VLLMPagedMemHPUConnectorV2
 
 
-def test_get_mla_token_major_view_accepts_paged_layout():
+def test_get_mla_token_major_view_handles_paged_layout(hpu_connector_cls):
     kv_cache = FakeTensor(
         [
             [[0, 1], [2, 3], [4, 5]],
@@ -143,23 +148,28 @@ def test_get_mla_token_major_view_accepts_paged_layout():
         ]
     )
 
-    flattened = VLLMPagedMemHPUConnectorV2._get_mla_token_major_view(kv_cache)
+    flattened = hpu_connector_cls._get_mla_token_major_view(kv_cache)
 
     assert flattened.shape == (6, 2)
     assert flattened.tolist() == [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11]]
 
 
-def test_get_mla_token_major_view_keeps_legacy_layout():
+def test_get_mla_token_major_view_preserves_legacy_layout(hpu_connector_cls):
     kv_cache = FakeTensor([[0, 1], [2, 3], [4, 5]])
 
-    flattened = VLLMPagedMemHPUConnectorV2._get_mla_token_major_view(kv_cache)
+    flattened = hpu_connector_cls._get_mla_token_major_view(kv_cache)
 
     assert flattened.shape == (3, 2)
     assert flattened.tolist() == [[0, 1], [2, 3], [4, 5]]
 
 
-def test_get_mla_token_major_view_rejects_invalid_layout():
-    kv_cache = FakeTensor([[[[1], [2]]]])
-
+@pytest.mark.parametrize(
+    "kv_cache",
+    [
+        FakeTensor([1, 2, 3]),
+        FakeTensor([[[[1], [2]]]]),
+    ],
+)
+def test_get_mla_token_major_view_rejects_invalid_layout(hpu_connector_cls, kv_cache):
     with pytest.raises(ValueError, match="Unsupported MLA KV cache shape"):
-        VLLMPagedMemHPUConnectorV2._get_mla_token_major_view(kv_cache)
+        hpu_connector_cls._get_mla_token_major_view(kv_cache)

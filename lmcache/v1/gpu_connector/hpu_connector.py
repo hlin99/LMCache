@@ -332,7 +332,8 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             num_blocks, block_size, head_size = kv_cache.shape
             return kv_cache.view(num_blocks * block_size, head_size)
         raise ValueError(
-            "Unsupported MLA KV cache shape. Expected "
-            "[page_buffer_size, head_size] or [num_blocks, block_size, head_size], "
+            "Unsupported MLA KV cache shape. Expected a 2D "
+            "[page_buffer_size, head_size] tensor or a 3D "
+            "[num_blocks, block_size, head_size] tensor, "
             f"but got {tuple(kv_cache.shape)}."
         )
