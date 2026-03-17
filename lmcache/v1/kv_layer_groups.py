@@ -61,6 +61,7 @@ class KVLayerGroupInfo:
     def hidden_dim_size(self) -> int:
         """Return the size of the hidden dimension in this group."""
         # hidden_dim_size = num_heads * head_size
+        logger.error("hidden_dim_size -> len(self.shape) = %s", len(self.shape))
         if len(self.shape) == 5:
             # MHA
             return self.shape[3] * self.shape[4]
@@ -167,16 +168,29 @@ class KVLayerGroupsManager:
             logger.debug("No KV caches available, skipping KV layer groups building")
             return
 
+        # hlin_first_tensor = next(iter(kv_caches.values()))
+        # hlin_shape = hlin_first_tensor.shape
+        # logger.error("build_kv_layer_groups+++ hlin_shape=%s", hlin_shape)
         # Group layers by (shape, dtype) in a single loop
         groups_dict: dict[tuple[torch.Size, torch.dtype], list[tuple[str, int]]] = (
             defaultdict(list)
         )
 
         for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
-            shape = kv_cache.shape
-            dtype = kv_cache.dtype
-            key = (shape, dtype)
-            groups_dict[key].append((layer_name, idx))
+            # Normalize kv_cache to iterable. Supports:
+            # - GPU (CUDA): A single tensor.
+            # - TPU/HPU: A tuple/list (e.g., (k, v, k_scale, v_scale)).
+            tensors = kv_cache if isinstance(kv_cache, (tuple, list)) else [kv_cache]
+            logger.error(" kv_cache is list ? %s ", isinstance(kv_cache, (tuple, list)))
+            if not isinstance(kv_cache, (tuple, list)):
+                logger.error("kv_cache.shape=%s", kv_cache.shape)
+            # Find the first non-None tensor
+            first_valid_tensor = next(
+                (tensor for tensor in tensors if tensor is not None), None
+            )
+            if first_valid_tensor is not None:
+                key = (first_valid_tensor.shape, first_valid_tensor.dtype)
+                groups_dict[key].append((layer_name, idx))
 
         # Build KVLayerGroupInfo list
         # Sort groups by the first layer index to maintain order
@@ -195,7 +209,7 @@ class KVLayerGroupsManager:
         for shape, dtype in sorted_keys:
             layers = groups_dict[(shape, dtype)]
             layer_names, layer_indices = zip(*layers, strict=False)
-
+            print(" build_kv_layer_groups--- shape=%s", shape)
             group_info = KVLayerGroupInfo(
                 layer_names=list(layer_names),
                 layer_indices=list(layer_indices),
