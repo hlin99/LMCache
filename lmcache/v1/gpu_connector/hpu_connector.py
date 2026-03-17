@@ -81,6 +81,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             self.gpu_buffer = torch.empty(
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
+            logger.error("self.gpu_buffer.shape=%s", self.gpu_buffer.shape)
 
     @classmethod
     def from_metadata(
@@ -114,6 +115,136 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             device=device,
             use_mla=metadata.use_mla,
         )
+
+    def to_gpu_xpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
+        The kvcaches should correspond to the "WHOLE token sequence".
+
+        Note:
+          1. This function expects the 'slot_mapping' is a "full slot mapping"
+             where it's length is the same as the whole token sequence.
+          2. In the case that there is prefix caching, slot_mapping will starts
+             with -1s until the end of the matched prefix. The start and end
+             should NEVER overlap with the prefix caching (which means the
+             underlying CUDA kernel will never see -1 in slot_mapping)
+
+
+        :raises ValueError: If 'kvcaches' is not provided in kwargs.
+        :raises AssertionError: If the memory object does not have a tensor.
+        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        """
+        assert memory_obj.tensor is not None
+
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format in"
+                    " order to be processed by VLLMPagedMemXPUConnector"
+                )
+        else:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
+                raise ValueError(
+                    "The memory object should be in KV_2LTD format in"
+                    " order to be processed by VLLMPagedMemXPUConnector"
+                )
+
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slices = slot_mapping[start:end]
+        
+        htorch.core.mark_step()
+
+        if self.use_mla:
+            tmp = memory_obj.tensor[0].to(slot_mapping.device)
+            num_blocks, block_size, head_size = kvcaches[0].shape
+            total_blocks = num_blocks * block_size
+            for i, kvcache in enumerate(kvcaches):
+                kvcache.view(total_blocks, head_size).index_copy_(0, slices, tmp[i])
+                htorch.core.mark_step()
+        else:
+            tmp_k = memory_obj.tensor[0].to(slot_mapping.device)
+            tmp_v = memory_obj.tensor[1].to(slot_mapping.device)
+            num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
+            total_blocks = num_blocks * block_size
+            d = num_heads * head_size
+            for i, (kcache, vcache) in enumerate(kvcaches):
+                kcache.view(total_blocks, d).index_copy_(0, slices, tmp_k[i])
+                vcache.view(total_blocks, d).index_copy_(0, slices, tmp_v[i])
+                htorch.core.mark_step()
+
+        torch.hpu.synchronize()
+
+    def from_gpu_xpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
+        The kvcaches should correspond to the "WHOLE token sequence".
+
+        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
+
+        Note:
+          1. This function expects the 'slot_mapping' is a "full slot mapping"
+             where it's length is the same as the whole token sequence.
+          2. In the case that there is prefix caching, slot_mapping will starts
+             with -1s until the end of the matched prefix. The start and end
+             should NEVER overlap with the prefix caching (which means the
+             underlying CUDA kernel will never see -1 in slot_mapping)
+
+        :raises ValueError: If 'kvcaches' is not provided in kwargs,
+        :raises AssertionError: If the memory object does not have a tensor.
+        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        """
+        assert memory_obj.tensor is not None
+
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slices = slot_mapping[start:end]
+
+        htorch.core.mark_step()
+
+        if self.use_mla:
+            num_blocks, block_size, head_size = kvcaches[0].shape
+            total_blocks = num_blocks * block_size
+            tmp = torch.stack(
+                [
+                    kvcache.view(total_blocks, head_size).index_select(0, slices)
+                    for kvcache in kvcaches
+                ]
+            )
+        else:
+            num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
+            total_blocks = num_blocks * block_size
+            d = num_heads * head_size
+            tmp_k = torch.stack(
+                [
+                    kvcache[0].view(total_blocks, d).index_select(0, slices)
+                    for kvcache in kvcaches
+                ]
+            )
+            tmp_v = torch.stack(
+                [
+                    kvcache[1].view(total_blocks, d).index_select(0, slices)
+                    for kvcache in kvcaches
+                ]
+            )
+            tmp = torch.stack([tmp_k, tmp_v])
+        memory_obj.tensor.copy_(tmp, non_blocking=True)
+
+        htorch.core.mark_step()
+        torch.hpu.synchronize()
+
+        if self.use_mla:
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -173,7 +304,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         if lmc_ops is None:
             if self.gpu_buffer is not None:
-                assert self.gpu_buffer.device == self.kvcaches[0][0].device
+                assert self.gpu_buffer.device == self.kvcaches[0].device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
                 layers = range(len(self.kvcaches))
 
@@ -183,10 +314,12 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                     tmp_gpu_buffer[0] = memory_obj.tensor[0].to(slot_mapping.device)
                     htorch.core.mark_step()
 
-                    b, hd = self.kvcaches[0][0].shape
-
+                    #b, hd = self.kvcaches[0][0].shape
+                    num_blocks, block_size, head_size = self.kvcaches[0].shape   # ✅ 不需要 [0][0]
+                    total_slots = num_blocks * block_size
+                    logger.error("num_blocks, block_size, head_size = %s %s %s", num_blocks, block_size, head_size)
                     for i in layers:
-                        self.kvcaches[i][0].view(b, hd).index_copy_(
+                        self.kvcaches[i].view(total_slots, head_size).index_copy_(
                             0,
                             slot_mapping[start:end],
                             tmp_gpu_buffer[0][i],
@@ -264,17 +397,20 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
         if lmc_ops is None:
             if self.gpu_buffer is not None:
-                assert self.gpu_buffer.device == self.kvcaches[0][0].device
+                assert self.gpu_buffer.device == self.kvcaches[0].device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
                 layers = range(len(self.kvcaches))
 
                 if self.use_mla:
-                    b, hd = self.kvcaches[0][0].shape
+                    # b, hd = self.kvcaches[0][0].shape
+                    num_blocks, block_size, head_size = self.kvcaches[0].shape   # ▒~\~E ▒~M▒~\~@▒~A [0][0]
+                    total_slots = num_blocks * block_size
+                    logger.error("num_blocks, block_size, head_size = %s %s %s", num_blocks, block_size, head_size)
 
                     tmp_gpu_buffer[0] = torch.stack(
                         tuple(
-                            self.kvcaches[i][0]
-                            .view(b, hd)
+                            self.kvcaches[i]
+                            .view(total_slots, head_size)
                             .index_select(0, slot_mapping[start:end])
                             for i in layers
                         ),
