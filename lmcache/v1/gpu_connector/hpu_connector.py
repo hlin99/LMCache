@@ -46,6 +46,13 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         use_gpu: bool = False,
         **kwargs,
     ):
+        """
+        If use_gpu is true, it will create a gpu intermediate buffer. In this
+        case, it requires the following kwargs:
+        - chunk_size: The MAX size of the chunk to be copied to GPU.
+        - dtype: The data type of the intermediate buffer.
+        - device: The device to place the intermediate buffer on.
+        """
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
         self.kv_cache_pointers = torch.empty(
@@ -58,6 +65,18 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         self.kvcaches: Optional[List[torch.Tensor]] = None
         self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        if use_gpu:
+            assert "chunk_size" in kwargs, (
+                "chunk_size should be provided to create a GPU buffer."
+            )
+            assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
+            assert "device" in kwargs, (
+                "device should be provided to create a GPU buffer."
+            )
+            shape = self.get_shape(kwargs["chunk_size"])
+            self.gpu_buffer = torch.empty(
+                shape, dtype=kwargs["dtype"], device=kwargs["device"]
+            )
 
     @classmethod
     def from_metadata(
@@ -67,10 +86,12 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         device: Optional[torch.device] = None,
     ) -> "VLLMPagedMemHPUConnectorV2":
         """Create a connector from LMCacheMetadata.
+
         Args:
             metadata: The LMCache engine metadata containing model configuration.
             use_gpu: Whether to use GPU intermediate buffer.
             device: The device to use for the connector.
+
         Returns:
             A new instance of VLLMPagedMemHPUConnectorV2.
         """
@@ -102,8 +123,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
           2. In the case that there is prefix caching, slot_mapping will starts
              with -1s until the end of the matched prefix. The start and end
              should NEVER overlap with the prefix caching (which means the
-             underlying CUDA kernel will never see -1 in slot_mapping)
-
+             underlying kernel will never see -1 in slot_mapping)
 
         :raises ValueError: If 'kvcaches' is not provided in kwargs.
         :raises AssertionError: If the memory object does not have a tensor.
@@ -115,13 +135,13 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
                 raise ValueError(
                     "The memory object should be in KV_MLA_FMT format in"
-                    " order to be processed by VLLMPagedMemXPUConnector"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
                 )
         else:
             if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
                 raise ValueError(
                     "The memory object should be in KV_2LTD format in"
-                    " order to be processed by VLLMPagedMemXPUConnector"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
                 )
 
         if "kvcaches" not in kwargs:
@@ -160,7 +180,8 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
 
-        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
+        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_MLA_FMT
+        if use_mla is True.
 
         Note:
           1. This function expects the 'slot_mapping' is a "full slot mapping"
@@ -168,9 +189,9 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
           2. In the case that there is prefix caching, slot_mapping will starts
              with -1s until the end of the matched prefix. The start and end
              should NEVER overlap with the prefix caching (which means the
-             underlying CUDA kernel will never see -1 in slot_mapping)
+             underlying kernel will never see -1 in slot_mapping)
 
-        :raises ValueError: If 'kvcaches' is not provided in kwargs,
+        :raises ValueError: If 'kvcaches' is not provided in kwargs.
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
@@ -232,4 +253,5 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         """Get the shape of the data given the number of tokens."""
-        raise NotImplementedError
+        kv_size = 1 if self.use_mla else 2
+        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
