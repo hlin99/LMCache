@@ -229,3 +229,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        """Get the shape of the data given the number of tokens."""
+        raise NotImplementedError
