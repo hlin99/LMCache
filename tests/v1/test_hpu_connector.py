@@ -2,6 +2,7 @@
 # Standard
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Optional
 import importlib.util
 import logging
 import sys
@@ -12,6 +13,8 @@ import torch
 
 
 class _KVCachePair(tuple):
+    """Tuple-like KV container that also exposes the device of the K tensor."""
+
     def __new__(
         cls, kcache: torch.Tensor, vcache: torch.Tensor
     ) -> "_KVCachePair":
@@ -23,8 +26,14 @@ class _KVCachePair(tuple):
 
 
 def _load_hpu_connector_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    target_path = Path(
-        "/home/runner/work/LMCache/LMCache/lmcache/v1/gpu_connector/hpu_connector.py"
+    """Load `hpu_connector.py` with stubbed imports for a non-Habana test run."""
+
+    target_path = (
+        Path(__file__).resolve().parents[2]
+        / "lmcache"
+        / "v1"
+        / "gpu_connector"
+        / "hpu_connector.py"
     )
 
     habana_frameworks = ModuleType("habana_frameworks")
@@ -80,14 +89,16 @@ def _load_hpu_connector_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         "test_hpu_connector_target", target_path
     )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module spec for {target_path}")
     module = importlib.util.module_from_spec(spec)
-    assert spec is not None
-    assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-def _make_memory_obj(tensor: torch.Tensor, fmt) -> SimpleNamespace:
+def _make_memory_obj(tensor: torch.Tensor, fmt: str) -> SimpleNamespace:
+    """Create the minimal memory object surface needed by the connector tests."""
+
     return SimpleNamespace(
         tensor=tensor,
         metadata=SimpleNamespace(fmt=fmt),
@@ -100,8 +111,10 @@ def _make_non_mla_kvcaches(
     num_heads: int,
     head_size: int,
     dtype: torch.dtype,
-    fill_value: float | None = None,
+    fill_value: Optional[float] = None,
 ) -> list[_KVCachePair]:
+    """Build non-MLA KV caches in the layout expected by the HPU connector."""
+
     ret = []
     for layer_id in range(num_layers):
         if fill_value is None:
@@ -127,8 +140,10 @@ def _make_mla_kvcaches(
     block_size: int,
     head_size: int,
     dtype: torch.dtype,
-    fill_value: float | None = None,
+    fill_value: Optional[float] = None,
 ) -> list[torch.Tensor]:
+    """Build MLA KV caches in the layout expected by the HPU connector."""
+
     ret = []
     for layer_id in range(num_layers):
         if fill_value is None:
@@ -147,6 +162,8 @@ def _make_mla_kvcaches(
 def test_hpu_connector_from_gpu_and_to_gpu_round_trip_without_mla(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Validate non-MLA `from_gpu`/`to_gpu` round-tripping on mapped slots."""
+
     module = _load_hpu_connector_module(monkeypatch)
 
     num_layers = 3
@@ -224,8 +241,9 @@ def test_hpu_connector_from_gpu_and_to_gpu_round_trip_without_mla(
     )
 
     selected_slots = slot_mapping[start:end]
+    selected_set = set(selected_slots.tolist())
     untouched_slots = torch.tensor(
-        [idx for idx in range(page_buffer_size) if idx not in selected_slots.tolist()],
+        [idx for idx in range(page_buffer_size) if idx not in selected_set],
         dtype=torch.int64,
     )
     for layer_id in range(num_layers):
@@ -257,6 +275,8 @@ def test_hpu_connector_from_gpu_and_to_gpu_round_trip_without_mla(
 def test_hpu_connector_from_gpu_and_to_gpu_round_trip_with_mla(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Validate MLA `from_gpu`/`to_gpu` round-tripping and metadata updates."""
+
     module = _load_hpu_connector_module(monkeypatch)
 
     num_layers = 3
@@ -327,8 +347,9 @@ def test_hpu_connector_from_gpu_and_to_gpu_round_trip_with_mla(
     )
 
     selected_slots = slot_mapping[start:end]
+    selected_set = set(selected_slots.tolist())
     untouched_slots = torch.tensor(
-        [idx for idx in range(total_slots) if idx not in selected_slots.tolist()],
+        [idx for idx in range(total_slots) if idx not in selected_set],
         dtype=torch.int64,
     )
     for layer_id in range(num_layers):
