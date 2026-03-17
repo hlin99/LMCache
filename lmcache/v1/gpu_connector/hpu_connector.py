@@ -183,10 +183,8 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                     tmp_gpu_buffer[0] = memory_obj.tensor[0].to(slot_mapping.device)
                     htorch.core.mark_step()
 
-                    b, hd = self.kvcaches[0][0].shape
-
                     for i in layers:
-                        self.kvcaches[i][0].view(b, hd).index_copy_(
+                        self._get_mla_token_major_view(self.kvcaches[i][0]).index_copy_(
                             0,
                             slot_mapping[start:end],
                             tmp_gpu_buffer[0][i],
@@ -269,13 +267,11 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                 layers = range(len(self.kvcaches))
 
                 if self.use_mla:
-                    b, hd = self.kvcaches[0][0].shape
-
                     tmp_gpu_buffer[0] = torch.stack(
                         tuple(
-                            self.kvcaches[i][0]
-                            .view(b, hd)
-                            .index_select(0, slot_mapping[start:end])
+                            self._get_mla_token_major_view(self.kvcaches[i][0]).index_select(
+                                0, slot_mapping[start:end]
+                            )
                             for i in layers
                         ),
                         dim=0,
@@ -321,3 +317,22 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
         return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
+
+    @staticmethod
+    def _get_mla_token_major_view(kv_cache: torch.Tensor) -> torch.Tensor:
+        """
+        Return a token-major view for MLA KV caches.
+
+        Accepts both the legacy `[page_buffer_size, head_size]` layout and the
+        current `[num_blocks, block_size, head_size]` layout.
+        """
+        if kv_cache.ndim == 2:
+            return kv_cache
+        if kv_cache.ndim == 3:
+            num_blocks, block_size, head_size = kv_cache.shape
+            return kv_cache.view(num_blocks * block_size, head_size)
+        raise ValueError(
+            "Unsupported MLA KV cache shape. Expected "
+            "[page_buffer_size, head_size] or [num_blocks, block_size, head_size], "
+            f"but got {tuple(kv_cache.shape)}."
+        )
