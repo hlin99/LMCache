@@ -33,6 +33,33 @@ lmc_ops = None
 logger = init_logger(__name__)
 
 
+def _log_tensor_values(label: str, tensor: torch.Tensor) -> None:
+    """Log tensor statistics for debugging precision issues.
+
+    Logs shape, dtype, min, max, mean, and first few values of a tensor
+    using ``logger.error`` so the output is always visible.
+
+    Args:
+        label: A human-readable label identifying the tensor being logged.
+        tensor: The tensor whose values should be logged.
+    """
+    t = tensor.detach().float()
+    logger.error(
+        "[DEBUG-HPU] %s | shape=%s dtype=%s "
+        "min=%.6e max=%.6e mean=%.6e "
+        "nan=%s inf=%s first_vals=%s",
+        label,
+        tuple(tensor.shape),
+        tensor.dtype,
+        t.min().item(),
+        t.max().item(),
+        t.mean().item(),
+        bool(torch.isnan(t).any()),
+        bool(torch.isinf(t).any()),
+        tensor.flatten()[:8].tolist(),
+    )
+
+
 class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
     """
     The GPU KV cache should be a nested tuple of K and V tensors.
@@ -81,7 +108,11 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             self.gpu_buffer = torch.empty(
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
-            logger.error("self.gpu_buffer.shape=%s", self.gpu_buffer.shape)
+            logger.error(
+                "[DEBUG-HPU] gpu_buffer allocated: shape=%s dtype=%s",
+                self.gpu_buffer.shape,
+                self.gpu_buffer.dtype,
+            )
 
     @classmethod
     def from_metadata(
@@ -157,19 +188,34 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
-        
+
+        logger.error(
+            "[DEBUG-HPU] to_gpu_xpu start=%s end=%s slot_mapping[start:end]=%s",
+            start,
+            end,
+            slices.tolist(),
+        )
+        _log_tensor_values("to_gpu_xpu input memory_obj.tensor", memory_obj.tensor)
+
         htorch.core.mark_step()
 
         if self.use_mla:
             tmp = memory_obj.tensor[0].to(slot_mapping.device)
+            _log_tensor_values("to_gpu_xpu MLA tmp (data to write)", tmp)
             num_blocks, block_size, head_size = kvcaches[0].shape
             total_blocks = num_blocks * block_size
             for i, kvcache in enumerate(kvcaches):
                 kvcache.view(total_blocks, head_size).index_copy_(0, slices, tmp[i])
                 htorch.core.mark_step()
+            _log_tensor_values(
+                "to_gpu_xpu MLA kvcaches[0] after write",
+                kvcaches[0].view(total_blocks, head_size).index_select(0, slices),
+            )
         else:
             tmp_k = memory_obj.tensor[0].to(slot_mapping.device)
             tmp_v = memory_obj.tensor[1].to(slot_mapping.device)
+            _log_tensor_values("to_gpu_xpu non-MLA tmp_k (K to write)", tmp_k)
+            _log_tensor_values("to_gpu_xpu non-MLA tmp_v (V to write)", tmp_v)
             num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
             total_blocks = num_blocks * block_size
             d = num_heads * head_size
@@ -177,6 +223,14 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                 kcache.view(total_blocks, d).index_copy_(0, slices, tmp_k[i])
                 vcache.view(total_blocks, d).index_copy_(0, slices, tmp_v[i])
                 htorch.core.mark_step()
+            _log_tensor_values(
+                "to_gpu_xpu non-MLA kvcaches[0][0] K after write",
+                kvcaches[0][0].view(total_blocks, d).index_select(0, slices),
+            )
+            _log_tensor_values(
+                "to_gpu_xpu non-MLA kvcaches[0][1] V after write",
+                kvcaches[0][1].view(total_blocks, d).index_select(0, slices),
+            )
 
         torch.hpu.synchronize()
 
@@ -210,21 +264,41 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
+        logger.error(
+            "[DEBUG-HPU] from_gpu_xpu start=%s end=%s slot_mapping[start:end]=%s",
+            start,
+            end,
+            slices.tolist(),
+        )
+
         htorch.core.mark_step()
 
         if self.use_mla:
             num_blocks, block_size, head_size = kvcaches[0].shape
             total_blocks = num_blocks * block_size
+            _log_tensor_values(
+                "from_gpu_xpu MLA kvcaches[0] at slots (source)",
+                kvcaches[0].view(total_blocks, head_size).index_select(0, slices),
+            )
             tmp = torch.stack(
                 [
                     kvcache.view(total_blocks, head_size).index_select(0, slices)
                     for kvcache in kvcaches
                 ]
             )
+            _log_tensor_values("from_gpu_xpu MLA tmp (read from GPU)", tmp)
         else:
             num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
             total_blocks = num_blocks * block_size
             d = num_heads * head_size
+            _log_tensor_values(
+                "from_gpu_xpu non-MLA kvcaches[0][0] K at slots (source)",
+                kvcaches[0][0].view(total_blocks, d).index_select(0, slices),
+            )
+            _log_tensor_values(
+                "from_gpu_xpu non-MLA kvcaches[0][1] V at slots (source)",
+                kvcaches[0][1].view(total_blocks, d).index_select(0, slices),
+            )
             tmp_k = torch.stack(
                 [
                     kvcache[0].view(total_blocks, d).index_select(0, slices)
@@ -238,10 +312,13 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                 ]
             )
             tmp = torch.stack([tmp_k, tmp_v])
+            _log_tensor_values("from_gpu_xpu non-MLA tmp (read from GPU)", tmp)
         memory_obj.tensor.copy_(tmp, non_blocking=True)
 
         htorch.core.mark_step()
         torch.hpu.synchronize()
+
+        _log_tensor_values("from_gpu_xpu output memory_obj.tensor", memory_obj.tensor)
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -261,30 +338,18 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
-        logger.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! to_gpu")
+        logger.error(
+            "[DEBUG-HPU] to_gpu called: start=%s end=%s use_mla=%s",
+            start,
+            end,
+            self.use_mla,
+        )
         assert memory_obj.tensor is not None
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
-        if isinstance(self.kvcaches, torch.Tensor):
-            logger.error("kvcaches is Tensor: shape=%s, dtype=%s", self.kvcaches.shape, self.kvcaches.dtype)
-        elif isinstance(self.kvcaches, (list, tuple)):
-            logger.error("kvcaches is %s, len=%s", type(self.kvcaches).__name__, len(self.kvcaches))
-            for i, item in enumerate(self.kvcaches):
-                if isinstance(item, torch.Tensor):
-                    logger.error("  kvcaches[%s]: shape=%s, dtype=%s", i, item.shape, item.dtype)
-                elif isinstance(item, (list, tuple)):
-                    logger.error("  kvcaches[%s]: %s, len=%s", i, type(item).__name__, len(item))
-                    for j, t in enumerate(item):
-                        if isinstance(t, torch.Tensor):
-                            logger.error("    kvcaches[%s][%s]: shape=%s, dtype=%s", i, j, t.shape, t.dtype)
-                        else:
-                            logger.error("    kvcaches[%s][%s]: type=%s", i, j, type(t).__name__)
-                else:
-                    logger.error("  kvcaches[%s]: type=%s", i, type(item).__name__)
-        else:
-            logger.error("kvcaches is unknown type: %s", type(self.kvcaches).__name__)
+        _log_tensor_values("to_gpu input memory_obj.tensor", memory_obj.tensor)
 
         if self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
@@ -302,6 +367,10 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        logger.error(
+            "[DEBUG-HPU] to_gpu slot_mapping[start:end]=%s",
+            slot_mapping[start:end].tolist(),
+        )
         if lmc_ops is None:
             if self.gpu_buffer is not None:
                 assert self.gpu_buffer.device == self.kvcaches[0].device
@@ -312,24 +381,39 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                 if self.use_mla:
                     # MLA: only fused KV in slot 0
                     tmp_gpu_buffer[0] = memory_obj.tensor[0].to(slot_mapping.device)
+                    _log_tensor_values(
+                        "to_gpu MLA tmp_gpu_buffer[0] (data to write)",
+                        tmp_gpu_buffer[0],
+                    )
                     htorch.core.mark_step()
 
-                    #b, hd = self.kvcaches[0][0].shape
-                    num_blocks, block_size, head_size = self.kvcaches[0].shape   # ✅ 不需要 [0][0]
+                    num_blocks, block_size, head_size = self.kvcaches[0].shape
                     total_slots = num_blocks * block_size
-                    logger.error("num_blocks, block_size, head_size = %s %s %s", num_blocks, block_size, head_size)
                     for i in layers:
                         self.kvcaches[i].view(total_slots, head_size).index_copy_(
                             0,
                             slot_mapping[start:end],
                             tmp_gpu_buffer[0][i],
                         )
-                    # IMPORTANT: do NOT touch kvcaches[i][1]
+                    _log_tensor_values(
+                        "to_gpu MLA kvcaches[0] after write",
+                        self.kvcaches[0]
+                        .view(total_slots, head_size)
+                        .index_select(0, slot_mapping[start:end]),
+                    )
 
                 else:
                     # non-MLA: real K / V
                     tmp_gpu_buffer[0] = memory_obj.tensor[0].to(slot_mapping.device)
                     tmp_gpu_buffer[1] = memory_obj.tensor[1].to(slot_mapping.device)
+                    _log_tensor_values(
+                        "to_gpu non-MLA tmp_gpu_buffer[0] K (data to write)",
+                        tmp_gpu_buffer[0],
+                    )
+                    _log_tensor_values(
+                        "to_gpu non-MLA tmp_gpu_buffer[1] V (data to write)",
+                        tmp_gpu_buffer[1],
+                    )
                     htorch.core.mark_step()
 
                     b, h, d = self.kvcaches[0][0].shape
@@ -346,6 +430,18 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                             slot_mapping[start:end],
                             tmp_gpu_buffer[1][i],
                         )
+                    _log_tensor_values(
+                        "to_gpu non-MLA kvcaches[0][0] K after write",
+                        self.kvcaches[0][0]
+                        .view(b, hd)
+                        .index_select(0, slot_mapping[start:end]),
+                    )
+                    _log_tensor_values(
+                        "to_gpu non-MLA kvcaches[0][1] V after write",
+                        self.kvcaches[0][1]
+                        .view(b, hd)
+                        .index_select(0, slot_mapping[start:end]),
+                    )
                 htorch.core.mark_step()
 
     @_lmcache_nvtx_annotate
@@ -364,7 +460,12 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
-        logger.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! from_gpu ")
+        logger.error(
+            "[DEBUG-HPU] from_gpu called: start=%s end=%s use_mla=%s",
+            start,
+            end,
+            self.use_mla,
+        )
         assert memory_obj.tensor is not None
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -373,26 +474,11 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        if isinstance(self.kvcaches, torch.Tensor):
-            logger.error("kvcaches is Tensor: shape=%s, dtype=%s", self.kvcaches.shape, self.kvcaches.dtype)
-        elif isinstance(self.kvcaches, (list, tuple)):
-            logger.error("kvcaches is %s, len=%s", type(self.kvcaches).__name__, len(self.kvcaches))
-            for i, item in enumerate(self.kvcaches):
-                if isinstance(item, torch.Tensor):
-                    logger.error("  kvcaches[%s]: shape=%s, dtype=%s", i, item.shape, item.dtype)
-                elif isinstance(item, (list, tuple)):
-                    logger.error("  kvcaches[%s]: %s, len=%s", i, type(item).__name__, len(item))
-                    for j, t in enumerate(item):
-                        if isinstance(t, torch.Tensor):
-                            logger.error("    kvcaches[%s][%s]: shape=%s, dtype=%s", i, j, t.shape, t.dtype)
-                        else:
-                            logger.error("    kvcaches[%s][%s]: type=%s", i, j, type(t).__name__)
-                else:
-                    logger.error("  kvcaches[%s]: type=%s", i, type(item).__name__)
-        else:
-            logger.error("kvcaches is unknown type: %s", type(self.kvcaches).__name__)
-
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        logger.error(
+            "[DEBUG-HPU] from_gpu slot_mapping[start:end]=%s",
+            slot_mapping[start:end].tolist(),
+        )
         htorch.core.mark_step()
 
         if lmc_ops is None:
@@ -402,10 +488,14 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                 layers = range(len(self.kvcaches))
 
                 if self.use_mla:
-                    # b, hd = self.kvcaches[0][0].shape
-                    num_blocks, block_size, head_size = self.kvcaches[0].shape   # ▒~\~E ▒~M▒~\~@▒~A [0][0]
+                    num_blocks, block_size, head_size = self.kvcaches[0].shape
                     total_slots = num_blocks * block_size
-                    logger.error("num_blocks, block_size, head_size = %s %s %s", num_blocks, block_size, head_size)
+                    _log_tensor_values(
+                        "from_gpu MLA kvcaches[0] at slots (source)",
+                        self.kvcaches[0]
+                        .view(total_slots, head_size)
+                        .index_select(0, slot_mapping[start:end]),
+                    )
 
                     tmp_gpu_buffer[0] = torch.stack(
                         tuple(
@@ -416,9 +506,25 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                         ),
                         dim=0,
                     )
+                    _log_tensor_values(
+                        "from_gpu MLA tmp_gpu_buffer (read from GPU)",
+                        tmp_gpu_buffer,
+                    )
                 else:
                     b, h, d = self.kvcaches[0][0].shape
                     hd_shape = h * d
+                    _log_tensor_values(
+                        "from_gpu non-MLA kvcaches[0][0] K at slots (source)",
+                        self.kvcaches[0][0]
+                        .view(b, hd_shape)
+                        .index_select(0, slot_mapping[start:end]),
+                    )
+                    _log_tensor_values(
+                        "from_gpu non-MLA kvcaches[0][1] V at slots (source)",
+                        self.kvcaches[0][1]
+                        .view(b, hd_shape)
+                        .index_select(0, slot_mapping[start:end]),
+                    )
                     tmp_gpu_buffer[0] = torch.stack(
                         tuple(
                             self.kvcaches[i][0]
@@ -437,9 +543,15 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                         ),
                         dim=0,
                     )
+                    _log_tensor_values(
+                        "from_gpu non-MLA tmp_gpu_buffer (read from GPU)",
+                        tmp_gpu_buffer,
+                    )
 
                 memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
         htorch.core.mark_step()
+
+        _log_tensor_values("from_gpu output memory_obj.tensor", memory_obj.tensor)
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
