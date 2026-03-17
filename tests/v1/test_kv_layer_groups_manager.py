@@ -290,5 +290,111 @@ class TestKVLayerGroupsManager:
         assert manager.get_layer_dtype(2) == torch.float16
 
 
+    def test_build_kv_layer_groups_list_kv_format_single_layer(self):
+        """Test building layer groups when kv_cache is a list[tensor] format."""
+        manager = KVLayerGroupsManager()
+
+        # Simulate TPU/HPU format: list of [k_tensor, v_tensor]
+        # Each tensor has shape [num_blocks, block_size, num_heads, head_size]
+        k = torch.randn(32, 256, 8, 64, dtype=torch.float16)
+        v = torch.randn(32, 256, 8, 64, dtype=torch.float16)
+        kv_caches = {"layer_0": [k, v]}
+
+        manager.build_kv_layer_groups(kv_caches)
+
+        assert len(manager.kv_layer_groups) == 1
+        group = manager.kv_layer_groups[0]
+        # The list of 2 tensors should produce canonical shape [2, 32, 256, 8, 64]
+        assert group.shape == torch.Size([2, 32, 256, 8, 64])
+        assert group.dtype == torch.float16
+        assert group.layer_names == ["layer_0"]
+        assert group.layer_indices == [0]
+
+    def test_build_kv_layer_groups_list_kv_format_multiple_layers(self):
+        """Test building layer groups with multiple layers in list[tensor] format."""
+        manager = KVLayerGroupsManager()
+
+        kv_caches = {
+            "layer_0": [
+                torch.randn(32, 256, 8, 64, dtype=torch.float16),
+                torch.randn(32, 256, 8, 64, dtype=torch.float16),
+            ],
+            "layer_1": [
+                torch.randn(32, 256, 8, 64, dtype=torch.float16),
+                torch.randn(32, 256, 8, 64, dtype=torch.float16),
+            ],
+            "layer_2": [
+                torch.randn(32, 256, 16, 64, dtype=torch.float16),
+                torch.randn(32, 256, 16, 64, dtype=torch.float16),
+            ],
+        }
+
+        manager.build_kv_layer_groups(kv_caches)
+
+        assert len(manager.kv_layer_groups) == 2
+        manager.kv_layer_groups.sort(key=lambda g: g.layer_indices[0])
+
+        group0 = manager.kv_layer_groups[0]
+        assert group0.shape == torch.Size([2, 32, 256, 8, 64])
+        assert set(group0.layer_names) == {"layer_0", "layer_1"}
+
+        group1 = manager.kv_layer_groups[1]
+        assert group1.shape == torch.Size([2, 32, 256, 16, 64])
+        assert group1.layer_names == ["layer_2"]
+
+    def test_build_kv_layer_groups_list_with_none(self):
+        """Test building layer groups when list contains None entries."""
+        manager = KVLayerGroupsManager()
+
+        # Only the non-None tensors are counted
+        k = torch.randn(32, 256, 8, 64, dtype=torch.float16)
+        v = torch.randn(32, 256, 8, 64, dtype=torch.float16)
+        kv_caches = {"layer_0": [k, v, None, None]}
+
+        manager.build_kv_layer_groups(kv_caches)
+
+        assert len(manager.kv_layer_groups) == 1
+        group = manager.kv_layer_groups[0]
+        # 2 valid tensors -> shape [2, ...]
+        assert group.shape == torch.Size([2, 32, 256, 8, 64])
+        assert group.dtype == torch.float16
+
+    def test_build_kv_layer_groups_list_single_tensor_preserves_shape(self):
+        """Test that a list with one valid tensor does NOT add an extra dimension."""
+        manager = KVLayerGroupsManager()
+
+        t = torch.randn(32, 256, 8, 64, dtype=torch.float16)
+        kv_caches = {"layer_0": [t]}
+
+        manager.build_kv_layer_groups(kv_caches)
+
+        assert len(manager.kv_layer_groups) == 1
+        group = manager.kv_layer_groups[0]
+        # Single tensor in list -> shape unchanged
+        assert group.shape == torch.Size([32, 256, 8, 64])
+
+    def test_build_kv_layer_groups_list_and_tensor_produce_same_shape(self):
+        """Test that MHA tensor and list[k,v] formats produce the same shape."""
+        manager_tensor = KVLayerGroupsManager()
+        manager_list = KVLayerGroupsManager()
+
+        # Standard MHA tensor: shape [2, num_blocks, block_size, num_heads, head_size]
+        mha_tensor = torch.randn(2, 32, 256, 8, 64, dtype=torch.float16)
+        manager_tensor.build_kv_layer_groups({"layer_0": mha_tensor})
+
+        # List format: [k_tensor, v_tensor] each with shape
+        # [num_blocks, block_size, num_heads, head_size]
+        k = torch.randn(32, 256, 8, 64, dtype=torch.float16)
+        v = torch.randn(32, 256, 8, 64, dtype=torch.float16)
+        manager_list.build_kv_layer_groups({"layer_0": [k, v]})
+
+        group_tensor = manager_tensor.kv_layer_groups[0]
+        group_list = manager_list.kv_layer_groups[0]
+        assert group_tensor.shape == group_list.shape
+        assert group_tensor.dtype == group_list.dtype
+        # hidden_dim_size should be the same for both
+        assert group_tensor.hidden_dim_size == group_list.hidden_dim_size
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
