@@ -36,13 +36,22 @@ logger = init_logger(__name__)
 def _log_tensor_values(label: str, tensor: torch.Tensor) -> None:
     """Log tensor statistics for debugging precision issues.
 
-    Logs shape, dtype, min, max, mean, and first few values of a tensor
-    using ``logger.error`` so the output is always visible.
+    Logs shape, dtype, min, max, mean, NaN/Inf presence, and first few
+    values of a tensor using ``logger.error`` so the output is always
+    visible.
+
+    Note:
+        Uses ``logger.error`` intentionally so that these debug messages
+        are visible regardless of the configured log level.  This is
+        temporary instrumentation for diagnosing PD disaggregation
+        precision problems and should be removed once the issue is
+        resolved.
 
     Args:
         label: A human-readable label identifying the tensor being logged.
         tensor: The tensor whose values should be logged.
     """
+    # Cast to float so that statistics are accurate even for bfloat16/fp16.
     t = tensor.detach().float()
     logger.error(
         "[DEBUG-HPU] %s | shape=%s dtype=%s "
