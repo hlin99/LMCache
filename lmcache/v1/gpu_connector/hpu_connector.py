@@ -14,10 +14,9 @@
 # limitations under the License.
 
 # Standard
-from typing import List, Optional
+from typing import List, Optional, Union
 
 # Third Party
-import habana_frameworks.torch as htorch
 import torch
 
 # First Party
@@ -27,6 +26,21 @@ from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 
 logger = init_logger(__name__)
+
+
+def _get_htorch():
+    """Lazily import habana_frameworks.torch.
+
+    Returns:
+        The ``habana_frameworks.torch`` module.
+
+    Raises:
+        ImportError: If ``habana_frameworks`` is not installed.
+    """
+    # Third Party
+    import habana_frameworks.torch as htorch
+
+    return htorch
 
 
 class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
@@ -46,7 +60,16 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         use_gpu: bool = False,
         **kwargs,
     ):
-        # TODO: use_gpu flag is not used
+        """Initialize the HPU connector.
+
+        Args:
+            hidden_dim_size: The hidden dimension size (num_kv_head * head_size).
+            num_layers: The number of transformer layers.
+            use_gpu: Whether to use a GPU intermediate buffer. Currently unused
+                on HPU.
+            **kwargs: Additional keyword arguments. Accepts ``use_mla`` (bool)
+                to enable MLA format support.
+        """
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
         self.kv_cache_pointers = torch.empty(
@@ -68,10 +91,12 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         device: Optional[torch.device] = None,
     ) -> "VLLMPagedMemHPUConnectorV2":
         """Create a connector from LMCacheMetadata.
+
         Args:
             metadata: The LMCache engine metadata containing model configuration.
             use_gpu: Whether to use GPU intermediate buffer.
             device: The device to use for the connector.
+
         Returns:
             A new instance of VLLMPagedMemHPUConnectorV2.
         """
@@ -135,6 +160,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
+        htorch = _get_htorch()
         htorch.core.mark_step()
 
         if self.use_mla:
@@ -188,6 +214,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
+        htorch = _get_htorch()
         htorch.core.mark_step()
 
         if self.use_mla:
@@ -224,14 +251,50 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_to_gpu(
+        self,
+        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ) -> None:
+        """Batched store data from memory objects to HPU KV cache.
+
+        Args:
+            memory_objs: The memory objects to store to HPU.
+            starts: The starting indices in the token sequence.
+            ends: The ending indices in the token sequence.
+            **kwargs: Additional keyword arguments passed to ``to_gpu``.
+        """
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.to_gpu(memory_obj, start, end, **kwargs)
 
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_from_gpu(
+        self,
+        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ) -> None:
+        """Batched load data from HPU KV cache into memory objects.
+
+        Args:
+            memory_objs: The memory objects to store the data from HPU.
+            starts: The starting indices in the token sequence.
+            ends: The ending indices in the token sequence.
+            **kwargs: Additional keyword arguments passed to ``from_gpu``.
+        """
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
-        """Get the shape of the data given the number of tokens."""
-        raise NotImplementedError
+        """Get the shape of the data given the number of tokens.
+
+        Args:
+            num_tokens: The number of tokens.
+
+        Returns:
+            The tensor shape for the KV cache data.
+        """
+        kv_size = 1 if self.use_mla else 2
+        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
