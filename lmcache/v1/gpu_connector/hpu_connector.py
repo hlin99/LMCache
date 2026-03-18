@@ -49,15 +49,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         # TODO: use_gpu flag is not used
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
-        self.kv_cache_pointers = torch.empty(
-            num_layers, dtype=torch.int64, device="cpu"
-        )
-        # Not sure we need a dict here. Maybe a single GPU connector always
-        # works with a single device?
-        self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
-        self.page_buffer_size = 0
         self.kvcaches: Optional[List[torch.Tensor]] = None
-        self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
     @classmethod
