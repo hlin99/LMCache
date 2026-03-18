@@ -46,7 +46,29 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         use_gpu: bool = False,
         **kwargs,
     ):
+        """
+        If use_gpu is true, it will create a gpu intermediate buffer. In this
+        case, it requires the following kwargs:
+        - chunk_size: The MAX size of the chunk to be copied to GPU.
+        - dtype: The data type of the intermediate buffer.
+        - device: The device to use for the intermediate buffer.
+        """
+        self.hidden_dim_size = hidden_dim_size
+        self.num_layers = num_layers
+        self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        if use_gpu:
+            assert "chunk_size" in kwargs, (
+                "chunk_size should be provided to create a GPU buffer."
+            )
+            assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
+            assert "device" in kwargs, (
+                "device should be provided to create a GPU buffer."
+            )
+            shape = self.get_shape(kwargs["chunk_size"])
+            self.gpu_buffer = torch.empty(
+                shape, dtype=kwargs["dtype"], device=kwargs["device"]
+            )
 
     @classmethod
     def from_metadata(
@@ -207,7 +229,12 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         memory_obj.tensor.copy_(tmp, non_blocking=True)
 
         htorch.core.mark_step()
-        torch.hpu.synchronize()
+
+        if memory_obj.tensor.device.type != "hpu":
+            # Force a synchronize if the target buffer is NOT on HPU device
+            # NOTE: for better performance, we may not want to sync for every
+            # memory object
+            torch.hpu.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -222,4 +249,5 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         """Get the shape of the data given the number of tokens."""
-        raise NotImplementedError
+        kv_size = 1 if self.use_mla else 2
+        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
