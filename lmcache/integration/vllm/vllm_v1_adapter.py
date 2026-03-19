@@ -322,6 +322,7 @@ class ReqMeta:
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
+        #    (but allow saves during decode when save_decode_cache is enabled)
         # 3. if save_decode_cache is False and it is in decode phase
 
         skip_leading_tokens = tracker.num_saved_tokens
@@ -335,7 +336,11 @@ class ReqMeta:
 
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
+            or (
+                tracker.num_saved_tokens > 0
+                and input_token_len < chunk_boundary
+                and not (tracker.is_decode_phase and save_decode_cache)
+            )
             or (tracker.is_decode_phase and not save_decode_cache)
             or request_skip
         )
