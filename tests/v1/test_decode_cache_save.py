@@ -38,7 +38,7 @@ def _make_tracker(
 
 
 class TestDecodeCacheSave:
-    """Tests for save_decode_cache behaviour in from_request_tracker."""
+    """Tests for save_decode_cache behavior in from_request_tracker."""
 
     def test_decode_save_not_skipped_when_enabled(self) -> None:
         """When save_decode_cache=True, decode-phase saves should not be
