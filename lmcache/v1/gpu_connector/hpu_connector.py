@@ -27,7 +27,14 @@ from lmcache.v1.gpu_connector import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import (
     discover_gpu_kv_format,
     get_block_size,
+    get_dtype,
+    get_head_size,
+    get_hidden_dim_size,
     get_num_blocks,
+    get_num_heads,
+    get_num_layers,
+    get_page_buffer_size,
+    is_mla,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
@@ -47,15 +54,12 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
     def __init__(
         self,
-        hidden_dim_size: int,
-        num_layers: int,
         use_gpu: bool = False,
         **kwargs,
     ):
         self._attributes_initialized = False
-
         self.kvcaches: Optional[List[torch.Tensor]] = None
-        self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        self.use_gpu = use_gpu
 
     @classmethod
     def from_metadata(
@@ -72,22 +76,8 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         Returns:
             A new instance of VLLMPagedMemHPUConnectorV2.
         """
-        # Extract parameters from metadata
-        # kv_shape: (num_layer, 2 or 1, chunk_size, num_kv_head, head_size)
-        num_layers = metadata.kv_shape[0]
-        chunk_size = metadata.kv_shape[2]
-        num_kv_head = metadata.kv_shape[3]
-        head_size = metadata.kv_shape[4]
-        hidden_dim_size = num_kv_head * head_size
-
         return cls(
-            hidden_dim_size=hidden_dim_size,
-            num_layers=num_layers,
             use_gpu=use_gpu,
-            chunk_size=chunk_size,
-            dtype=metadata.kv_dtype,
-            device=device,
-            use_mla=metadata.use_mla,
         )
 
     def _initialize_attributes(self, kv_caches: List[torch.Tensor]):
@@ -125,9 +115,15 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             )
 
         self.gpu_kv_format = discover_gpu_kv_format(kv_caches, EngineType.VLLM)
+        self.num_layers = get_num_layers(kv_caches, self.gpu_kv_format)
         self.num_blocks = get_num_blocks(kv_caches, self.gpu_kv_format)
         self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
-        self.page_buffer_size = self.num_blocks * self.block_size
+        self.page_buffer_size = get_page_buffer_size(kv_caches, self.gpu_kv_format)
+        self.num_heads = get_num_heads(kv_caches, self.gpu_kv_format)
+        self.hidden_dim_size = get_hidden_dim_size(kv_caches, self.gpu_kv_format)
+        self.head_size = get_head_size(kv_caches, self.gpu_kv_format)
+        self.use_mla = is_mla(self.gpu_kv_format)
+        self.dtype = get_dtype(kv_caches, self.gpu_kv_format)
 
         self._attributes_initialized = True
         logger.info(
@@ -158,19 +154,6 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         """
         assert memory_obj.tensor is not None
 
-        if self.use_mla:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
-                raise ValueError(
-                    "The memory object should be in KV_MLA_FMT format in"
-                    " order to be processed by VLLMPagedMemHPUConnectorV2"
-                )
-        else:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
-                raise ValueError(
-                    "The memory object should be in KV_2LTD format in"
-                    " order to be processed by VLLMPagedMemHPUConnectorV2"
-                )
-
         self.initialize_kvcaches_ptr(**kwargs)
 
         assert self.kvcaches is not None, (
@@ -183,6 +166,19 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
         self._initialize_attributes(self.kvcaches)
+
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format in"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
+                )
+        else:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
+                raise ValueError(
+                    "The memory object should be in KV_2LTD format in"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
+                )
 
         # Flush the HPU lazy-mode op graph so the slot_mapping slice is
         # materialized before downstream ops consume it. This also keeps
@@ -242,6 +238,19 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
         self._initialize_attributes(self.kvcaches)
+
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format in"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
+                )
+        else:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
+                raise ValueError(
+                    "The memory object should be in KV_2LTD format in"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
+                )
 
         htorch.core.mark_step()
 
