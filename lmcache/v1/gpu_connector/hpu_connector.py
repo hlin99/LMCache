@@ -188,18 +188,20 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
         if self.use_mla:
             tmp = memory_obj.tensor[0].to(slot_mapping.device)
+            total_blocks = self.num_blocks * self.block_size
             for i, kvcache in enumerate(self.kvcaches):
-                kvcache.view(self.page_buffer_size, self.head_size).index_copy_(
+                kvcache.view(total_blocks, self.head_size).index_copy_(
                     0, slices, tmp[i]
                 )
                 htorch.core.mark_step()
         else:
             tmp_k = memory_obj.tensor[0].to(slot_mapping.device)
             tmp_v = memory_obj.tensor[1].to(slot_mapping.device)
+            total_blocks = self.num_blocks * self.block_size
             d = self.num_heads * self.head_size
             for i, (kcache, vcache) in enumerate(self.kvcaches):
-                kcache.view(self.page_buffer_size, d).index_copy_(0, slices, tmp_k[i])
-                vcache.view(self.page_buffer_size, d).index_copy_(0, slices, tmp_v[i])
+                kcache.view(total_blocks, d).index_copy_(0, slices, tmp_k[i])
+                vcache.view(total_blocks, d).index_copy_(0, slices, tmp_v[i])
                 htorch.core.mark_step()
 
         torch.hpu.synchronize()
@@ -241,25 +243,25 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         htorch.core.mark_step()
 
         if self.use_mla:
+            total_blocks = self.num_blocks * self.block_size
             tmp = torch.stack(
                 [
-                    kvcache.view(self.page_buffer_size, self.head_size).index_select(
-                        0, slices
-                    )
+                    kvcache.view(total_blocks, self.head_size).index_select(0, slices)
                     for kvcache in self.kvcaches
                 ]
             )
         else:
+            total_blocks = self.num_blocks * self.block_size
             d = self.num_heads * self.head_size
             tmp_k = torch.stack(
                 [
-                    kvcache[0].view(self.page_buffer_size, d).index_select(0, slices)
+                    kvcache[0].view(total_blocks, d).index_select(0, slices)
                     for kvcache in self.kvcaches
                 ]
             )
             tmp_v = torch.stack(
                 [
-                    kvcache[1].view(self.page_buffer_size, d).index_select(0, slices)
+                    kvcache[1].view(total_blocks, d).index_select(0, slices)
                     for kvcache in self.kvcaches
                 ]
             )
