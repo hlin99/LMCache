@@ -425,6 +425,63 @@ def is_mla(gpu_kv_format: "lmc_ops.GPUKVFormat") -> bool:
     )
 
 
+def get_kvcache_page_buffer_size(kvcaches: Any, use_mla: bool) -> int:
+    """Get the page buffer size (num_blocks * block_size) from vLLM-style
+    kvcaches without requiring GPUKVFormat.
+
+    This helper is intended for device-agnostic connectors (e.g., HPU, XPU)
+    that do not have access to the CUDA-dependent GPUKVFormat enum.
+
+    Args:
+        kvcaches: The KV cache tensors. For MLA format, this is a
+            ``List[Tensor]`` where each tensor has shape
+            ``[num_blocks, block_size, head_size]``. For non-MLA format,
+            this is a ``List[Tuple[Tensor, Tensor]]`` where each tensor
+            has shape ``[num_blocks, block_size, num_heads, head_size]``.
+        use_mla: Whether the model uses Multi-Head Latent Attention.
+
+    Returns:
+        The page buffer size (``num_blocks * block_size``).
+    """
+    if use_mla:
+        # kvcaches[i] has shape [num_blocks, block_size, head_size]
+        return kvcaches[0].shape[0] * kvcaches[0].shape[1]
+    else:
+        # kvcaches[i] is (K, V), each with shape
+        # [num_blocks, block_size, num_heads, head_size]
+        return kvcaches[0][0].shape[0] * kvcaches[0][0].shape[1]
+
+
+def get_kvcache_hidden_dim(kvcaches: Any, use_mla: bool) -> int:
+    """Get the hidden dimension size from vLLM-style kvcaches without
+    requiring GPUKVFormat.
+
+    For MLA format, returns ``head_size``. For non-MLA format, returns
+    ``num_heads * head_size``.
+
+    This helper is intended for device-agnostic connectors (e.g., HPU, XPU)
+    that do not have access to the CUDA-dependent GPUKVFormat enum.
+
+    Args:
+        kvcaches: The KV cache tensors. For MLA format, this is a
+            ``List[Tensor]`` where each tensor has shape
+            ``[num_blocks, block_size, head_size]``. For non-MLA format,
+            this is a ``List[Tuple[Tensor, Tensor]]`` where each tensor
+            has shape ``[num_blocks, block_size, num_heads, head_size]``.
+        use_mla: Whether the model uses Multi-Head Latent Attention.
+
+    Returns:
+        The hidden dimension size.
+    """
+    if use_mla:
+        # kvcaches[i] has shape [num_blocks, block_size, head_size]
+        return kvcaches[0].shape[2]
+    else:
+        # kvcaches[i] is (K, V), each with shape
+        # [num_blocks, block_size, num_heads, head_size]
+        return kvcaches[0][0].shape[2] * kvcaches[0][0].shape[3]
+
+
 def get_dtype(kv_caches: Any, gpu_kv_format: "lmc_ops.GPUKVFormat") -> torch.dtype:
     """
     Get the dtype from the kv_caches

@@ -23,6 +23,10 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.gpu_connector import GPUConnectorInterface
+from lmcache.v1.gpu_connector.utils import (
+    get_kvcache_hidden_dim,
+    get_kvcache_page_buffer_size,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 
@@ -123,24 +127,22 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
+        total_blocks = get_kvcache_page_buffer_size(kvcaches, self.use_mla)
+        hidden_dim = get_kvcache_hidden_dim(kvcaches, self.use_mla)
+
         htorch.core.mark_step()
 
         if self.use_mla:
             tmp = memory_obj.tensor[0].to(slot_mapping.device)
-            num_blocks, block_size, head_size = kvcaches[0].shape
-            total_blocks = num_blocks * block_size
             for i, kvcache in enumerate(kvcaches):
-                kvcache.view(total_blocks, head_size).index_copy_(0, slices, tmp[i])
+                kvcache.view(total_blocks, hidden_dim).index_copy_(0, slices, tmp[i])
                 htorch.core.mark_step()
         else:
             tmp_k = memory_obj.tensor[0].to(slot_mapping.device)
             tmp_v = memory_obj.tensor[1].to(slot_mapping.device)
-            num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
-            total_blocks = num_blocks * block_size
-            d = num_heads * head_size
             for i, (kcache, vcache) in enumerate(kvcaches):
-                kcache.view(total_blocks, d).index_copy_(0, slices, tmp_k[i])
-                vcache.view(total_blocks, d).index_copy_(0, slices, tmp_v[i])
+                kcache.view(total_blocks, hidden_dim).index_copy_(0, slices, tmp_k[i])
+                vcache.view(total_blocks, hidden_dim).index_copy_(0, slices, tmp_v[i])
                 htorch.core.mark_step()
 
         torch.hpu.synchronize()
@@ -176,30 +178,28 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
+        total_blocks = get_kvcache_page_buffer_size(kvcaches, self.use_mla)
+        hidden_dim = get_kvcache_hidden_dim(kvcaches, self.use_mla)
+
         htorch.core.mark_step()
 
         if self.use_mla:
-            num_blocks, block_size, head_size = kvcaches[0].shape
-            total_blocks = num_blocks * block_size
             tmp = torch.stack(
                 [
-                    kvcache.view(total_blocks, head_size).index_select(0, slices)
+                    kvcache.view(total_blocks, hidden_dim).index_select(0, slices)
                     for kvcache in kvcaches
                 ]
             )
         else:
-            num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
-            total_blocks = num_blocks * block_size
-            d = num_heads * head_size
             tmp_k = torch.stack(
                 [
-                    kvcache[0].view(total_blocks, d).index_select(0, slices)
+                    kvcache[0].view(total_blocks, hidden_dim).index_select(0, slices)
                     for kvcache in kvcaches
                 ]
             )
             tmp_v = torch.stack(
                 [
-                    kvcache[1].view(total_blocks, d).index_select(0, slices)
+                    kvcache[1].view(total_blocks, hidden_dim).index_select(0, slices)
                     for kvcache in kvcaches
                 ]
             )
