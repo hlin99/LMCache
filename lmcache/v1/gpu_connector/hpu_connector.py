@@ -69,12 +69,10 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         device: Optional[torch.device] = None,
     ) -> "VLLMPagedMemHPUConnectorV2":
         """Create a connector from LMCacheMetadata.
-
         Args:
             metadata: The LMCache engine metadata containing model configuration.
             use_gpu: Whether to use GPU intermediate buffer.
             device: The device to use for the connector.
-
         Returns:
             A new instance of VLLMPagedMemHPUConnectorV2.
         """
