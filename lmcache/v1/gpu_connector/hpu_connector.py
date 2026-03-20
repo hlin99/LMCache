@@ -49,6 +49,12 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
         self.kvcaches: Optional[List[torch.Tensor]] = None
         self._kv_attributes_initialized = False
+        self._num_blocks: int = 0
+        self._block_size: int = 0
+        self._total_blocks: int = 0
+        self._head_size: int = 0
+        self._num_heads: int = 0
+        self._d: int = 0
 
     @classmethod
     def from_metadata(
