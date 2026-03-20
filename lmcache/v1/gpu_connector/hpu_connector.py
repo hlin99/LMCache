@@ -130,11 +130,19 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         self._attributes_initialized = True
         logger.info(
             "HPU: attributes initialized - format: %s, "
-            "num_blocks: %d, block_size: %d, page_buffer_size: %d",
+            "num_layers: %d, num_blocks: %d, block_size: %d, "
+            "page_buffer_size: %d, hidden_dim_size: %d, head_size: %d, "
+            "use_mla: %s, dtype: %s, num_heads: %d",
             self.gpu_kv_format,
+            self.num_layers,
             self.num_blocks,
             self.block_size,
             self.page_buffer_size,
+            self.hidden_dim_size,
+            self.head_size,
+            self.use_mla,
+            self.dtype,
+            self.num_heads,
         )
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
