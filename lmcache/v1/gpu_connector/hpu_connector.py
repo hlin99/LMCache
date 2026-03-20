@@ -176,19 +176,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
         self._initialize_attributes(self.kvcaches)
-
-        if self.use_mla:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
-                raise ValueError(
-                    "The memory object should be in KV_MLA_FMT format in"
-                    " order to be processed by VLLMPagedMemHPUConnectorV2"
-                )
-        else:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
-                raise ValueError(
-                    "The memory object should be in KV_2LTD format in"
-                    " order to be processed by VLLMPagedMemHPUConnectorV2"
-                )
+        self._validate_memory_format(memory_obj)
 
         # Flush the HPU lazy-mode op graph so the slot_mapping slice is
         # materialized before downstream ops consume it. This also keeps
@@ -248,19 +236,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
         self._initialize_attributes(self.kvcaches)
-
-        if self.use_mla:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
-                raise ValueError(
-                    "The memory object should be in KV_MLA_FMT format in"
-                    " order to be processed by VLLMPagedMemHPUConnectorV2"
-                )
-        else:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
-                raise ValueError(
-                    "The memory object should be in KV_2LTD format in"
-                    " order to be processed by VLLMPagedMemHPUConnectorV2"
-                )
+        self._validate_memory_format(memory_obj)
 
         htorch.core.mark_step()
 
@@ -305,5 +281,46 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             self.from_gpu(memory_obj, start, end, **kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
-        """Get the shape of the data given the number of tokens."""
-        raise NotImplementedError
+        """Get the shape of the data given the number of tokens.
+
+        Args:
+            num_tokens: The number of tokens in the data.
+
+        Returns:
+            The shape of the KV cache data.
+
+        Raises:
+            RuntimeError: If attributes have not been initialized yet
+                (i.e., no kv_caches have been seen).
+        """
+        if not self._attributes_initialized:
+            raise RuntimeError(
+                "Cannot determine shape before attributes are initialized. "
+                "Call to_gpu or from_gpu first so that _initialize_attributes "
+                "can discover the KV cache layout."
+            )
+        kv_size = 1 if self.use_mla else 2
+        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
+
+    def _validate_memory_format(self, memory_obj: MemoryObj) -> None:
+        """Validate that the memory object has the expected format.
+
+        Args:
+            memory_obj: The memory object to validate.
+
+        Raises:
+            ValueError: If the memory format does not match the expected
+                format based on whether MLA is in use.
+        """
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format in"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
+                )
+        else:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
+                raise ValueError(
+                    "The memory object should be in KV_2LTD format in"
+                    " order to be processed by VLLMPagedMemHPUConnectorV2"
+                )
