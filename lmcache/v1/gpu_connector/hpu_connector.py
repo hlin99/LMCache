@@ -47,6 +47,8 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         **kwargs,
     ):
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        self.kvcaches: Optional[List[torch.Tensor]] = None
+        self._kv_attributes_initialized = False
 
     @classmethod
     def from_metadata(
@@ -81,6 +83,34 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             use_mla=metadata.use_mla,
         )
 
+    def _initialize_kv_attributes(self, kvcaches: List[torch.Tensor]) -> None:
+        """Cache KV cache shape attributes on first call.
+
+        Extracts shape information (num_blocks, block_size, etc.) from the
+        kvcaches tensors and caches them as instance attributes. Since KV
+        caches are pre-allocated with a fixed size in vLLM, these attributes
+        remain constant across calls and only need to be discovered once.
+
+        Args:
+            kvcaches: The KV cache tensors to extract shape attributes from.
+        """
+        if self._kv_attributes_initialized:
+            return
+
+        if self.use_mla:
+            num_blocks, block_size, head_size = kvcaches[0].shape
+            self._head_size = head_size
+        else:
+            num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
+            self._num_heads = num_heads
+            self._head_size = head_size
+            self._d = num_heads * head_size
+
+        self._num_blocks = num_blocks
+        self._block_size = block_size
+        self._total_blocks = num_blocks * block_size
+        self._kv_attributes_initialized = True
+
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
@@ -94,11 +124,16 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
              underlying kernel will never see -1 in slot_mapping)
 
 
-        :raises ValueError: If 'kvcaches' is not provided in kwargs,
-        :raises AssertionError: If the memory object does not have a tensor.
+        :raises AssertionError: If the memory object does not have a tensor,
+            or if kvcaches have not been provided.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
         assert memory_obj.tensor is not None
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
 
         if self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
@@ -113,13 +148,11 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
                     " order to be processed by VLLMPagedMemHPUConnectorV2"
                 )
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
-
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        self._initialize_kv_attributes(self.kvcaches)
+        kvcaches = self.kvcaches
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
@@ -127,20 +160,21 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
         if self.use_mla:
             tmp = memory_obj.tensor[0].to(slot_mapping.device)
-            num_blocks, block_size, head_size = kvcaches[0].shape
-            total_blocks = num_blocks * block_size
             for i, kvcache in enumerate(kvcaches):
-                kvcache.view(total_blocks, head_size).index_copy_(0, slices, tmp[i])
+                kvcache.view(self._total_blocks, self._head_size).index_copy_(
+                    0, slices, tmp[i]
+                )
                 htorch.core.mark_step()
         else:
             tmp_k = memory_obj.tensor[0].to(slot_mapping.device)
             tmp_v = memory_obj.tensor[1].to(slot_mapping.device)
-            num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
-            total_blocks = num_blocks * block_size
-            d = num_heads * head_size
             for i, (kcache, vcache) in enumerate(kvcaches):
-                kcache.view(total_blocks, d).index_copy_(0, slices, tmp_k[i])
-                vcache.view(total_blocks, d).index_copy_(0, slices, tmp_v[i])
+                kcache.view(self._total_blocks, self._d).index_copy_(
+                    0, slices, tmp_k[i]
+                )
+                vcache.view(self._total_blocks, self._d).index_copy_(
+                    0, slices, tmp_v[i]
+                )
                 htorch.core.mark_step()
 
         torch.hpu.synchronize()
@@ -160,46 +194,46 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
              should NEVER overlap with the prefix caching (which means the
              underlying kernel will never see -1 in slot_mapping)
 
-        :raises ValueError: If 'kvcaches' is not provided in kwargs,
-        :raises AssertionError: If the memory object does not have a tensor.
+        :raises AssertionError: If the memory object does not have a tensor,
+            or if kvcaches have not been provided.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
         assert memory_obj.tensor is not None
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        self._initialize_kv_attributes(self.kvcaches)
+        kvcaches = self.kvcaches
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
         htorch.core.mark_step()
 
         if self.use_mla:
-            num_blocks, block_size, head_size = kvcaches[0].shape
-            total_blocks = num_blocks * block_size
             tmp = torch.stack(
                 [
-                    kvcache.view(total_blocks, head_size).index_select(0, slices)
+                    kvcache.view(self._total_blocks, self._head_size).index_select(
+                        0, slices
+                    )
                     for kvcache in kvcaches
                 ]
             )
         else:
-            num_blocks, block_size, num_heads, head_size = kvcaches[0][0].shape
-            total_blocks = num_blocks * block_size
-            d = num_heads * head_size
             tmp_k = torch.stack(
                 [
-                    kvcache[0].view(total_blocks, d).index_select(0, slices)
+                    kvcache[0].view(self._total_blocks, self._d).index_select(0, slices)
                     for kvcache in kvcaches
                 ]
             )
             tmp_v = torch.stack(
                 [
-                    kvcache[1].view(total_blocks, d).index_select(0, slices)
+                    kvcache[1].view(self._total_blocks, self._d).index_select(0, slices)
                     for kvcache in kvcaches
                 ]
             )
