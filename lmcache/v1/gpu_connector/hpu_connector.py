@@ -22,7 +22,13 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector import GPUConnectorInterface
+from lmcache.v1.gpu_connector.utils import (
+    discover_gpu_kv_format,
+    get_block_size,
+    get_num_blocks,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 
@@ -46,6 +52,8 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         use_gpu: bool = False,
         **kwargs,
     ):
+        self._attributes_initialized = False
+
         self.kvcaches: Optional[List[torch.Tensor]] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
@@ -80,6 +88,55 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
             dtype=metadata.kv_dtype,
             device=device,
             use_mla=metadata.use_mla,
+        )
+
+    def _initialize_attributes(self, kv_caches: List[torch.Tensor]):
+        if self._attributes_initialized:
+            return
+
+        self.device = kv_caches[0].device
+        assert self.device.type == "hpu", "The device should be HPU."
+
+        # HPU vLLM provides kv_caches as List[TensorTuple(k_tensor, v_tensor)],
+        # where each TensorTuple contains two 4D tensors of shape
+        # (num_blocks, block_size, num_heads, head_size).
+        # We create a lightweight proxy List[Tensor(2, ...)] to match the
+        # standard vLLM format (NL_X_TWO_NB_BS_NH_HS) for format discovery.
+        if (
+            isinstance(kv_caches, (list, tuple))
+            and len(kv_caches) > 0
+            and len(kv_caches[0]) == 2
+            and not isinstance(kv_caches[0], torch.Tensor)
+            and isinstance(kv_caches[0][0], torch.Tensor)
+            and isinstance(kv_caches[0][1], torch.Tensor)
+        ):
+            # kv_caches[i][0].shape = (num_blocks, block_size, num_heads, head_size)
+            # We need shape (2, num_blocks, block_size, num_heads, head_size)
+            inner_shape = kv_caches[0][0].shape
+            fake_shape = (2, *inner_shape)
+            kv_caches = [
+                torch.empty(fake_shape, dtype=kv_caches[0][0].dtype, device="meta")
+                for _ in range(len(kv_caches))
+            ]
+            logger.info(
+                "HPU: created lightweight kv_caches proxy with shape %s "
+                "for format discovery",
+                fake_shape,
+            )
+
+        self.gpu_kv_format = discover_gpu_kv_format(kv_caches, EngineType.VLLM)
+        self.num_blocks = get_num_blocks(kv_caches, self.gpu_kv_format)
+        self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
+        self.page_buffer_size = self.num_blocks * self.block_size
+
+        self._attributes_initialized = True
+        logger.info(
+            "HPU: attributes initialized - format: %s, "
+            "num_blocks: %d, block_size: %d, page_buffer_size: %d",
+            self.gpu_kv_format,
+            self.num_blocks,
+            self.block_size,
+            self.page_buffer_size,
         )
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -125,6 +182,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
+        self._initialize_attributes(self.kvcaches)
 
         # Flush the HPU lazy-mode op graph so the slot_mapping slice is
         # materialized before downstream ops consume it. This also keeps
@@ -183,6 +241,7 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
+        self._initialize_attributes(self.kvcaches)
 
         htorch.core.mark_step()
 
