@@ -119,11 +119,13 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         self.num_blocks = get_num_blocks(kv_caches, self.gpu_kv_format)
         self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
         self.page_buffer_size = get_page_buffer_size(kv_caches, self.gpu_kv_format)
-        self.num_heads = get_num_heads(kv_caches, self.gpu_kv_format)
         self.hidden_dim_size = get_hidden_dim_size(kv_caches, self.gpu_kv_format)
         self.head_size = get_head_size(kv_caches, self.gpu_kv_format)
         self.use_mla = is_mla(self.gpu_kv_format)
         self.dtype = get_dtype(kv_caches, self.gpu_kv_format)
+        self.num_heads = (
+            1 if self.use_mla else get_num_heads(kv_caches, self.gpu_kv_format)
+        )
 
         self._attributes_initialized = True
         logger.info(
@@ -188,17 +190,17 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
 
         if self.use_mla:
             tmp = memory_obj.tensor[0].to(slot_mapping.device)
-            num_blocks, block_size, head_size = self.kvcaches[0].shape
-            total_blocks = num_blocks * block_size
+            total_blocks = self.num_blocks * self.block_size
             for i, kvcache in enumerate(self.kvcaches):
-                kvcache.view(total_blocks, head_size).index_copy_(0, slices, tmp[i])
+                kvcache.view(total_blocks, self.head_size).index_copy_(
+                    0, slices, tmp[i]
+                )
                 htorch.core.mark_step()
         else:
             tmp_k = memory_obj.tensor[0].to(slot_mapping.device)
             tmp_v = memory_obj.tensor[1].to(slot_mapping.device)
-            num_blocks, block_size, num_heads, head_size = self.kvcaches[0][0].shape
-            total_blocks = num_blocks * block_size
-            d = num_heads * head_size
+            total_blocks = self.num_blocks * self.block_size
+            d = self.num_heads * self.head_size
             for i, (kcache, vcache) in enumerate(self.kvcaches):
                 kcache.view(total_blocks, d).index_copy_(0, slices, tmp_k[i])
                 vcache.view(total_blocks, d).index_copy_(0, slices, tmp_v[i])
@@ -255,18 +257,16 @@ class VLLMPagedMemHPUConnectorV2(GPUConnectorInterface):
         htorch.core.mark_step()
 
         if self.use_mla:
-            num_blocks, block_size, head_size = self.kvcaches[0].shape
-            total_blocks = num_blocks * block_size
+            total_blocks = self.num_blocks * self.block_size
             tmp = torch.stack(
                 [
-                    kvcache.view(total_blocks, head_size).index_select(0, slices)
+                    kvcache.view(total_blocks, self.head_size).index_select(0, slices)
                     for kvcache in self.kvcaches
                 ]
             )
         else:
-            num_blocks, block_size, num_heads, head_size = self.kvcaches[0][0].shape
-            total_blocks = num_blocks * block_size
-            d = num_heads * head_size
+            total_blocks = self.num_blocks * self.block_size
+            d = self.num_heads * self.head_size
             tmp_k = torch.stack(
                 [
                     kvcache[0].view(total_blocks, d).index_select(0, slices)
