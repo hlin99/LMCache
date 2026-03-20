@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 # Standard
 from typing import List, Optional
 
@@ -22,7 +21,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
-from lmcache.v1.gpu_connector import GPUConnectorInterface
+from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemGPUConnectorV2
 from lmcache.v1.gpu_connector.utils import (
     discover_gpu_kv_format,
     get_block_size,
@@ -41,7 +40,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 logger = init_logger(__name__)
 
 
-class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
+class VLLMPagedMemXPUConnectorV2(VLLMPagedMemGPUConnectorV2):
     """
     The GPU KV cache should be a nested tuple of K and V tensors.
     More specifically, we have:
@@ -54,12 +53,43 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
 
     def __init__(
         self,
+        hidden_dim_size: int,
+        num_layers: int,
         use_gpu: bool = False,
         **kwargs,
     ):
+        """
+        If use_gpu is true, it will create a gpu intermediate buffer. In this
+        case, it requires the following kwargs:
+        - chunk_size: The MAX size of the chunk to be copied to GPU.
+        - dtype: The data type of the intermediate buffer.
+        """
         self._attributes_initialized = False
+        self.hidden_dim_size = hidden_dim_size
+        self.num_layers = num_layers
+        self.kv_cache_pointers = torch.empty(
+            num_layers, dtype=torch.int64, device="cpu"
+        )
+        # Not sure we need a dict here. Maybe a single GPU connector always
+        # works with a single device?
+        self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
+        self.page_buffer_size = 0
+
         self.kvcaches: Optional[List[torch.Tensor]] = None
-        self.use_gpu = use_gpu
+        self.gpu_buffer: Optional[torch.Tensor] = None
+        self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        if use_gpu:
+            assert "chunk_size" in kwargs, (
+                "chunk_size should be provided to create a GPU buffer."
+            )
+            assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
+            assert "device" in kwargs, (
+                "device should be provided to create a GPU buffer."
+            )
+            shape = self.get_shape(kwargs["chunk_size"])
+            self.gpu_buffer = torch.empty(
+                shape, dtype=kwargs["dtype"], device=kwargs["device"]
+            )
 
     @classmethod
     def from_metadata(
@@ -78,8 +108,22 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         Returns:
             A new instance of VLLMPagedMemXPUConnectorV2.
         """
+        # Extract parameters from metadata
+        # kv_shape: (num_layer, 2 or 1, chunk_size, num_kv_head, head_size)
+        num_layers = metadata.kv_shape[0]
+        chunk_size = metadata.kv_shape[2]
+        num_kv_head = metadata.kv_shape[3]
+        head_size = metadata.kv_shape[4]
+        hidden_dim_size = num_kv_head * head_size
+
         return cls(
+            hidden_dim_size=hidden_dim_size,
+            num_layers=num_layers,
             use_gpu=use_gpu,
+            chunk_size=chunk_size,
+            dtype=metadata.kv_dtype,
+            device=device,
+            use_mla=metadata.use_mla,
         )
 
     def _initialize_attributes(self, kv_caches: List[torch.Tensor]):
@@ -139,7 +183,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
           2. In the case that there is prefix caching, slot_mapping will starts
              with -1s until the end of the matched prefix. The start and end
              should NEVER overlap with the prefix caching (which means the
-             underlying kernel will never see -1 in slot_mapping)
+             underlying CUDA kernel will never see -1 in slot_mapping)
 
 
         :raises ValueError: If 'kvcaches' is not provided in kwargs.
@@ -191,7 +235,7 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
           2. In the case that there is prefix caching, slot_mapping will starts
              with -1s until the end of the matched prefix. The start and end
              should NEVER overlap with the prefix caching (which means the
-             underlying kernel will never see -1 in slot_mapping)
+             underlying CUDA kernel will never see -1 in slot_mapping)
 
         :raises ValueError: If 'kvcaches' is not provided in kwargs,
         :raises AssertionError: If the memory object does not have a tensor.
@@ -247,35 +291,10 @@ class VLLMPagedMemXPUConnectorV2(GPUConnectorInterface):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
+    # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.to_gpu(memory_obj, start, end, **kwargs)
-
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.from_gpu(memory_obj, start, end, **kwargs)
-
-    def get_shape(self, num_tokens: int) -> torch.Size:
-        """Get the shape of the data given the number of tokens.
-
-        Args:
-            num_tokens: The number of tokens in the data.
-
-        Returns:
-            The shape of the KV cache data.
-
-        Raises:
-            RuntimeError: If attributes have not been initialized yet
-                (i.e., no kv_caches have been seen).
-        """
-        if not self._attributes_initialized:
-            raise RuntimeError(
-                "Cannot determine shape before attributes are initialized. "
-                "Call to_gpu or from_gpu first so that _initialize_attributes "
-                "can discover the KV cache layout."
-            )
-        kv_size = 1 if self.use_mla else 2
-        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
 
     def _validate_memory_format(self, memory_obj: MemoryObj) -> None:
         """Validate that the memory object has the expected format.
