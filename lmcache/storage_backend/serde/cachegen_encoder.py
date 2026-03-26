@@ -6,6 +6,7 @@ from typing import Dict, Tuple
 import torch
 
 # First Party
+from lmcache.device_utils import get_accelerator, get_device_name
 from lmcache.logging import init_logger
 from lmcache.storage_backend.serde.cachegen_basics import (
     CacheGenConfig,
@@ -216,7 +217,10 @@ class CacheGenEncoderImpl:
             results = []
             for x in X:
                 """do permute here"""
-                batch_counts = process_batch(x.cuda().permute(1, 0), max_val)
+                batch_counts = process_batch(
+                    x.to(get_device_name()).permute(1, 0),
+                    max_val,
+                )
                 results.append(batch_counts)
 
             final_counts = torch.cat(results, dim=0)
@@ -350,13 +354,13 @@ class CacheGenSerializer(Serializer):
         ret = torch.zeros(config.nlayers)
         for spec in config.kspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(get_device_name())
 
     def make_value_bins(self, config: CacheGenConfig) -> torch.Tensor:
         ret = torch.zeros(config.nlayers)
         for spec in config.vspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(get_device_name())
 
     @_lmcache_nvtx_annotate
     def to_bytes(self, tensor: torch.Tensor) -> bytes:
@@ -374,8 +378,8 @@ class CacheGenSerializer(Serializer):
         # Temporary fix for issue #83: encoder will have the default device 0
         # on all the ray workers. Need to set it to the correct device.
         # Also need to figure out why this happens.
-        if torch.cuda.current_device != tensor.device:
-            torch.cuda.set_device(tensor.device)
+        if get_accelerator().current_device() != tensor.device.index:
+            get_accelerator().set_device(tensor.device)
         if tensor.device != self.key_bins.device:
             self.key_bins = self.key_bins.to(tensor.device)
         if tensor.device != self.value_bins.device:
@@ -389,7 +393,7 @@ class CacheGenSerializer(Serializer):
         [num_layers, 2, num_tokens, num_heads, head_size] """
         ntokens = tensor.shape[2]
         output_dict = encode_function(
-            tensor.cuda(),
+            tensor.to(get_device_name()),
             self.cachegen_config,
             self.key_bins,
             self.value_bins,

@@ -7,6 +7,7 @@ from torch import nn
 import torch
 
 # First Party
+from lmcache.device_utils import get_device_name
 from lmcache.v1.compute.attention.utils import infer_attn_backend_from_vllm
 from lmcache.v1.compute.positional_encoding import get_fused_rope
 
@@ -68,7 +69,7 @@ class LMCBaseModel(nn.Module, ABC):
         self,
         input_ids: torch.Tensor,
     ):
-        input_ids = input_ids.cuda()
+        input_ids = input_ids.to(get_device_name())
         hidden_states = self.vllm_model.get_input_embeddings(input_ids)
         residual = None
 
