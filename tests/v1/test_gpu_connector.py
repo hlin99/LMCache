@@ -493,6 +493,122 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, gpu_kv_format):
     not torch.cuda.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemLayerwiseGPUConnector",
 )
+def test_layerwise_vllm_paged_connector_with_gpu_mla(use_gpu):
+    """Test VLLMPagedMemLayerwiseGPUConnector with MLA format (NL_X_NB_BS_HS)."""
+    gpu_kv_format = lmc_ops.GPUKVFormat.NL_X_NB_BS_HS
+    num_blocks = 100
+    block_size = 16
+    num_layers = 32
+    head_size = 128
+    device = "cuda"
+    hidden_dim = head_size
+
+    num_tokens = 800
+    chunk_size = 256
+
+    allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+
+    gpu_kv_src = generate_kv_cache_paged_list_tensors(
+        num_blocks=num_blocks,
+        device=device,
+        block_size=block_size,
+        gpu_kv_format=gpu_kv_format,
+        head_size=head_size,
+    )
+    gpu_kv_dst = generate_kv_cache_paged_list_tensors(
+        num_blocks=num_blocks,
+        device=device,
+        block_size=block_size,
+        gpu_kv_format=gpu_kv_format,
+        head_size=head_size,
+    )
+    dtype = get_dtype(gpu_kv_src, gpu_kv_format)
+
+    slot_mapping = random.sample(range(0, num_blocks * block_size), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping, device=device, dtype=torch.int64)
+
+    # Check the gpu_kv is not the same before copying
+    with pytest.raises(AssertionError):
+        check_paged_kv_cache_equal_with_mla(
+            gpu_kv_src, gpu_kv_dst, slot_mapping, head_size
+        )
+
+    connector = VLLMPagedMemLayerwiseGPUConnector(
+        hidden_dim,
+        num_layers,
+        use_gpu=use_gpu,
+        chunk_size=chunk_size,
+        dtype=dtype,
+        device=device,
+        use_mla=True,
+    )
+
+    # from gpu to cpu
+    starts = []
+    ends = []
+    memory_objs = []
+
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        shape_single_layer = connector.get_shape(end - start)
+        memory_objs_multi_layer = []
+
+        for layer_id in range(num_layers):
+            mem_obj_single_layer = allocator.allocate(
+                shape_single_layer, dtype, fmt=MemoryFormat.KV_MLA_FMT
+            )
+            memory_objs_multi_layer.append(mem_obj_single_layer)
+
+        starts.append(start)
+        ends.append(end)
+        memory_objs.append(memory_objs_multi_layer)
+
+    memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
+
+    mem_obj_generator = connector.batched_from_gpu(
+        memory_objs,
+        starts,
+        ends,
+        kvcaches=gpu_kv_src,
+        slot_mapping=slot_mapping,
+        sync=True,
+    )
+
+    for layer_id in range(num_layers + 1):
+        next(mem_obj_generator)
+
+    # from cpu to gpu
+    mem_obj_consumer = connector.batched_to_gpu(
+        starts,
+        ends,
+        kvcaches=gpu_kv_dst,
+        slot_mapping=slot_mapping,
+        sync=True,
+    )
+    next(mem_obj_consumer)
+    for layer_id in range(num_layers):
+        mem_obj_consumer.send(memory_objs[layer_id])
+    next(mem_obj_consumer)
+
+    # free all mem objs
+    for mem_obj_multi_layer in memory_objs:
+        for mem_obj in mem_obj_multi_layer:
+            mem_obj.ref_count_down()
+
+    assert allocator.memcheck()
+
+    assert connector.gpu_buffer_allocator.memcheck()
+
+    check_paged_kv_cache_equal_with_mla(gpu_kv_src, gpu_kv_dst, slot_mapping, head_size)
+
+    allocator.close()
+
+
+@pytest.mark.parametrize("use_gpu", [True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemLayerwiseGPUConnector",
+)
 def test_batched_layerwise_vllm_paged_connector_with_gpu(use_gpu):
     num_blocks = 100
     block_size = 16
