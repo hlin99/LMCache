@@ -122,7 +122,9 @@ class RemoteMetadata:
         Raises:
             AssertionError: If the shape has more than 4 dimensions.
         """
-        assert len(shape) <= 4, f"Shape dimension should be <= 4, got {len(shape)}"
+        assert len(shape) <= 4, (
+            f"Shape dimension must be <= 4 for serialization, got {len(shape)}"
+        )
         padded = list(shape) + [0] * (4 - len(shape))
         return padded
 
