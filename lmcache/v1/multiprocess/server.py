@@ -10,6 +10,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache.device_utils import get_accelerator
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.distributed.api import (
@@ -213,7 +214,7 @@ class MPCacheEngine:
             del self.gpu_contexts[instance_id]
             del self.gpu_context_meta[instance_id]
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
-            torch.cuda.empty_cache()
+            get_accelerator().empty_cache()
         else:
             logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
 
@@ -257,14 +258,14 @@ class MPCacheEngine:
         gpu_context = self.gpu_contexts[instance_id]
 
         with (
-            torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.stream),
+            get_accelerator().device(gpu_context.device),
+            get_accelerator().stream(gpu_context.stream),
         ):
-            event = torch.cuda.Event(interprocess=True)
+            event = get_accelerator().Event(interprocess=True)
             slot_mapping_tensor = gpu_context.get_slot_mapping_tensor(gpu_block_ids)
 
             # Wait for vLLM to finish
-            vllm_event = torch.cuda.Event.from_ipc_handle(
+            vllm_event = get_accelerator().Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
@@ -428,12 +429,12 @@ class MPCacheEngine:
                 )
 
         with (
-            torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.high_priority_stream),
+            get_accelerator().device(gpu_context.device),
+            get_accelerator().stream(gpu_context.high_priority_stream),
         ):
             slot_mapping_tensor = gpu_context.get_slot_mapping_tensor(gpu_block_ids)
 
-            event = torch.cuda.Event(interprocess=True)
+            event = get_accelerator().Event(interprocess=True)
 
             prefetched_keys: list[ObjectKey] = []
             retrieve_succeeded = False
@@ -904,7 +905,7 @@ def run_cache_server(
         mp_config.port,
     )
     # Start the ZMQ server
-    torch.cuda.init()
+    get_accelerator().init()
     server.start()
 
     # Start telemetry controller

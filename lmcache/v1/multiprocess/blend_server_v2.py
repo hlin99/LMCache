@@ -46,6 +46,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache.device_utils import get_accelerator
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
@@ -436,13 +437,13 @@ class BlendEngineV2(MPCacheEngine):
             reserved_dict is the dictionary of reserved memory objects.
         """
         with (
-            torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.stream),
+            get_accelerator().device(gpu_context.device),
+            get_accelerator().stream(gpu_context.stream),
         ):
-            event = torch.cuda.Event(interprocess=True)
+            event = get_accelerator().Event(interprocess=True)
 
             # Wait for vLLM event to finish
-            vllm_event = torch.cuda.Event.from_ipc_handle(
+            vllm_event = get_accelerator().Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
@@ -594,10 +595,10 @@ class BlendEngineV2(MPCacheEngine):
         logger.debug("DEBUG object keys to retrieve: %s", all_obj_keys)
 
         with (
-            torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.stream),
+            get_accelerator().device(gpu_context.device),
+            get_accelerator().stream(gpu_context.stream),
         ):
-            event = torch.cuda.Event(interprocess=True)
+            event = get_accelerator().Event(interprocess=True)
 
             try:
                 with self.storage_manager.read_prefetched_results(
@@ -828,7 +829,7 @@ def run_cache_server(
         mp_config.port,
     )
     # Start the ZMQ server
-    torch.cuda.init()
+    get_accelerator().init()
     server.start()
 
     # Start telemetry controller

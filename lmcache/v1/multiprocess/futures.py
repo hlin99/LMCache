@@ -6,6 +6,9 @@ import threading
 # Third Party
 import torch
 
+# First Party
+from lmcache.device_utils import get_accelerator
+
 T = TypeVar("T")
 
 
@@ -93,7 +96,7 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         self.raw_future_ = raw_future
         self.event_: torch.cuda.Event | None = None
         self.result_: T | None = None
-        self.device_ = device if device is not None else torch.cuda.current_device()
+        self.device_ = device if device is not None else get_accelerator().current_device()
 
     def _on_raw_future_complete(self):
         """
@@ -103,7 +106,7 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         self.result_ = result
 
         # Deserialize the CUDA event
-        self.event_ = torch.cuda.Event.from_ipc_handle(self.device_, event_bytes)
+        self.event_ = get_accelerator().Event.from_ipc_handle(self.device_, event_bytes)
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """

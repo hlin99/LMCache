@@ -15,6 +15,7 @@ import cupy
 import torch
 
 # First Party
+from lmcache.device_utils import get_accelerator
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
 from lmcache.v1.gpu_connector.utils import (
@@ -92,13 +93,13 @@ class GPUCacheContext:
         )
 
         # Cuda streams
-        self.cuda_stream_ = torch.cuda.Stream(device=self.device_)
+        self.cuda_stream_ = get_accelerator().Stream(device=self.device_)
         self.cupy_stream_ = cupy.cuda.ExternalStream(
             self.cuda_stream_.cuda_stream, self.device_.index
         )
 
-        _, high_priority = torch.cuda.Stream.priority_range()
-        self.high_priority_cuda_stream_ = torch.cuda.Stream(
+        _, high_priority = get_accelerator().Stream.priority_range()
+        self.high_priority_cuda_stream_ = get_accelerator().Stream(
             device=self.device_, priority=high_priority
         )
         self.high_priority_cupy_stream_ = cupy.cuda.ExternalStream(
@@ -259,13 +260,13 @@ class PlainGPUCacheContext:
         )
 
         # Cuda streams
-        self._cuda_stream = torch.cuda.Stream(device=self._device)
+        self._cuda_stream = get_accelerator().Stream(device=self._device)
         self._cupy_stream = cupy.cuda.ExternalStream(
             self._cuda_stream.cuda_stream, self._device.index
         )
 
-        _, high_priority = torch.cuda.Stream.priority_range()
-        self._high_priority_cuda_stream = torch.cuda.Stream(
+        _, high_priority = get_accelerator().Stream.priority_range()
+        self._high_priority_cuda_stream = get_accelerator().Stream(
             device=self._device, priority=high_priority
         )
         self._high_priority_cupy_stream = cupy.cuda.ExternalStream(

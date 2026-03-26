@@ -10,6 +10,7 @@ import torch
 import uvicorn
 
 # First Party
+from lmcache.device_utils import is_accelerator_available
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.config import (
     StorageManagerConfig,
@@ -61,7 +62,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(
         "Starting LMCache HTTP server... (CUDA available: %s)",
-        torch.cuda.is_available(),
+        is_accelerator_available(),
     )
     mp_config = _configs["mp"]
     if mp_config.engine_type == "blend":
