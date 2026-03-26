@@ -39,10 +39,12 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """
         Initialize some common attributes, which will be used in the subclasses.
         - `save_chunk_meta` is a flag to indicate whether to save the chunk meta info.
-        - `meta_shapes` is a list of shapes of lmcache full chunk.
+        - `meta_shapes` is a list of shapes of lmcache chunk (per-layer in layerwise
+          mode, full chunk otherwise).
         - `meta_dtypes` is a list of dtypes of lmcache chunk.
         - `meta_fmt` is the memory format of the lmcache chunk.
-        - `full_chunk_size_bytes` is the size of the lmcache full chunk.
+        - `full_chunk_size_bytes` is the size of one stored item (per-layer chunk in
+          layerwise mode, full chunk otherwise).
         - `single_token_size` is the size of a single token.`
         - `remote_metadata_bytes` is the size of the remote metadata.
 
@@ -50,7 +52,6 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             config: the lmcache engine config
             metadata: the lmcache engine metadata
         """
-        # TODO(chunxiaozheng): support layerwise here
         assert metadata is not None
         self.save_chunk_meta: bool = (
             config.extra_config is None
@@ -62,6 +63,19 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         self.meta_fmt: MemoryFormat = (
             MemoryFormat.KV_MLA_FMT if metadata.use_mla else MemoryFormat.KV_2LTD
         )
+
+        if config.use_layerwise:
+            # In layerwise mode each key stores a single layer, so set
+            # num_layers (dimension index 1 in the [kv_size, num_layers,
+            # num_tokens, hidden_dim] shape) to 1.  This ensures buffer
+            # sizes, token sizes, and reshape validation match the
+            # per-layer data that is actually stored/retrieved.
+            _LAYER_DIM = 1
+            self.meta_shapes = [
+                torch.Size(list(s[:_LAYER_DIM]) + [1] + list(s[_LAYER_DIM + 1 :]))
+                for s in self.meta_shapes
+            ]
+
         self.full_chunk_size_bytes: int = get_size_bytes(
             self.meta_shapes, self.meta_dtypes
         )
