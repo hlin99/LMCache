@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 
-if torch.cuda.is_available():
+if torch.accelerator.is_available():
     # First Party
     import lmcache.c_ops as lmc_ops
 

@@ -193,7 +193,7 @@ class LMCFlashInferSparseBackend(AttentionInterface):
         self.vllm_attn = vllm_attn
         self.vllm_attn_impl: FlashInferImpl = vllm_attn.impl
 
-        idx = torch.cuda.current_device()
+        idx = torch.accelerator.current_device_index()
         self.device = torch.device(f"cuda:{idx}")
 
         self.workspace_buffer = torch.empty(

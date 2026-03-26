@@ -118,7 +118,7 @@ class LMCacheEngine:
             self.broadcast_stream = (
                 self.gpu_connector.load_stream
                 if hasattr(self.gpu_connector, "load_stream")
-                else torch.cuda.Stream()
+                else torch.Stream()
             )
 
         self.enable_controller = config.enable_controller
@@ -829,7 +829,7 @@ class LMCacheEngine:
 
         if self.save_only_first_rank:
             with retrieve_stats.profile_broadcast():
-                with torch.cuda.stream(self.broadcast_stream):
+                with self.broadcast_stream:
                     self._broadcast_or_receive_memory_objs(
                         reordered_chunks,
                         ret_mask,
@@ -839,7 +839,7 @@ class LMCacheEngine:
                 # to self.gpu_connector.load_stream, the broadcast and to_gpu operation
                 # will execute sequentially within the stream.
                 # if self.gpu_connector does not have load_stream, self.broadcast_stream
-                # is created by torch.cuda.Stream(), we need to synchronize broadcast
+                # is created by torch.Stream(), we need to synchronize broadcast
                 # operation, and then process to_cpu operation.
                 if not hasattr(self.gpu_connector, "load_stream"):
                     self.broadcast_stream.synchronize()
@@ -1750,7 +1750,7 @@ class LMCacheEngine:
 
                 # Create tensor and receive data
                 metadata = MemoryObjMetadata.from_dict(metadata_dict)
-                local_rank = self.metadata.worker_id % torch.cuda.device_count()
+                local_rank = self.metadata.worker_id % torch.accelerator.device_count()
                 raw_tensor = torch.empty(
                     torch.Size([metadata.get_size()]),
                     dtype=torch.uint8,
@@ -1883,7 +1883,7 @@ class LMCacheEngineBuilder:
                 )
             else:
                 logger.info(f"Setting cuda device to {corrected_device} ")
-                torch.cuda.set_device(corrected_device)
+                torch.accelerator.set_device_index(corrected_device)
 
             return PagedTensorMemoryAllocator(
                 buffer,

@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(
         "Starting LMCache HTTP server... (CUDA available: %s)",
-        torch.cuda.is_available(),
+        torch.accelerator.is_available(),
     )
     mp_config = _configs["mp"]
     if mp_config.engine_type == "blend":

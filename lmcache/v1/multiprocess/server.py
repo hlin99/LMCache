@@ -68,7 +68,7 @@ from lmcache.v1.multiprocess.protocol import (
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
-if torch.cuda.is_available():
+if torch.accelerator.is_available():
     # First Party
     import lmcache.c_ops as lmc_ops
 
@@ -213,7 +213,7 @@ class MPCacheEngine:
             del self.gpu_contexts[instance_id]
             del self.gpu_context_meta[instance_id]
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         else:
             logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
 
@@ -258,13 +258,13 @@ class MPCacheEngine:
 
         with (
             torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.stream),
+            gpu_context.stream,
         ):
-            event = torch.cuda.Event(interprocess=True)
+            event = torch.Event(interprocess=True)
             slot_mapping_tensor = gpu_context.get_slot_mapping_tensor(gpu_block_ids)
 
             # Wait for vLLM to finish
-            vllm_event = torch.cuda.Event.from_ipc_handle(
+            vllm_event = torch.Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
@@ -429,11 +429,11 @@ class MPCacheEngine:
 
         with (
             torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.high_priority_stream),
+            gpu_context.high_priority_stream,
         ):
             slot_mapping_tensor = gpu_context.get_slot_mapping_tensor(gpu_block_ids)
 
-            event = torch.cuda.Event(interprocess=True)
+            event = torch.Event(interprocess=True)
 
             prefetched_keys: list[ObjectKey] = []
             retrieve_succeeded = False

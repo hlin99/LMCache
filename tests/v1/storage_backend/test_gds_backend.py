@@ -94,7 +94,7 @@ def gds_backend(temp_gds_path, async_loop):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="Requires CUDA for TestGdsBackend",
 )
 @pytest.mark.skipif(
@@ -152,7 +152,7 @@ class TestGdsBackend:
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(
-        not torch.cuda.is_available(),
+        not torch.accelerator.is_available(),
         reason="Requires CUDA for GdsBackend get_blocking",
     )
     @pytest.mark.skipif(

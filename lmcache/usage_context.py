@@ -242,9 +242,9 @@ class UsageContext:
         return num_cpu, cpu_type, cpu_family_model_stepping
 
     def _get_gpu_info(self):
-        if torch.cuda.is_available():
+        if torch.accelerator.is_available():
             device_property = torch.cuda.get_device_properties(0)
-            gpu_count = torch.cuda.device_count()
+            gpu_count = torch.accelerator.device_count()
             gpu_type = device_property.name
             gpu_memory_per_device = device_property.total_memory
         elif torch.xpu.is_available():

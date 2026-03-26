@@ -34,12 +34,12 @@ except ImportError:
 
 # Skip all tests in this module if CUDA is not available
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is not available"
+    not torch.accelerator.is_available(), reason="CUDA is not available"
 )
 
 
 def should_use_lazy_alloc() -> bool:
-    return torch.cuda.is_available()
+    return torch.accelerator.is_available()
 
 
 # =============================================================================

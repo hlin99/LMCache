@@ -22,7 +22,7 @@ from lmcache.v1.memory_management import AdHocMemoryAllocator, MemoryFormat, Mem
 from lmcache.v1.metadata import LMCacheMetadata
 
 # Conditional import for CUDA-only operations
-if torch.cuda.is_available():
+if torch.accelerator.is_available():
     try:
         # First Party
         import lmcache.c_ops as lmc_ops

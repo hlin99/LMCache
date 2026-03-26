@@ -223,7 +223,7 @@ class PDBackend(AllocatorBackendInterface):
 
         if self.corrected_device != "cpu":
             logger.info(f"Setting cuda device to {self.corrected_device} ")
-            torch.cuda.set_device(self.corrected_device)
+            torch.accelerator.set_device_index(self.corrected_device)
 
         paged_mem_allocator = PagedCpuGpuMemoryAllocator()
 

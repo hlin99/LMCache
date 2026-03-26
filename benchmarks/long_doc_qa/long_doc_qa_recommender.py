@@ -13,7 +13,7 @@ import torch
 
 
 def determine_per_gpu_memory():
-    if not torch.cuda.is_available():
+    if not torch.accelerator.is_available():
         raise RuntimeError("CUDA is not available")
     total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     return total_memory
@@ -150,9 +150,9 @@ def get_cpu_offload_GiB_per_gpu(
 def main(model_name: str):
     tp = get_tensor_parallel_recommendation(model_name)
     print(f"Tensor Parallel Recommendation: {tp}")
-    if torch.cuda.device_count() < tp:
+    if torch.accelerator.device_count() < tp:
         print(
-            f"Warning: You have {torch.cuda.device_count()} GPUs, "
+            f"Warning: You have {torch.accelerator.device_count()} GPUs, "
             f"but {model_name} requires {tp} tensor parallelism to run on your hardware"
         )
         return

@@ -64,7 +64,7 @@ def allocate_and_copy_objects(
     allocator_backend: AllocatorBackendInterface,
     keys: Sequence[CacheEngineKey],
     src_memory_objs: list[MemoryObj],
-    stream: torch.cuda.Stream,
+    stream: torch.Stream,
 ) -> tuple[Sequence[CacheEngineKey], list[MemoryObj]]:
     """
     Allocate the memory objects and copy the data from src_memory_objs to
@@ -107,7 +107,7 @@ def allocate_and_copy_objects(
             memory_obj.ref_count_down()
             break
 
-        with torch.cuda.stream(stream):
+        with stream:
             memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
         allocated_objects.append(memory_obj)
 
@@ -268,7 +268,7 @@ class StorageManager:
 
         # The cuda stream for internal copies during put
         if is_cuda_worker(metadata):
-            self.internal_copy_stream = torch.cuda.Stream()
+            self.internal_copy_stream = torch.Stream()
         else:
             self.internal_copy_stream = None
 

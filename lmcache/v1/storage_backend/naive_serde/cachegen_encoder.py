@@ -57,8 +57,8 @@ class CacheGenSerializer(Serializer):
         # Temporary fix for issue #83: encoder will have the default device 0
         # on all the ray workers. Need to set it to the correct device.
         # Also need to figure out why this happens.
-        if torch.cuda.current_device != tensor.device:
-            torch.cuda.set_device(tensor.device)
+        if torch.accelerator.current_device_index != tensor.device:
+            torch.accelerator.set_device_index(tensor.device)
         if tensor.device != self.key_bins.device:
             self.key_bins = self.key_bins.to(tensor.device)
         if tensor.device != self.value_bins.device:

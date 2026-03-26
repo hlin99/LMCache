@@ -104,7 +104,7 @@ class LocalDiskBackend(StorageBackendInterface):
         lmcache_worker: Optional["LMCacheWorker"] = None,
         metadata: Optional[LMCacheMetadata] = None,
     ):
-        if torch.cuda.is_available():
+        if torch.accelerator.is_available():
             super().__init__(dst_device)
         else:
             super().__init__("cpu")

@@ -19,7 +19,7 @@ except ImportError:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non CUDA implementations for CUDA enhanced functions",
 )
 def test_rope():

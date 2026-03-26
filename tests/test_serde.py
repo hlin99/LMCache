@@ -35,7 +35,7 @@ def to_blob(kv_tuples):
 
 @pytest.mark.parametrize("chunk_size", [16, 128, 256])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to CacheGenSerializer",
 )
 def test_cachegen_encoder(chunk_size):
@@ -75,7 +75,7 @@ def test_cachegen_encoder(chunk_size):
 
 @pytest.mark.parametrize("chunk_size", [16, 128, 256])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to CacheGenSerializer",
 )
 def test_cachegen_decoder(chunk_size):
@@ -101,7 +101,7 @@ def test_cachegen_decoder(chunk_size):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to CacheGenSerializer",
 )
 def test_cachegen_unmatched_size():

@@ -420,7 +420,7 @@ class BlendEngineV2(MPCacheEngine):
         gpu_context: PlainGPUCacheContext,
         offset: int,
         event_ipc_handle: bytes,
-    ) -> tuple[torch.cuda.Event, dict]:
+    ) -> tuple[torch.Event, dict]:
         """
         Helper function to perform GPU-to-CPU copy operations for storing chunks.
 
@@ -437,12 +437,12 @@ class BlendEngineV2(MPCacheEngine):
         """
         with (
             torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.stream),
+            gpu_context.stream,
         ):
-            event = torch.cuda.Event(interprocess=True)
+            event = torch.Event(interprocess=True)
 
             # Wait for vLLM event to finish
-            vllm_event = torch.cuda.Event.from_ipc_handle(
+            vllm_event = torch.Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
@@ -595,9 +595,9 @@ class BlendEngineV2(MPCacheEngine):
 
         with (
             torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.stream),
+            gpu_context.stream,
         ):
-            event = torch.cuda.Event(interprocess=True)
+            event = torch.Event(interprocess=True)
 
             try:
                 with self.storage_manager.read_prefetched_results(

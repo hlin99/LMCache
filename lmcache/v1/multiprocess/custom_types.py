@@ -34,10 +34,10 @@ class CudaIPCWrapper:
         """Discover all available GPU devices and map their UUIDs to
         the physical device ordinals.
         """
-        if not torch.cuda.is_available():
+        if not torch.accelerator.is_available():
             return
 
-        num_devices = torch.cuda.device_count()
+        num_devices = torch.accelerator.device_count()
         with CudaIPCWrapper._device_mapping_lock:
             if CudaIPCWrapper._discovered_device_mapping:
                 return  # Already discovered

@@ -23,7 +23,7 @@ def _create_cuda_event_in_process(event_queue: mp.Queue, delay: float = 0.0):
         time.sleep(delay)
 
     # Create and record a CUDA event with interprocess flag
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
     event_bytes = event.ipc_handle()
 
@@ -179,7 +179,7 @@ def test_messaging_future_complex_type():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_basic_usage():
@@ -221,7 +221,7 @@ def test_cuda_messaging_future_basic_usage():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_with_thread():
@@ -265,7 +265,7 @@ def test_cuda_messaging_future_with_thread():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_wait_no_timeout():
@@ -303,7 +303,7 @@ def test_cuda_messaging_future_wait_no_timeout():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_wait_with_timeout_success():
@@ -339,7 +339,7 @@ def test_cuda_messaging_future_wait_with_timeout_success():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_wait_timeout_reached():
@@ -360,7 +360,7 @@ def test_cuda_messaging_future_wait_timeout_reached():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_result_with_timeout_success():
@@ -395,7 +395,7 @@ def test_cuda_messaging_future_result_with_timeout_success():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_result_timeout_reached():
@@ -413,7 +413,7 @@ def test_cuda_messaging_future_result_timeout_reached():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_multiple_result_calls():
@@ -446,7 +446,7 @@ def test_cuda_messaging_future_multiple_result_calls():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_query_before_and_after():
@@ -482,7 +482,7 @@ def test_cuda_messaging_future_query_before_and_after():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_complex_type():
@@ -518,7 +518,7 @@ def test_cuda_messaging_future_complex_type():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_messaging_future_to_cuda_future():
@@ -555,7 +555,7 @@ def test_messaging_future_to_cuda_future():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for CUDAMessagingFuture tests",
 )
 def test_cuda_messaging_future_with_explicit_device():
@@ -572,7 +572,7 @@ def test_cuda_messaging_future_with_explicit_device():
     event_bytes = event_queue.get(timeout=5)
     process.join(timeout=2)
 
-    device = torch.cuda.current_device()
+    device = torch.accelerator.current_device_index()
     raw_future = MessagingFuture[tuple[bytes, str]]()
 
     # Create CUDA future with explicit device

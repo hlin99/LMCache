@@ -9,7 +9,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 
-if torch.cuda.is_available():
+if torch.accelerator.is_available():
     # First Party
     import lmcache.c_ops as lmc_ops
 

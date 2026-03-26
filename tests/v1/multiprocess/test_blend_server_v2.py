@@ -480,24 +480,24 @@ def client(
 
 @pytest.fixture(scope="function")
 def cb_client_context() -> Generator[CBClientContext, None, None]:
-    if not torch.cuda.is_available():
+    if not torch.accelerator.is_available():
         pytest.skip("CUDA is not available")
     device = torch.device("cuda:0")
     ctx = CBClientContext(device=device)
     yield ctx
     del ctx.gpu_kv_cache
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
 
 @pytest.fixture(scope="function")
 def client_context() -> Generator[ClientContext, None, None]:
-    if not torch.cuda.is_available():
+    if not torch.accelerator.is_available():
         pytest.skip("CUDA is not available")
     device = torch.device("cuda:0")
     ctx = ClientContext(device=device)
     yield ctx
     del ctx.gpu_kv_caches
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
 
 @pytest.fixture(scope="function")
@@ -573,7 +573,7 @@ def test_server_running_v2(server_process: mp.Process):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="NOOP request requires CUDA server"
+    not torch.accelerator.is_available(), reason="NOOP request requires CUDA server"
 )
 def test_noop_request_v2(client: MessageQueueClient):
     """NOOP request should return 'OK'."""
@@ -584,7 +584,7 @@ def test_noop_request_v2(client: MessageQueueClient):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="GET_CHUNK_SIZE requires CUDA server"
+    not torch.accelerator.is_available(), reason="GET_CHUNK_SIZE requires CUDA server"
 )
 def test_get_chunk_size_v2(client: MessageQueueClient):
     """Server should report the configured chunk size."""
@@ -600,7 +600,7 @@ def test_get_chunk_size_v2(client: MessageQueueClient):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB register/unregister requires CUDA"
+    not torch.accelerator.is_available(), reason="CB register/unregister requires CUDA"
 )
 def test_cb_register_unregister_kv_cache_v2(
     client: MessageQueueClient, cb_client_context: CBClientContext
@@ -624,7 +624,8 @@ def test_cb_register_unregister_kv_cache_v2(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB register multiple instances requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB register multiple instances requires CUDA",
 )
 def test_cb_register_multiple_instances_v2(
     client: MessageQueueClient, cb_client_context: CBClientContext
@@ -651,7 +652,8 @@ def test_cb_register_multiple_instances_v2(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB unregister nonexistent requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB unregister nonexistent requires CUDA",
 )
 def test_cb_unregister_nonexistent_v2(client: MessageQueueClient):
     """Unregistering a non-existent instance should not raise; returns None."""
@@ -669,7 +671,7 @@ def test_cb_unregister_nonexistent_v2(client: MessageQueueClient):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Store Pre-Computed requires CUDA"
+    not torch.accelerator.is_available(), reason="CB Store Pre-Computed requires CUDA"
 )
 def test_cb_store_pre_computed_basic_v2(
     client: MessageQueueClient,
@@ -680,7 +682,7 @@ def test_cb_store_pre_computed_basic_v2(
     token_ids = tuple(range(1000, 1000 + CHUNK_SIZE))
     key = create_cb_cache_key(token_ids, request_id="store-basic-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     result = (
@@ -697,7 +699,7 @@ def test_cb_store_pre_computed_basic_v2(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Store Pre-Computed multi-chunk requires CUDA",
 )
 def test_cb_store_pre_computed_multiple_chunks_v2(
@@ -710,7 +712,7 @@ def test_cb_store_pre_computed_multiple_chunks_v2(
     token_ids = tuple(range(2000, 2000 + num_tokens))
     key = create_cb_cache_key(token_ids, request_id="store-multi-chunk-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     result = (
@@ -732,7 +734,8 @@ def test_cb_store_pre_computed_multiple_chunks_v2(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Lookup V2 after store requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB Lookup V2 after store requires CUDA",
 )
 def test_cb_lookup_v2_returns_cb_match_results(
     client: MessageQueueClient,
@@ -746,7 +749,7 @@ def test_cb_lookup_v2_returns_cb_match_results(
     token_ids = tuple(range(3000, 3000 + CHUNK_SIZE))
     key = create_cb_cache_key(token_ids, request_id="lookup-type-check-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     store_result = (
@@ -772,7 +775,8 @@ def test_cb_lookup_v2_returns_cb_match_results(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Lookup V2 exact match requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB Lookup V2 exact match requires CUDA",
 )
 def test_cb_lookup_v2_exact_match_fields(
     client: MessageQueueClient,
@@ -786,7 +790,7 @@ def test_cb_lookup_v2_exact_match_fields(
     token_ids = tuple(range(4000, 4000 + CHUNK_SIZE))
     key = create_cb_cache_key(token_ids, request_id="lookup-fields-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -811,7 +815,8 @@ def test_cb_lookup_v2_exact_match_fields(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Lookup V2 sub-sequence requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB Lookup V2 sub-sequence requires CUDA",
 )
 def test_cb_lookup_v2_sub_sequence_match(
     client: MessageQueueClient,
@@ -831,7 +836,7 @@ def test_cb_lookup_v2_sub_sequence_match(
     stored_tokens = tuple(range(5000, 5000 + CHUNK_SIZE))
     store_key = create_cb_cache_key(stored_tokens, request_id="sub-seq-store-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     store_result = (
@@ -870,7 +875,7 @@ def test_cb_lookup_v2_sub_sequence_match(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Lookup V2 no match requires CUDA"
+    not torch.accelerator.is_available(), reason="CB Lookup V2 no match requires CUDA"
 )
 def test_cb_lookup_v2_no_match(
     client: MessageQueueClient,
@@ -892,7 +897,8 @@ def test_cb_lookup_v2_no_match(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Lookup V2 partial match requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB Lookup V2 partial match requires CUDA",
 )
 def test_cb_lookup_v2_partial_match(
     client: MessageQueueClient,
@@ -906,7 +912,7 @@ def test_cb_lookup_v2_partial_match(
     chunk_a = tuple(range(6000, 6000 + CHUNK_SIZE))
     chunk_b = tuple(range(7000, 7000 + CHUNK_SIZE))
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     # Store chunk A
@@ -949,7 +955,7 @@ def test_cb_lookup_v2_partial_match(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Lookup V2 isolation from normal store requires CUDA",
 )
 def test_cb_lookup_v2_cannot_find_normal_store(
@@ -964,7 +970,7 @@ def test_cb_lookup_v2_cannot_find_normal_store(
     CB_LOOKUP_PRE_COMPUTED_V2 (returns []).
     """
     token_ids = tuple(range(CHUNK_SIZE))
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     store_key = create_cache_key(token_ids, request_id="isolation-normal-v2")
@@ -987,7 +993,7 @@ def test_cb_lookup_v2_cannot_find_normal_store(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Lookup V2 multiple chunks aligned requires CUDA",
 )
 def test_cb_lookup_v2_multiple_chunks_found(
@@ -1006,7 +1012,7 @@ def test_cb_lookup_v2_multiple_chunks_found(
     chunk_a = tuple(range(30000, 30000 + CHUNK_SIZE))
     chunk_b = tuple(range(31000, 31000 + CHUNK_SIZE))
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -1050,7 +1056,7 @@ def test_cb_lookup_v2_multiple_chunks_found(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Lookup V2 multiple chunks unaligned requires CUDA",
 )
 def test_cb_lookup_v2_multiple_chunks_unaligned(
@@ -1071,7 +1077,7 @@ def test_cb_lookup_v2_multiple_chunks_unaligned(
     prefix_x = tuple(range(34000, 34000 + CHUNK_SIZE))
     prefix_y = tuple(range(35000, 35000 + CHUNK_SIZE))
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -1125,7 +1131,7 @@ def test_cb_lookup_v2_multiple_chunks_unaligned(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Retrieve V2 basic requires CUDA"
+    not torch.accelerator.is_available(), reason="CB Retrieve V2 basic requires CUDA"
 )
 def test_cb_retrieve_v2_after_store_and_lookup(
     client: MessageQueueClient,
@@ -1136,7 +1142,7 @@ def test_cb_retrieve_v2_after_store_and_lookup(
     token_ids = tuple(range(10000, 10000 + CHUNK_SIZE))
     key = create_cb_cache_key(token_ids, request_id="retrieve-basic-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -1152,7 +1158,7 @@ def test_cb_retrieve_v2_after_store_and_lookup(
     ).result(timeout=DEFAULT_TIMEOUT)
     assert len(cb_results) > 0
 
-    event2 = torch.cuda.Event(interprocess=True)
+    event2 = torch.Event(interprocess=True)
     event2.record()
 
     result = (
@@ -1169,7 +1175,7 @@ def test_cb_retrieve_v2_after_store_and_lookup(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Retrieve V2 data correctness requires CUDA",
 )
 def test_cb_retrieve_v2_verify_data_correctness(
@@ -1192,7 +1198,7 @@ def test_cb_retrieve_v2_verify_data_correctness(
     token_ids = tuple(range(11000, 11000 + CHUNK_SIZE))
     key = create_cb_cache_key(token_ids, request_id="retrieve-correctness-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -1217,7 +1223,7 @@ def test_cb_retrieve_v2_verify_data_correctness(
     dst_slice = cb_client_context.get_tensor_slice(dest_offset, CHUNK_SIZE)
     assert not torch.allclose(dst_slice, src_slice, atol=1e-4)
 
-    event2 = torch.cuda.Event(interprocess=True)
+    event2 = torch.Event(interprocess=True)
     event2.record()
 
     result = (
@@ -1231,7 +1237,7 @@ def test_cb_retrieve_v2_verify_data_correctness(
     )
     assert result is True
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     src_slice = cb_client_context.get_tensor_slice(source_offset, CHUNK_SIZE)
     dst_slice = cb_client_context.get_tensor_slice(dest_offset, CHUNK_SIZE)
     assert torch.allclose(src_slice, dst_slice, atol=1e-4), (
@@ -1249,7 +1255,8 @@ def test_cb_retrieve_v2_verify_data_correctness(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Retrieve V2 sub-sequence requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB Retrieve V2 sub-sequence requires CUDA",
 )
 def test_cb_retrieve_v2_sub_sequence(
     client: MessageQueueClient,
@@ -1271,7 +1278,7 @@ def test_cb_retrieve_v2_sub_sequence(
     stored_tokens = tuple(range(12000, 12000 + CHUNK_SIZE))
     store_key = create_cb_cache_key(stored_tokens, request_id="sub-seq-e2e-store-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -1296,7 +1303,7 @@ def test_cb_retrieve_v2_sub_sequence(
     # Reset destination region before retrieve
     cb_client_context.set_tensor_slice(CHUNK_SIZE, CHUNK_SIZE, 0.0)
 
-    event2 = torch.cuda.Event(interprocess=True)
+    event2 = torch.Event(interprocess=True)
     event2.record()
 
     result = (
@@ -1310,7 +1317,7 @@ def test_cb_retrieve_v2_sub_sequence(
     )
     assert result is True
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     # Data should have been copied to gpu_st = cur_st + offset = CHUNK_SIZE + 0
     src_slice = cb_client_context.get_tensor_slice(0, CHUNK_SIZE)
     dst_slice = cb_client_context.get_tensor_slice(CHUNK_SIZE, CHUNK_SIZE)
@@ -1320,7 +1327,7 @@ def test_cb_retrieve_v2_sub_sequence(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Retrieve V2 multiple chunks data correctness requires CUDA",
 )
 def test_cb_retrieve_v2_multiple_chunks_data_correctness(
@@ -1351,7 +1358,7 @@ def test_cb_retrieve_v2_multiple_chunks_data_correctness(
     chunk_a = tuple(range(36000, 36000 + CHUNK_SIZE))
     chunk_b = tuple(range(37000, 37000 + CHUNK_SIZE))
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -1391,7 +1398,7 @@ def test_cb_retrieve_v2_multiple_chunks_data_correctness(
     dest_offset = 2 * CHUNK_SIZE
     cb_client_context.set_tensor_slice(dest_offset, 2 * CHUNK_SIZE, 0.0)
 
-    event2 = torch.cuda.Event(interprocess=True)
+    event2 = torch.Event(interprocess=True)
     event2.record()
 
     result = (
@@ -1411,7 +1418,7 @@ def test_cb_retrieve_v2_multiple_chunks_data_correctness(
     )
     assert result is True
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # chunk_A → gpu_st = 0 + 2*CHUNK_SIZE = slot 2
     src_a = cb_client_context.get_tensor_slice(0, CHUNK_SIZE)
@@ -1429,7 +1436,7 @@ def test_cb_retrieve_v2_multiple_chunks_data_correctness(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Retrieve V2 unaligned with non-zero offset requires CUDA",
 )
 def test_cb_retrieve_v2_unaligned_nonzero_offset(
@@ -1460,7 +1467,7 @@ def test_cb_retrieve_v2_unaligned_nonzero_offset(
         stored_tokens, request_id="unaligned-offset-store-v2"
     )
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(
@@ -1488,7 +1495,7 @@ def test_cb_retrieve_v2_unaligned_nonzero_offset(
     retrieve_offset = CHUNK_SIZE
     cb_client_context.set_tensor_slice(2 * CHUNK_SIZE, CHUNK_SIZE, 0.0)
 
-    event2 = torch.cuda.Event(interprocess=True)
+    event2 = torch.Event(interprocess=True)
     event2.record()
 
     result = (
@@ -1508,7 +1515,7 @@ def test_cb_retrieve_v2_unaligned_nonzero_offset(
     )
     assert result is True
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     src_slice = cb_client_context.get_tensor_slice(0, CHUNK_SIZE)
     dst_slice = cb_client_context.get_tensor_slice(2 * CHUNK_SIZE, CHUNK_SIZE)
     assert torch.allclose(src_slice, dst_slice, atol=1e-4), (
@@ -1517,7 +1524,8 @@ def test_cb_retrieve_v2_unaligned_nonzero_offset(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Retrieve V2 empty results requires CUDA"
+    not torch.accelerator.is_available(),
+    reason="CB Retrieve V2 empty results requires CUDA",
 )
 def test_cb_retrieve_v2_empty_match_results(
     client: MessageQueueClient,
@@ -1528,7 +1536,7 @@ def test_cb_retrieve_v2_empty_match_results(
     token_ids = tuple(range(13000, 13000 + CHUNK_SIZE))
     key = create_cb_cache_key(token_ids, request_id="empty-results-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     result = (
@@ -1550,7 +1558,7 @@ def test_cb_retrieve_v2_empty_match_results(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CB Store Final basic requires CUDA"
+    not torch.accelerator.is_available(), reason="CB Store Final basic requires CUDA"
 )
 def test_cb_store_final_basic_v2(
     client: MessageQueueClient,
@@ -1561,7 +1569,7 @@ def test_cb_store_final_basic_v2(
     token_ids = tuple(range(14000, 14000 + CHUNK_SIZE))
     key = create_cb_cache_key(token_ids, request_id="final-basic-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     result = (
@@ -1578,7 +1586,7 @@ def test_cb_store_final_basic_v2(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Store Final then normal lookup requires CUDA",
 )
 def test_cb_store_final_v2_then_normal_lookup(
@@ -1598,7 +1606,7 @@ def test_cb_store_final_v2_then_normal_lookup(
     token_ids = tuple(range(15000, 15000 + CHUNK_SIZE))
     cb_key = create_cb_cache_key(token_ids, request_id="final-norm-lookup-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     store_result = (
@@ -1642,7 +1650,7 @@ def test_cb_store_final_v2_then_normal_lookup(
     retrieve_key = create_cb_cache_key(token_ids, request_id="final-norm-retrieve-v2")
     pages_per_chunk = 16
     gpu_block_ids = list(range(pages_per_chunk))
-    event2 = torch.cuda.Event(interprocess=True)
+    event2 = torch.Event(interprocess=True)
     event2.record()
 
     retrieve_result = (
@@ -1656,7 +1664,7 @@ def test_cb_store_final_v2_then_normal_lookup(
     )
     assert retrieve_result is True
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for layer in range(client_context.num_layers):
         tensor_slice = client_context.get_tensor_slice(layer, 0, pages_per_chunk)
         assert tensor_slice.mean().item() == pytest.approx(source_value, abs=1e-4), (
@@ -1665,7 +1673,7 @@ def test_cb_store_final_v2_then_normal_lookup(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CB Store Final not visible to CB Lookup V2 requires CUDA",
 )
 def test_cb_store_final_v2_not_visible_to_cb_lookup_v2(
@@ -1681,7 +1689,7 @@ def test_cb_store_final_v2_not_visible_to_cb_lookup_v2(
     token_ids = tuple(range(16000, 16000 + CHUNK_SIZE))
     cb_key = create_cb_cache_key(token_ids, request_id="final-not-cb-v2")
 
-    event = torch.cuda.Event(interprocess=True)
+    event = torch.Event(interprocess=True)
     event.record()
 
     client.submit_request(

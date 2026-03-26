@@ -147,7 +147,7 @@ def create_interleaved_lookup_keys(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for tensor parallel tests",
 )
 class TestStorageManagerTPLookup:
@@ -410,7 +410,7 @@ class TestStorageManagerTPLookup:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for tensor parallel tests",
 )
 class TestStorageManagerTPStoreRetrieve:
@@ -493,7 +493,7 @@ class TestStorageManagerTPStoreRetrieve:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for tensor parallel tests",
 )
 class TestTPEdgeCases:
@@ -617,7 +617,7 @@ class TestTPEdgeCases:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for tensor parallel tests",
 )
 class TestTPIntegration:

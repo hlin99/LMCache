@@ -354,7 +354,7 @@ def test_mq_noop_multiple_clients():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="CUDA is required for REGISTER_KV_CACHE tests",
 )
 def test_mq_register_kv_cache():

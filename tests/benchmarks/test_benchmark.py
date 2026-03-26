@@ -105,7 +105,7 @@ def create_config():
 @pytest.mark.parametrize("backend", ["cpu", "disk", "fsconnector"])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_store_1GB(
@@ -219,7 +219,7 @@ def test_store_1GB(
 @pytest.mark.parametrize("backend", ["cpu", "disk", "fsconnector"])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_retrieve_1GB_allhit(
@@ -342,7 +342,7 @@ def test_retrieve_1GB_allhit(
 @pytest.mark.parametrize("backend", ["cpu", "disk", "fsconnector"])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_lookup_20K_tokens(

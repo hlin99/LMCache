@@ -36,7 +36,7 @@ def is_cuda_worker(metadata: LMCacheMetadata) -> bool:
     Returns:
         True if the worker is not a scheduler and CUDA is available.
     """
-    return metadata.role != "scheduler" and torch.cuda.is_available()
+    return metadata.role != "scheduler" and torch.accelerator.is_available()
 
 
 def storage_plugin_launcher(
@@ -120,7 +120,7 @@ def CreateStorageBackends(
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     if is_cuda_worker(metadata):
-        dst_device = f"cuda:{torch.cuda.current_device()}"
+        dst_device = f"cuda:{torch.accelerator.current_device_index()}"
     elif dst_device == "xpu":
         dst_device = f"xpu:{torch.xpu.current_device()}"
     else:

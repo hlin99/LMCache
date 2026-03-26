@@ -41,7 +41,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 
 # Skip all tests in this module if CUDA is not available
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is not available"
+    not torch.accelerator.is_available(), reason="CUDA is not available"
 )
 
 
@@ -69,7 +69,7 @@ def make_layout() -> MemoryLayoutDesc:
 
 def should_use_lazy_alloc() -> bool:
     """Determine if lazy allocation should be used based on CUDA availability."""
-    return torch.cuda.is_available()
+    return torch.accelerator.is_available()
 
 
 def wait_for_condition(
@@ -343,13 +343,15 @@ class TestStoreControllerSingleAdapter:
 
         # Verify read lock is released: the key should be updatable
         ok = wait_for_condition(
-            lambda: l1_manager.reserve_write(
-                keys=keys,
-                is_temporary=[False],
-                layout_desc=layout,
-                mode="update",
-            )[keys[0]][1]
-            is not None,
+            lambda: (
+                l1_manager.reserve_write(
+                    keys=keys,
+                    is_temporary=[False],
+                    layout_desc=layout,
+                    mode="update",
+                )[keys[0]][1]
+                is not None
+            ),
             timeout=5.0,
         )
         assert ok, "Key should be updatable after store controller releases read lock"
@@ -414,13 +416,15 @@ class TestStoreControllerMultipleAdapters:
         assert ok
 
         ok = wait_for_condition(
-            lambda: l1_manager.reserve_write(
-                keys=keys,
-                is_temporary=[False],
-                layout_desc=layout,
-                mode="update",
-            )[keys[0]][1]
-            is not None,
+            lambda: (
+                l1_manager.reserve_write(
+                    keys=keys,
+                    is_temporary=[False],
+                    layout_desc=layout,
+                    mode="update",
+                )[keys[0]][1]
+                is not None
+            ),
             timeout=5.0,
         )
         assert ok, "Key should be updatable after all adapter stores complete"
@@ -534,13 +538,15 @@ class TestStoreControllerCustomPolicy:
 
         # After deletion, reserve_write with mode="new" should succeed
         ok = wait_for_condition(
-            lambda: l1_manager.reserve_write(
-                keys=keys,
-                is_temporary=[False],
-                layout_desc=layout,
-                mode="new",
-            )[keys[0]][1]
-            is not None,
+            lambda: (
+                l1_manager.reserve_write(
+                    keys=keys,
+                    is_temporary=[False],
+                    layout_desc=layout,
+                    mode="new",
+                )[keys[0]][1]
+                is not None
+            ),
             timeout=5.0,
         )
         assert ok, "Key should be re-creatable after L1 deletion by policy"

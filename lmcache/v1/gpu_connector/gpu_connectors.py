@@ -24,7 +24,7 @@ from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 
-if torch.cuda.is_available():
+if torch.accelerator.is_available():
     # First Party
     import lmcache.c_ops as lmc_ops
 
@@ -180,8 +180,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
 
-        self.store_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.Stream()
+        self.load_stream = torch.Stream()
 
     @classmethod
     def from_metadata(
@@ -334,7 +334,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
-        with torch.cuda.stream(self.store_stream):
+        with self.store_stream:
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
@@ -373,7 +373,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.cuda.stream(self.load_stream):
+        with self.load_stream:
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
@@ -408,8 +408,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
         self.group_tmp_buffer: Optional[list[torch.Tensor]] = None
 
-        self.store_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.Stream()
+        self.load_stream = torch.Stream()
 
     @classmethod
     def from_metadata(
@@ -508,7 +508,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
-        with torch.cuda.stream(self.store_stream):
+        with self.store_stream:
             if not self.use_gpu or end - start != self.chunk_size:
                 for i, kv_cache_pointer in enumerate(
                     self.group_kv_cache_pointers_on_gpu
@@ -556,7 +556,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.cuda.stream(self.load_stream):
+        with self.load_stream:
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
@@ -595,8 +595,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.dtype = kwargs["dtype"]
         self.device = kwargs["device"]
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.load_stream = torch.Stream()
+        self.store_stream = torch.Stream()
 
         self.buffer_mapping: dict[int, MemoryObj] = {}
 
@@ -760,7 +760,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert compute_gpu_buffer_obj.tensor is not None
         assert load_gpu_buffer_obj.tensor is not None
 
-        # current_stream = torch.cuda.current_stream()
+        # current_stream = torch.accelerator.current_stream()
 
         if self.cache_positions:
             old_positions_full = torch.zeros(
@@ -782,7 +782,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -811,7 +811,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 memory_objs_layer = yield
 
                 # memobj -> gpu_buffer
-                with torch.cuda.stream(self.load_stream):
+                with self.load_stream:
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -921,12 +921,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         )
         assert tmp_gpu_buffer_obj.tensor is not None
 
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.accelerator.current_stream()
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
+            with self.store_stream:
                 self.store_stream.wait_stream(current_stream)
                 lmc_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
@@ -996,8 +996,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # All sizes are in bytes
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.load_stream = torch.Stream()
+        self.store_stream = torch.Stream()
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
@@ -1133,7 +1133,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.accelerator.current_stream()
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
@@ -1143,7 +1143,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
-            with torch.cuda.stream(self.load_stream):
+            with self.load_stream:
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
@@ -1263,12 +1263,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.accelerator.current_stream()
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
+            with self.store_stream:
                 self.store_stream.wait_stream(current_stream)
                 if self.use_gpu:
                     lmc_ops.single_layer_kv_transfer(
@@ -1514,7 +1514,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT

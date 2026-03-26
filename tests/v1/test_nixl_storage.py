@@ -185,7 +185,7 @@ def run(config: LMCacheEngineConfig, shape, dtype):
 
 
 @pytest.mark.no_shared_allocator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="Requires CUDA")
 def test_nixl_gds_mt_cuda_backend():
     BASE_DIR = Path(__file__).parent
     config = LMCacheEngineConfig.from_file(BASE_DIR / "data/nixl.yaml")
@@ -216,7 +216,7 @@ def test_nixl_gds_mt_cpu_backend():
 
 
 @pytest.mark.no_shared_allocator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="Requires CUDA")
 def test_nixl_gds_cuda_backend():
     BASE_DIR = Path(__file__).parent
     config = LMCacheEngineConfig.from_file(BASE_DIR / "data/nixl.yaml")

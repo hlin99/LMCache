@@ -27,7 +27,7 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.metadata import LMCacheMetadata
 
-if torch.cuda.is_available():
+if torch.accelerator.is_available():
     try:
         # First Party
         import lmcache.c_ops as lmc_ops
@@ -97,7 +97,7 @@ def patch_pin_allocator():
 
     def fake_pin_close(self):
         if not self._unregistered:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             # torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
             self._unregistered = True
 
@@ -120,7 +120,7 @@ def patch_pin_allocator():
     ],  # vllm MLA
 )
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, gpu_kv_format):
@@ -241,7 +241,7 @@ def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, gpu_kv_format):
     ],  # vllm MLA
 )
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV3",
 )
 def test_vllm_paged_connector_v3_with_gpu_and_mla(use_gpu, num_groups, gpu_kv_format):
@@ -376,7 +376,7 @@ def test_vllm_paged_connector_v3_with_gpu_and_mla(use_gpu, num_groups, gpu_kv_fo
     ],
 )
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemLayerwiseGPUConnector",
 )
 def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, gpu_kv_format):
@@ -490,7 +490,7 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, gpu_kv_format):
 
 @pytest.mark.parametrize("use_gpu", [True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemLayerwiseGPUConnector",
 )
 def test_batched_layerwise_vllm_paged_connector_with_gpu(use_gpu):
@@ -657,7 +657,7 @@ def test_batched_layerwise_vllm_paged_connector_with_gpu(use_gpu):
 @pytest.mark.skip(reason="This test is skipped due to vllm dependency")
 @pytest.mark.parametrize("use_gpu", [True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMBufferLayerwiseGPUConnector",
 )
 def test_layerwise_vllm_buffer_connector_with_gpu(use_gpu):
@@ -757,7 +757,7 @@ def test_layerwise_vllm_buffer_connector_with_gpu(use_gpu):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_vllm_paged_connector_v2_to_gpu_bench(benchmark):
@@ -821,7 +821,7 @@ def test_vllm_paged_connector_v2_to_gpu_bench(benchmark):
 @pytest.mark.parametrize("use_gpu", [True, False])
 @pytest.mark.parametrize("use_mla", [True, False])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to SGLangGPUConnector",
 )
 def test_sglang_connector_with_gpu_and_mla(use_gpu, use_mla):

@@ -53,7 +53,7 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_same_retrieve_store(save_unfull_chunk, autorelease_v1):
@@ -138,7 +138,7 @@ def test_paged_same_retrieve_store(save_unfull_chunk, autorelease_v1):
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.parametrize("lmserver_v1_process", ["cpu"], indirect=True)
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_retrieve_prefix(
@@ -259,7 +259,7 @@ def test_paged_retrieve_prefix(
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.parametrize("lmserver_v1_process", ["cpu"], indirect=True)
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_store_offset(
@@ -370,7 +370,7 @@ def test_paged_store_offset(
 )
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_mixed_retrieve(chunk_size, backend, save_unfull_chunk, autorelease_v1):
@@ -519,7 +519,7 @@ def test_paged_mixed_retrieve(chunk_size, backend, save_unfull_chunk, autoreleas
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_store_kv_tensors_mask(save_unfull_chunk, autorelease_v1):
@@ -696,7 +696,7 @@ def test_paged_store_kv_tensors_mask(save_unfull_chunk, autorelease_v1):
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.parametrize("lmserver_v1_process", ["cpu"], indirect=True)
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_hierarchy_retrieve(
@@ -843,7 +843,7 @@ def test_paged_hierarchy_retrieve(
 )
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_prefetch_retrieve(
@@ -984,7 +984,7 @@ def test_paged_prefetch_retrieve(
 @pytest.mark.no_shared_allocator
 @pytest.mark.parametrize("lmserver_v1_process", ["cpu"], indirect=True)
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_mem_leak(
@@ -1079,7 +1079,7 @@ def test_paged_mem_leak(
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.no_shared_allocator
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_paged_retrieve_after_eviction(
@@ -1224,7 +1224,7 @@ def test_builder(autorelease_v1):
 
 @pytest.mark.no_shared_allocator
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_force_store_wait(autorelease_v1):
@@ -1294,7 +1294,7 @@ def test_force_store_wait(autorelease_v1):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_builder_destroy(autorelease_v1):
@@ -1346,7 +1346,7 @@ def test_builder_destroy(autorelease_v1):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
 )
 def test_builder_destroy_multiple_instances(autorelease_v1):
@@ -1404,7 +1404,7 @@ def test_builder_destroy_multiple_instances(autorelease_v1):
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    not torch.accelerator.is_available(),
     reason="Requires CUDA for test_multi_device_backends",
 )
 @pytest.mark.skipif(

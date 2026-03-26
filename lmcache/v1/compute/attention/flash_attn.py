@@ -34,7 +34,7 @@ class LMCFlashAttnBackend(AttentionInterface):
         # TODO(Jiayi): remove this hardcode
         self.aot_schedule = False
 
-        idx = torch.cuda.current_device()
+        idx = torch.accelerator.current_device_index()
         self.device = torch.device(f"cuda:{idx}")
 
     def forward_contiguous(

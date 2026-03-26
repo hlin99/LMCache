@@ -42,8 +42,8 @@ class MockConnector(RemoteConnector):
         return []
 
 
-# Mock the entire torch.cuda.Stream class
-@mock.patch("torch.cuda.Stream")
+# Mock the entire torch.Stream class
+@mock.patch("torch.Stream")
 def test_remote_mla_worker_id_as0(mock_stream):
     # Create configuration
     config = LMCacheEngineConfig(
