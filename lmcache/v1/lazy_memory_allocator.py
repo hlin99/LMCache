@@ -8,6 +8,7 @@ import threading
 import torch
 
 # First Party
+from lmcache.device_utils import get_accelerator, is_accelerator_available
 from lmcache.logging import init_logger
 from lmcache.v1.memory_management import (
     AddressManager,
@@ -42,7 +43,7 @@ def get_numa_id(numa_mapping: NUMAMapping) -> int:
     Raises:
         KeyError: If GPU id is not detected in the numa mapping.
     """
-    gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
+    gpu_id = get_accelerator().current_device() if is_accelerator_available() else 0
     return numa_mapping.gpu_to_numa_mapping[gpu_id]
 
 

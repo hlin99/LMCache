@@ -16,6 +16,11 @@ from sortedcontainers import SortedList
 import torch
 
 # First Party
+from lmcache.device_utils import (
+    get_accelerator,
+    get_device_name,
+    is_accelerator_available,
+)
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
@@ -392,8 +397,8 @@ def _resolve_pinned_alloc_free(
             (lmc_ops.free_shm_pinned_ptr, size, shm_name),
         )
     elif numa_mapping:
-        if torch.cuda.is_available():
-            current_device_id = torch.cuda.current_device()
+        if is_accelerator_available():
+            current_device_id = get_accelerator().current_device()
         else:
             current_device_id = 0
         gpu_to_numa_mapping = numa_mapping.gpu_to_numa_mapping
@@ -440,8 +445,8 @@ def _free_cpu_memory(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
 ) -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if is_accelerator_available():
+        get_accelerator().synchronize()
 
     _, free_info = _resolve_pinned_alloc_free(
         numa_mapping,
@@ -2189,8 +2194,8 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
     def close(self):
         if not self._unregistered:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if is_accelerator_available():
+                get_accelerator().synchronize()
             if self.buffer.numel() == 0:
                 return
             _free_cpu_memory(
@@ -2220,7 +2225,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         :param int size: The size of the GPU memory in bytes.
         :param Optional[int] align_bytes: The byte alignment for allocations.
         """
-        if not torch.cuda.is_available():
+        if not is_accelerator_available():
             device = "cpu"
 
         self.tensor = torch.empty(size, dtype=torch.uint8, device=device)
@@ -2304,7 +2309,7 @@ class AdHocMemoryAllocator(MemoryAllocatorInterface):
         """
         :param str device: The device of the ad hoc memory allocator.
         """
-        if not torch.cuda.is_available():
+        if not is_accelerator_available():
             self.device = "cpu"
         else:
             self.device = device
@@ -2393,8 +2398,8 @@ class CuFileMemoryAllocator(GPUMemoryAllocator):
         if device is None:
             # TODO(Serapheim): Ideally we'd get the device from the upper
             # layer - for now just use the current device.
-            if torch.cuda.is_available():
-                device = f"cuda:{torch.cuda.current_device()}"
+            if is_accelerator_available():
+                device = f"{get_device_name()}:{get_accelerator().current_device()}"
             else:
                 device = "cpu:0"
         super().__init__(size, device, align_bytes=4096)
