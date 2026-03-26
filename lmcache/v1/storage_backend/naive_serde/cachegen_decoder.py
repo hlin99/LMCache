@@ -69,11 +69,11 @@ class CacheGenDeserializer(Deserializer):
             buffer_memory_obj.byte_array
         )
 
-        encoder_output.max_tensors_key = (
-            encoder_output.max_tensors_key.to(get_device_name())
+        encoder_output.max_tensors_key = encoder_output.max_tensors_key.to(
+            get_device_name()
         )
-        encoder_output.max_tensors_value = (
-            encoder_output.max_tensors_value.to(get_device_name())
+        encoder_output.max_tensors_value = encoder_output.max_tensors_value.to(
+            get_device_name()
         )
 
         ntokens = encoder_output.max_tensors_key.shape[1]
