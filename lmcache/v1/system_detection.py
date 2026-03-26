@@ -17,6 +17,7 @@ if torch.cuda.is_available():
         get_gpu_pci_bus_id = None
 
 # First Party
+from lmcache.device_utils import get_accelerator
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 
@@ -98,7 +99,7 @@ class NUMADetector:
         """
 
         try:
-            device_index = torch.cuda.current_device()
+            device_index = get_accelerator().current_device()
             pci_bus_id = get_gpu_pci_bus_id(device_index).lower()
 
             numa_node_file = f"/sys/bus/pci/devices/{pci_bus_id}/numa_node"
