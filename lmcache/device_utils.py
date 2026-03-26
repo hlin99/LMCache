@@ -19,10 +19,10 @@ Initialization is lazy (happens on first call) and thread-safe.
 """
 
 # Standard
-import logging
-import threading
 from types import ModuleType
 from typing import Optional, Tuple
+import logging
+import threading
 
 # Third Party
 import torch

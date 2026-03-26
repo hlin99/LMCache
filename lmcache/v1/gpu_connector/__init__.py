@@ -3,6 +3,7 @@
 import torch
 
 # First Party
+from lmcache.device_utils import get_accelerator, get_device_name
 from lmcache.integration.vllm.utils import get_vllm_torch_dev
 from lmcache.utils import EngineType
 from lmcache.v1.config import LMCacheEngineConfig
@@ -36,8 +37,8 @@ def CreateGPUConnector(
         num_layer, _, chunk_size, num_kv_head, head_dim = metadata.kv_shape
         hidden_dim_size = num_kv_head * head_dim
         local_worker_id = metadata.local_worker_id
-        torch.cuda.device(local_worker_id)
-        device = torch.device(f"cuda:{local_worker_id}")
+        get_accelerator().device(local_worker_id)
+        device = torch.device(f"{get_device_name()}:{local_worker_id}")
         kv_dtype = metadata.kv_dtype
         if config.use_layerwise:
             return SGLangLayerwiseGPUConnector(

@@ -7,7 +7,7 @@ import abc
 import torch
 
 # First Party
-from lmcache.device_utils import get_accelerator, get_device_name, is_accelerator_available
+from lmcache.device_utils import get_accelerator
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate

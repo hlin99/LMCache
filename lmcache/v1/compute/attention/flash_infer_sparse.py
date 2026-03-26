@@ -18,6 +18,7 @@ import flashinfer
 import torch
 
 # First Party
+from lmcache.device_utils import get_accelerator, get_device_name
 from lmcache.v1.compute.attention.abstract import AttentionInterface
 from lmcache.v1.compute.attention.metadata import LMCFlashInferSparseMetadata
 
@@ -193,8 +194,8 @@ class LMCFlashInferSparseBackend(AttentionInterface):
         self.vllm_attn = vllm_attn
         self.vllm_attn_impl: FlashInferImpl = vllm_attn.impl
 
-        idx = torch.cuda.current_device()
-        self.device = torch.device(f"cuda:{idx}")
+        idx = get_accelerator().current_device()
+        self.device = torch.device(f"{get_device_name()}:{idx}")
 
         self.workspace_buffer = torch.empty(
             self._WORKSPACE_BUFFER_SIZE_BYTES, dtype=torch.uint8, device=self.device

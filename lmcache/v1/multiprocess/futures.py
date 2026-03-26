@@ -96,7 +96,11 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         self.raw_future_ = raw_future
         self.event_: torch.cuda.Event | None = None
         self.result_: T | None = None
-        self.device_ = device if device is not None else get_accelerator().current_device()
+        self.device_ = (
+            device
+            if device is not None
+            else get_accelerator().current_device()
+        )
 
     def _on_raw_future_complete(self):
         """
