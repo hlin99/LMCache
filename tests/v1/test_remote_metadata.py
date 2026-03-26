@@ -104,9 +104,7 @@ def test_pad_shape_to_4d():
 
 def test_strip_shape_padding():
     """Unit-test the stripping helper directly."""
-    assert RemoteMetadata._strip_shape_padding([2, 3, 4, 5]) == torch.Size(
-        [2, 3, 4, 5]
-    )
+    assert RemoteMetadata._strip_shape_padding([2, 3, 4, 5]) == torch.Size([2, 3, 4, 5])
     assert RemoteMetadata._strip_shape_padding([2, 256, 8192, 0]) == torch.Size(
         [2, 256, 8192]
     )

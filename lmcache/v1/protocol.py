@@ -122,9 +122,7 @@ class RemoteMetadata:
         Raises:
             AssertionError: If the shape has more than 4 dimensions.
         """
-        assert len(shape) <= 4, (
-            f"Shape dimension should be <= 4, got {len(shape)}"
-        )
+        assert len(shape) <= 4, f"Shape dimension should be <= 4, got {len(shape)}"
         padded = list(shape) + [0] * (4 - len(shape))
         return padded
 
@@ -234,9 +232,7 @@ class ClientMetaMessage:
         command, length, fmt, dtype, location, shape0, shape1, shape2, shape3, key = (
             struct.unpack(f"iiiiiiiii{MAX_KEY_LENGTH}s", s)
         )
-        shape = RemoteMetadata._strip_shape_padding(
-            [shape0, shape1, shape2, shape3]
-        )
+        shape = RemoteMetadata._strip_shape_padding([shape0, shape1, shape2, shape3])
         return ClientMetaMessage(
             ClientCommand(command),
             parse_cache_key(key.decode().strip()),
@@ -291,9 +287,7 @@ class ServerMetaMessage:
         code, length, fmt, dtype, shape0, shape1, shape2, shape3, location = (
             struct.unpack("iiiiiiiii", s)
         )
-        shape = RemoteMetadata._strip_shape_padding(
-            [shape0, shape1, shape2, shape3]
-        )
+        shape = RemoteMetadata._strip_shape_padding([shape0, shape1, shape2, shape3])
         return ServerMetaMessage(
             ServerReturnCode(code),
             length,
