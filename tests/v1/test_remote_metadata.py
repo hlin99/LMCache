@@ -4,6 +4,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.protocol import (
     ClientCommand,
@@ -16,9 +17,6 @@ from lmcache.v1.protocol import (
     get_remote_metadata_bytes,
     init_remote_metadata_info,
 )
-
-# First Party
-from lmcache.utils import CacheEngineKey
 
 
 @pytest.mark.parametrize("num_groups", [1, 2, 3])

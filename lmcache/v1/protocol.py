@@ -16,14 +16,14 @@ from lmcache.v1.memory_management import MemoryFormat
 logger = init_logger(__name__)
 
 
-def _pad_shape_to_4d(shape: torch.Size) -> tuple:
+def _pad_shape_to_4d(shape: torch.Size) -> tuple[int, int, int, int]:
     """Pad a shape to 4D by appending zeros for missing dimensions.
 
     The wire protocol always transmits exactly 4 dimension values.
     Shapes with fewer than 4 dimensions are right-padded with 0.
 
     Args:
-        shape: The original tensor shape (1-D to 4-D).
+        shape: The original tensor shape (0-D to 4-D).
 
     Returns:
         A 4-element tuple suitable for struct packing.
