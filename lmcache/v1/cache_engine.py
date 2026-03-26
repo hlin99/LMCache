@@ -28,6 +28,7 @@ import time
 import torch
 
 # First Party
+from lmcache.device_utils import get_accelerator
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
@@ -118,7 +119,7 @@ class LMCacheEngine:
             self.broadcast_stream = (
                 self.gpu_connector.load_stream
                 if hasattr(self.gpu_connector, "load_stream")
-                else torch.cuda.Stream()
+                else get_accelerator().Stream()
             )
 
         self.enable_controller = config.enable_controller
@@ -829,7 +830,7 @@ class LMCacheEngine:
 
         if self.save_only_first_rank:
             with retrieve_stats.profile_broadcast():
-                with torch.cuda.stream(self.broadcast_stream):
+                with get_accelerator().stream(self.broadcast_stream):
                     self._broadcast_or_receive_memory_objs(
                         reordered_chunks,
                         ret_mask,
@@ -1750,7 +1751,7 @@ class LMCacheEngine:
 
                 # Create tensor and receive data
                 metadata = MemoryObjMetadata.from_dict(metadata_dict)
-                local_rank = self.metadata.worker_id % torch.cuda.device_count()
+                local_rank = self.metadata.worker_id % get_accelerator().device_count()
                 raw_tensor = torch.empty(
                     torch.Size([metadata.get_size()]),
                     dtype=torch.uint8,
@@ -1883,7 +1884,7 @@ class LMCacheEngineBuilder:
                 )
             else:
                 logger.info(f"Setting cuda device to {corrected_device} ")
-                torch.cuda.set_device(corrected_device)
+                get_accelerator().set_device(corrected_device)
 
             return PagedTensorMemoryAllocator(
                 buffer,

@@ -9,6 +9,11 @@ import importlib  # Added for dynamic import
 import torch
 
 # First Party
+from lmcache.device_utils import (
+    get_accelerator,
+    get_device_name,
+    is_accelerator_available,
+)
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
@@ -36,7 +41,7 @@ def is_cuda_worker(metadata: LMCacheMetadata) -> bool:
     Returns:
         True if the worker is not a scheduler and CUDA is available.
     """
-    return metadata.role != "scheduler" and torch.cuda.is_available()
+    return metadata.role != "scheduler" and is_accelerator_available()
 
 
 def storage_plugin_launcher(
@@ -120,7 +125,7 @@ def CreateStorageBackends(
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     if is_cuda_worker(metadata):
-        dst_device = f"cuda:{torch.cuda.current_device()}"
+        dst_device = f"{get_device_name()}:{get_accelerator().current_device()}"
     elif dst_device == "xpu":
         dst_device = f"xpu:{torch.xpu.current_device()}"
     else:

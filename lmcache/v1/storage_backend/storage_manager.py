@@ -23,6 +23,7 @@ import threading
 import torch
 
 # First Party
+from lmcache.device_utils import get_accelerator
 from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
@@ -107,7 +108,7 @@ def allocate_and_copy_objects(
             memory_obj.ref_count_down()
             break
 
-        with torch.cuda.stream(stream):
+        with get_accelerator().stream(stream):
             memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
         allocated_objects.append(memory_obj)
 
@@ -268,7 +269,7 @@ class StorageManager:
 
         # The cuda stream for internal copies during put
         if is_cuda_worker(metadata):
-            self.internal_copy_stream = torch.cuda.Stream()
+            self.internal_copy_stream = get_accelerator().Stream()
         else:
             self.internal_copy_stream = None
 
