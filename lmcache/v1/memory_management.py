@@ -1389,7 +1389,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             return None
         addresses = [addr for addr, _ in alloc_results]
         raw_datas = [
-            self._get_buffer_slice(addr, unit_aligned_size) for addr in addresses
+            self._get_buffer_slice(addr, unit_raw_size) for addr in addresses
         ]
 
         # For debug
