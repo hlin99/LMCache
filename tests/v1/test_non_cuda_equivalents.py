@@ -1727,6 +1727,10 @@ SCENARIO_REGISTRY = {
     "get_gpu_pci_bus_id": scenario_get_gpu_pci_bus_id,
 }
 
+# Scenarios whose results are hardware-environment-dependent and should not be
+# compared numerically across backends (e.g. hardware info queries).
+_SKIP_CROSS_BACKEND_COMPARE: set[str] = {"get_gpu_pci_bus_id"}
+
 
 # ==========================================
 # 4. Test functions pytest sees
@@ -1785,6 +1789,11 @@ class TestScenarios:
 
         if len(backend_results) < 2:
             # Only one backend available (no CUDA); just verify results exist
+            return
+
+        if name in _SKIP_CROSS_BACKEND_COMPARE:
+            # Hardware-info queries return environment-dependent values;
+            # cross-backend numerical comparison is not meaningful.
             return
 
         # Collect all result keys across all backends for this scenario

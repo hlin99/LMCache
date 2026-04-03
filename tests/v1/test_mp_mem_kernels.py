@@ -43,23 +43,28 @@ def _create_zero_tensor(
 
 
 # Format enum values from c_ops
-FMT_NORMAL = lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
-FMT_CROSS_LAYER = lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS
-FMT_FLASH_INFER = lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS
-FMT_MLA = lmc_ops.GPUKVFormat.NL_X_NB_BS_HS
-FMT_SGLANG_MHA = lmc_ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS
-FMT_SGLANG_MLA = lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS
+if lmc_ops is not None:
+    FMT_NORMAL = lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
+    FMT_CROSS_LAYER = lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS
+    FMT_FLASH_INFER = lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS
+    FMT_MLA = lmc_ops.GPUKVFormat.NL_X_NB_BS_HS
+    FMT_SGLANG_MHA = lmc_ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS
+    FMT_SGLANG_MLA = lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS
 
-# Format parameters: (gpu_kv_format, num_layers, num_heads, head_size, is_mla)
-# Use small layer counts to keep GPU memory usage low in CI
-FORMAT_PARAMS = [
-    (FMT_NORMAL, 4, 8, 128, False),
-    (FMT_CROSS_LAYER, 4, 8, 128, False),
-    (FMT_FLASH_INFER, 4, 8, 128, False),
-    (FMT_MLA, 4, 1, 576, True),
-    (FMT_SGLANG_MHA, 4, 8, 128, False),
-    (FMT_SGLANG_MLA, 4, 1, 576, True),
-]
+    # Format parameters: (gpu_kv_format, num_layers, num_heads, head_size, is_mla)
+    # Use small layer counts to keep GPU memory usage low in CI
+    FORMAT_PARAMS = [
+        (FMT_NORMAL, 4, 8, 128, False),
+        (FMT_CROSS_LAYER, 4, 8, 128, False),
+        (FMT_FLASH_INFER, 4, 8, 128, False),
+        (FMT_MLA, 4, 1, 576, True),
+        (FMT_SGLANG_MHA, 4, 8, 128, False),
+        (FMT_SGLANG_MLA, 4, 1, 576, True),
+    ]
+else:
+    FMT_NORMAL = FMT_CROSS_LAYER = FMT_FLASH_INFER = None
+    FMT_MLA = FMT_SGLANG_MHA = FMT_SGLANG_MLA = None
+    FORMAT_PARAMS = None
 
 
 def create_vllm_tensors(
