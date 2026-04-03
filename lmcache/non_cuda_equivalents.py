@@ -76,8 +76,8 @@ def _tensor_from_ptr(
         A tensor that shares memory with the original pointer.
         For CPU: always zero-copy via ctypes + torch.frombuffer.
         For CUDA: zero-copy via torch._C._construct_storage_from_data_pointer
-                  (PyTorch >= 2.0) or __cuda_array_interface__, with a
-                  cudaMemcpy D2D fallback.
+                  (PyTorch >= 2.0) or __cuda_array_interface__; raises
+                  RuntimeError if neither strategy succeeds.
 
     Raises:
         ValueError: if ptr is 0.
@@ -193,33 +193,35 @@ def _tensor_from_cuda_ptr(
     except Exception:
         pass
 
-    # Strategy 2: cudaMemcpy Device-to-Device (Fallback)
-    libcudart = _get_copy_lib()
-    if libcudart is None:
-        raise RuntimeError("Failed to load libcudart/libamdhip")
+    # Strategy 2: torch.UntypedStorage from data pointer (PyTorch >= 2.0)
+    # This is a true zero-copy view backed by the original pointer.
+    try:
+        storage = torch.cuda.UntypedStorage.from_data_pointer(  # type: ignore[attr-defined]
+            ptr, device, total_bytes
+        )
+        # Create a scalar-typed tensor, repoint its storage to the shared
+        # UntypedStorage obtained above, then reshape to the target dimensions.
+        t = torch.empty([], dtype=dtype, device=device).set_(storage).view(*shape)
+        return t
+    except Exception as e:
+        # from_data_pointer may not be available on older PyTorch versions;
+        # fall through to the final RuntimeError below rather than silently
+        # swallowing the failure.
+        _strategy2_err = e
 
-    cudaMemcpy = libcudart.cudaMemcpy
-    cudaMemcpy.restype = ctypes.c_int
-    cudaMemcpy.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-    ]
-    _MEMCPY_D2D = 3
-
-    dst = torch.empty(numel, dtype=dtype, device=device)
-
-    err = cudaMemcpy(
-        ctypes.c_void_p(dst.data_ptr()),
-        ctypes.c_void_p(ptr),
-        ctypes.c_size_t(total_bytes),
-        ctypes.c_int(_MEMCPY_D2D),
+    # Strategy 3: Last resort — raise a clear error.
+    # The cudaMemcpy D2D fallback was intentionally removed because it creates
+    # a disconnected copy of the data, which silently breaks in-place writes
+    # (e.g., index_copy_ used in H2D transfers would write to the copy and
+    # leave the original GPU paged buffer unchanged).
+    raise RuntimeError(
+        "_tensor_from_cuda_ptr: cannot create a zero-copy view of the given "
+        "CUDA pointer. The cudaMemcpy D2D fallback was removed because it "
+        "creates a disconnected copy that silently breaks in-place writes "
+        f"(e.g., index_copy_). Strategy 2 (UntypedStorage) failed with: "
+        f"{_strategy2_err}. Please ensure PyTorch >= 2.0 is installed or "
+        "that __cuda_array_interface__ works for this dtype."
     )
-    if err != 0:
-        raise RuntimeError(f"cudaMemcpy D2D failed with error code {err}.")
-
-    return dst.view(*shape)
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
