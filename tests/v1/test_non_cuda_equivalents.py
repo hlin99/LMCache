@@ -111,6 +111,9 @@ def backend(request: pytest.FixtureRequest) -> Any:
 
 def scenario_get_gpu_pci_bus_id(ops: Any, device: str) -> dict[str, torch.Tensor]:
     """Test get_gpu_pci_bus_id returns a valid string on CUDA backends."""
+    if not torch.cuda.is_available():
+        pytest.skip("get_gpu_pci_bus_id requires CUDA to be available")
+
     res = ops.get_gpu_pci_bus_id(0)
 
     is_valid = isinstance(res, str) and len(res) > 0
