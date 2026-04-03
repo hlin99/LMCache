@@ -75,12 +75,11 @@ def _tensor_from_ptr(
     Returns:
         A tensor that shares memory with the original pointer.
         For CPU: always zero-copy via ctypes + torch.frombuffer.
-        For CUDA: zero-copy via torch._C._construct_storage_from_data_pointer
-                  (PyTorch >= 2.0) or __cuda_array_interface__, with a
-                  cudaMemcpy D2D fallback.
+        For CUDA: zero-copy via __cuda_array_interface__.
 
     Raises:
         ValueError: if ptr is 0.
+        RuntimeError: if zero-copy view cannot be created for CUDA pointer.
 
     Warning:
         The caller is responsible for keeping the underlying memory alive
@@ -190,36 +189,17 @@ def _tensor_from_cuda_ptr(
             t = t.view(torch.bfloat16)
 
         return t.view(*shape)
-    except Exception:
-        pass
-
-    # Strategy 2: cudaMemcpy Device-to-Device (Fallback)
-    libcudart = _get_copy_lib()
-    if libcudart is None:
-        raise RuntimeError("Failed to load libcudart/libamdhip")
-
-    cudaMemcpy = libcudart.cudaMemcpy
-    cudaMemcpy.restype = ctypes.c_int
-    cudaMemcpy.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-    ]
-    _MEMCPY_D2D = 3
-
-    dst = torch.empty(numel, dtype=dtype, device=device)
-
-    err = cudaMemcpy(
-        ctypes.c_void_p(dst.data_ptr()),
-        ctypes.c_void_p(ptr),
-        ctypes.c_size_t(total_bytes),
-        ctypes.c_int(_MEMCPY_D2D),
-    )
-    if err != 0:
-        raise RuntimeError(f"cudaMemcpy D2D failed with error code {err}.")
-
-    return dst.view(*shape)
+    except Exception as e:
+        # Strategy 2 would create a copy via cudaMemcpy D2D, but that violates
+        # the zero-copy contract promised in the docstring. Callers like
+        # multi_layer_kv_transfer use index_copy_ on the returned tensor for
+        # H2D transfers, expecting mutations to propagate to the original memory.
+        # A copy breaks this expectation, causing silent data corruption.
+        raise RuntimeError(
+            f"Failed to create zero-copy CUDA tensor view from pointer {ptr:#x}. "
+            f"__cuda_array_interface__ method failed: {e}. "
+            "Cannot provide a zero-copy view as required by this function's contract."
+        ) from e
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
