@@ -57,10 +57,7 @@ def _get_backend() -> Any:
             return module
         except ImportError as e:
             logger.warning("Failed to import backend %s: %s", module_name, e)
-            logger.warning("Fallback to python backend lmcache.non_cuda_equivalents")
-            module = importlib.import_module("lmcache.non_cuda_equivalents")
-            logger.info("Using backend: lmcache.non_cuda_equivalents")
-            return module
+            continue
     raise ImportError("No backend could be imported for lmcache.")
 
 
