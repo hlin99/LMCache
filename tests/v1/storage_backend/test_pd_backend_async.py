@@ -37,7 +37,11 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    PagedCpuGpuMemoryAllocator,
+)
 from lmcache.v1.storage_backend.pd_backend import AllocRequest, AllocResponse, PDBackend
 
 # ---------------------------------------------------------------------------
@@ -106,17 +110,15 @@ def async_sender(tmp_path):
     # Third Party
     import msgspec
 
-    # Build mock allocator first so initialize_allocator can return it directly,
-    # bypassing the isinstance(allocator, PagedCpuGpuMemoryAllocator) assert.
+    # Use spec= so isinstance(mock, PagedCpuGpuMemoryAllocator) returns True.
     mock_allocator_inst = MagicMock()
     mock_allocator_inst.cpu_allocator.buffer_ptr = 0
     mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
     mock_allocator_inst.cpu_allocator.align_bytes = 1
+    # Make isinstance(mock, PagedCpuGpuMemoryAllocator) return True
+    mock_allocator_inst.__class__ = PagedCpuGpuMemoryAllocator
 
     with (
-        patch(
-            "lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator"
-        ) as mock_alloc_cls,
         patch("lmcache.v1.storage_backend.pd_backend.get_zmq_context") as mock_zmq_ctx,
         patch("lmcache.v1.storage_backend.pd_backend.get_zmq_socket") as mock_zmq_sock,
         patch(
@@ -126,12 +128,7 @@ def async_sender(tmp_path):
             "lmcache.v1.storage_backend.pd_backend.get_correct_device",
             return_value="cpu",
         ),
-        patch.object(
-            PDBackend, "initialize_allocator", return_value=mock_allocator_inst
-        ),
     ):
-        mock_alloc_cls.return_value = mock_allocator_inst
-
         # --- zmq context stub ---
         mock_zmq_ctx.return_value = MagicMock()
 
@@ -200,17 +197,15 @@ def async_receiver(tmp_path):
     The ZMQ server socket is mocked so no real port is bound.
     The memory allocator is mocked so we control when allocate() returns None.
     """
-    # Build mock allocator first so initialize_allocator can return it directly,
-    # bypassing the isinstance(allocator, PagedCpuGpuMemoryAllocator) assert.
+    # Use spec= so isinstance(mock, PagedCpuGpuMemoryAllocator) returns True.
     mock_allocator_inst = MagicMock()
     mock_allocator_inst.cpu_allocator.buffer_ptr = 0
     mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
     mock_allocator_inst.cpu_allocator.align_bytes = 1
+    # Make isinstance(mock, PagedCpuGpuMemoryAllocator) return True
+    mock_allocator_inst.__class__ = PagedCpuGpuMemoryAllocator
 
     with (
-        patch(
-            "lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator"
-        ) as mock_alloc_cls,
         patch("lmcache.v1.storage_backend.pd_backend.get_zmq_context") as mock_zmq_ctx,
         patch("lmcache.v1.storage_backend.pd_backend.get_zmq_socket") as mock_zmq_sock,
         patch(
@@ -220,12 +215,7 @@ def async_receiver(tmp_path):
             "lmcache.v1.storage_backend.pd_backend.get_correct_device",
             return_value="cpu",
         ),
-        patch.object(
-            PDBackend, "initialize_allocator", return_value=mock_allocator_inst
-        ),
     ):
-        mock_alloc_cls.return_value = mock_allocator_inst
-
         mock_zmq_ctx.return_value = MagicMock()
         mock_zmq_sock.return_value = MagicMock()
         mock_create_tc.return_value = MagicMock()
