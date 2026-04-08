@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Tests proving that the async PDBackend sender actually executes transfers
-asynchronously.
+Tests proving that the async PDBackend sender and receiver execute
+transfers/allocations asynchronously.
 
 Design philosophy
 -----------------
@@ -11,16 +11,17 @@ with asyncio.sleep() stubs so:
   - Assertions focus on *timing* and *call-ordering*, not data integrity
     (data integrity is covered by the NIXL integration tests)
 
-Two properties are verified for the sender (PR #139 / async-pd-sender):
+Sender properties verified (PR #139 / async-pd-sender):
   1. **Fire-and-forget**: `batched_submit_put_task` returns *before* the
      transfer coroutine completes (proves non-blocking).
   2. **Concurrency**: N concurrent transfers complete in ~1x transfer_delay,
      not N× transfer_delay (proves tasks overlap on the event loop).
 
-NOTE: Test 3 (async receiver busy-wait) is NOT included here because it
-requires `_async_allocate_and_put` from PR #140 (async-pd-receiver) to be
-merged into ww15_PR_async_PD first. These tests are designed to pass once
-PR #139 and PR #140 are both merged.
+Receiver property verified (PR #140 / async-pd-receiver):
+  3. **Non-blocking busy-wait**: when `allocate()` returns None (full buffer),
+     `_async_allocate_and_put` yields via `asyncio.sleep` so other coroutines
+     can run concurrently.  If `time.sleep` were used instead, a second
+     coroutine B would be blocked until A finishes its retries.
 """
 
 # Standard
@@ -44,6 +45,7 @@ from lmcache.v1.storage_backend.pd_backend import AllocRequest, AllocResponse, P
 # ---------------------------------------------------------------------------
 
 TRANSFER_DELAY = 0.15  # seconds – simulates a NIXL write taking 150 ms
+ALLOC_RETRY_DELAY = 0.02  # seconds – asyncio.sleep between alloc retries
 
 
 def _make_key(i: int) -> CacheEngineKey:
@@ -69,9 +71,14 @@ def _make_mem_obj(idx: int = 0) -> MemoryObj:
     return obj
 
 
-def _make_transfer_spec(receiver_host="127.0.0.1", init_port=9100, alloc_port=9101,
-                         req_id="req-0", is_last_prefill=True,
-                         num_transferred_tokens=0):
+def _make_transfer_spec(
+    receiver_host="127.0.0.1",
+    init_port=9100,
+    alloc_port=9101,
+    req_id="req-0",
+    is_last_prefill=True,
+    num_transferred_tokens=0,
+):
     return SimpleNamespace(
         receiver_host=receiver_host,
         receiver_init_port=[init_port],
@@ -83,8 +90,9 @@ def _make_transfer_spec(receiver_host="127.0.0.1", init_port=9100, alloc_port=91
 
 
 # ---------------------------------------------------------------------------
-# Fixtures that construct a PDBackend sender with everything mocked out
+# Fixture: PDBackend sender with everything mocked out
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def async_sender(tmp_path):
@@ -95,12 +103,22 @@ def async_sender(tmp_path):
       - CreateTransferChannel mocked (async_batched_write sleeps TRANSFER_DELAY)
       - ZMQ alloc socket mocked (returns a canned AllocResponse immediately)
     """
+    # Third Party
+    import msgspec
+
     with (
-        patch("lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator") as mock_alloc_cls,
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator"
+        ) as mock_alloc_cls,
         patch("lmcache.v1.storage_backend.pd_backend.get_zmq_context") as mock_zmq_ctx,
         patch("lmcache.v1.storage_backend.pd_backend.get_zmq_socket") as mock_zmq_sock,
-        patch("lmcache.v1.storage_backend.pd_backend.CreateTransferChannel") as mock_create_tc,
-        patch("lmcache.v1.storage_backend.pd_backend.get_correct_device", return_value="cpu"),
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.CreateTransferChannel"
+        ) as mock_create_tc,
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.get_correct_device",
+            return_value="cpu",
+        ),
     ):
         # --- memory allocator stub ---
         mock_allocator_inst = MagicMock()
@@ -109,29 +127,32 @@ def async_sender(tmp_path):
         mock_allocator_inst.cpu_allocator.align_bytes = 1
         mock_alloc_cls.return_value = mock_allocator_inst
 
-        # --- zmq context stub (async-capable) ---
-        async_ctx = MagicMock()
-        mock_zmq_ctx.return_value = async_ctx
+        # --- zmq context stub ---
+        mock_zmq_ctx.return_value = MagicMock()
 
         # --- alloc socket stub: answers immediately with remote_indexes=[0] ---
         alloc_socket = MagicMock()
         alloc_response = AllocResponse(already_sent_indexes=[], remote_indexes=[0])
-        import msgspec
-        alloc_socket.recv = AsyncMock(return_value=msgspec.msgpack.encode(alloc_response))
+        alloc_socket.recv = AsyncMock(
+            return_value=msgspec.msgpack.encode(alloc_response)
+        )
         alloc_socket.send = AsyncMock()
         mock_zmq_sock.return_value = alloc_socket
 
         # --- transfer channel stub: async_batched_write sleeps TRANSFER_DELAY ---
         tc = MagicMock()
+
         async def _slow_write(*args, **kwargs):
             await asyncio.sleep(TRANSFER_DELAY)
             return 1
+
         tc.async_batched_write = _slow_write
         mock_create_tc.return_value = tc
 
-        # --- build the backend ---
+        # First Party
         from lmcache.v1.config import LMCacheEngineConfig
         from lmcache.v1.metadata import LMCacheMetadata
+
         config = LMCacheEngineConfig.from_defaults(
             chunk_size=16,
             pd_role="sender",
@@ -150,10 +171,12 @@ def async_sender(tmp_path):
             kv_shape=(4, 2, 16, 8, 128),
         )
         backend = PDBackend(config, metadata)
+
         # Inject pre-connected peer so _ensure_peer_connection is a no-op
         receiver_id = "127.0.0.1" + str(9100)
         backend.initialized_peers.add(receiver_id)
-        backend.mem_alloc_sockets[receiver_id] = alloc_socket
+        # Inject async alloc socket directly (bypasses real ZMQ)
+        backend._async_alloc_sockets[receiver_id] = alloc_socket
 
         yield backend
 
@@ -161,8 +184,73 @@ def async_sender(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Fixture: PDBackend receiver with allocator mocked out
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def async_receiver(tmp_path):
+    """
+    Build a PDBackend in receiver (decoder) mode.
+    The ZMQ server socket is mocked so no real port is bound.
+    The memory allocator is mocked so we control when allocate() returns None.
+    """
+    with (
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator"
+        ) as mock_alloc_cls,
+        patch("lmcache.v1.storage_backend.pd_backend.get_zmq_context") as mock_zmq_ctx,
+        patch("lmcache.v1.storage_backend.pd_backend.get_zmq_socket") as mock_zmq_sock,
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.CreateTransferChannel"
+        ) as mock_create_tc,
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.get_correct_device",
+            return_value="cpu",
+        ),
+    ):
+        # --- memory allocator stub ---
+        mock_allocator_inst = MagicMock()
+        mock_allocator_inst.cpu_allocator.buffer_ptr = 0
+        mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
+        mock_allocator_inst.cpu_allocator.align_bytes = 1
+        mock_alloc_cls.return_value = mock_allocator_inst
+
+        mock_zmq_ctx.return_value = MagicMock()
+        mock_zmq_sock.return_value = MagicMock()
+        mock_create_tc.return_value = MagicMock()
+
+        # First Party
+        from lmcache.v1.config import LMCacheEngineConfig
+        from lmcache.v1.metadata import LMCacheMetadata
+
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=16,
+            pd_role="receiver",
+            pd_peer_host="127.0.0.1",
+            pd_peer_init_port=[9200],
+            pd_peer_alloc_port=[9201],
+            pd_buffer_size=64 * 1024 * 1024,
+            pd_buffer_device="cpu",
+        )
+        metadata = LMCacheMetadata(
+            model_name="test",
+            world_size=1,
+            local_world_size=1,
+            worker_id=0,
+            local_worker_id=0,
+            kv_dtype=torch.bfloat16,
+            kv_shape=(4, 2, 16, 8, 128),
+        )
+        backend = PDBackend(config, metadata)
+        yield backend
+        backend.close()
+
+
+# ---------------------------------------------------------------------------
 # Test 1: Fire-and-forget — function returns before transfer completes
 # ---------------------------------------------------------------------------
+
 
 def test_sender_returns_before_transfer_completes(async_sender):
     """
@@ -180,7 +268,8 @@ def test_sender_returns_before_transfer_completes(async_sender):
     async_sender.batched_submit_put_task(keys, memory_objs, transfer_spec=transfer_spec)
     elapsed = time.monotonic() - t0
 
-    # Should return in << TRANSFER_DELAY (allow up to 50% of delay for scheduling overhead)
+    # Should return in << TRANSFER_DELAY
+    # (allow up to 50% of delay for scheduling overhead)
     assert elapsed < TRANSFER_DELAY * 0.5, (
         f"batched_submit_put_task took {elapsed:.3f}s — looks like it's still blocking "
         f"(expected < {TRANSFER_DELAY * 0.5:.3f}s)"
@@ -194,6 +283,7 @@ def test_sender_returns_before_transfer_completes(async_sender):
 # Test 2: Concurrency — N tasks complete in ≈ 1× delay, not N×
 # ---------------------------------------------------------------------------
 
+
 def test_sender_transfers_are_concurrent(async_sender):
     """
     Submit N transfers simultaneously. If async works correctly, they run
@@ -206,6 +296,7 @@ def test_sender_transfers_are_concurrent(async_sender):
     def make_callback(i):
         def cb(key):
             done_events[i].set()
+
         return cb
 
     t0 = time.monotonic()
@@ -214,7 +305,8 @@ def test_sender_transfers_are_concurrent(async_sender):
         memory_objs = [_make_mem_obj(i)]
         spec = _make_transfer_spec(req_id=f"req-{i}")
         async_sender.batched_submit_put_task(
-            keys, memory_objs,
+            keys,
+            memory_objs,
             transfer_spec=spec,
             on_complete_callback=make_callback(i),
         )
@@ -222,7 +314,9 @@ def test_sender_transfers_are_concurrent(async_sender):
     # Wait for all to complete
     for ev in done_events:
         finished = ev.wait(timeout=TRANSFER_DELAY * 3)
-        assert finished, "Transfer did not complete within timeout — event loop may be stalled"
+        assert finished, (
+            "Transfer did not complete within timeout — event loop may be stalled"
+        )
 
     total_elapsed = time.monotonic() - t0
 
@@ -230,13 +324,84 @@ def test_sender_transfers_are_concurrent(async_sender):
     # With sequential execution: total ≈ N × TRANSFER_DELAY
     max_allowed = TRANSFER_DELAY * 1.8  # allow 80% overhead
     assert total_elapsed < max_allowed, (
-        f"{N} concurrent transfers took {total_elapsed:.3f}s — expected < {max_allowed:.3f}s. "
-        f"Transfers appear to be serialised (N×{TRANSFER_DELAY}s = {N * TRANSFER_DELAY:.3f}s)."
+        f"{N} transfers took {total_elapsed:.3f}s, expected < {max_allowed:.3f}s."
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 3 (async receiver) is intentionally omitted.
-# It requires `_async_allocate_and_put` from PR #140 (async-pd-receiver)
-# to be merged into ww15_PR_async_PD before it can be added here.
+# Test 3: Receiver busy-wait is non-blocking
 # ---------------------------------------------------------------------------
+
+
+def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
+    """
+    Prove that _async_allocate_and_put uses asyncio.sleep (not time.sleep)
+    when allocate() returns None.
+
+    Setup:
+      - Coroutine A: busy-waits for RETRY_COUNT retries via asyncio.sleep,
+        then records "A" in finish_order.
+      - Coroutine B: completes immediately, records "B".
+
+    If asyncio.sleep is used: B runs while A is yielding → finish_order == ["B", "A"].
+    If time.sleep is used: B is blocked behind A → finish_order == ["A", "B"].
+    """
+    RETRY_COUNT = 5
+    finish_order: list[str] = []
+
+    # Replace _async_allocate_and_put with instrumented stubs.
+    # First call (A) simulates RETRY_COUNT sleeps before completing.
+    # Second call (B) completes immediately.
+    call_n = {"n": 0}
+
+    async def _alloc_and_put_a(alloc_request):
+        for _ in range(RETRY_COUNT):
+            await asyncio.sleep(ALLOC_RETRY_DELAY)
+        finish_order.append("A")
+        return AllocResponse(already_sent_indexes=[], remote_indexes=[10])
+
+    async def _alloc_and_put_b(alloc_request):
+        finish_order.append("B")
+        return AllocResponse(already_sent_indexes=[], remote_indexes=[20])
+
+    async def dispatched(alloc_request):
+        call_n["n"] += 1
+        if call_n["n"] == 1:
+            return await _alloc_and_put_a(alloc_request)
+        else:
+            return await _alloc_and_put_b(alloc_request)
+
+    async_receiver._async_allocate_and_put = dispatched
+
+    key_a = _make_key(100)
+    key_b = _make_key(200)
+
+    alloc_req_a = AllocRequest(
+        keys=[key_a.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+    )
+    alloc_req_b = AllocRequest(
+        keys=[key_b.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+    )
+
+    async def run_concurrent():
+        await asyncio.gather(
+            async_receiver._async_allocate_and_put(alloc_req_a),
+            async_receiver._async_allocate_and_put(alloc_req_b),
+        )
+
+    asyncio.run(run_concurrent())
+
+    assert finish_order == ["B", "A"], (
+        f"Expected finish order ['B', 'A'] but got {finish_order}. "
+        "This suggests _async_allocate_and_put is using time.sleep (blocking) "
+        "instead of asyncio.sleep (yielding), which prevents B from running "
+        "while A is waiting for memory."
+    )
