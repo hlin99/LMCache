@@ -482,7 +482,10 @@ class PDBackend(AllocatorBackendInterface):
             ):
                 notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
                 notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
-                self.proxy_side_channel.send(notif_msg_bytes)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self.proxy_side_channel.send, notif_msg_bytes
+                )
         except Exception as e:
             logger.error("Async transfer task failed: %s", str(e))
             # Release ref counts on error to avoid leaks (only those not yet released)
