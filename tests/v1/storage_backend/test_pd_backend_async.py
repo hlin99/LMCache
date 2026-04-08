@@ -32,6 +32,7 @@ import threading
 import time
 
 # Third Party
+import msgspec
 import pytest
 import torch
 
@@ -42,7 +43,7 @@ from lmcache.v1.memory_management import (
     MemoryObj,
     PagedCpuGpuMemoryAllocator,
 )
-from lmcache.v1.storage_backend.pd_backend import AllocRequest, AllocResponse, PDBackend
+from lmcache.v1.storage_backend.pd_backend import AllocRequest, AllocResponse, PDBackend, ProxyNotif, PDMsg
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -424,3 +425,59 @@ def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
         "instead of asyncio.sleep (non-blocking): req_b could not run while "
         "req_a was busy-waiting for memory."
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Proxy notification sent on last prefill
+# ---------------------------------------------------------------------------
+
+
+def test_sender_proxy_notification_on_last_prefill(async_sender):
+    """
+    When transfer_spec.is_last_prefill is True, the sender must send a
+    ProxyNotif message to proxy_side_channel after transfer completes.
+    """
+    keys = [_make_key(0)]
+    memory_objs = [_make_mem_obj(0)]
+    transfer_spec = _make_transfer_spec(is_last_prefill=True, req_id="req-notify")
+
+    done = threading.Event()
+
+    def cb(key):
+        done.set()
+
+    async_sender.batched_submit_put_task(
+        keys, memory_objs, transfer_spec=transfer_spec, on_complete_callback=cb
+    )
+
+    assert done.wait(timeout=TRANSFER_DELAY * 3), "Transfer did not complete"
+
+    # Verify proxy notification was sent
+    async_sender.proxy_side_channel.send.assert_called_once()
+    sent_bytes = async_sender.proxy_side_channel.send.call_args[0][0]
+    notif = msgspec.msgpack.decode(sent_bytes, type=PDMsg)
+    assert isinstance(notif, ProxyNotif)
+    assert notif.req_id == "req-notify"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: No proxy notification when not last prefill
+# ---------------------------------------------------------------------------
+
+
+def test_sender_no_proxy_notification_when_not_last_prefill(async_sender):
+    """
+    When transfer_spec.is_last_prefill is False, no ProxyNotif should be sent.
+    """
+    keys = [_make_key(0)]
+    memory_objs = [_make_mem_obj(0)]
+    transfer_spec = _make_transfer_spec(is_last_prefill=False)
+
+    done = threading.Event()
+    async_sender.batched_submit_put_task(
+        keys, memory_objs, transfer_spec=transfer_spec,
+        on_complete_callback=lambda k: done.set()
+    )
+
+    assert done.wait(timeout=TRANSFER_DELAY * 3)
+    async_sender.proxy_side_channel.send.assert_not_called()
