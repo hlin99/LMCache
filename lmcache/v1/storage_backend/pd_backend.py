@@ -594,10 +594,14 @@ class PDBackend(AllocatorBackendInterface):
                     # request until proxy receives the ack.
                     alloc_resp = await self._async_allocate_and_put(alloc_req)
                     await socket.send(msgspec.msgpack.encode(alloc_resp))
+                except asyncio.CancelledError:
+                    break
                 except Exception as e:
                     logger.error("Failed to process async mem alloc: %s", str(e))
                     if self.running:
                         await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            pass
         finally:
             socket.close()
             async_ctx.term()
@@ -683,6 +687,24 @@ class PDBackend(AllocatorBackendInterface):
     # Decoder functions end
     ############################################################
 
+    @staticmethod
+    def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
+        """Cancel all pending tasks on *loop*, then stop it."""
+
+        async def _cancel_and_stop():
+            tasks = [
+                t
+                for t in asyncio.all_tasks(loop)
+                if t is not asyncio.current_task() and not t.done()
+            ]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            loop.stop()
+
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.create_task, _cancel_and_stop())
+
     def close(self) -> None:
         """
         Close the storage backend.
@@ -692,7 +714,7 @@ class PDBackend(AllocatorBackendInterface):
             thread.join()
         # Shut down sender async loop if present
         if hasattr(self, "_sender_loop"):
-            self._sender_loop.call_soon_threadsafe(self._sender_loop.stop)
+            self._shutdown_loop(self._sender_loop)
             self._sender_thread.join(timeout=5)
             # Close async alloc sockets
             for sock in self._async_alloc_sockets.values():
@@ -706,7 +728,7 @@ class PDBackend(AllocatorBackendInterface):
                 pass
         # Shut down receiver async loop if present
         if hasattr(self, "_recv_loop"):
-            self._recv_loop.call_soon_threadsafe(self._recv_loop.stop)
+            self._shutdown_loop(self._recv_loop)
             self._recv_thread.join(timeout=5)
         self.transfer_channel.close()
         self.zmq_context.term()

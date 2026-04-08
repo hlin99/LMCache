@@ -263,6 +263,12 @@ def async_receiver(tmp_path):
         )
         backend = PDBackend(config, metadata)
         yield backend
+        # Release all allocated MemoryObjs to avoid ref_count warnings
+        for mem_obj in backend.data.values():
+            try:
+                mem_obj.ref_count_down()
+            except Exception:
+                pass
         backend.close()
 
 
