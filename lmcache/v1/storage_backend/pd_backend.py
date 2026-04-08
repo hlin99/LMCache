@@ -208,7 +208,6 @@ class PDBackend(AllocatorBackendInterface):
         if self.pd_config.role == "sender":
             self._init_sender()
             self.initialized_peers: set[str] = set()
-            self.mem_alloc_sockets: dict[str, zmq.Socket] = {}
             # Dedicated asyncio event loop for async transfers
             self._sender_loop = asyncio.new_event_loop()
             self._sender_thread = threading.Thread(
@@ -362,32 +361,12 @@ class PDBackend(AllocatorBackendInterface):
             local_id=self.local_id, peer_id=receiver_id, peer_init_url=receiver_init_url
         )
 
-        # Set up the sync memory allocation socket (kept for backward compat)
-        mem_alloc_socket = get_zmq_socket(
-            self.zmq_context,
-            receiver_mem_alloc_url,
-            "tcp",
-            zmq.REQ,
-            "connect",
-        )
-        self.mem_alloc_sockets[receiver_id] = mem_alloc_socket
-
         # Set up the async memory allocation socket
         async_alloc_socket = self._async_zmq_context.socket(zmq.REQ)
         async_alloc_socket.connect(f"tcp://{receiver_mem_alloc_url}")
         self._async_alloc_sockets[receiver_id] = async_alloc_socket
 
         self.initialized_peers.add(receiver_id)
-
-    def _remote_allocate(
-        self, receiver_id: str, alloc_request: AllocRequest
-    ) -> AllocResponse:
-        side_channel = self.mem_alloc_sockets[receiver_id]
-        side_channel.send(msgspec.msgpack.encode(alloc_request))
-        msg = side_channel.recv()
-        alloc_response = msgspec.msgpack.decode(msg, type=PDMsg)
-
-        return alloc_response
 
     async def _async_remote_allocate(
         self, receiver_id: str, alloc_request: AllocRequest
