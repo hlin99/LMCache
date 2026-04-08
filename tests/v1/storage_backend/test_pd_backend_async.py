@@ -664,9 +664,10 @@ def test_receiver_alloc_server_survives_exception(async_receiver):
                 pass
 
         # Patch allocate to succeed
-        async_receiver.allocate = lambda shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw: (
-            mem_obj_ok
-        )
+        def _alloc_ok(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+            return mem_obj_ok
+
+        async_receiver.allocate = _alloc_ok
 
         # Run server manually — stop after 2 iterations
         socket = FakeSocket()
