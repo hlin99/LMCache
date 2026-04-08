@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
@@ -548,6 +547,7 @@ class PDBackend(AllocatorBackendInterface):
         When _async_allocate_and_put needs to wait for free memory it yields
         via `await asyncio.sleep`, keeping the event loop responsive.
         """
+        # Third Party
         import zmq.asyncio as azmq
 
         async_ctx = azmq.Context()
@@ -569,9 +569,7 @@ class PDBackend(AllocatorBackendInterface):
                     alloc_resp = await self._async_allocate_and_put(alloc_req)
                     await socket.send(msgspec.msgpack.encode(alloc_resp))
                 except Exception as e:
-                    logger.error(
-                        "Failed to process async mem alloc: %s", str(e)
-                    )
+                    logger.error("Failed to process async mem alloc: %s", str(e))
                     if self.running:
                         await asyncio.sleep(0.01)
         finally:
