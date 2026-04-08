@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
@@ -525,22 +526,103 @@ class PDBackend(AllocatorBackendInterface):
     # Decoder functions
     ############################################################
     def _init_receiver(self):
-        # Initialize initialization side channels
-        receiver_alloc_url = (
-            f"{self.pd_config.peer_host}:{self.pd_config.peer_alloc_port}"
+        """
+        Start a dedicated asyncio event loop in a background daemon thread
+        and launch the async memory allocation server coroutine.
+        """
+        self._recv_loop = asyncio.new_event_loop()
+        self._recv_thread = threading.Thread(
+            target=self._recv_loop.run_forever,
+            daemon=True,
+            name="pd-receiver-async",
         )
-        self.alloc_side_channel = get_zmq_socket(
-            self.zmq_context, receiver_alloc_url, "tcp", zmq.REP, "bind"
+        self._recv_thread.start()
+        asyncio.run_coroutine_threadsafe(
+            self._async_mem_alloc_server(), self._recv_loop
         )
-        self.side_channels.append(self.alloc_side_channel)
 
-        # Start the memory allocation thread
-        self.mem_alloc_thread = threading.Thread(
-            target=self._mem_alloc_loop, daemon=True
-        )
-        self.mem_alloc_thread.start()
-        self.running_threads.append(self.mem_alloc_thread)
+    async def _async_mem_alloc_server(self):
+        """
+        Async ZMQ REP server for memory allocation requests.
+        Replaces the blocking _mem_alloc_loop / _mem_alloc_thread.
+        When _async_allocate_and_put needs to wait for free memory it yields
+        via `await asyncio.sleep`, keeping the event loop responsive.
+        """
+        import zmq.asyncio as azmq
 
+        async_ctx = azmq.Context()
+        socket = async_ctx.socket(zmq.REP)
+        alloc_port = self.pd_config.peer_alloc_port
+        socket.bind(f"tcp://*:{alloc_port}")
+        logger.info(f"Async mem alloc server listening on port {alloc_port}")
+        try:
+            while self.running:
+                try:
+                    alloc_req_bytes = await socket.recv()
+                    alloc_req = msgspec.msgpack.decode(alloc_req_bytes, type=PDMsg)
+                    assert isinstance(alloc_req, AllocRequest), (
+                        "The request from the remote peer is not an AllocRequest"
+                    )
+                    # NOTE: it's okay to put the memory objs into the storage backend
+                    # first because decode vllm will not be able to see the decode
+                    # request until proxy receives the ack.
+                    alloc_resp = await self._async_allocate_and_put(alloc_req)
+                    await socket.send(msgspec.msgpack.encode(alloc_resp))
+                except Exception as e:
+                    logger.error(
+                        "Failed to process async mem alloc: %s", str(e)
+                    )
+                    if self.running:
+                        await asyncio.sleep(0.01)
+        finally:
+            socket.close()
+            async_ctx.term()
+
+    async def _async_allocate_and_put(
+        self, alloc_request: AllocRequest
+    ) -> AllocResponse:
+        """
+        Async version of _allocate_and_put.
+        Uses `await asyncio.sleep` instead of `time.sleep` so the event loop
+        can continue processing while waiting for free memory.
+        pin=False: PDBackend has no eviction; pinning is unnecessary and
+        causes ref_count leaks.
+        """
+        total_allocs = len(alloc_request.keys)
+        fmt = MemoryFormat(alloc_request.fmt)
+        dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
+        shape = list(alloc_request.shape)  # copy — we mutate token_dim
+
+        alloc_indexes = []
+        already_send_indexes = []
+
+        for idx, key_str in enumerate(alloc_request.keys):
+            key = CacheEngineKey.from_string(key_str)
+            if self.contains(key, pin=False):  # pin=False: no eviction in PDBackend
+                already_send_indexes.append(idx)
+                continue
+
+            if idx == total_allocs - 1:
+                token_dim = fmt.token_dim()
+                shape[token_dim] = alloc_request.last_chunk_toks
+
+            mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+            wait_time = 0.01
+            while mem_obj is None:
+                logger.warning("Failed to allocate memory object, retrying...")
+                await asyncio.sleep(wait_time)
+                mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+
+            alloc_indexes.append(mem_obj.meta.address)
+            self.put(key, mem_obj)
+
+        return AllocResponse(
+            already_sent_indexes=already_send_indexes, remote_indexes=alloc_indexes
+        )
+
+    # ---------------------------------------------------------------------------
+    # Legacy sync methods kept for reference; no longer called in normal path.
+    # ---------------------------------------------------------------------------
     def _allocate_and_put(self, alloc_request: AllocRequest) -> AllocResponse:
         total_allocs = len(alloc_request.keys)
         fmt = MemoryFormat(alloc_request.fmt)
@@ -565,9 +647,6 @@ class PDBackend(AllocatorBackendInterface):
 
             mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
-            # TODO(Jiayi): make busy loop allocation part of
-            # memory allocator instead of backend as both PD
-            # and CPU offloading might need this.
             wait_time = 0.01
             while mem_obj is None:
                 logger.warning(
@@ -577,7 +656,6 @@ class PDBackend(AllocatorBackendInterface):
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
             alloc_indexes.append(mem_obj.meta.address)
-
             self.put(key, mem_obj)
 
         return AllocResponse(
@@ -585,30 +663,8 @@ class PDBackend(AllocatorBackendInterface):
         )
 
     def _mem_alloc_loop(self):
-        """
-        Running the memory allocation loop.
-        """
-        while self.running:
-            try:
-                # receive alloc request
-                alloc_req_bytes = self.alloc_side_channel.recv()
-                alloc_req = msgspec.msgpack.decode(alloc_req_bytes, type=PDMsg)
-                assert isinstance(alloc_req, AllocRequest), (
-                    "The request from the remote peer is not a AllocRequest"
-                )
-
-                # NOTE: it's okay to put the memory objs into the storage backend
-                # first because decode vllm will not be able to see the decode
-                # request until proxy receives the ack.
-                alloc_resp = self._allocate_and_put(alloc_req)
-
-                # send back response
-                self.alloc_side_channel.send(msgspec.msgpack.encode(alloc_resp))
-
-            except Exception as e:
-                logger.error("Failed to process mem alloc loop: %s", str(e))
-                if self.running:
-                    time.sleep(0.01)
+        """Legacy sync mem alloc loop (no longer used)."""
+        pass
 
     def put(
         self,
@@ -670,6 +726,10 @@ class PDBackend(AllocatorBackendInterface):
                 self._async_zmq_context.term()
             except Exception:
                 pass
+        # Shut down receiver async loop if present
+        if hasattr(self, "_recv_loop"):
+            self._recv_loop.call_soon_threadsafe(self._recv_loop.stop)
+            self._recv_thread.join(timeout=5)
         self.transfer_channel.close()
         self.zmq_context.term()
 
