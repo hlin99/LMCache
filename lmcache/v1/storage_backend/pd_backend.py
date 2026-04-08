@@ -218,6 +218,7 @@ class PDBackend(AllocatorBackendInterface):
             # Separate async ZMQ context for sender coroutines
             self._async_zmq_context = zmq.asyncio.Context()
             self._async_alloc_sockets: dict[str, zmq.asyncio.Socket] = {}
+            self._async_alloc_locks: dict[str, asyncio.Lock] = {}
         elif self.pd_config.role == "receiver":
             self._init_receiver()
         else:
@@ -360,19 +361,29 @@ class PDBackend(AllocatorBackendInterface):
             local_id=self.local_id, peer_id=receiver_id, peer_init_url=receiver_init_url
         )
 
-        # Set up the async memory allocation socket
+        # Schedule socket creation on the sender event loop to avoid cross-thread issues
+        future = asyncio.run_coroutine_threadsafe(
+            self._async_create_alloc_socket(receiver_id, receiver_mem_alloc_url),
+            self._sender_loop,
+        )
+        future.result(timeout=10)  # Wait for socket to be created
+
+        self.initialized_peers.add(receiver_id)
+
+    async def _async_create_alloc_socket(self, receiver_id: str, receiver_mem_alloc_url: str):
         async_alloc_socket = self._async_zmq_context.socket(zmq.REQ)
         async_alloc_socket.connect(f"tcp://{receiver_mem_alloc_url}")
         self._async_alloc_sockets[receiver_id] = async_alloc_socket
 
-        self.initialized_peers.add(receiver_id)
-
     async def _async_remote_allocate(
         self, receiver_id: str, alloc_request: AllocRequest
     ) -> AllocResponse:
-        socket = self._async_alloc_sockets[receiver_id]
-        await socket.send(msgspec.msgpack.encode(alloc_request))
-        msg = await socket.recv()
+        if receiver_id not in self._async_alloc_locks:
+            self._async_alloc_locks[receiver_id] = asyncio.Lock()
+        async with self._async_alloc_locks[receiver_id]:
+            socket = self._async_alloc_sockets[receiver_id]
+            await socket.send(msgspec.msgpack.encode(alloc_request))
+            msg = await socket.recv()
         alloc_response = msgspec.msgpack.decode(msg, type=PDMsg)
         return alloc_response
 
@@ -412,12 +423,14 @@ class PDBackend(AllocatorBackendInterface):
         memory_objs: List[MemoryObj],
         receiver_id: str,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+        transfer_spec: Any = None,
     ) -> None:
         """
         Async coroutine that performs the full KV transfer:
         remote alloc → async_batched_write → ref_count_down → callback.
         Runs in the dedicated sender event loop (_sender_loop).
         """
+        completed_indexes: set[int] = set()
         try:
             alloc_request = self._get_remote_alloc_request(keys, memory_objs)
             alloc_response = await self._async_remote_allocate(
@@ -430,6 +443,7 @@ class PDBackend(AllocatorBackendInterface):
             for idx, mem_obj in enumerate(memory_objs):
                 if idx in already_sent_indexes:
                     mem_obj.ref_count_down()
+                    completed_indexes.add(idx)
                 else:
                     mem_objs_to_send.append(mem_obj)
 
@@ -442,16 +456,15 @@ class PDBackend(AllocatorBackendInterface):
                     objects=mem_objs_to_send,
                     transfer_spec=channel_transfer_spec,
                 )
-                for mem_obj in mem_objs_to_send:
-                    mem_obj.ref_count_down()
+                for idx, mem_obj in enumerate(memory_objs):
+                    if idx not in completed_indexes:
+                        mem_obj.ref_count_down()
+                        completed_indexes.add(idx)
             else:
                 logger.debug(
                     "All memory objects have been already sent to the remote peer."
                     " Skipping transfer."
                 )
-
-            # NOTE: pd_skip_proxy_notification=True is assumed;
-            # proxy notification is intentionally skipped here.
 
             if on_complete_callback is not None:
                 for key in keys:
@@ -461,14 +474,20 @@ class PDBackend(AllocatorBackendInterface):
                         logger.warning(
                             f"on_complete_callback failed for key {key}: {e}"
                         )
+
+            if transfer_spec is not None and getattr(transfer_spec, 'is_last_prefill', False):
+                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
+                notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+                self.proxy_side_channel.send(notif_msg_bytes)
         except Exception as e:
             logger.error("Async transfer task failed: %s", str(e))
-            # Release ref counts on error to avoid leaks
-            for mem_obj in memory_objs:
-                try:
-                    mem_obj.ref_count_down()
-                except Exception:
-                    pass
+            # Release ref counts on error to avoid leaks (only those not yet released)
+            for idx, mem_obj in enumerate(memory_objs):
+                if idx not in completed_indexes:
+                    try:
+                        mem_obj.ref_count_down()
+                    except Exception:
+                        pass
 
     def batched_submit_put_task(
         self,
@@ -512,6 +531,7 @@ class PDBackend(AllocatorBackendInterface):
                 memory_objs=list(memory_objs),
                 receiver_id=receiver_id,
                 on_complete_callback=on_complete_callback,
+                transfer_spec=transfer_spec,
             ),
             self._sender_loop,
         )
