@@ -468,6 +468,13 @@ class PDBackend(AllocatorBackendInterface):
                     " Skipping transfer."
                 )
 
+            if transfer_spec is not None and getattr(
+                transfer_spec, "is_last_prefill", False
+            ):
+                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
+                notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+                self.proxy_side_channel.send(notif_msg_bytes)
+
             if on_complete_callback is not None:
                 for key in keys:
                     try:
@@ -476,13 +483,6 @@ class PDBackend(AllocatorBackendInterface):
                         logger.warning(
                             f"on_complete_callback failed for key {key}: {e}"
                         )
-
-            if transfer_spec is not None and getattr(
-                transfer_spec, "is_last_prefill", False
-            ):
-                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
-                self.proxy_side_channel.send(notif_msg_bytes)
         except Exception as e:
             logger.error("Async transfer task failed: %s", str(e))
             # Release ref counts on error to avoid leaks (only those not yet released)
