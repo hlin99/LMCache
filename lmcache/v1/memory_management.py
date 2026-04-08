@@ -525,9 +525,7 @@ class TensorMemoryObj(MemoryObj):
         return self.valid
 
     def get_size(self) -> int:
-        # Use raw_data actual size to handle partial chunks correctly
-        # (e.g. after reshape_partial_chunk which truncates raw_data)
-        return self.raw_data.numel() * self.raw_data.element_size()
+        return self.group_prefix_sum[-1]
 
     # TODO(chunxiaozheng): use get_shapes and get_dtypes to replace
     #  get_shape and get_dtype
