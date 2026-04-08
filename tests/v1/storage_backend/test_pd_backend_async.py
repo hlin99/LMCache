@@ -11,13 +11,13 @@ with asyncio.sleep() stubs so:
   - Assertions focus on *timing* and *call-ordering*, not data integrity
     (data integrity is covered by the NIXL integration tests)
 
-Sender properties verified (PR #139 / async-pd-sender):
+Sender properties:
   1. **Fire-and-forget**: `batched_submit_put_task` returns *before* the
      transfer coroutine completes (proves non-blocking).
   2. **Concurrency**: N concurrent transfers complete in ~1x transfer_delay,
      not N× transfer_delay (proves tasks overlap on the event loop).
 
-Receiver property verified (PR #140 / async-pd-receiver):
+Receiver property:
   3. **Non-blocking busy-wait**: when `allocate()` returns None (full buffer),
      `_async_allocate_and_put` yields via `asyncio.sleep` so other coroutines
      can run concurrently.  If `time.sleep` were used instead, a second
