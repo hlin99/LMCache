@@ -335,46 +335,65 @@ def test_sender_transfers_are_concurrent(async_sender):
 
 def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
     """
-    Prove that _async_allocate_and_put uses asyncio.sleep (not time.sleep)
-    when allocate() returns None.
+    Prove that the *real* _async_allocate_and_put uses asyncio.sleep (not
+    time.sleep) when allocate() returns None.
 
-    Setup:
-      - Coroutine A: busy-waits for RETRY_COUNT retries via asyncio.sleep,
-        then records "A" in finish_order.
-      - Coroutine B: completes immediately, records "B".
+    Two AllocRequests run concurrently via asyncio.gather:
+      - req_a: allocate() returns None for RETRY_COUNT calls (per task),
+               then succeeds. The real busy-wait loop fires RETRY_COUNT times.
+      - req_b: allocate() succeeds immediately.
 
-    If asyncio.sleep is used: B runs while A is yielding → finish_order == ["B", "A"].
-    If time.sleep is used: B is blocked behind A → finish_order == ["A", "B"].
+    We use asyncio.current_task() inside patched allocate() to distinguish
+    which coroutine is calling, so retry counts are tracked per-task.
+
+    If asyncio.sleep is used (correct):
+        req_b runs while req_a is yielding → finish_order == ["b", "a"].
+    If time.sleep is used (blocking):
+        req_b cannot run until req_a finishes → finish_order == ["a", "b"].
     """
     RETRY_COUNT = 5
-    finish_order: list[str] = []
-
-    # Replace _async_allocate_and_put with instrumented stubs.
-    # First call (A) simulates RETRY_COUNT sleeps before completing.
-    # Second call (B) completes immediately.
-    call_n = {"n": 0}
-
-    async def _alloc_and_put_a(alloc_request):
-        for _ in range(RETRY_COUNT):
-            await asyncio.sleep(ALLOC_RETRY_DELAY)
-        finish_order.append("A")
-        return AllocResponse(already_sent_indexes=[], remote_indexes=[10])
-
-    async def _alloc_and_put_b(alloc_request):
-        finish_order.append("B")
-        return AllocResponse(already_sent_indexes=[], remote_indexes=[20])
-
-    async def dispatched(alloc_request):
-        call_n["n"] += 1
-        if call_n["n"] == 1:
-            return await _alloc_and_put_a(alloc_request)
-        else:
-            return await _alloc_and_put_b(alloc_request)
-
-    async_receiver._async_allocate_and_put = dispatched
 
     key_a = _make_key(100)
     key_b = _make_key(200)
+    mem_obj_a = _make_mem_obj(idx=10)
+    mem_obj_b = _make_mem_obj(idx=20)
+
+    finish_order: list[str] = []
+
+    # Wrap put() to record store order
+    original_put = async_receiver.put
+
+    def tracked_put(key, mem_obj):
+        if key == key_a:
+            finish_order.append("a")
+        elif key == key_b:
+            finish_order.append("b")
+        return original_put(key, mem_obj)
+
+    async_receiver.put = tracked_put
+
+    # Patch allocate() to use asyncio.current_task() as per-coroutine context.
+    # Each task tracks its own call count independently.
+    task_alloc_calls: dict[int, int] = {}
+
+    def patched_allocate(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kwargs):
+        task = asyncio.current_task()
+        task_id = id(task)
+        task_alloc_calls[task_id] = task_alloc_calls.get(task_id, 0) + 1
+        n = task_alloc_calls[task_id]
+        # The task handling key_a was submitted first (call n=1 initially);
+        # distinguish by whether this task has already been seen before the
+        # *other* task's first call. Use a simple heuristic: first task to
+        # call allocate is A (gets retries), second is B (immediate success).
+        if task_id not in _task_roles:
+            _task_roles[task_id] = "a" if len(_task_roles) == 0 else "b"
+        role = _task_roles[task_id]
+        if role == "a" and n <= RETRY_COUNT:
+            return None
+        return mem_obj_a if role == "a" else mem_obj_b
+
+    _task_roles: dict[int, str] = {}
+    async_receiver.allocate = patched_allocate
 
     alloc_req_a = AllocRequest(
         keys=[key_a.to_string()],
@@ -399,9 +418,9 @@ def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
 
     asyncio.run(run_concurrent())
 
-    assert finish_order == ["B", "A"], (
-        f"Expected finish order ['B', 'A'] but got {finish_order}. "
-        "This suggests _async_allocate_and_put is using time.sleep (blocking) "
-        "instead of asyncio.sleep (yielding), which prevents B from running "
-        "while A is waiting for memory."
+    assert finish_order == ["b", "a"], (
+        f"Expected finish order ['b', 'a'] but got {finish_order}. "
+        "This suggests _async_allocate_and_put uses time.sleep (blocking) "
+        "instead of asyncio.sleep (non-blocking): req_b could not run while "
+        "req_a was busy-waiting for memory."
     )
