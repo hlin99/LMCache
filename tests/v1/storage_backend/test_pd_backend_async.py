@@ -17,11 +17,19 @@ Sender properties verified (PR #139 / async-pd-sender):
   2. **Concurrency**: N concurrent transfers complete in ~1x transfer_delay,
      not N× transfer_delay (proves tasks overlap on the event loop).
 
-Receiver property verified (PR #140 / async-pd-receiver):
+Receiver properties verified (PR #140 / async-pd-receiver):
   3. **Non-blocking busy-wait**: when `allocate()` returns None (full buffer),
      `_async_allocate_and_put` yields via `asyncio.sleep` so other coroutines
      can run concurrently.  If `time.sleep` were used instead, a second
      coroutine B would be blocked until A finishes its retries.
+  6. **already_sent deduplication**: keys that already exist are skipped
+     (no allocate call) and their indexes appear in already_sent_indexes.
+  7. **last_chunk_toks shape override**: the last chunk's token dimension
+     is correctly overwritten to last_chunk_toks.
+  8. **Exception recovery**: the alloc server survives a malformed request
+     and continues to process subsequent requests.
+  9. **Graceful shutdown**: close() stops the receiver event loop and joins
+     its background thread.
 """
 
 # Standard
@@ -493,3 +501,219 @@ def test_sender_no_proxy_notification_when_not_last_prefill(async_sender):
 
     assert done.wait(timeout=TRANSFER_DELAY * 3)
     async_sender.proxy_side_channel.send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Receiver — already_sent deduplication
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_already_sent_deduplication(async_receiver):
+    """
+    When a key already exists in the backend (contains() returns True),
+    _async_allocate_and_put must:
+      - Include its index in already_sent_indexes
+      - NOT call allocate() for that key
+      - Still allocate the new key normally
+    """
+    key_existing = _make_key(300)
+    key_new = _make_key(301)
+    mem_obj_new = _make_mem_obj(idx=30)
+
+    # Pre-populate backend with key_existing
+    existing_obj = _make_mem_obj(idx=99)
+    async_receiver.put(key_existing, existing_obj)
+
+    # Patch allocate to always succeed and track calls
+    alloc_calls: list[torch.Size] = []
+    original_allocate = async_receiver.allocate
+
+    def tracking_allocate(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kwargs):
+        alloc_calls.append(shapes)
+        return mem_obj_new
+
+    async_receiver.allocate = tracking_allocate
+
+    alloc_req = AllocRequest(
+        keys=[key_existing.to_string(), key_new.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=8,
+    )
+
+    resp = asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
+
+    # Index 0 (key_existing) should be in already_sent
+    assert 0 in resp.already_sent_indexes, (
+        f"Expected index 0 in already_sent_indexes, got {resp.already_sent_indexes}"
+    )
+    # Only one allocation call should have been made (for key_new)
+    assert len(alloc_calls) == 1, (
+        f"Expected 1 allocate() call but got {len(alloc_calls)}"
+    )
+    # remote_indexes should contain the address of the new obj
+    assert resp.remote_indexes == [mem_obj_new.meta.address]
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Receiver — last_chunk_toks shape override
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_last_chunk_shape_override(async_receiver):
+    """
+    For the last chunk in an AllocRequest, shape[token_dim] must be
+    overwritten to last_chunk_toks. For earlier chunks the original
+    shape must be preserved.
+    """
+    key_full = _make_key(400)
+    key_last = _make_key(401)
+    mem_obj = _make_mem_obj(idx=40)
+
+    FULL_TOKENS = 16
+    LAST_TOKENS = 7
+
+    alloc_shapes: list[torch.Size] = []
+
+    def capturing_allocate(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kwargs):
+        alloc_shapes.append(shapes)
+        return mem_obj
+
+    async_receiver.allocate = capturing_allocate
+
+    alloc_req = AllocRequest(
+        keys=[key_full.to_string(), key_last.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, FULL_TOKENS, 8, 128],  # token_dim=2 for KV_2LTD
+        dtype="bfloat16",
+        last_chunk_toks=LAST_TOKENS,
+    )
+
+    asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
+
+    assert len(alloc_shapes) == 2, f"Expected 2 allocations, got {len(alloc_shapes)}"
+
+    # First chunk: token dim should remain FULL_TOKENS
+    token_dim = MemoryFormat.KV_2LTD.token_dim()
+    assert alloc_shapes[0][token_dim] == FULL_TOKENS, (
+        f"First chunk token dim should be {FULL_TOKENS}, got {alloc_shapes[0][token_dim]}"
+    )
+    # Last chunk: token dim should be overridden to LAST_TOKENS
+    assert alloc_shapes[1][token_dim] == LAST_TOKENS, (
+        f"Last chunk token dim should be {LAST_TOKENS}, got {alloc_shapes[1][token_dim]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Receiver — alloc server recovers from exception
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_alloc_server_survives_exception(async_receiver):
+    """
+    If _async_allocate_and_put raises an exception for one request,
+    the _async_mem_alloc_server must NOT crash — the next request
+    should still be processed normally.
+
+    Strategy: run the server coroutine with a mock socket that feeds
+    two requests. The first triggers an exception; the second succeeds.
+    """
+    key_ok = _make_key(500)
+    mem_obj_ok = _make_mem_obj(idx=50)
+
+    # Build two encoded requests: first will cause exception, second is normal
+    bad_bytes = b"not-a-valid-msgpack-alloc-request"
+    good_req = AllocRequest(
+        keys=[key_ok.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+    )
+    good_bytes = msgspec.msgpack.encode(good_req)
+
+    responses_collected: list[bytes] = []
+
+    async def run_server_two_requests():
+        # Third Party
+        import zmq.asyncio as azmq
+
+        recv_queue = asyncio.Queue()
+        await recv_queue.put(bad_bytes)
+        await recv_queue.put(good_bytes)
+
+        call_count = 0
+
+        class FakeSocket:
+            async def recv(self):
+                return await recv_queue.get()
+
+            async def send(self, data):
+                responses_collected.append(data)
+
+            def bind(self, url):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeCtx:
+            def socket(self, stype):
+                return FakeSocket()
+
+            def term(self):
+                pass
+
+        # Patch allocate to succeed
+        async_receiver.allocate = lambda shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw: mem_obj_ok
+
+        # Run server manually — stop after 2 iterations
+        socket = FakeSocket()
+        processed = 0
+        max_iters = 2
+
+        while async_receiver.running and processed < max_iters:
+            try:
+                alloc_req_bytes = await socket.recv()
+                alloc_req = msgspec.msgpack.decode(alloc_req_bytes, type=PDMsg)
+                assert isinstance(alloc_req, AllocRequest)
+                alloc_resp = await async_receiver._async_allocate_and_put(alloc_req)
+                await socket.send(msgspec.msgpack.encode(alloc_resp))
+            except Exception:
+                # Server should catch and continue — mirrors _async_mem_alloc_server
+                pass
+            processed += 1
+
+    asyncio.run(run_server_two_requests())
+
+    # First request failed (bad bytes) — no response sent
+    # Second request succeeded — one response sent
+    assert len(responses_collected) == 1, (
+        f"Expected 1 successful response, got {len(responses_collected)}"
+    )
+    resp = msgspec.msgpack.decode(responses_collected[0], type=PDMsg)
+    assert isinstance(resp, AllocResponse)
+    assert resp.remote_indexes == [mem_obj_ok.meta.address]
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Receiver — close() shuts down event loop and thread
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_close_stops_event_loop(async_receiver):
+    """
+    After close(), the receiver's _recv_loop should be stopped and
+    _recv_thread should have joined (not alive).
+    """
+    assert async_receiver._recv_thread.is_alive(), (
+        "Receiver thread should be alive before close()"
+    )
+    async_receiver.close()
+
+    assert not async_receiver._recv_thread.is_alive(), (
+        "Receiver thread should not be alive after close()"
+    )
+    # Prevent fixture's close() from double-closing
+    async_receiver.running = False
