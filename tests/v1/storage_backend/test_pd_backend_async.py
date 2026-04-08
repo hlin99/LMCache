@@ -106,6 +106,13 @@ def async_sender(tmp_path):
     # Third Party
     import msgspec
 
+    # Build mock allocator first so initialize_allocator can return it directly,
+    # bypassing the isinstance(allocator, PagedCpuGpuMemoryAllocator) assert.
+    mock_allocator_inst = MagicMock()
+    mock_allocator_inst.cpu_allocator.buffer_ptr = 0
+    mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
+    mock_allocator_inst.cpu_allocator.align_bytes = 1
+
     with (
         patch(
             "lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator"
@@ -119,12 +126,10 @@ def async_sender(tmp_path):
             "lmcache.v1.storage_backend.pd_backend.get_correct_device",
             return_value="cpu",
         ),
+        patch.object(
+            PDBackend, "initialize_allocator", return_value=mock_allocator_inst
+        ),
     ):
-        # --- memory allocator stub ---
-        mock_allocator_inst = MagicMock()
-        mock_allocator_inst.cpu_allocator.buffer_ptr = 0
-        mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
-        mock_allocator_inst.cpu_allocator.align_bytes = 1
         mock_alloc_cls.return_value = mock_allocator_inst
 
         # --- zmq context stub ---
@@ -195,6 +200,13 @@ def async_receiver(tmp_path):
     The ZMQ server socket is mocked so no real port is bound.
     The memory allocator is mocked so we control when allocate() returns None.
     """
+    # Build mock allocator first so initialize_allocator can return it directly,
+    # bypassing the isinstance(allocator, PagedCpuGpuMemoryAllocator) assert.
+    mock_allocator_inst = MagicMock()
+    mock_allocator_inst.cpu_allocator.buffer_ptr = 0
+    mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
+    mock_allocator_inst.cpu_allocator.align_bytes = 1
+
     with (
         patch(
             "lmcache.v1.storage_backend.pd_backend.PagedCpuGpuMemoryAllocator"
@@ -208,12 +220,10 @@ def async_receiver(tmp_path):
             "lmcache.v1.storage_backend.pd_backend.get_correct_device",
             return_value="cpu",
         ),
+        patch.object(
+            PDBackend, "initialize_allocator", return_value=mock_allocator_inst
+        ),
     ):
-        # --- memory allocator stub ---
-        mock_allocator_inst = MagicMock()
-        mock_allocator_inst.cpu_allocator.buffer_ptr = 0
-        mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
-        mock_allocator_inst.cpu_allocator.align_bytes = 1
         mock_alloc_cls.return_value = mock_allocator_inst
 
         mock_zmq_ctx.return_value = MagicMock()
