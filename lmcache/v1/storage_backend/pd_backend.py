@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
 import threading
-import time
 
 # Third Party
 import msgspec
@@ -617,52 +616,6 @@ class PDBackend(AllocatorBackendInterface):
         return AllocResponse(
             already_sent_indexes=already_send_indexes, remote_indexes=alloc_indexes
         )
-
-    # ---------------------------------------------------------------------------
-    # Legacy sync methods kept for reference; no longer called in normal path.
-    # ---------------------------------------------------------------------------
-    def _allocate_and_put(self, alloc_request: AllocRequest) -> AllocResponse:
-        total_allocs = len(alloc_request.keys)
-        fmt = MemoryFormat(alloc_request.fmt)
-        dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
-        shape = alloc_request.shape
-
-        alloc_indexes = []
-        already_send_indexes = []
-
-        for idx, key_str in enumerate(alloc_request.keys):
-            key = CacheEngineKey.from_string(key_str)
-            if self.contains(key, pin=True):
-                already_send_indexes.append(idx)
-                continue
-
-            if idx == total_allocs - 1:
-                num_alloc_tokens = alloc_request.last_chunk_toks
-                token_dim = fmt.token_dim()
-                shape[token_dim] = num_alloc_tokens
-            else:
-                num_alloc_tokens = self.full_chunk_size_bytes
-
-            mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
-
-            wait_time = 0.01
-            while mem_obj is None:
-                logger.warning(
-                    "Failed to allocate memory object, retrying...",
-                )
-                time.sleep(wait_time)
-                mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
-
-            alloc_indexes.append(mem_obj.meta.address)
-            self.put(key, mem_obj)
-
-        return AllocResponse(
-            already_sent_indexes=already_send_indexes, remote_indexes=alloc_indexes
-        )
-
-    def _mem_alloc_loop(self):
-        """Legacy sync mem alloc loop (no longer used)."""
-        pass
 
     def put(
         self,
