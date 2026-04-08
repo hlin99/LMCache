@@ -175,6 +175,10 @@ def async_sender(tmp_path):
         )
         backend = PDBackend(config, metadata)
 
+        # Replace proxy_side_channel with a dedicated mock so it doesn't
+        # share call history with the alloc socket mock.
+        backend.proxy_side_channel = MagicMock()
+
         # Inject pre-connected peer so _ensure_peer_connection is a no-op
         receiver_id = "127.0.0.1" + str(9100)
         backend.initialized_peers.add(receiver_id)
