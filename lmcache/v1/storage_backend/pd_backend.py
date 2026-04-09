@@ -254,6 +254,9 @@ class PDBackend(AllocatorBackendInterface):
         elif self.pd_config.role == "receiver":
             self._init_receiver()
             # Decoder-side flow control: block allocation when buffer is near-full
+            assert self._chunk_size_bytes > 0, (
+                "chunk_size_bytes must be > 0 for inflight flow control"
+            )
             total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
             self._max_inflight_chunks = max(1, total_chunks * 3 // 4)
             self._inflight_chunks = 0
@@ -888,7 +891,7 @@ class PDBackend(AllocatorBackendInterface):
                     len(self.data),
                 )
                 mem_obj.ref_count_down()
-                if hasattr(self, "_inflight_condition"):
+                if self.pd_config.role == "receiver":
                     asyncio.run_coroutine_threadsafe(
                         self._notify_inflight_freed(), self._recv_loop
                     )
@@ -904,7 +907,13 @@ class PDBackend(AllocatorBackendInterface):
         called from within the correct event loop.
         """
         async with self._inflight_condition:
-            self._inflight_chunks = max(0, self._inflight_chunks - 1)
+            if self._inflight_chunks == 0:
+                logger.warning(
+                    "inflight_chunks is already 0 before decrement; "
+                    "this indicates a counter synchronization bug."
+                )
+            else:
+                self._inflight_chunks -= 1
             self._inflight_condition.notify_all()
 
     ############################################################
@@ -975,7 +984,7 @@ class PDBackend(AllocatorBackendInterface):
             if alloc_type == "cpu"
             else self.memory_allocator.gpu_allocator
         )
-        if hasattr(self, "_inflight_chunks"):
+        if self.pd_config.role == "receiver":
             logger.info(
                 "[PDBackend %s] %s: "
                 "data_entries=%d, "
