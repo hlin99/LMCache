@@ -771,9 +771,10 @@ class PDBackend(AllocatorBackendInterface):
                 if retries > max_retries:
                     logger.error(
                         "Failed to allocate memory for key %s after %d "
-                        "retries, aborting.",
+                        "retries (~%.0f s), aborting.",
                         key,
                         max_retries,
+                        wait_time * max_retries,
                     )
                     break
                 await asyncio.sleep(wait_time)
