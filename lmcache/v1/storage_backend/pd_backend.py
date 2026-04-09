@@ -483,8 +483,13 @@ class PDBackend(AllocatorBackendInterface):
         # Acquire chunk-level permits to limit decoder buffer pressure.
         # Acquired before remote allocation so that the total number of
         # chunks simultaneously occupying decoder buffers is bounded.
+        # Track the actual number acquired so the finally block releases
+        # only as many as were successfully acquired (guards against
+        # cancellation mid-loop).
+        acquired_chunks = 0
         for _ in range(num_chunks):
             await self._chunk_semaphore.acquire()
+            acquired_chunks += 1
 
         try:
             alloc_request = self._get_remote_alloc_request(keys, memory_objs)
@@ -575,8 +580,10 @@ class PDBackend(AllocatorBackendInterface):
                     except Exception:
                         pass
         finally:
-            # Always release chunk semaphore permits so other requests can proceed
-            for _ in range(num_chunks):
+            # Always release the permits that were actually acquired so that
+            # other requests can proceed (guards against cancellation mid-loop
+            # leaving fewer than num_chunks permits held).
+            for _ in range(acquired_chunks):
                 self._chunk_semaphore.release()
 
     def batched_submit_put_task(
