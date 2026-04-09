@@ -498,7 +498,12 @@ class PDBackend(AllocatorBackendInterface):
             # already_sent_indexes is empty. We back off and retry.
             # max_alloc_retries additional retries after the first attempt,
             # for max_alloc_retries+1 total attempts.
+            # 30 retries × 0.5 s = ~15 s total backoff, enough for a typical
+            # decode cycle to drain the buffer pool under load.
             max_alloc_retries = 30
+            # 0.5 s sleep is long enough to let the decoder complete a few
+            # decode steps and free buffers, but short enough to avoid
+            # excessive latency for the prefill request.
             alloc_retry_sleep = 0.5
             alloc_response = None
             for _retry in range(max_alloc_retries + 1):
@@ -742,6 +747,10 @@ class PDBackend(AllocatorBackendInterface):
         # Decoder-side admission control: reject the entire request if the
         # buffer pool is too full, so the sender retries with backoff instead
         # of busy-looping here on the decoder event loop.
+        # The 25% threshold keeps a quarter of the pool free as headroom for
+        # allocations that are in-flight (allocated but not yet freed by the
+        # decode step). This prevents starvation when many requests compete
+        # for the last few blocks.
         allocator = (
             self.memory_allocator.cpu_allocator
             if self.corrected_device == "cpu"

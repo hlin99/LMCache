@@ -758,9 +758,11 @@ def test_receiver_admission_control_rejects_full_pool(async_receiver):
 
     # Patch the CPU allocator with controlled free_blocks and num_active_allocations
     # so that free_count (1) < total_allocs (2), triggering rejection.
+    # num_active_allocations=127: any value that together with free makes a realistic
+    # total pool size (here: 1 free + 127 active = 128 total).
     fake_allocator = MagicMock()
-    fake_allocator.free_blocks = [object()]  # len == 1
-    fake_allocator.num_active_allocations = 127
+    fake_allocator.free_blocks = [object()]  # len == 1; only 1 free < 2 needed
+    fake_allocator.num_active_allocations = 127  # 1 free + 127 active = 128 total
     original_cpu_allocator = async_receiver.memory_allocator.cpu_allocator
     async_receiver.memory_allocator.cpu_allocator = fake_allocator
 
@@ -805,9 +807,11 @@ def test_receiver_admission_control_rejects_below_threshold(async_receiver):
     )
 
     # 24 free out of 100 total → below 25% threshold, reject even for 1-chunk request
+    free_blocks_count = 24
+    active_count = 76  # total = free_blocks_count + active_count = 100
     fake_allocator = MagicMock()
-    fake_allocator.free_blocks = list(range(24))  # len == 24
-    fake_allocator.num_active_allocations = 76  # total = 100
+    fake_allocator.free_blocks = list(range(free_blocks_count))  # len == 24
+    fake_allocator.num_active_allocations = active_count
     original_cpu_allocator = async_receiver.memory_allocator.cpu_allocator
     async_receiver.memory_allocator.cpu_allocator = fake_allocator
 
@@ -816,8 +820,10 @@ def test_receiver_admission_control_rejects_below_threshold(async_receiver):
     finally:
         async_receiver.memory_allocator.cpu_allocator = original_cpu_allocator
 
+    total_count = free_blocks_count + active_count
     assert resp.remote_indexes == [-1], (
-        f"Should reject when free_count ({24}) < total_count ({100}) * 0.25, "
+        f"Should reject when free_count ({free_blocks_count}) < "
+        f"total_count ({total_count}) * 0.25, "
         f"got {resp.remote_indexes}"
     )
     assert len(alloc_calls) == 0, (
