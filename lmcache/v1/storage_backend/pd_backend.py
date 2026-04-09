@@ -453,6 +453,10 @@ class PDBackend(AllocatorBackendInterface):
         Async coroutine that performs the full KV transfer:
         remote alloc → async_batched_write → ref_count_down → callback.
         Runs in the dedicated sender event loop (_sender_loop).
+
+        ``remote_indexes`` may contain ``-1`` sentinels for keys whose
+        allocation failed on the receiver.  Those objects are released
+        immediately and excluded from the RDMA write.
         """
         completed_indexes: set[int] = set()
         try:
@@ -463,18 +467,35 @@ class PDBackend(AllocatorBackendInterface):
             already_sent_indexes = alloc_response.already_sent_indexes
             remote_indexes = alloc_response.remote_indexes
 
-            mem_objs_to_send = []
+            mem_objs_to_send: list[MemoryObj] = []
+            filtered_remote_indexes: list[int] = []
+            # Index into remote_indexes (one entry per non-already-sent key).
+            ri = 0
             for idx, mem_obj in enumerate(memory_objs):
                 if idx in already_sent_indexes:
                     mem_obj.ref_count_down()
                     completed_indexes.add(idx)
                 else:
-                    mem_objs_to_send.append(mem_obj)
+                    remote_addr = remote_indexes[ri] if ri < len(remote_indexes) else -1
+                    ri += 1
+                    if remote_addr == -1:
+                        # Receiver failed to allocate for this key; skip it.
+                        logger.warning(
+                            "Receiver allocation failed for key %s "
+                            "(idx=%d), releasing local memory object.",
+                            keys[idx],
+                            idx,
+                        )
+                        mem_obj.ref_count_down()
+                        completed_indexes.add(idx)
+                    else:
+                        mem_objs_to_send.append(mem_obj)
+                        filtered_remote_indexes.append(remote_addr)
 
             if mem_objs_to_send:
                 channel_transfer_spec = {
                     "receiver_id": receiver_id,
-                    "remote_indexes": remote_indexes,
+                    "remote_indexes": filtered_remote_indexes,
                 }
                 await self.transfer_channel.async_batched_write(
                     objects=mem_objs_to_send,
@@ -630,19 +651,30 @@ class PDBackend(AllocatorBackendInterface):
         can continue processing while waiting for free memory.
         pin=False: PDBackend has no eviction; pinning is unnecessary and
         causes ref_count leaks.
+
+        ``remote_indexes`` always contains one entry per non-already-sent key
+        so that the sender can match objects to addresses by position.
+        A value of ``-1`` signals that allocation failed for that slot.
         """
         total_allocs = len(alloc_request.keys)
         fmt = MemoryFormat(alloc_request.fmt)
         dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
         shape = list(alloc_request.shape)  # copy — we mutate token_dim
 
-        alloc_indexes = []
-        already_send_indexes = []
+        alloc_indexes: list[int] = []
+        already_send_indexes: list[int] = []
+
+        self._log_pool_state("before _async_allocate_and_put")
 
         for idx, key_str in enumerate(alloc_request.keys):
             key = CacheEngineKey.from_string(key_str)
             if self.contains(key, pin=False):
                 already_send_indexes.append(idx)
+                logger.debug(
+                    "Key %s (idx=%d) already exists, skipping allocation.",
+                    key,
+                    idx,
+                )
                 continue
 
             if idx == total_allocs - 1:
@@ -660,26 +692,48 @@ class PDBackend(AllocatorBackendInterface):
                     logger.error(
                         "Failed to allocate memory for key %s after %d retries "
                         "(~%.0f s), aborting. "
+                        "Pool state: %d entries in data dict. "
                         "The PD buffer pool may be exhausted.",
                         key,
                         max_retries,
                         wait_time * max_retries,
+                        len(self.data),
                     )
                     break
-                logger.warning("Failed to allocate memory object, retrying...")
+                if retries % 50 == 0:
+                    logger.warning(
+                        "Allocation retry %d/%d for key %s. "
+                        "Pool state: %d entries in data dict.",
+                        retries,
+                        max_retries,
+                        key,
+                        len(self.data),
+                    )
                 await asyncio.sleep(wait_time)
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
             if mem_obj is None:
                 logger.warning(
-                    "Skipping allocation for key %s; it will be absent from "
-                    "remote_indexes in the AllocResponse.",
+                    "Allocation failed for key %s (idx=%d); "
+                    "marking as -1 in remote_indexes.",
                     key,
+                    idx,
                 )
+                # Use -1 sentinel so the sender can match objects to
+                # addresses by position and skip failed slots.
+                alloc_indexes.append(-1)
                 continue
 
+            logger.debug(
+                "Allocated address %d for key %s (idx=%d).",
+                mem_obj.meta.address,
+                key,
+                idx,
+            )
             alloc_indexes.append(mem_obj.meta.address)
             self.put(key, mem_obj)
+
+        self._log_pool_state("after _async_allocate_and_put")
 
         return AllocResponse(
             already_sent_indexes=already_send_indexes, remote_indexes=alloc_indexes
@@ -691,7 +745,23 @@ class PDBackend(AllocatorBackendInterface):
         mem_obj: MemoryObj,
     ):
         with self.data_lock:
+            old = self.data.get(key, None)
+            if old is not None:
+                logger.warning(
+                    "Overwriting existing entry for key %s "
+                    "(old address=%s, new address=%s). "
+                    "The old MemoryObj will be freed via __del__.",
+                    key,
+                    old.meta.address,
+                    mem_obj.meta.address,
+                )
             self.data[key] = mem_obj
+            logger.debug(
+                "put key=%s address=%d data_size=%d",
+                key,
+                mem_obj.meta.address,
+                len(self.data),
+            )
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         with self.data_lock:
@@ -722,8 +792,16 @@ class PDBackend(AllocatorBackendInterface):
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
             if mem_obj is not None:
+                logger.debug(
+                    "remove key=%s address=%d ref_count=%d data_size=%d",
+                    key,
+                    mem_obj.meta.address,
+                    mem_obj.get_ref_count(),
+                    len(self.data),
+                )
                 mem_obj.ref_count_down()
                 return True
+            logger.debug("remove key=%s not found, data_size=%d", key, len(self.data))
             return False
 
     ############################################################
@@ -781,3 +859,29 @@ class PDBackend(AllocatorBackendInterface):
 
     def unpin(self, key: CacheEngineKey) -> bool:
         return True
+
+    # ------------------------------------------------------------------
+    # Debugging helpers
+    # ------------------------------------------------------------------
+
+    def _log_pool_state(self, label: str) -> None:
+        """Log current pool usage for debugging allocation failures."""
+        alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"
+        allocator = (
+            self.memory_allocator.cpu_allocator
+            if alloc_type == "cpu"
+            else self.memory_allocator.gpu_allocator
+        )
+        logger.info(
+            "[PDBackend %s] %s: "
+            "data_entries=%d, "
+            "free_blocks=%d, "
+            "active_allocs=%d, "
+            "total_alloc_bytes=%d",
+            self.pd_config.role,
+            label,
+            len(self.data),
+            len(allocator.free_blocks),
+            allocator.num_active_allocations,
+            allocator.total_allocated_size,
+        )
