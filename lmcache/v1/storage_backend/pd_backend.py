@@ -650,6 +650,7 @@ class PDBackend(AllocatorBackendInterface):
                 shape[token_dim] = alloc_request.last_chunk_toks
 
             mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+            # 500 retries × 10 ms = ~5 s timeout before giving up.
             wait_time = 0.01
             max_retries = 500
             retries = 0
@@ -657,9 +658,12 @@ class PDBackend(AllocatorBackendInterface):
                 retries += 1
                 if retries > max_retries:
                     logger.error(
-                        "Failed to allocate memory after %d retries, aborting. "
+                        "Failed to allocate memory for key %s after %d retries "
+                        "(~%.0f s), aborting. "
                         "The PD buffer pool may be exhausted.",
+                        key,
                         max_retries,
+                        wait_time * max_retries,
                     )
                     break
                 logger.warning("Failed to allocate memory object, retrying...")
@@ -667,6 +671,11 @@ class PDBackend(AllocatorBackendInterface):
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
             if mem_obj is None:
+                logger.warning(
+                    "Skipping allocation for key %s; it will be absent from "
+                    "remote_indexes in the AllocResponse.",
+                    key,
+                )
                 continue
 
             alloc_indexes.append(mem_obj.meta.address)
