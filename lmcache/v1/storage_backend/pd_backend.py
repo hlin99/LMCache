@@ -493,9 +493,35 @@ class PDBackend(AllocatorBackendInterface):
 
         try:
             alloc_request = self._get_remote_alloc_request(keys, memory_objs)
+            # Retry loop: decoder may reject the entire request if its buffer
+            # pool is too full. In that case all remote_indexes are -1 and
+            # already_sent_indexes is empty. We back off and retry.
+            max_alloc_retries = 30
+            alloc_retry_sleep = 0.5
             alloc_response = await self._async_remote_allocate(
                 receiver_id, alloc_request
             )
+            for _retry in range(max_alloc_retries):
+                already_sent_indexes = alloc_response.already_sent_indexes
+                remote_indexes = alloc_response.remote_indexes
+                all_rejected = (
+                    len(already_sent_indexes) == 0
+                    and len(remote_indexes) == num_chunks
+                    and all(r == -1 for r in remote_indexes)
+                )
+                if not all_rejected:
+                    break
+                logger.warning(
+                    "Decoder rejected entire alloc request (buffer full), "
+                    "retry %d/%d in %.1fs.",
+                    _retry + 1,
+                    max_alloc_retries,
+                    alloc_retry_sleep,
+                )
+                await asyncio.sleep(alloc_retry_sleep)
+                alloc_response = await self._async_remote_allocate(
+                    receiver_id, alloc_request
+                )
             already_sent_indexes = alloc_response.already_sent_indexes
             remote_indexes = alloc_response.remote_indexes
 
@@ -702,8 +728,38 @@ class PDBackend(AllocatorBackendInterface):
         ``remote_indexes`` always contains one entry per non-already-sent key
         so that the sender can match objects to addresses by position.
         A value of ``-1`` signals that allocation failed for that slot.
+
+        Decoder-side admission control: if the buffer pool is too full to
+        satisfy this request, the entire request is rejected up-front
+        (all remote_indexes set to -1) so the sender can retry later.
+        This avoids the 500-retry busy-loop inside the for-loop and lets
+        the sender back off while the decoder drains its in-use buffers.
         """
         total_allocs = len(alloc_request.keys)
+
+        # Decoder-side admission control: reject the entire request if the
+        # buffer pool is too full, so the sender retries with backoff instead
+        # of busy-looping here on the decoder event loop.
+        allocator = (
+            self.memory_allocator.cpu_allocator
+            if self.corrected_device == "cpu"
+            else self.memory_allocator.gpu_allocator
+        )
+        free_count = len(allocator.free_blocks)
+        total_count = free_count + allocator.num_active_allocations
+        if free_count < total_allocs or free_count < total_count * 0.25:
+            logger.warning(
+                "Decoder buffer pool too full to accept request "
+                "(free_blocks=%d, total_allocs=%d, total_count=%d, "
+                "threshold=25%%). Rejecting entire request so sender retries.",
+                free_count,
+                total_allocs,
+                total_count,
+            )
+            return AllocResponse(
+                already_sent_indexes=[],
+                remote_indexes=[-1] * total_allocs,
+            )
         fmt = MemoryFormat(alloc_request.fmt)
         dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
         shape = list(alloc_request.shape)  # copy — we mutate token_dim

@@ -724,3 +724,170 @@ def test_receiver_close_stops_event_loop(async_receiver):
     )
     # Prevent fixture's close() from double-closing
     async_receiver.running = False
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Decoder admission control — rejects request when pool is too full
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_admission_control_rejects_full_pool(async_receiver):
+    """
+    When the buffer pool has fewer free blocks than total_allocs,
+    or free_count < total_count * 0.25, _async_allocate_and_put must return
+    all -1 remote_indexes immediately without calling allocate().
+    """
+    key1 = _make_key(600)
+    key2 = _make_key(601)
+
+    alloc_calls: list = []
+
+    def no_alloc_should_be_called(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        alloc_calls.append(shapes)
+        return _make_mem_obj(idx=60)
+
+    async_receiver.allocate = no_alloc_should_be_called
+
+    alloc_req = AllocRequest(
+        keys=[key1.to_string(), key2.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+    )
+
+    # Patch the CPU allocator with controlled free_blocks and num_active_allocations
+    # so that free_count (1) < total_allocs (2), triggering rejection.
+    fake_allocator = MagicMock()
+    fake_allocator.free_blocks = [object()]  # len == 1
+    fake_allocator.num_active_allocations = 127
+    original_cpu_allocator = async_receiver.memory_allocator.cpu_allocator
+    async_receiver.memory_allocator.cpu_allocator = fake_allocator
+
+    try:
+        resp = asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
+    finally:
+        async_receiver.memory_allocator.cpu_allocator = original_cpu_allocator
+
+    assert resp.already_sent_indexes == [], (
+        "No keys should be marked already sent on pool-full rejection"
+    )
+    assert resp.remote_indexes == [-1, -1], (
+        f"All remote_indexes should be -1 on pool-full rejection, "
+        f"got {resp.remote_indexes}"
+    )
+    assert len(alloc_calls) == 0, (
+        "allocate() must not be called when the admission control rejects the request"
+    )
+
+
+def test_receiver_admission_control_rejects_below_threshold(async_receiver):
+    """
+    Even if free_count >= total_allocs, reject when free_count < 25% of total.
+    (e.g. pool has 100 slots total, 24 free, request needs only 1 → still reject)
+    """
+    key = _make_key(610)
+
+    alloc_calls: list = []
+
+    def tracking_alloc(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        alloc_calls.append(shapes)
+        return _make_mem_obj(idx=61)
+
+    async_receiver.allocate = tracking_alloc
+
+    alloc_req = AllocRequest(
+        keys=[key.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+    )
+
+    # 24 free out of 100 total → below 25% threshold, reject even for 1-chunk request
+    fake_allocator = MagicMock()
+    fake_allocator.free_blocks = list(range(24))  # len == 24
+    fake_allocator.num_active_allocations = 76  # total = 100
+    original_cpu_allocator = async_receiver.memory_allocator.cpu_allocator
+    async_receiver.memory_allocator.cpu_allocator = fake_allocator
+
+    try:
+        resp = asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
+    finally:
+        async_receiver.memory_allocator.cpu_allocator = original_cpu_allocator
+
+    assert resp.remote_indexes == [-1], (
+        f"Should reject when free_count ({24}) < total_count ({100}) * 0.25, "
+        f"got {resp.remote_indexes}"
+    )
+    assert len(alloc_calls) == 0, (
+        "allocate() must not be called when the 25%% threshold check rejects"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Sender retries when decoder rejects entire request (all-rejected)
+# ---------------------------------------------------------------------------
+
+
+def test_sender_retries_on_all_rejected_response(async_sender):
+    """
+    When the decoder returns all remote_indexes=-1 (buffer full), the sender
+    must retry _async_remote_allocate until the decoder accepts.
+
+    Strategy: mock _async_remote_allocate to return all-rejected twice, then
+    succeed. Call _async_transfer_task directly via asyncio.run() and verify
+    the transfer eventually completes. asyncio.sleep is patched to a no-op so
+    the test runs instantly.
+    """
+    keys = [_make_key(700), _make_key(701)]
+    memory_objs = [_make_mem_obj(0), _make_mem_obj(1)]
+    transfer_spec = _make_transfer_spec(is_last_prefill=False)
+
+    call_count = 0
+
+    async def mock_remote_allocate(receiver_id, alloc_request):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            # Reject entire request: all -1
+            return AllocResponse(
+                already_sent_indexes=[],
+                remote_indexes=[-1, -1],
+            )
+        # Accept on third attempt with valid addresses
+        return AllocResponse(
+            already_sent_indexes=[],
+            remote_indexes=[10, 20],
+        )
+
+    completed_keys: list = []
+
+    def cb(key):
+        completed_keys.append(key)
+
+    async def fake_write(objects, transfer_spec):
+        pass  # No-op: we only care about retry logic, not RDMA
+
+    async_sender._async_remote_allocate = mock_remote_allocate
+    async_sender.transfer_channel.async_batched_write = fake_write
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        asyncio.run(
+            async_sender._async_transfer_task(
+                keys=keys,
+                memory_objs=memory_objs,
+                receiver_id="127.0.0.19100",
+                on_complete_callback=cb,
+                transfer_spec=transfer_spec,
+            )
+        )
+
+    assert call_count == 3, (
+        f"Expected 3 calls to _async_remote_allocate (2 rejections + 1 success), "
+        f"got {call_count}"
+    )
+    assert len(completed_keys) == len(keys), (
+        f"Expected on_complete_callback for {len(keys)} keys after retries, "
+        f"got {len(completed_keys)}"
+    )
