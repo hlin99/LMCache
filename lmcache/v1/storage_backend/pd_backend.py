@@ -651,10 +651,23 @@ class PDBackend(AllocatorBackendInterface):
 
             mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
             wait_time = 0.01
+            max_retries = 500
+            retries = 0
             while mem_obj is None:
+                retries += 1
+                if retries > max_retries:
+                    logger.error(
+                        "Failed to allocate memory after %d retries, aborting. "
+                        "The PD buffer pool may be exhausted.",
+                        max_retries,
+                    )
+                    break
                 logger.warning("Failed to allocate memory object, retrying...")
                 await asyncio.sleep(wait_time)
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+
+            if mem_obj is None:
+                continue
 
             alloc_indexes.append(mem_obj.meta.address)
             self.put(key, mem_obj)
@@ -685,16 +698,22 @@ class PDBackend(AllocatorBackendInterface):
         force: bool = True,
     ) -> bool:
         """
-        Remove the key from the storage backend.
+        Remove the key from the storage backend and free the associated page.
+
+        Unconditionally deletes the key from the data store and calls
+        ``ref_count_down()`` so that the underlying paged memory is returned
+        to the free-block pool.  The caller (``cache_engine.py``) must NOT
+        call ``ref_count_down()`` again for the same object after invoking
+        this method — the ``elif`` guard in ``cache_engine.py`` ensures this.
 
         :param key: The key to remove.
+        :param force: Unused; retained for interface compatibility.
+        :return: True if the key existed and was removed, False otherwise.
         """
-        # TODO(Jiayi): The logic here is confusing. Ref count down
-        # will be done after this function call in cache engine.
         with self.data_lock:
-            if mem_obj := self.data.get(key, None):
-                if mem_obj.get_ref_count() == 1:
-                    del self.data[key]
+            mem_obj = self.data.pop(key, None)
+            if mem_obj is not None:
+                mem_obj.ref_count_down()
                 return True
             return False
 
