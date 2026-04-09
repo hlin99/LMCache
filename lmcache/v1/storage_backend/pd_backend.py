@@ -253,6 +253,24 @@ class PDBackend(AllocatorBackendInterface):
             )
         elif self.pd_config.role == "receiver":
             self._init_receiver()
+            # Decoder-side flow control: block allocation when buffer is near-full
+            total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
+            self._max_inflight_chunks = max(1, total_chunks * 3 // 4)
+            self._inflight_chunks = 0
+            # The condition must be created on the receiver event loop
+            future = asyncio.run_coroutine_threadsafe(
+                self._create_inflight_condition(), self._recv_loop
+            )
+            future.result(timeout=5)
+            logger.info(
+                "PDBackend receiver: inflight flow control initialized with "
+                "max_inflight_chunks=%d (total_chunks=%d, buffer=%d bytes, "
+                "chunk=%d bytes)",
+                self._max_inflight_chunks,
+                total_chunks,
+                self._aligned_buffer_size,
+                self._chunk_size_bytes,
+            )
 
         self.full_chunk_size_bytes = config.chunk_size
 
@@ -640,6 +658,14 @@ class PDBackend(AllocatorBackendInterface):
     ############################################################
     # Decoder functions
     ############################################################
+    async def _create_inflight_condition(self) -> None:
+        """Create the asyncio.Condition for inflight chunk flow control.
+
+        Must be called from within the receiver event loop so that the
+        Condition is bound to the correct loop.
+        """
+        self._inflight_condition = asyncio.Condition()
+
     def _init_receiver(self):
         """
         Launch the async memory allocation server coroutine on the already-running
@@ -728,6 +754,17 @@ class PDBackend(AllocatorBackendInterface):
                 token_dim = fmt.token_dim()
                 shape[token_dim] = alloc_request.last_chunk_toks
 
+            # Wait until inflight count is below threshold before allocating.
+            async with self._inflight_condition:
+                while self._inflight_chunks >= self._max_inflight_chunks:
+                    logger.warning(
+                        "Decoder buffer near-full: inflight_chunks=%d >= max=%d, "
+                        "waiting for buffers to be freed...",
+                        self._inflight_chunks,
+                        self._max_inflight_chunks,
+                    )
+                    await self._inflight_condition.wait()
+
             mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
             # 500 retries × 10 ms = ~5 s timeout before giving up.
             wait_time = 0.01
@@ -779,6 +816,9 @@ class PDBackend(AllocatorBackendInterface):
             )
             alloc_indexes.append(mem_obj.meta.address)
             self.put(key, mem_obj)
+            # Increment the inflight counter now that a chunk is allocated.
+            async with self._inflight_condition:
+                self._inflight_chunks += 1
 
         self._log_pool_state("after _async_allocate_and_put")
 
@@ -848,9 +888,24 @@ class PDBackend(AllocatorBackendInterface):
                     len(self.data),
                 )
                 mem_obj.ref_count_down()
+                if hasattr(self, "_inflight_condition"):
+                    asyncio.run_coroutine_threadsafe(
+                        self._notify_inflight_freed(), self._recv_loop
+                    )
                 return True
             logger.debug("remove key=%s not found, data_size=%d", key, len(self.data))
             return False
+
+    async def _notify_inflight_freed(self) -> None:
+        """Decrement the inflight chunk counter and notify waiting allocations.
+
+        Scheduled on the receiver event loop from ``remove()`` (which runs in
+        a vLLM worker thread) so that asyncio.Condition operations are always
+        called from within the correct event loop.
+        """
+        async with self._inflight_condition:
+            self._inflight_chunks = max(0, self._inflight_chunks - 1)
+            self._inflight_condition.notify_all()
 
     ############################################################
     # Decoder functions end
@@ -920,16 +975,35 @@ class PDBackend(AllocatorBackendInterface):
             if alloc_type == "cpu"
             else self.memory_allocator.gpu_allocator
         )
-        logger.info(
-            "[PDBackend %s] %s: "
-            "data_entries=%d, "
-            "free_blocks=%d, "
-            "active_allocs=%d, "
-            "total_alloc_bytes=%d",
-            self.pd_config.role,
-            label,
-            len(self.data),
-            len(allocator.free_blocks),
-            allocator.num_active_allocations,
-            allocator.total_allocated_size,
-        )
+        if hasattr(self, "_inflight_chunks"):
+            logger.info(
+                "[PDBackend %s] %s: "
+                "data_entries=%d, "
+                "free_blocks=%d, "
+                "active_allocs=%d, "
+                "total_alloc_bytes=%d, "
+                "inflight_chunks=%d, "
+                "max_inflight_chunks=%d",
+                self.pd_config.role,
+                label,
+                len(self.data),
+                len(allocator.free_blocks),
+                allocator.num_active_allocations,
+                allocator.total_allocated_size,
+                self._inflight_chunks,
+                self._max_inflight_chunks,
+            )
+        else:
+            logger.info(
+                "[PDBackend %s] %s: "
+                "data_entries=%d, "
+                "free_blocks=%d, "
+                "active_allocs=%d, "
+                "total_alloc_bytes=%d",
+                self.pd_config.role,
+                label,
+                len(self.data),
+                len(allocator.free_blocks),
+                allocator.num_active_allocations,
+                allocator.total_allocated_size,
+            )
