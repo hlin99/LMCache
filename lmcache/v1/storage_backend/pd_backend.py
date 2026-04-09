@@ -496,12 +496,15 @@ class PDBackend(AllocatorBackendInterface):
             # Retry loop: decoder may reject the entire request if its buffer
             # pool is too full. In that case all remote_indexes are -1 and
             # already_sent_indexes is empty. We back off and retry.
+            # max_alloc_retries additional retries after the first attempt,
+            # for max_alloc_retries+1 total attempts.
             max_alloc_retries = 30
             alloc_retry_sleep = 0.5
-            alloc_response = await self._async_remote_allocate(
-                receiver_id, alloc_request
-            )
-            for _retry in range(max_alloc_retries):
+            alloc_response = None
+            for _retry in range(max_alloc_retries + 1):
+                alloc_response = await self._async_remote_allocate(
+                    receiver_id, alloc_request
+                )
                 already_sent_indexes = alloc_response.already_sent_indexes
                 remote_indexes = alloc_response.remote_indexes
                 all_rejected = (
@@ -511,17 +514,16 @@ class PDBackend(AllocatorBackendInterface):
                 )
                 if not all_rejected:
                     break
-                logger.warning(
-                    "Decoder rejected entire alloc request (buffer full), "
-                    "retry %d/%d in %.1fs.",
-                    _retry + 1,
-                    max_alloc_retries,
-                    alloc_retry_sleep,
-                )
-                await asyncio.sleep(alloc_retry_sleep)
-                alloc_response = await self._async_remote_allocate(
-                    receiver_id, alloc_request
-                )
+                if _retry < max_alloc_retries:
+                    logger.warning(
+                        "Decoder rejected entire alloc request (buffer full), "
+                        "retry %d/%d in %.1fs.",
+                        _retry + 1,
+                        max_alloc_retries,
+                        alloc_retry_sleep,
+                    )
+                    await asyncio.sleep(alloc_retry_sleep)
+            assert alloc_response is not None
             already_sent_indexes = alloc_response.already_sent_indexes
             remote_indexes = alloc_response.remote_indexes
 

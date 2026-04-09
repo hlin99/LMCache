@@ -821,7 +821,7 @@ def test_receiver_admission_control_rejects_below_threshold(async_receiver):
         f"got {resp.remote_indexes}"
     )
     assert len(alloc_calls) == 0, (
-        "allocate() must not be called when the 25%% threshold check rejects"
+        "allocate() must not be called when the 25% threshold check rejects"
     )
 
 
