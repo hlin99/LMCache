@@ -609,8 +609,11 @@ class PDBackend(AllocatorBackendInterface):
                                 already_sent_indexes=[], remote_indexes=[]
                             )
                             await socket.send(msgspec.msgpack.encode(error_resp))
-                        except Exception:
-                            pass  # Socket may be broken; log and continue
+                        except Exception as send_err:
+                            logger.debug(
+                                "Failed to send error reply on broken socket: %s",
+                                str(send_err),
+                            )
                     if self.running:
                         await asyncio.sleep(0.01)
         except asyncio.CancelledError:
@@ -725,13 +728,13 @@ class PDBackend(AllocatorBackendInterface):
                 for sock in sockets_to_close:
                     try:
                         sock.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to close async alloc socket: %s", str(e))
             if context_to_term is not None:
                 try:
                     context_to_term.term()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to terminate async ZMQ context: %s", str(e))
             loop.stop()
 
         if loop.is_running():
