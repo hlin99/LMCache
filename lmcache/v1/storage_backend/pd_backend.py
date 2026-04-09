@@ -186,6 +186,29 @@ class PDBackend(AllocatorBackendInterface):
                 self.pd_config.peer_init_port
             )
 
+        # Create the event loop before the transfer channel so it can be passed
+        # into the channel constructor for async_mode initialization.
+        if self.pd_config.role == "sender":
+            self._sender_loop = asyncio.new_event_loop()
+            self._sender_thread = threading.Thread(
+                target=self._sender_loop.run_forever,
+                daemon=True,
+                name="pd-sender-async",
+            )
+            self._sender_thread.start()
+            event_loop = self._sender_loop
+        elif self.pd_config.role == "receiver":
+            self._recv_loop = asyncio.new_event_loop()
+            self._recv_thread = threading.Thread(
+                target=self._recv_loop.run_forever,
+                daemon=True,
+                name="pd-receiver-async",
+            )
+            self._recv_thread.start()
+            event_loop = self._recv_loop
+        else:
+            raise ValueError("Invalid PD role.")
+
         allocator = (
             self.memory_allocator.cpu_allocator
             if self.corrected_device == "cpu"
@@ -202,27 +225,18 @@ class PDBackend(AllocatorBackendInterface):
             peer_init_url=peer_init_url,
             backends=config.nixl_backends,
             device=self.corrected_device,
+            event_loop=event_loop,
         )
 
         if self.pd_config.role == "sender":
             self._init_sender()
             self.initialized_peers: set[str] = set()
-            # Dedicated asyncio event loop for async transfers
-            self._sender_loop = asyncio.new_event_loop()
-            self._sender_thread = threading.Thread(
-                target=self._sender_loop.run_forever,
-                daemon=True,
-                name="pd-sender-async",
-            )
-            self._sender_thread.start()
             # Separate async ZMQ context for sender coroutines
             self._async_zmq_context = zmq.asyncio.Context()
             self._async_alloc_sockets: dict[str, zmq.asyncio.Socket] = {}
             self._async_alloc_locks: dict[str, asyncio.Lock] = {}
         elif self.pd_config.role == "receiver":
             self._init_receiver()
-        else:
-            raise ValueError("Invalid PD role.")
 
         self.full_chunk_size_bytes = config.chunk_size
 
@@ -356,10 +370,18 @@ class PDBackend(AllocatorBackendInterface):
         receiver_init_url = f"{receiver_host}:{receiver_init_port}"
         receiver_mem_alloc_url = f"{receiver_host}:{receiver_alloc_port}"
 
-        # Establish the connection with the receiver/decoder
-        self.transfer_channel.lazy_init_peer_connection(
-            local_id=self.local_id, peer_id=receiver_id, peer_init_url=receiver_init_url
+        # Establish the connection with the receiver/decoder.
+        # The transfer channel uses an async ZMQ context (async_mode=True), so
+        # we must call the async version scheduled on the sender event loop.
+        future = asyncio.run_coroutine_threadsafe(
+            self.transfer_channel.async_lazy_init_peer_connection(
+                local_id=self.local_id,
+                peer_id=receiver_id,
+                peer_init_url=receiver_init_url,
+            ),
+            self._sender_loop,
         )
+        future.result()  # Block until connection is established
 
         # Schedule socket creation on the sender event loop to avoid cross-thread issues
         future = asyncio.run_coroutine_threadsafe(
@@ -552,16 +574,9 @@ class PDBackend(AllocatorBackendInterface):
     ############################################################
     def _init_receiver(self):
         """
-        Start a dedicated asyncio event loop in a background daemon thread
-        and launch the async memory allocation server coroutine.
+        Launch the async memory allocation server coroutine on the already-running
+        receiver event loop (self._recv_loop, created before the transfer channel).
         """
-        self._recv_loop = asyncio.new_event_loop()
-        self._recv_thread = threading.Thread(
-            target=self._recv_loop.run_forever,
-            daemon=True,
-            name="pd-receiver-async",
-        )
-        self._recv_thread.start()
         asyncio.run_coroutine_threadsafe(
             self._async_mem_alloc_server(), self._recv_loop
         )
