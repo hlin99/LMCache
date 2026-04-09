@@ -10,6 +10,7 @@ import abc
 import ctypes
 import os
 import threading
+import traceback
 
 # Third Party
 from sortedcontainers import SortedList
@@ -552,11 +553,40 @@ class TensorMemoryObj(MemoryObj):
 
     def ref_count_up(self):
         with self.lock:
+            old_ref = self.meta.ref_count
             self.meta.ref_count += 1
+            logger.info(
+                "[MemoryObj] REF_COUNT_UP: addr=%d, ref_count %d -> %d",
+                self.meta.address,
+                old_ref,
+                self.meta.ref_count,
+            )
 
     def ref_count_down(self):
         with self.lock:
+            old_ref = self.meta.ref_count
             self.meta.ref_count -= 1
+            will_free = (
+                self.meta.ref_count == 0
+                and self.parent_allocator is not None
+                and self.meta.pin_count == 0
+            )
+            logger.info(
+                "[MemoryObj] REF_COUNT_DOWN: addr=%d, ref_count %d -> %d, "
+                "pin_count=%d, will_free=%s, parent=%s",
+                self.meta.address,
+                old_ref,
+                self.meta.ref_count,
+                self.meta.pin_count,
+                will_free,
+                str(self.parent_allocator),
+            )
+            if will_free:
+                stack_snippet = "".join(traceback.format_stack()[-4:-1])
+                logger.info(
+                    "[MemoryObj] REF_COUNT_DOWN free triggered at:\n%s",
+                    stack_snippet,
+                )
             if self.meta.ref_count < 0:
                 logger.warning(
                     f"Ref count of MemoryObj {self.meta.address}"
@@ -565,11 +595,7 @@ class TensorMemoryObj(MemoryObj):
                     "Setting ref count back to 0 as a hack but please find the bug."
                 )
                 self.meta.ref_count = 0
-            if (
-                self.meta.ref_count == 0
-                and self.parent_allocator is not None
-                and self.meta.pin_count == 0
-            ):
+            if will_free:
                 self.parent_allocator.free(self)
 
     def get_ref_count(self) -> int:
@@ -583,11 +609,19 @@ class TensorMemoryObj(MemoryObj):
 
     def pin(self) -> bool:
         with self.lock:
+            old_pin = self.meta.pin_count
             # if pin_count is 0, indicates that the object is pinned for the first time
             if self.meta.pin_count == 0:
                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
 
             self.meta.pin_count += 1
+
+            logger.info(
+                "[MemoryObj] PIN: addr=%d, pin_count %d -> %d",
+                self.meta.address,
+                old_pin,
+                self.meta.pin_count,
+            )
 
             # Register/update with PinMonitor for timeout tracking on every pin
             pin_monitor = PinMonitor.GetOrCreate()
@@ -596,7 +630,20 @@ class TensorMemoryObj(MemoryObj):
 
     def unpin(self) -> bool:
         with self.lock:
+            old_pin = self.meta.pin_count
             self.meta.pin_count -= 1
+
+            will_free = self.meta.pin_count <= 0 and self.meta.ref_count <= 0
+
+            logger.info(
+                "[MemoryObj] UNPIN: addr=%d, pin_count %d -> %d, "
+                "ref_count=%d, will_free=%s",
+                self.meta.address,
+                old_pin,
+                self.meta.pin_count,
+                self.meta.ref_count,
+                will_free,
+            )
 
             # if pin_count is 0, indicates that the object is unpinned
             if self.meta.pin_count == 0:
@@ -605,7 +652,7 @@ class TensorMemoryObj(MemoryObj):
                 pin_monitor = PinMonitor.GetOrCreate()
                 pin_monitor.on_unpin(self)
 
-            if self.meta.pin_count <= 0 and self.meta.ref_count <= 0:
+            if will_free:
                 if self.parent_allocator is None:
                     logger.error(
                         "Parent allocator is None when trying to free MemoryObj."
@@ -1325,6 +1372,16 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             block_start, aligned_size = self.address_manager.allocate(raw_size)
         except RuntimeError:
             # No block found
+            logger.info(
+                "[TensorMemoryAllocator] ALLOCATE FAILED: requested_size=%d, "
+                "active_allocs=%d, total_allocated=%.2f MB, "
+                "free=%.2f MB, heap=%.2f MB",
+                raw_size,
+                self.num_active_allocations,
+                self.address_manager.total_allocated_size / 1048576,
+                self.address_manager.get_free_size() / 1048576,
+                self.address_manager.get_heap_size() / 1048576,
+            )
             return None
 
         # For debug
@@ -1335,6 +1392,18 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             self.address_manager.total_allocated_size
         )
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+
+        logger.info(
+            "[TensorMemoryAllocator] ALLOCATE: addr=%d, size=%d, aligned_size=%d, "
+            "active_allocs=%d, total_allocated=%.2f MB, free=%.2f MB, heap=%.2f MB",
+            block_start,
+            raw_size,
+            aligned_size,
+            self.num_active_allocations,
+            self.address_manager.total_allocated_size / 1048576,
+            self.address_manager.get_free_size() / 1048576,
+            self.address_manager.get_heap_size() / 1048576,
+        )
 
         # Allocate the block
         raw_data = self._get_buffer_slice(block_start, raw_size)
@@ -1381,6 +1450,17 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                 unit_aligned_size, batch_size
             )
         except RuntimeError:
+            logger.info(
+                "[TensorMemoryAllocator] BATCHED_ALLOCATE FAILED: batch_size=%d, "
+                "unit_size=%d, active_allocs=%d, total_allocated=%.2f MB, "
+                "free=%.2f MB, heap=%.2f MB",
+                batch_size,
+                unit_raw_size,
+                self.num_active_allocations,
+                self.address_manager.total_allocated_size / 1048576,
+                self.address_manager.get_free_size() / 1048576,
+                self.address_manager.get_heap_size() / 1048576,
+            )
             return None
         addresses = [addr for addr, _ in alloc_results]
         raw_datas = [
@@ -1395,6 +1475,17 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             self.address_manager.total_allocated_size
         )
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+
+        logger.info(
+            "[TensorMemoryAllocator] BATCHED_ALLOCATE: batch_size=%d, unit_size=%d, "
+            "active_allocs=%d, total_allocated=%.2f MB, free=%.2f MB, heap=%.2f MB",
+            batch_size,
+            unit_raw_size,
+            self.num_active_allocations,
+            self.address_manager.total_allocated_size / 1048576,
+            self.address_manager.get_free_size() / 1048576,
+            self.address_manager.get_heap_size() / 1048576,
+        )
 
         tensor_mem_objs = []
         for raw_data, address in zip(raw_datas, addresses, strict=True):
@@ -1423,7 +1514,9 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         if not memory_obj.is_valid():
             return
 
-        self.address_manager.free(memory_obj.meta.address, memory_obj.meta.phy_size)
+        addr = memory_obj.meta.address
+        phy_size = memory_obj.meta.phy_size
+        self.address_manager.free(addr, phy_size)
         memory_obj.invalidate()
 
         # For debug
@@ -1434,6 +1527,17 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             self.address_manager.total_allocated_size
         )
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+
+        logger.info(
+            "[TensorMemoryAllocator] FREE: addr=%d, phy_size=%d, "
+            "active_allocs=%d, total_allocated=%.2f MB, free=%.2f MB, heap=%.2f MB",
+            addr,
+            phy_size,
+            self.num_active_allocations,
+            self.address_manager.total_allocated_size / 1048576,
+            self.address_manager.get_free_size() / 1048576,
+            self.address_manager.get_heap_size() / 1048576,
+        )
 
     @_lmcache_nvtx_annotate
     def batched_free(
@@ -1498,6 +1602,16 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             self.stats_monitor.update_active_memory_objs_count(
                 self.num_active_allocations
             )
+
+        logger.info(
+            "[TensorMemoryAllocator] BATCHED_FREE: count=%d, "
+            "active_allocs=%d, total_allocated=%.2f MB, free=%.2f MB, heap=%.2f MB",
+            total_count,
+            self.num_active_allocations,
+            self.address_manager.total_allocated_size / 1048576,
+            self.address_manager.get_free_size() / 1048576,
+            self.address_manager.get_heap_size() / 1048576,
+        )
 
     def memcheck(self):
         """For debug purposes.
@@ -1642,10 +1756,12 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         try:
             free_block = self.free_blocks.popleft()
         except IndexError:
-            logger.debug(
-                f"Failed to allocate memory for "
-                f"tensor({shapes}, {dtypes}) because "
-                "no free blocks is available"
+            logger.info(
+                "[PagedTensorMemoryAllocator] ALLOCATE FAILED: free_pages=0, "
+                "active_allocs=%d, total_allocated=%.2f MB, buffer=%.2f MB",
+                self.num_active_allocations,
+                self.total_allocated_size / 1048576,
+                self.buffer_size / 1048576,
             )
             return None
 
@@ -1670,6 +1786,16 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
 
+        logger.info(
+            "[PagedTensorMemoryAllocator] ALLOCATE: page_idx=%d, free_pages=%d, "
+            "active_allocs=%d, total_allocated=%.2f MB, buffer=%.2f MB",
+            free_block.meta.address,
+            len(self.free_blocks),
+            self.num_active_allocations,
+            self.total_allocated_size / 1048576,
+            self.buffer_size / 1048576,
+        )
+
         # Allocate the block
         return free_block
 
@@ -1692,10 +1818,15 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             try:
                 free_block = self.free_blocks.popleft()
             except IndexError:
-                logger.debug(
-                    f"Failed to allocate memory for "
-                    f"tensor({shapes}, {dtypes}) because "
-                    "no free blocks is available"
+                logger.info(
+                    "[PagedTensorMemoryAllocator] BATCHED_ALLOCATE FAILED: "
+                    "batch_size=%d, free_pages=%d, active_allocs=%d, "
+                    "total_allocated=%.2f MB, buffer=%.2f MB",
+                    batch_size,
+                    len(self.free_blocks),
+                    self.num_active_allocations,
+                    self.total_allocated_size / 1048576,
+                    self.buffer_size / 1048576,
                 )
                 self.batched_free(allocated_blocks, update_stats=False)
                 return None
@@ -1724,6 +1855,16 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
 
+        logger.info(
+            "[PagedTensorMemoryAllocator] BATCHED_ALLOCATE: batch_size=%d, "
+            "free_pages=%d, active_allocs=%d, total_allocated=%.2f MB, buffer=%.2f MB",
+            batch_size,
+            len(self.free_blocks),
+            self.num_active_allocations,
+            self.total_allocated_size / 1048576,
+            self.buffer_size / 1048576,
+        )
+
         # Allocate the block
         return allocated_blocks
 
@@ -1731,8 +1872,8 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
     def free(self, memory_obj: TensorMemoryObj, allocator_type: Optional[str] = None):
         if not memory_obj.is_valid():
             return
+        page_idx = memory_obj.meta.address
         if memory_obj.meta.shapes != self.shapes:
-            page_idx = memory_obj.meta.address
             memory_obj.raw_data = self.paged_buffers[page_idx]
 
         self.free_blocks.append(memory_obj)
@@ -1747,6 +1888,16 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         self.num_active_allocations -= 1
         self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+
+        logger.info(
+            "[PagedTensorMemoryAllocator] FREE: page_idx=%d, free_pages=%d, "
+            "active_allocs=%d, total_allocated=%.2f MB, buffer=%.2f MB",
+            page_idx,
+            len(self.free_blocks),
+            self.num_active_allocations,
+            self.total_allocated_size / 1048576,
+            self.buffer_size / 1048576,
+        )
 
     @_lmcache_nvtx_annotate
     def batched_free(
@@ -1785,6 +1936,16 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
             self.stats_monitor.update_active_memory_objs_count(
                 self.num_active_allocations
+            )
+
+            logger.info(
+                "[PagedTensorMemoryAllocator] BATCHED_FREE: count=%d, free_pages=%d, "
+                "active_allocs=%d, total_allocated=%.2f MB, buffer=%.2f MB",
+                num_freed_blocks,
+                len(self.free_blocks),
+                self.num_active_allocations,
+                self.total_allocated_size / 1048576,
+                self.buffer_size / 1048576,
             )
 
     def memcheck(self):
@@ -1914,6 +2075,7 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[MemoryObj]:
+        logger.info("[HostMemoryAllocator] ALLOCATE: delegating to inner allocator")
         with self.host_mem_lock:
             return self.allocator.allocate(shapes, dtypes, fmt, str(self))
 
@@ -1926,6 +2088,9 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[List[MemoryObj]]:
+        logger.info(
+            "[HostMemoryAllocator] BATCHED_ALLOCATE: delegating to inner allocator"
+        )
         with self.host_mem_lock:
             return self.allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt, str(self)
@@ -1933,6 +2098,7 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
+        logger.info("[HostMemoryAllocator] FREE: delegating to inner allocator")
         with self.host_mem_lock:
             self.allocator.free(memory_obj)
 
@@ -1943,6 +2109,7 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
         allocator_type: Optional[str] = None,
         update_stats: bool = True,
     ):
+        logger.info("[HostMemoryAllocator] BATCHED_FREE: delegating to inner allocator")
         with self.host_mem_lock:
             self.allocator.batched_free(memory_objs)
 
@@ -1993,6 +2160,7 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[MemoryObj]:
+        logger.info("[PinMemoryAllocator] ALLOCATE: delegating to inner allocator")
         with self.host_mem_lock:
             return self.allocator.allocate(shapes, dtypes, fmt, str(self))
 
@@ -2005,6 +2173,9 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[List[MemoryObj]]:
+        logger.info(
+            "[PinMemoryAllocator] BATCHED_ALLOCATE: delegating to inner allocator"
+        )
         with self.host_mem_lock:
             return self.allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt, str(self)
@@ -2012,6 +2183,7 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
+        logger.info("[PinMemoryAllocator] FREE: delegating to inner allocator")
         with self.host_mem_lock:
             self.allocator.free(memory_obj)
 
@@ -2022,6 +2194,7 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         allocator_type: Optional[str] = None,
         update_stats: bool = True,
     ):
+        logger.info("[PinMemoryAllocator] BATCHED_FREE: delegating to inner allocator")
         with self.host_mem_lock:
             self.allocator.batched_free(memory_objs)
 
@@ -2103,6 +2276,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[MemoryObj]:
+        logger.info("[MixedMemoryAllocator] ALLOCATE: delegating to inner allocator")
         if fmt == MemoryFormat.BINARY_BUFFER:
             return self.buffer_allocator.allocate(shapes, dtypes, fmt)
         elif fmt in [
@@ -2125,6 +2299,9 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[List[MemoryObj]]:
+        logger.info(
+            "[MixedMemoryAllocator] BATCHED_ALLOCATE: delegating to inner allocator"
+        )
         if fmt == MemoryFormat.BINARY_BUFFER:
             return self.buffer_allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt
@@ -2144,6 +2321,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
+        logger.info("[MixedMemoryAllocator] FREE: delegating to inner allocator")
         fmt = memory_obj.meta.fmt
         if fmt == MemoryFormat.BINARY_BUFFER:
             self.buffer_allocator.free(memory_obj)
@@ -2165,6 +2343,9 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         allocator_type: Optional[str] = None,
         update_stats: bool = True,
     ):
+        logger.info(
+            "[MixedMemoryAllocator] BATCHED_FREE: delegating to inner allocator"
+        )
         if not memory_objs:
             return
 
@@ -2256,6 +2437,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[MemoryObj]:
+        logger.info("[GPUMemoryAllocator] ALLOCATE: delegating to inner allocator")
         with self.device_mem_lock:
             return self.allocator.allocate(shapes, dtypes, fmt, str(self))
 
@@ -2268,12 +2450,16 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[List[MemoryObj]]:
+        logger.info(
+            "[GPUMemoryAllocator] BATCHED_ALLOCATE: delegating to inner allocator"
+        )
         with self.device_mem_lock:
             return self.allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt, str(self)
             )
 
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
+        logger.info("[GPUMemoryAllocator] FREE: delegating to inner allocator")
         with self.device_mem_lock:
             self.allocator.free(memory_obj)
 
@@ -2283,6 +2469,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         allocator_type: Optional[str] = None,
         update_stats: bool = True,
     ):
+        logger.info("[GPUMemoryAllocator] BATCHED_FREE: delegating to inner allocator")
         with self.device_mem_lock:
             self.allocator.batched_free(memory_objs)
 
@@ -2488,6 +2675,9 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = "cpu",
     ) -> Optional[MemoryObj]:
+        logger.info(
+            "[PagedCpuGpuMemoryAllocator] ALLOCATE: delegating to inner allocator"
+        )
         if allocator_type == "gpu":
             return self.gpu_allocator.allocate(shapes, dtypes, fmt)
         elif allocator_type == "cpu":
@@ -2503,6 +2693,10 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = "gpu",
     ) -> Optional[List[MemoryObj]]:
+        logger.info(
+            "[PagedCpuGpuMemoryAllocator] BATCHED_ALLOCATE: "
+            "delegating to inner allocator"
+        )
         if allocator_type == "gpu":
             return self.gpu_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
         elif allocator_type == "cpu":
@@ -2511,6 +2705,7 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
             raise ValueError(f"Unsupported allocator type: {allocator_type}")
 
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = "cpu"):
+        logger.info("[PagedCpuGpuMemoryAllocator] FREE: delegating to inner allocator")
         if allocator_type == "gpu":
             self.gpu_allocator.free(memory_obj)
         elif allocator_type == "cpu":
@@ -2524,6 +2719,9 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         allocator_type: Optional[str] = None,
         update_stats: bool = True,
     ):
+        logger.info(
+            "[PagedCpuGpuMemoryAllocator] BATCHED_FREE: delegating to inner allocator"
+        )
         if allocator_type == "gpu":
             self.gpu_allocator.batched_free(memory_objs, update_stats=update_stats)
         elif allocator_type == "cpu":

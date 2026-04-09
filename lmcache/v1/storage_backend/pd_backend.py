@@ -338,7 +338,11 @@ class PDBackend(AllocatorBackendInterface):
             if mem_obj := self.data.get(key, None):
                 if pin:
                     mem_obj.ref_count_up()
+                logger.info(
+                    "[PDBackend] CONTAINS: key=%s, found=True, pin=%s", key, pin
+                )
                 return True
+            logger.info("[PDBackend] CONTAINS: key=%s, found=False, pin=%s", key, pin)
             return False
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -636,12 +640,19 @@ class PDBackend(AllocatorBackendInterface):
         dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
         shape = list(alloc_request.shape)  # copy — we mutate token_dim
 
+        logger.info(
+            "[PDBackend] _async_allocate_and_put: total_allocs=%d, keys=%s",
+            total_allocs,
+            alloc_request.keys,
+        )
+
         alloc_indexes = []
         already_send_indexes = []
 
         for idx, key_str in enumerate(alloc_request.keys):
             key = CacheEngineKey.from_string(key_str)
             if self.contains(key, pin=False):
+                logger.info("[PDBackend] Key already exists, skipping: %s", key)
                 already_send_indexes.append(idx)
                 continue
 
@@ -651,13 +662,30 @@ class PDBackend(AllocatorBackendInterface):
 
             mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
             wait_time = 0.01
+            retry_count = 0
             while mem_obj is None:
+                retry_count += 1
+                logger.info(
+                    "[PDBackend] Allocation failed, retry #%d for key=%s",
+                    retry_count,
+                    key,
+                )
                 logger.warning("Failed to allocate memory object, retrying...")
                 await asyncio.sleep(wait_time)
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
+            logger.info(
+                "[PDBackend] Allocated page_idx=%d for key=%s",
+                mem_obj.meta.address,
+                key,
+            )
             alloc_indexes.append(mem_obj.meta.address)
             self.put(key, mem_obj)
+            logger.info(
+                "[PDBackend] Put key=%s, data dict size=%d",
+                key,
+                len(self.data),
+            )
 
         return AllocResponse(
             already_sent_indexes=already_send_indexes, remote_indexes=alloc_indexes
@@ -668,6 +696,9 @@ class PDBackend(AllocatorBackendInterface):
         key: CacheEngineKey,
         mem_obj: MemoryObj,
     ):
+        logger.info(
+            "[PDBackend] PUT: key=%s, data dict size=%d", key, len(self.data) + 1
+        )
         with self.data_lock:
             self.data[key] = mem_obj
 
@@ -676,6 +707,8 @@ class PDBackend(AllocatorBackendInterface):
             # NOTE(Jiayi): we assume that the key must be in local data
             # because we are using a push-based transfer
             mem_obj = self.data.get(key, None)
+            found = mem_obj is not None
+            logger.info("[PDBackend] GET: key=%s, found=%s", key, found)
             assert mem_obj is not None, f"Key {key} not found in local data."
             return mem_obj
 
@@ -693,9 +726,23 @@ class PDBackend(AllocatorBackendInterface):
         # will be done after this function call in cache engine.
         with self.data_lock:
             if mem_obj := self.data.get(key, None):
-                if mem_obj.get_ref_count() == 1:
+                ref_count = mem_obj.get_ref_count()
+                removed = ref_count == 1
+                if removed:
                     del self.data[key]
+                logger.info(
+                    "[PDBackend] REMOVE: key=%s, found=True, ref_count=%d, "
+                    "removed_from_dict=%s",
+                    key,
+                    ref_count,
+                    removed,
+                )
                 return True
+            logger.info(
+                "[PDBackend] REMOVE: key=%s, found=False, ref_count=N/A, "
+                "removed_from_dict=False",
+                key,
+            )
             return False
 
     ############################################################
