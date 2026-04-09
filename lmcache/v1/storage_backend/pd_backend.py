@@ -438,12 +438,12 @@ class PDBackend(AllocatorBackendInterface):
             alloc_response = await self._async_remote_allocate(
                 receiver_id, alloc_request
             )
-            already_sent_indexes = alloc_response.already_sent_indexes
             remote_indexes = alloc_response.remote_indexes
 
+            already_sent_set = set(alloc_response.already_sent_indexes)
             mem_objs_to_send = []
             for idx, mem_obj in enumerate(memory_objs):
-                if idx in already_sent_indexes:
+                if idx in already_sent_set:
                     mem_obj.ref_count_down()
                     completed_indexes.add(idx)
                 else:
@@ -576,15 +576,18 @@ class PDBackend(AllocatorBackendInterface):
         # Third Party
         import zmq.asyncio as azmq
 
-        async_ctx = azmq.Context()
+        self._async_alloc_ctx = azmq.Context()
+        async_ctx = self._async_alloc_ctx
         socket = async_ctx.socket(zmq.REP)
         alloc_port = self.pd_config.peer_alloc_port
         socket.bind(f"tcp://*:{alloc_port}")
         logger.info(f"Async mem alloc server listening on port {alloc_port}")
         try:
             while self.running:
+                recv_done = False
                 try:
                     alloc_req_bytes = await socket.recv()
+                    recv_done = True
                     alloc_req = msgspec.msgpack.decode(alloc_req_bytes, type=PDMsg)
                     assert isinstance(alloc_req, AllocRequest), (
                         "The request from the remote peer is not an AllocRequest"
@@ -598,6 +601,16 @@ class PDBackend(AllocatorBackendInterface):
                     break
                 except Exception as e:
                     logger.error("Failed to process async mem alloc: %s", str(e))
+                    if recv_done:
+                        # Must send a reply to maintain REQ/REP state machine;
+                        # without a reply the sender will block forever.
+                        try:
+                            error_resp = AllocResponse(
+                                already_sent_indexes=[], remote_indexes=[]
+                            )
+                            await socket.send(msgspec.msgpack.encode(error_resp))
+                        except Exception:
+                            pass  # Socket may be broken; log and continue
                     if self.running:
                         await asyncio.sleep(0.01)
         except asyncio.CancelledError:
@@ -605,6 +618,7 @@ class PDBackend(AllocatorBackendInterface):
         finally:
             socket.close()
             async_ctx.term()
+            self._async_alloc_ctx = None
 
     async def _async_allocate_and_put(
         self, alloc_request: AllocRequest
@@ -688,8 +702,13 @@ class PDBackend(AllocatorBackendInterface):
     ############################################################
 
     @staticmethod
-    def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
-        """Cancel all pending tasks on *loop*, then stop it."""
+    def _shutdown_loop(
+        loop: asyncio.AbstractEventLoop,
+        sockets_to_close: Optional[list] = None,
+        context_to_term: Optional[Any] = None,
+    ) -> None:
+        """Cancel all pending tasks on *loop*, close optional sockets/context
+        on the loop thread, then stop the loop."""
 
         async def _cancel_and_stop():
             tasks = [
@@ -700,6 +719,19 @@ class PDBackend(AllocatorBackendInterface):
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Close async ZMQ sockets on their own event loop to avoid
+            # cross-thread socket access.
+            if sockets_to_close:
+                for sock in sockets_to_close:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            if context_to_term is not None:
+                try:
+                    context_to_term.term()
+                except Exception:
+                    pass
             loop.stop()
 
         if loop.is_running():
@@ -714,22 +746,32 @@ class PDBackend(AllocatorBackendInterface):
             thread.join()
         # Shut down sender async loop if present
         if hasattr(self, "_sender_loop"):
-            self._shutdown_loop(self._sender_loop)
+            self._shutdown_loop(
+                self._sender_loop,
+                sockets_to_close=list(self._async_alloc_sockets.values()),
+                context_to_term=self._async_zmq_context,
+            )
             self._sender_thread.join(timeout=5)
-            # Close async alloc sockets
-            for sock in self._async_alloc_sockets.values():
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            try:
-                self._async_zmq_context.term()
-            except Exception:
-                pass
+            if self._sender_thread.is_alive():
+                logger.warning(
+                    "Sender thread did not exit within 5 s timeout after shutdown"
+                )
         # Shut down receiver async loop if present
         if hasattr(self, "_recv_loop"):
             self._shutdown_loop(self._recv_loop)
             self._recv_thread.join(timeout=5)
+            if self._recv_thread.is_alive():
+                logger.warning(
+                    "Receiver thread did not exit within 5 s timeout after shutdown"
+                )
+            # Fallback: clean up receiver ZMQ context if the finally block in
+            # _async_mem_alloc_server did not run (e.g. loop was force-stopped).
+            if getattr(self, "_async_alloc_ctx", None) is not None:
+                try:
+                    self._async_alloc_ctx.term()
+                except Exception:
+                    pass
+                self._async_alloc_ctx = None
         self.transfer_channel.close()
         self.zmq_context.term()
 

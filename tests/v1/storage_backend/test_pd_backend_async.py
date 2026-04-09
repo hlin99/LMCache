@@ -625,6 +625,12 @@ def test_receiver_alloc_server_survives_exception(async_receiver):
 
     Strategy: run the server coroutine with a mock socket that feeds
     two requests. The first triggers an exception; the second succeeds.
+
+    NOTE: This test manually replicates the server loop logic with a
+    FakeSocket instead of calling the real _async_mem_alloc_server method
+    (which would need a live ZMQ context to bind a port). It therefore
+    verifies that the loop-recovery pattern is correct, but does not
+    exercise the actual bind/recv/send path of _async_mem_alloc_server.
     """
     key_ok = _make_key(500)
     mem_obj_ok = _make_mem_obj(idx=50)
