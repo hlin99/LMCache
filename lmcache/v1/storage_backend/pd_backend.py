@@ -471,6 +471,15 @@ class PDBackend(AllocatorBackendInterface):
             filtered_remote_indexes: list[int] = []
             # Index into remote_indexes (one entry per non-already-sent key).
             ri = 0
+            num_non_already_sent = len(memory_objs) - len(already_sent_indexes)
+            if len(remote_indexes) != num_non_already_sent:
+                logger.error(
+                    "Protocol mismatch: remote_indexes length (%d) != "
+                    "non-already-sent objects (%d). Some allocations may "
+                    "have been silently dropped by an older receiver.",
+                    len(remote_indexes),
+                    num_non_already_sent,
+                )
             for idx, mem_obj in enumerate(memory_objs):
                 if idx in already_sent_indexes:
                     mem_obj.ref_count_down()
@@ -750,11 +759,12 @@ class PDBackend(AllocatorBackendInterface):
                 logger.warning(
                     "Overwriting existing entry for key %s "
                     "(old address=%s, new address=%s). "
-                    "The old MemoryObj will be freed via __del__.",
+                    "Explicitly freeing old MemoryObj.",
                     key,
                     old.meta.address,
                     mem_obj.meta.address,
                 )
+                old.ref_count_down()
             self.data[key] = mem_obj
             logger.debug(
                 "put key=%s address=%d data_size=%d",
