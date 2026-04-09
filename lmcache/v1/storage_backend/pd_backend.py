@@ -235,6 +235,22 @@ class PDBackend(AllocatorBackendInterface):
             self._async_zmq_context = zmq.asyncio.Context()
             self._async_alloc_sockets: dict[str, zmq.asyncio.Socket] = {}
             self._async_alloc_locks: dict[str, asyncio.Lock] = {}
+            # Chunk-level semaphore to limit decoder buffer pressure.
+            # We allow at most half of the total available chunks to be
+            # in-flight at once, leaving headroom for chunks that have been
+            # transferred but are still in use by the decoder.
+            total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
+            max_inflight = max(1, total_chunks // 2)
+            self._chunk_semaphore = asyncio.Semaphore(max_inflight)
+            logger.info(
+                "PDBackend sender: chunk semaphore initialized with "
+                "max_inflight=%d (total_chunks=%d, buffer=%d bytes, "
+                "chunk=%d bytes)",
+                max_inflight,
+                total_chunks,
+                self._aligned_buffer_size,
+                self._chunk_size_bytes,
+            )
         elif self.pd_config.role == "receiver":
             self._init_receiver()
 
@@ -280,6 +296,9 @@ class PDBackend(AllocatorBackendInterface):
                 f"The remaining {origin_buffer_size - aligned_buffer_size} bytes "
                 f"will not be allocated."
             )
+
+        self._chunk_size_bytes = chunk_size_bytes
+        self._aligned_buffer_size = aligned_buffer_size
 
         init_func(
             aligned_buffer_size,
@@ -459,6 +478,19 @@ class PDBackend(AllocatorBackendInterface):
         immediately and excluded from the RDMA write.
         """
         completed_indexes: set[int] = set()
+        num_chunks = len(memory_objs)
+
+        # Acquire chunk-level permits to limit decoder buffer pressure.
+        # Acquired before remote allocation so that the total number of
+        # chunks simultaneously occupying decoder buffers is bounded.
+        # Track the actual number acquired so the finally block releases
+        # only as many as were successfully acquired (guards against
+        # cancellation mid-loop).
+        acquired_chunks = 0
+        for _ in range(num_chunks):
+            await self._chunk_semaphore.acquire()
+            acquired_chunks += 1
+
         try:
             alloc_request = self._get_remote_alloc_request(keys, memory_objs)
             alloc_response = await self._async_remote_allocate(
@@ -547,6 +579,12 @@ class PDBackend(AllocatorBackendInterface):
                         mem_obj.ref_count_down()
                     except Exception:
                         pass
+        finally:
+            # Always release the permits that were actually acquired so that
+            # other requests can proceed (guards against cancellation mid-loop
+            # leaving fewer than num_chunks permits held).
+            for _ in range(acquired_chunks):
+                self._chunk_semaphore.release()
 
     def batched_submit_put_task(
         self,
