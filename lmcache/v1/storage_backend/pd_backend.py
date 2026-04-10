@@ -645,6 +645,29 @@ class PDBackend(AllocatorBackendInterface):
                     " Skipping transfer."
                 )
 
+            # Send ProxyNotif if this is the last prefill chunk, BEFORE invoking
+            # on_complete_callback.  The consumer processes chunks sequentially,
+            # so all prior chunks have already completed by the time we reach
+            # this point.  Sending here (inside _async_transfer_task) guarantees
+            # the notification is observable the moment the callback fires.
+            is_last_prefill = transfer_spec is not None and getattr(
+                transfer_spec, "is_last_prefill", False
+            )
+            if is_last_prefill:
+                try:
+                    notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
+                    notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None, self.proxy_side_channel.send, notif_msg_bytes
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to send ProxyNotif for req %s: %s",
+                        transfer_spec.req_id,
+                        e,
+                    )
+
             if on_complete_callback is not None:
                 for key in keys:
                     try:
@@ -743,15 +766,16 @@ class PDBackend(AllocatorBackendInterface):
         """Drain a per-request transfer queue, processing items sequentially.
 
         Processes one ``_TransferItem`` at a time by calling
-        ``_async_transfer_task``.  When the item flagged with
-        ``is_last_prefill=True`` is processed, sends the ``ProxyNotif`` and
-        exits.  Cleans up the queue and consumer entries from the tracking
-        dicts in the finally block.
+        ``_async_transfer_task``.  ``_async_transfer_task`` is responsible for
+        sending ``ProxyNotif`` (when ``is_last_prefill=True``) before invoking
+        ``on_complete_callback``, guaranteeing the notification is observable
+        the moment the callback fires.  This consumer exits after the item
+        flagged with ``is_last_prefill=True`` is processed and cleans up
+        tracking dicts in the finally block.
 
         :param req_id: The request identifier (used for logging and cleanup).
         :param q: The asyncio.Queue feeding this consumer.
         """
-        last_transfer_spec: Any = None
         try:
             while True:
                 item: _TransferItem = await q.get()
@@ -772,20 +796,9 @@ class PDBackend(AllocatorBackendInterface):
                     item.transfer_spec, "is_last_prefill", False
                 )
                 if is_last:
-                    last_transfer_spec = item.transfer_spec
                     break
         finally:
-            # Send ProxyNotif after ALL chunks for this request are done.
-            if last_transfer_spec is not None:
-                try:
-                    notif_msg = ProxyNotif(req_id=last_transfer_spec.req_id)
-                    notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        None, self.proxy_side_channel.send, notif_msg_bytes
-                    )
-                except Exception as e:
-                    logger.error("Failed to send ProxyNotif for req %s: %s", req_id, e)
+            # Only cleanup — ProxyNotif is sent inside _async_transfer_task.
             self._transfer_queues.pop(req_id, None)
             self._transfer_consumers.pop(req_id, None)
 
