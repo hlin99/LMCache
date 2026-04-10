@@ -270,6 +270,10 @@ class PDBackend(AllocatorBackendInterface):
                 self._sender_max_inflight_chunks,
                 total_chunks,
             )
+            # Per-request in-flight task tracking, keyed by req_id.
+            # Only ever accessed from coroutines running on _sender_loop, so
+            # no additional lock is needed.
+            self._pending_transfer_tasks: dict[str, list[asyncio.Task]] = {}
         elif self.pd_config.role == "receiver":
             self._init_receiver()
             # Decoder-side flow control: block allocation when buffer is near-full
@@ -631,6 +635,22 @@ class PDBackend(AllocatorBackendInterface):
             if transfer_spec is not None and getattr(
                 transfer_spec, "is_last_prefill", False
             ):
+                req_id = getattr(transfer_spec, "req_id", None)
+                if req_id is not None:
+                    # Wait for all other in-flight transfer tasks of the same
+                    # request before notifying the proxy.  This prevents the
+                    # race where the smaller final chunk finishes its RDMA write
+                    # before earlier (larger) chunks, causing the proxy to
+                    # forward the decode request while those chunks' buffers are
+                    # still incomplete.
+                    current_task = asyncio.current_task()
+                    prior_tasks = [
+                        t
+                        for t in self._pending_transfer_tasks.get(req_id, [])
+                        if t is not current_task and not t.done()
+                    ]
+                    if prior_tasks:
+                        await asyncio.gather(*prior_tasks, return_exceptions=True)
                 notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
                 notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
                 loop = asyncio.get_running_loop()
@@ -665,6 +685,14 @@ class PDBackend(AllocatorBackendInterface):
             # can proceed.  num_chunks equals the number of memory objects that
             # were allocated from the staging buffer via allocate().
             self._release_sender_staging_chunks(num_chunks)
+            # Remove per-request task tracking when the last-prefill task
+            # finishes (whether successfully or not) to avoid memory leaks.
+            if transfer_spec is not None and getattr(
+                transfer_spec, "is_last_prefill", False
+            ):
+                req_id = getattr(transfer_spec, "req_id", None)
+                if req_id is not None:
+                    self._pending_transfer_tasks.pop(req_id, None)
 
     def _release_sender_staging_chunks(self, count: int) -> None:
         """Decrement sender staging inflight counter and notify waiters.
@@ -682,6 +710,43 @@ class PDBackend(AllocatorBackendInterface):
                     0, self._sender_inflight_chunks - count
                 )
                 self._sender_staging_condition.notify_all()
+
+    async def _schedule_transfer_task(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        receiver_id: str,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+        transfer_spec: Any,
+    ) -> None:
+        """Create an asyncio.Task for ``_async_transfer_task`` and register it
+        in ``_pending_transfer_tasks`` keyed by ``req_id``.
+
+        Must be called as a coroutine on ``_sender_loop`` (via
+        ``asyncio.run_coroutine_threadsafe``).  Keeping all dict accesses on
+        the event loop avoids cross-thread data races without needing locks.
+
+        :param keys: Cache keys for this transfer batch.
+        :param memory_objs: Memory objects to transfer.
+        :param receiver_id: Identifier of the remote receiver.
+        :param on_complete_callback: Optional per-key completion callback.
+        :param transfer_spec: Transfer specification (carries ``req_id`` and
+            ``is_last_prefill``).
+        """
+        req_id = getattr(transfer_spec, "req_id", None)
+        task: asyncio.Task = asyncio.create_task(
+            self._async_transfer_task(
+                keys=keys,
+                memory_objs=memory_objs,
+                receiver_id=receiver_id,
+                on_complete_callback=on_complete_callback,
+                transfer_spec=transfer_spec,
+            )
+        )
+        if req_id is not None:
+            if req_id not in self._pending_transfer_tasks:
+                self._pending_transfer_tasks[req_id] = []
+            self._pending_transfer_tasks[req_id].append(task)
 
     def batched_submit_put_task(
         self,
@@ -718,10 +783,14 @@ class PDBackend(AllocatorBackendInterface):
             receiver_alloc_port=receiver_alloc_port,
         )
 
-        # Fire-and-forget: submit to background asyncio event loop
+        # Schedule via _schedule_transfer_task so the asyncio.Task is
+        # registered in _pending_transfer_tasks before _async_transfer_task
+        # starts executing.  This preserves fire-and-forget semantics while
+        # allowing the final chunk (is_last_prefill=True) to wait for all
+        # prior chunks before notifying the proxy.
         asyncio.run_coroutine_threadsafe(
-            self._async_transfer_task(
-                keys=keys,
+            self._schedule_transfer_task(
+                keys=list(keys),
                 memory_objs=list(memory_objs),
                 receiver_id=receiver_id,
                 on_complete_callback=on_complete_callback,
