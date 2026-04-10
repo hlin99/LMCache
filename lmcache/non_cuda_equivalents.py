@@ -396,12 +396,30 @@ def multi_layer_kv_transfer(
     page_buffer_size: int,
     direction: TransferDirection,
     gpu_kv_format: GPUKVFormat,
-    block_size: int,
+    block_size: int = 0,
+    head_size: int = 0,
+    skip_prefix_n_tokens: int = 0,
 ):
     """
     Fully vectorized Python fallback for multi_layer_kv_transfer.
     Eliminates ALL token- and KV-level Python loops.
     """
+    # TODO: Implement head_size support for HND layouts (NL_X_TWO_NB_NH_BS_HS,
+    # NL_X_NB_TWO_NH_BS_HS) when needed for non-CUDA platforms.
+    if gpu_kv_format in (
+        GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
+    ):
+        raise NotImplementedError(
+            "HND layouts (NL_X_TWO_NB_NH_BS_HS, NL_X_NB_TWO_NH_BS_HS) "
+            "are not supported in the non-CUDA fallback. "
+            "head_size parameter is required but not implemented in this path."
+        )
+
+    # TODO: Implement skip_prefix_n_tokens to skip already-cached prefix tokens.
+    # Currently safe to ignore on CPU (no stream-level race conditions),
+    # but results in redundant copies for the skipped prefix tokens.
+
     if not isinstance(key_value_ptrs, (torch.Tensor, list)):
         raise TypeError(
             f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
