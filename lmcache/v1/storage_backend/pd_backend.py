@@ -740,17 +740,10 @@ class PDBackend(AllocatorBackendInterface):
         alloc_indexes: list[int] = []
         already_send_indexes: list[int] = []
 
-        self._log_pool_state("before _async_allocate_and_put")
-
         for idx, key_str in enumerate(alloc_request.keys):
             key = CacheEngineKey.from_string(key_str)
             if self.contains(key, pin=False):
                 already_send_indexes.append(idx)
-                logger.debug(
-                    "Key %s (idx=%d) already exists, skipping allocation.",
-                    key,
-                    idx,
-                )
                 continue
 
             if idx == total_allocs - 1:
@@ -777,25 +770,13 @@ class PDBackend(AllocatorBackendInterface):
                 retries += 1
                 if retries > max_retries:
                     logger.error(
-                        "Failed to allocate memory for key %s after %d retries "
-                        "(~%.0f s), aborting. "
-                        "Pool state: %d entries in data dict. "
-                        "The PD buffer pool may be exhausted.",
+                        "Failed to allocate memory for key %s after %d "
+                        "retries (~%.0f s), aborting.",
                         key,
                         max_retries,
                         wait_time * max_retries,
-                        len(self.data),
                     )
                     break
-                if retries % 50 == 0:
-                    logger.warning(
-                        "Allocation retry %d/%d for key %s. "
-                        "Pool state: %d entries in data dict.",
-                        retries,
-                        max_retries,
-                        key,
-                        len(self.data),
-                    )
                 await asyncio.sleep(wait_time)
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
@@ -810,20 +791,11 @@ class PDBackend(AllocatorBackendInterface):
                 # addresses by position and skip failed slots.
                 alloc_indexes.append(-1)
                 continue
-
-            logger.debug(
-                "Allocated address %d for key %s (idx=%d).",
-                mem_obj.meta.address,
-                key,
-                idx,
-            )
             alloc_indexes.append(mem_obj.meta.address)
             self.put(key, mem_obj)
             # Increment the inflight counter now that a chunk is allocated.
             async with self._inflight_condition:
                 self._inflight_chunks += 1
-
-        self._log_pool_state("after _async_allocate_and_put")
 
         return AllocResponse(
             already_sent_indexes=already_send_indexes, remote_indexes=alloc_indexes
@@ -835,24 +807,7 @@ class PDBackend(AllocatorBackendInterface):
         mem_obj: MemoryObj,
     ):
         with self.data_lock:
-            old = self.data.get(key, None)
-            if old is not None:
-                logger.warning(
-                    "Overwriting existing entry for key %s "
-                    "(old address=%s, new address=%s). "
-                    "Explicitly freeing old MemoryObj.",
-                    key,
-                    old.meta.address,
-                    mem_obj.meta.address,
-                )
-                old.ref_count_down()
             self.data[key] = mem_obj
-            logger.debug(
-                "put key=%s address=%d data_size=%d",
-                key,
-                mem_obj.meta.address,
-                len(self.data),
-            )
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         with self.data_lock:
@@ -883,20 +838,12 @@ class PDBackend(AllocatorBackendInterface):
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
             if mem_obj is not None:
-                logger.debug(
-                    "remove key=%s address=%d ref_count=%d data_size=%d",
-                    key,
-                    mem_obj.meta.address,
-                    mem_obj.get_ref_count(),
-                    len(self.data),
-                )
                 mem_obj.ref_count_down()
                 if self.pd_config.role == "receiver":
                     asyncio.run_coroutine_threadsafe(
                         self._notify_inflight_freed(), self._recv_loop
                     )
                 return True
-            logger.debug("remove key=%s not found, data_size=%d", key, len(self.data))
             return False
 
     async def _notify_inflight_freed(self) -> None:
@@ -971,48 +918,3 @@ class PDBackend(AllocatorBackendInterface):
 
     def unpin(self, key: CacheEngineKey) -> bool:
         return True
-
-    # ------------------------------------------------------------------
-    # Debugging helpers
-    # ------------------------------------------------------------------
-
-    def _log_pool_state(self, label: str) -> None:
-        """Log current pool usage for debugging allocation failures."""
-        alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"
-        allocator = (
-            self.memory_allocator.cpu_allocator
-            if alloc_type == "cpu"
-            else self.memory_allocator.gpu_allocator
-        )
-        if self.pd_config.role == "receiver":
-            logger.info(
-                "[PDBackend %s] %s: "
-                "data_entries=%d, "
-                "free_blocks=%d, "
-                "active_allocs=%d, "
-                "total_alloc_bytes=%d, "
-                "inflight_chunks=%d, "
-                "max_inflight_chunks=%d",
-                self.pd_config.role,
-                label,
-                len(self.data),
-                len(allocator.free_blocks),
-                allocator.num_active_allocations,
-                allocator.total_allocated_size,
-                self._inflight_chunks,
-                self._max_inflight_chunks,
-            )
-        else:
-            logger.info(
-                "[PDBackend %s] %s: "
-                "data_entries=%d, "
-                "free_blocks=%d, "
-                "active_allocs=%d, "
-                "total_alloc_bytes=%d",
-                self.pd_config.role,
-                label,
-                len(self.data),
-                len(allocator.free_blocks),
-                allocator.num_active_allocations,
-                allocator.total_allocated_size,
-            )
