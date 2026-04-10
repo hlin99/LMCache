@@ -724,3 +724,70 @@ def test_receiver_close_stops_event_loop(async_receiver):
     )
     # Prevent fixture's close() from double-closing
     async_receiver.running = False
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Sender — staging buffer backpressure blocks then unblocks
+# ---------------------------------------------------------------------------
+
+
+def test_sender_staging_backpressure_blocks_then_unblocks(async_sender):
+    """
+    When the sender staging buffer is full (_sender_inflight_chunks >=
+    _sender_max_inflight_chunks), allocate() must block until
+    _release_sender_staging_chunks() makes room.
+
+    Strategy:
+      1. Fill the staging counter to the maximum by calling allocate() via
+         the real PDBackend.allocate() path with a patched memory_allocator
+         that always succeeds.
+      2. Manually saturate _sender_inflight_chunks to the maximum.
+      3. Launch a background thread that calls allocate() — it should block.
+      4. After a short delay, call _release_sender_staging_chunks(1) to free
+         one slot.
+      5. The blocked thread must unblock and return a MemoryObj.
+    """
+    sentinel = _make_mem_obj(idx=77)
+
+    # Patch memory_allocator.allocate to always return sentinel
+    async_sender.memory_allocator.allocate = MagicMock(return_value=sentinel)
+
+    # Saturate the inflight counter
+    max_chunks = async_sender._sender_max_inflight_chunks
+    with async_sender._sender_staging_condition:
+        async_sender._sender_inflight_chunks = max_chunks
+
+    result_holder: list = []
+    blocked_event = threading.Event()
+    unblocked_event = threading.Event()
+
+    def allocating_thread():
+        blocked_event.set()  # Signal that we are about to call allocate()
+        mem_obj = async_sender.allocate(torch.Size([4, 2, 16, 8, 128]), torch.bfloat16)
+        result_holder.append(mem_obj)
+        unblocked_event.set()
+
+    t = threading.Thread(target=allocating_thread, daemon=True)
+    t.start()
+
+    # Wait until the thread is definitely inside allocate()
+    assert blocked_event.wait(timeout=2.0), "Thread did not start in time"
+    # Give it a moment to enter the wait() call
+    time.sleep(0.05)
+
+    # Thread should still be blocked
+    assert not unblocked_event.is_set(), (
+        "allocate() returned before the staging slot was freed — "
+        "backpressure is not working"
+    )
+
+    # Release one slot — the blocked thread should wake up
+    async_sender._release_sender_staging_chunks(1)
+
+    assert unblocked_event.wait(timeout=2.0), (
+        "allocate() did not unblock within 2 s after slot was freed"
+    )
+    assert result_holder and result_holder[0] is sentinel, (
+        "allocate() did not return the expected MemoryObj after unblocking"
+    )
+    t.join(timeout=1.0)
