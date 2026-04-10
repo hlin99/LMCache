@@ -791,3 +791,106 @@ def test_sender_staging_backpressure_blocks_then_unblocks(async_sender):
         "allocate() did not return the expected MemoryObj after unblocking"
     )
     t.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Last prefill waits for prior transfer tasks before notifying proxy
+# ---------------------------------------------------------------------------
+
+
+def test_sender_last_prefill_waits_for_prior_tasks(async_sender):
+    """
+    When a long prompt is chunked into multiple prefills, the final chunk
+    (is_last_prefill=True) must NOT send ProxyNotif until all prior chunks'
+    RDMA transfers have completed.
+
+    Strategy:
+      - Submit chunk #1 (is_last_prefill=False) with a SLOW transfer
+        (TRANSFER_DELAY_SLOW).
+      - Submit chunk #2 (is_last_prefill=True) with a FAST transfer
+        (TRANSFER_DELAY_FAST, much smaller).
+      - Without the fix, chunk #2 would send ProxyNotif after only
+        TRANSFER_DELAY_FAST, before chunk #1 finishes.
+      - With the fix, ProxyNotif must arrive no earlier than TRANSFER_DELAY_SLOW.
+
+    We record the wall-clock time at which ProxyNotif is sent by wrapping
+    proxy_side_channel.send.
+    """
+    TRANSFER_DELAY_SLOW = 0.30  # simulates large chunk RDMA
+    TRANSFER_DELAY_FAST = 0.05  # simulates small final chunk RDMA
+    REQ_ID = "req-chunked"
+
+    # Replace the global slow write with per-call timing controlled by a flag.
+    # Chunk #1 (not last) uses slow delay; chunk #2 (last) uses fast delay.
+    # We distinguish them by the is_last_prefill field on the transfer_spec
+    # passed through to the mock via closure.
+
+    write_call_count = 0
+    write_call_lock = threading.Lock()
+
+    async def _controlled_write(*args, **kwargs):
+        nonlocal write_call_count
+        with write_call_lock:
+            write_call_count += 1
+            call_index = write_call_count
+        if call_index == 1:
+            await asyncio.sleep(TRANSFER_DELAY_SLOW)
+        else:
+            await asyncio.sleep(TRANSFER_DELAY_FAST)
+        return 1
+
+    async_sender.transfer_channel.async_batched_write = _controlled_write
+
+    notify_time: list[float] = []
+    original_send = async_sender.proxy_side_channel.send
+
+    def recording_send(data):
+        notify_time.append(time.monotonic())
+        return original_send(data)
+
+    async_sender.proxy_side_channel.send = recording_send
+
+    # Submit chunk #1: slow RDMA, is_last_prefill=False
+    spec1 = _make_transfer_spec(req_id=REQ_ID, is_last_prefill=False)
+    async_sender.batched_submit_put_task(
+        keys=[_make_key(0)],
+        memory_objs=[_make_mem_obj(0)],
+        transfer_spec=spec1,
+    )
+
+    # Small gap so chunk #1's _schedule_transfer_task is enqueued first
+    time.sleep(0.01)
+
+    # Submit chunk #2: fast RDMA, is_last_prefill=True
+    done = threading.Event()
+    spec2 = _make_transfer_spec(req_id=REQ_ID, is_last_prefill=True)
+    async_sender.batched_submit_put_task(
+        keys=[_make_key(1)],
+        memory_objs=[_make_mem_obj(1)],
+        transfer_spec=spec2,
+        on_complete_callback=lambda k: done.set(),
+    )
+
+    t_submit = time.monotonic()
+
+    # Wait long enough for both transfers to complete
+    finished = done.wait(timeout=TRANSFER_DELAY_SLOW * 3)
+    assert finished, "Transfer did not complete within timeout"
+
+    assert len(notify_time) == 1, (
+        f"Expected exactly one ProxyNotif, got {len(notify_time)}"
+    )
+
+    # The notify must have arrived at least TRANSFER_DELAY_SLOW after the
+    # faster chunk was submitted (meaning it waited for the slow chunk).
+    # We allow up to 20% scheduling overhead — the important thing is that
+    # the notify did NOT arrive in TRANSFER_DELAY_FAST (≈0.05 s), which
+    # would indicate the race condition is present.
+    TIMING_TOLERANCE_FACTOR = 0.8  # accept up to 20% scheduling overhead
+    elapsed = notify_time[0] - t_submit
+    assert elapsed >= TRANSFER_DELAY_SLOW * TIMING_TOLERANCE_FACTOR, (
+        f"ProxyNotif sent after only {elapsed:.3f}s — "
+        f"expected >= {TRANSFER_DELAY_SLOW * TIMING_TOLERANCE_FACTOR:.3f}s "
+        f"(slow chunk delay). "
+        "The final chunk did not wait for the prior slow chunk to finish."
+    )
