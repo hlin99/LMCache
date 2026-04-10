@@ -858,7 +858,7 @@ def test_sender_last_prefill_waits_for_prior_tasks(async_sender):
         transfer_spec=spec1,
     )
 
-    # Small gap so chunk #1's _schedule_transfer_task is enqueued first
+    # Small gap so chunk #1 is enqueued onto the per-request queue first
     time.sleep(0.01)
 
     # Submit chunk #2: fast RDMA, is_last_prefill=True
