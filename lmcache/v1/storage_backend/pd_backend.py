@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
 import threading
+import time
 
 # Third Party
 import msgspec
@@ -251,6 +252,24 @@ class PDBackend(AllocatorBackendInterface):
                 self._aligned_buffer_size,
                 self._chunk_size_bytes,
             )
+            # Sender staging buffer flow control: block cache_engine.store()
+            # (which runs in a vLLM worker thread) when the staging buffer is
+            # near-full so that in-flight RDMA transfers can drain before new
+            # allocations are allowed.  threading.Condition is required because
+            # allocate() is called from a worker thread, not the asyncio loop.
+            self._sender_staging_lock = threading.Lock()
+            self._sender_staging_condition = threading.Condition(
+                self._sender_staging_lock
+            )
+            self._sender_inflight_chunks = 0
+            # Leave headroom: allow at most 3/4 of total chunks to be in-flight
+            self._sender_max_inflight_chunks = max(1, total_chunks * 3 // 4)
+            logger.info(
+                "PDBackend sender: staging flow control initialized with "
+                "max_inflight=%d (total_chunks=%d)",
+                self._sender_max_inflight_chunks,
+                total_chunks,
+            )
         elif self.pd_config.role == "receiver":
             self._init_receiver()
             # Decoder-side flow control: block allocation when buffer is near-full
@@ -348,9 +367,45 @@ class PDBackend(AllocatorBackendInterface):
             fmt = MemoryFormat.KV_2LTD
         # NOTE: no eviction and busy_loop in PD
         alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"
-        return self.memory_allocator.allocate(
-            shapes, dtypes, fmt=fmt, allocator_type=alloc_type
-        )
+
+        if self.pd_config.role == "sender":
+            # Block until the sender staging buffer has enough headroom.
+            # This runs in the vLLM worker thread so threading.Condition is used.
+            with self._sender_staging_condition:
+                while self._sender_inflight_chunks >= self._sender_max_inflight_chunks:
+                    logger.warning(
+                        "Sender staging buffer near-full: inflight_chunks=%d >= "
+                        "max=%d, waiting for transfers to complete...",
+                        self._sender_inflight_chunks,
+                        self._sender_max_inflight_chunks,
+                    )
+                    self._sender_staging_condition.wait(timeout=1.0)
+                    if not self.running:
+                        return None
+
+            # Retry allocation with backoff in case the underlying allocator
+            # needs a moment to reclaim pages freed by just-completed transfers.
+            max_retries = 500
+            wait_time = 0.01
+            for attempt in range(max_retries + 1):
+                mem_obj = self.memory_allocator.allocate(
+                    shapes, dtypes, fmt=fmt, allocator_type=alloc_type
+                )
+                if mem_obj is not None:
+                    with self._sender_staging_condition:
+                        self._sender_inflight_chunks += 1
+                    return mem_obj
+                if attempt < max_retries:
+                    time.sleep(wait_time)
+
+            logger.error(
+                "Sender staging allocation failed after %d retries", max_retries
+            )
+            return None
+        else:
+            return self.memory_allocator.allocate(
+                shapes, dtypes, fmt=fmt, allocator_type=alloc_type
+            )
 
     # TODO(Jiayi): Please implement batched allocate to reduce memory
     # allocation overhead.
@@ -606,6 +661,27 @@ class PDBackend(AllocatorBackendInterface):
             # leaving fewer than num_chunks permits held).
             for _ in range(acquired_chunks):
                 self._chunk_semaphore.release()
+            # Release sender staging buffer slots so that allocate() waiters
+            # can proceed.  num_chunks equals the number of memory objects that
+            # were allocated from the staging buffer via allocate().
+            self._release_sender_staging_chunks(num_chunks)
+
+    def _release_sender_staging_chunks(self, count: int) -> None:
+        """Decrement sender staging inflight counter and notify waiters.
+
+        Called from ``_async_transfer_task`` (asyncio) after all staging
+        buffers for a transfer have been freed via ``ref_count_down()``.
+        ``threading.Condition.notify_all()`` is non-blocking and safe to call
+        from an asyncio coroutine.
+
+        :param count: Number of staging slots to release.
+        """
+        if self.pd_config.role == "sender" and count > 0:
+            with self._sender_staging_condition:
+                self._sender_inflight_chunks = max(
+                    0, self._sender_inflight_chunks - count
+                )
+                self._sender_staging_condition.notify_all()
 
     def batched_submit_put_task(
         self,
