@@ -883,9 +883,14 @@ def test_sender_last_prefill_waits_for_prior_tasks(async_sender):
 
     # The notify must have arrived at least TRANSFER_DELAY_SLOW after the
     # faster chunk was submitted (meaning it waited for the slow chunk).
+    # We allow up to 20% scheduling overhead — the important thing is that
+    # the notify did NOT arrive in TRANSFER_DELAY_FAST (≈0.05 s), which
+    # would indicate the race condition is present.
+    TIMING_TOLERANCE_FACTOR = 0.8  # accept up to 20% scheduling overhead
     elapsed = notify_time[0] - t_submit
-    assert elapsed >= TRANSFER_DELAY_SLOW * 0.8, (
+    assert elapsed >= TRANSFER_DELAY_SLOW * TIMING_TOLERANCE_FACTOR, (
         f"ProxyNotif sent after only {elapsed:.3f}s — "
-        f"expected >= {TRANSFER_DELAY_SLOW * 0.8:.3f}s (slow chunk delay). "
+        f"expected >= {TRANSFER_DELAY_SLOW * TIMING_TOLERANCE_FACTOR:.3f}s "
+        f"(slow chunk delay). "
         "The final chunk did not wait for the prior slow chunk to finish."
     )

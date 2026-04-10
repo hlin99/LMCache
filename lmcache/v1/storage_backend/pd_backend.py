@@ -559,6 +559,14 @@ class PDBackend(AllocatorBackendInterface):
         """
         completed_indexes: set[int] = set()
         num_chunks = len(memory_objs)
+        is_last_prefill = transfer_spec is not None and getattr(
+            transfer_spec, "is_last_prefill", False
+        )
+        req_id: Optional[str] = (
+            getattr(transfer_spec, "req_id", None)
+            if transfer_spec is not None
+            else None
+        )
 
         # Acquire chunk-level permits to limit decoder buffer pressure.
         # Acquired before remote allocation so that the total number of
@@ -632,10 +640,7 @@ class PDBackend(AllocatorBackendInterface):
                     " Skipping transfer."
                 )
 
-            if transfer_spec is not None and getattr(
-                transfer_spec, "is_last_prefill", False
-            ):
-                req_id = getattr(transfer_spec, "req_id", None)
+            if is_last_prefill:
                 if req_id is not None:
                     # Wait for all other in-flight transfer tasks of the same
                     # request before notifying the proxy.  This prevents the
@@ -687,12 +692,8 @@ class PDBackend(AllocatorBackendInterface):
             self._release_sender_staging_chunks(num_chunks)
             # Remove per-request task tracking when the last-prefill task
             # finishes (whether successfully or not) to avoid memory leaks.
-            if transfer_spec is not None and getattr(
-                transfer_spec, "is_last_prefill", False
-            ):
-                req_id = getattr(transfer_spec, "req_id", None)
-                if req_id is not None:
-                    self._pending_transfer_tasks.pop(req_id, None)
+            if is_last_prefill and req_id is not None:
+                self._pending_transfer_tasks.pop(req_id, None)
 
     def _release_sender_staging_chunks(self, count: int) -> None:
         """Decrement sender staging inflight counter and notify waiters.
