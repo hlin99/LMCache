@@ -861,7 +861,9 @@ class LMCacheEngine:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
                 self.storage_manager.remove(key, self.retrieve_locations)
-            if not self.async_loading:
+                # PDBackend.remove() already calls ref_count_down(), so skip
+                # the decrement below to avoid a double-free.
+            elif not self.async_loading:
                 memory_obj.ref_count_down()
 
         retrieved_tokens = torch.sum(ret_mask)
@@ -1676,11 +1678,23 @@ class LMCacheEngine:
         if last_failed_block_start is not None:
             ret_mask[last_failed_block_start:] = False
 
-            reordered_chunks = [
-                (key, memory_obj, start, end)
-                for key, memory_obj, start, end in reordered_chunks
-                if end < last_failed_block_start
-            ]
+            kept_chunks: List[ProcessedChunk] = []
+            for key, memory_obj, start, end in reordered_chunks:
+                if end < last_failed_block_start:
+                    kept_chunks.append((key, memory_obj, start, end))
+                else:
+                    # This chunk will not be used.  If the engine is
+                    # configured to remove-after-retrieve the caller would
+                    # normally call remove (which frees the block), but
+                    # since we are dropping these chunks here, we must
+                    # free them ourselves to avoid leaking PD buffer pool
+                    # memory.
+                    if self.remove_after_retrieve:
+                        assert self.storage_manager is not None
+                        self.storage_manager.remove(key, self.retrieve_locations)
+                    else:
+                        memory_obj.ref_count_down()
+            reordered_chunks = kept_chunks
         return reordered_chunks, tot_kv_size
 
     def _broadcast_or_receive_memory_objs(
