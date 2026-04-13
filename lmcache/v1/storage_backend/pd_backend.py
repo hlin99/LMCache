@@ -35,6 +35,11 @@ from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
 
+# Maximum seconds to spend retrying a memory allocation before giving up.
+_ALLOCATION_TIMEOUT_SECONDS = 5.0
+# Polling interval used when waiting on a threading/asyncio Condition; small
+# enough to be responsive, large enough not to spin-waste CPU.
+_CONDITION_WAIT_INTERVAL = 0.5
 
 class PDMsgBase(msgspec.Struct, tag=True):
     """Base class for all PD-related messages"""
@@ -254,8 +259,10 @@ class PDBackend(AllocatorBackendInterface):
             # transferred but are still in use by the decoder.
             # NOTE: The chunk semaphore limits sender-side in-flight chunks to
             # total_chunks // 2.  The receiver independently enforces its own
-            # limit of total_chunks * 3 // 4.  If sender and receiver buffer
-            # sizes differ, the effective flow control may not be optimal.
+            # limit of total_chunks * 3 // 4.  If sender buffer size is smaller
+            # than receiver buffer size, the sender's limit will be reached
+            # before the receiver's, potentially underutilizing receiver capacity.
+            # If sender buffer is larger, the receiver may become the bottleneck.
             # A future improvement could negotiate capacity via the alloc protocol.
             total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
             max_inflight = max(1, total_chunks // 2)
@@ -412,7 +419,7 @@ class PDBackend(AllocatorBackendInterface):
                 # Event-driven retry: wait on the condition for notification
                 # instead of time.sleep polling so that the thread wakes up
                 # immediately when _release_sender_staging_chunks fires.
-                deadline = time.monotonic() + 5.0
+                deadline = time.monotonic() + _ALLOCATION_TIMEOUT_SECONDS
                 while True:
                     mem_obj = self.memory_allocator.allocate(
                         shapes, dtypes, fmt=fmt, allocator_type=alloc_type
@@ -423,7 +430,7 @@ class PDBackend(AllocatorBackendInterface):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
-                    self._sender_staging_condition.wait(timeout=min(remaining, 0.5))
+                    self._sender_staging_condition.wait(timeout=min(remaining, _CONDITION_WAIT_INTERVAL))
                     if not self.running:
                         return None
 
@@ -794,8 +801,12 @@ class PDBackend(AllocatorBackendInterface):
             for mem_obj in item.memory_objs:
                 try:
                     mem_obj.ref_count_down()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "ref_count_down() failed during drain for req %s: %s",
+                        req_id,
+                        e,
+                    )
             self._release_sender_staging_chunks(len(item.memory_objs))
             q.task_done()
             drained += 1
@@ -1026,20 +1037,21 @@ class PDBackend(AllocatorBackendInterface):
             # Event-driven retry: wait on _inflight_condition for notification
             # instead of asyncio.sleep polling so the coroutine wakes up
             # immediately when _notify_inflight_freed fires.
-            deadline = asyncio.get_event_loop().time() + 5.0
+            deadline = asyncio.get_event_loop().time() + _ALLOCATION_TIMEOUT_SECONDS
             while mem_obj is None:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     logger.error(
-                        "Failed to allocate memory for key %s after timeout (~5s), aborting.",
+                        "Failed to allocate memory for key %s after timeout (~%.0fs), aborting.",
                         key,
+                        _ALLOCATION_TIMEOUT_SECONDS,
                     )
                     break
                 async with self._inflight_condition:
                     try:
                         await asyncio.wait_for(
                             self._inflight_condition.wait(),
-                            timeout=min(remaining, 0.5),
+                            timeout=min(remaining, _CONDITION_WAIT_INTERVAL),
                         )
                     except asyncio.TimeoutError:
                         pass
