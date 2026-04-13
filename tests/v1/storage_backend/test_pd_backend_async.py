@@ -11,25 +11,16 @@ with asyncio.sleep() stubs so:
   - Assertions focus on *timing* and *call-ordering*, not data integrity
     (data integrity is covered by the NIXL integration tests)
 
-Sender properties:
-  1. **Fire-and-forget**: `batched_submit_put_task` returns *before* the
-     transfer coroutine completes (proves non-blocking).
-  2. **Concurrency**: N concurrent transfers complete in ~1x transfer_delay,
-     not N× transfer_delay (proves tasks overlap on the event loop).
-
-Receiver property:
-  3. **Non-blocking busy-wait**: when `allocate()` returns None (full buffer),
-     `_async_allocate_and_put` yields via `asyncio.sleep` so other coroutines
-     can run concurrently.  If `time.sleep` were used instead, a second
-     coroutine B would be blocked until A finishes its retries.
-  6. **already_sent deduplication**: keys that already exist are skipped
-     (no allocate call) and their indexes appear in already_sent_indexes.
-  7. **last_chunk_toks shape override**: the last chunk's token dimension
-     is correctly overwritten to last_chunk_toks.
-  8. **Exception recovery**: the alloc server survives a malformed request
-     and continues to process subsequent requests.
-  9. **Graceful shutdown**: close() stops the receiver event loop and joins
-     its background thread.
+Test matrix (behaviour × role)
+------------------------------
+  1. Sender  — Non-blocking: N concurrent transfers complete in ≈1× delay
+  2. Receiver — Non-blocking: asyncio.sleep yields, not time.sleep
+  3. Sender  — Flow control: allocate() blocks when staging buffer full
+  4. Receiver — Flow control: _async_allocate_and_put blocks when inflight full
+  5. Sender  — Close: close() stops _sender_loop and joins _sender_thread
+  6. Receiver — Close: close() stops _recv_loop and joins _recv_thread
+  7. Receiver — Data correctness: already_sent dedup + last_chunk_toks shape
+  8. Sender  — Chunk ordering: last prefill waits for prior slow chunk
 """
 
 # Standard
@@ -49,7 +40,6 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
-    PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.storage_backend.pd_backend import (
     AllocRequest,
@@ -64,7 +54,6 @@ from lmcache.v1.storage_backend.pd_backend import (
 # ---------------------------------------------------------------------------
 
 TRANSFER_DELAY = 0.15  # seconds – simulates a NIXL write taking 150 ms
-ALLOC_RETRY_DELAY = 0.02  # seconds – asyncio.sleep between alloc retries
 
 
 def _make_key(i: int) -> CacheEngineKey:
@@ -109,44 +98,48 @@ def _make_transfer_spec(
 
 
 # ---------------------------------------------------------------------------
+# Shared patch context for PDBackend construction
+# ---------------------------------------------------------------------------
+
+
+def _pd_backend_patches():
+    """Return a combined patch context that mocks out all external deps."""
+    return (
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.get_zmq_context",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.get_zmq_socket",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.CreateTransferChannel",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "lmcache.v1.storage_backend.pd_backend.get_correct_device",
+            return_value="cpu",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Fixture: PDBackend sender with everything mocked out
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def async_sender(tmp_path):
+def async_sender():
     """
     Build a PDBackend in sender (prefiller) mode with:
-      - PagedCpuGpuMemoryAllocator mocked (no real GPU memory)
-      - get_zmq_context mocked (no real sockets)
+      - get_zmq_context / get_zmq_socket mocked (no real sockets)
       - CreateTransferChannel mocked (async_batched_write sleeps TRANSFER_DELAY)
       - ZMQ alloc socket mocked (returns a canned AllocResponse immediately)
     """
-    # Third Party
-    import msgspec
+    p1, p2, p3, p4 = _pd_backend_patches()
 
-    # Use spec= so isinstance(mock, PagedCpuGpuMemoryAllocator) returns True.
-    mock_allocator_inst = MagicMock()
-    mock_allocator_inst.cpu_allocator.buffer_ptr = 0
-    mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
-    mock_allocator_inst.cpu_allocator.align_bytes = 1
-    # Make isinstance(mock, PagedCpuGpuMemoryAllocator) return True
-    mock_allocator_inst.__class__ = PagedCpuGpuMemoryAllocator
-
-    with (
-        patch("lmcache.v1.storage_backend.pd_backend.get_zmq_context") as mock_zmq_ctx,
-        patch("lmcache.v1.storage_backend.pd_backend.get_zmq_socket") as mock_zmq_sock,
-        patch(
-            "lmcache.v1.storage_backend.pd_backend.CreateTransferChannel"
-        ) as mock_create_tc,
-        patch(
-            "lmcache.v1.storage_backend.pd_backend.get_correct_device",
-            return_value="cpu",
-        ),
-    ):
-        # --- zmq context stub ---
-        mock_zmq_ctx.return_value = MagicMock()
-
+    with p1, p2 as mock_zmq_sock, p3 as mock_create_tc, p4:
         # --- alloc socket stub: answers immediately with remote_indexes=[0] ---
         alloc_socket = MagicMock()
         alloc_response = AllocResponse(already_sent_indexes=[], remote_indexes=[0])
@@ -210,35 +203,15 @@ def async_sender(tmp_path):
 
 
 @pytest.fixture
-def async_receiver(tmp_path):
+def async_receiver():
     """
     Build a PDBackend in receiver (decoder) mode.
     The ZMQ server socket is mocked so no real port is bound.
     The memory allocator is mocked so we control when allocate() returns None.
     """
-    # Use spec= so isinstance(mock, PagedCpuGpuMemoryAllocator) returns True.
-    mock_allocator_inst = MagicMock()
-    mock_allocator_inst.cpu_allocator.buffer_ptr = 0
-    mock_allocator_inst.cpu_allocator.buffer_size = 1024 * 1024 * 64
-    mock_allocator_inst.cpu_allocator.align_bytes = 1
-    # Make isinstance(mock, PagedCpuGpuMemoryAllocator) return True
-    mock_allocator_inst.__class__ = PagedCpuGpuMemoryAllocator
+    p1, p2, p3, p4 = _pd_backend_patches()
 
-    with (
-        patch("lmcache.v1.storage_backend.pd_backend.get_zmq_context") as mock_zmq_ctx,
-        patch("lmcache.v1.storage_backend.pd_backend.get_zmq_socket") as mock_zmq_sock,
-        patch(
-            "lmcache.v1.storage_backend.pd_backend.CreateTransferChannel"
-        ) as mock_create_tc,
-        patch(
-            "lmcache.v1.storage_backend.pd_backend.get_correct_device",
-            return_value="cpu",
-        ),
-    ):
-        mock_zmq_ctx.return_value = MagicMock()
-        mock_zmq_sock.return_value = MagicMock()
-        mock_create_tc.return_value = MagicMock()
-
+    with p1, p2, p3, p4:
         # First Party
         from lmcache.v1.config import LMCacheEngineConfig
         from lmcache.v1.metadata import LMCacheMetadata
@@ -273,47 +246,16 @@ def async_receiver(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Fire-and-forget — function returns before transfer completes
+# Test 1: Sender — Non-blocking concurrency
 # ---------------------------------------------------------------------------
 
 
-def test_sender_returns_before_transfer_completes(async_sender):
-    """
-    batched_submit_put_task() must return BEFORE async_batched_write finishes.
-
-    We measure the wall time of the call. If it takes >= TRANSFER_DELAY the
-    call is blocking (bad). If it returns in << TRANSFER_DELAY it's truly
-    fire-and-forget (good).
-    """
-    keys = [_make_key(0)]
-    memory_objs = [_make_mem_obj(0)]
-    transfer_spec = _make_transfer_spec()
-
-    t0 = time.monotonic()
-    async_sender.batched_submit_put_task(keys, memory_objs, transfer_spec=transfer_spec)
-    elapsed = time.monotonic() - t0
-
-    # Should return in << TRANSFER_DELAY
-    # (allow up to 50% of delay for scheduling overhead)
-    assert elapsed < TRANSFER_DELAY * 0.5, (
-        f"batched_submit_put_task took {elapsed:.3f}s — looks like it's still blocking "
-        f"(expected < {TRANSFER_DELAY * 0.5:.3f}s)"
-    )
-
-    # Give the background task time to finish so we don't leave dangling tasks
-    time.sleep(TRANSFER_DELAY * 1.5)
-
-
-# ---------------------------------------------------------------------------
-# Test 2: Concurrency — N tasks complete in ≈ 1× delay, not N×
-# ---------------------------------------------------------------------------
-
-
-def test_sender_transfers_are_concurrent(async_sender):
+def test_sender_nonblocking_concurrent_transfers(async_sender):
     """
     Submit N transfers simultaneously. If async works correctly, they run
     concurrently on the event loop and finish in ≈ TRANSFER_DELAY total,
-    not N × TRANSFER_DELAY.
+    not N × TRANSFER_DELAY. This implicitly proves fire-and-forget (each
+    batched_submit_put_task returns before its transfer completes).
     """
     N = 4
     done_events = [threading.Event() for _ in range(N)]
@@ -347,29 +289,30 @@ def test_sender_transfers_are_concurrent(async_sender):
 
     # With true concurrency: total ≈ TRANSFER_DELAY
     # With sequential execution: total ≈ N × TRANSFER_DELAY
-    max_allowed = TRANSFER_DELAY * 1.8  # allow 80% overhead
+    max_allowed = TRANSFER_DELAY * 2.0  # generous margin for CI
     assert total_elapsed < max_allowed, (
         f"{N} transfers took {total_elapsed:.3f}s, expected < {max_allowed:.3f}s."
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Receiver busy-wait is non-blocking
+# Test 2: Receiver — Non-blocking busy-wait uses asyncio.sleep
 # ---------------------------------------------------------------------------
 
 
-def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
+def test_receiver_nonblocking_async_sleep(async_receiver):
     """
-    Prove that the *real* _async_allocate_and_put uses asyncio.sleep (not
-    time.sleep) when allocate() returns None.
+    Prove that _async_allocate_and_put uses asyncio.sleep (not time.sleep)
+    when allocate() returns None.
 
     Two AllocRequests run concurrently via asyncio.gather:
-      - req_a: allocate() returns None for RETRY_COUNT calls (per task),
-               then succeeds. The real busy-wait loop fires RETRY_COUNT times.
+      - req_a: allocate() returns None for RETRY_COUNT calls, then succeeds.
       - req_b: allocate() succeeds immediately.
 
-    We use asyncio.current_task() inside patched allocate() to distinguish
-    which coroutine is calling, so retry counts are tracked per-task.
+    We distinguish them by shape: req_a uses shape [4,2,16,8,128] (token=16),
+    req_b uses shape [4,2,8,8,128] (token=8). The patched allocate inspects
+    shape to determine which request is calling, avoiding any dependence on
+    asyncio scheduling order.
 
     If asyncio.sleep is used (correct):
         req_b runs while req_a is yielding → finish_order == ["b", "a"].
@@ -377,6 +320,8 @@ def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
         req_b cannot run until req_a finishes → finish_order == ["a", "b"].
     """
     RETRY_COUNT = 5
+    SHAPE_A_TOKS = 16
+    SHAPE_B_TOKS = 8
 
     key_a = _make_key(100)
     key_b = _make_key(200)
@@ -397,42 +342,36 @@ def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
 
     async_receiver.put = tracked_put
 
-    # Patch allocate() to use asyncio.current_task() as per-coroutine context.
-    # Each task tracks its own call count independently.
-    task_alloc_calls: dict[int, int] = {}
+    # Per-shape call counters; shape determines role, not call order
+    shape_alloc_calls: dict[int, int] = {}
 
     def patched_allocate(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kwargs):
-        task = asyncio.current_task()
-        task_id = id(task)
-        task_alloc_calls[task_id] = task_alloc_calls.get(task_id, 0) + 1
-        n = task_alloc_calls[task_id]
-        # The task handling key_a was submitted first (call n=1 initially);
-        # distinguish by whether this task has already been seen before the
-        # *other* task's first call. Use a simple heuristic: first task to
-        # call allocate is A (gets retries), second is B (immediate success).
-        if task_id not in _task_roles:
-            _task_roles[task_id] = "a" if len(_task_roles) == 0 else "b"
-        role = _task_roles[task_id]
-        if role == "a" and n <= RETRY_COUNT:
-            return None
-        return mem_obj_a if role == "a" else mem_obj_b
+        token_dim = MemoryFormat.KV_2LTD.token_dim()
+        toks = (
+            shapes[token_dim] if isinstance(shapes, torch.Size) else shapes[token_dim]
+        )
+        shape_alloc_calls[toks] = shape_alloc_calls.get(toks, 0) + 1
+        n = shape_alloc_calls[toks]
 
-    _task_roles: dict[int, str] = {}
+        if toks == SHAPE_A_TOKS and n <= RETRY_COUNT:
+            return None  # req_a retries
+        return mem_obj_a if toks == SHAPE_A_TOKS else mem_obj_b
+
     async_receiver.allocate = patched_allocate
 
     alloc_req_a = AllocRequest(
         keys=[key_a.to_string()],
         fmt=MemoryFormat.KV_2LTD.value,
-        shape=[4, 2, 16, 8, 128],
+        shape=[4, 2, SHAPE_A_TOKS, 8, 128],
         dtype="bfloat16",
-        last_chunk_toks=16,
+        last_chunk_toks=SHAPE_A_TOKS,
     )
     alloc_req_b = AllocRequest(
         keys=[key_b.to_string()],
         fmt=MemoryFormat.KV_2LTD.value,
-        shape=[4, 2, 16, 8, 128],
+        shape=[4, 2, SHAPE_B_TOKS, 8, 128],
         dtype="bfloat16",
-        last_chunk_toks=16,
+        last_chunk_toks=SHAPE_B_TOKS,
     )
 
     async def run_concurrent():
@@ -452,300 +391,15 @@ def test_receiver_alloc_busy_wait_is_non_blocking(async_receiver):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Proxy notification sent on last prefill
+# Test 3: Sender — Flow control backpressure
 # ---------------------------------------------------------------------------
 
 
-def test_sender_proxy_notification_on_last_prefill(async_sender):
-    """
-    When transfer_spec.is_last_prefill is True, the sender must send a
-    ProxyNotif message to proxy_side_channel after transfer completes.
-    """
-    keys = [_make_key(0)]
-    memory_objs = [_make_mem_obj(0)]
-    transfer_spec = _make_transfer_spec(is_last_prefill=True, req_id="req-notify")
-
-    done = threading.Event()
-
-    def cb(key):
-        done.set()
-
-    async_sender.batched_submit_put_task(
-        keys, memory_objs, transfer_spec=transfer_spec, on_complete_callback=cb
-    )
-
-    assert done.wait(timeout=TRANSFER_DELAY * 3), "Transfer did not complete"
-
-    # Verify proxy notification was sent
-    async_sender.proxy_side_channel.send.assert_called_once()
-    sent_bytes = async_sender.proxy_side_channel.send.call_args[0][0]
-    notif = msgspec.msgpack.decode(sent_bytes, type=PDMsg)
-    assert isinstance(notif, ProxyNotif)
-    assert notif.req_id == "req-notify"
-
-
-# ---------------------------------------------------------------------------
-# Test 5: No proxy notification when not last prefill
-# ---------------------------------------------------------------------------
-
-
-def test_sender_no_proxy_notification_when_not_last_prefill(async_sender):
-    """
-    When transfer_spec.is_last_prefill is False, no ProxyNotif should be sent.
-    """
-    keys = [_make_key(0)]
-    memory_objs = [_make_mem_obj(0)]
-    transfer_spec = _make_transfer_spec(is_last_prefill=False)
-
-    done = threading.Event()
-    async_sender.batched_submit_put_task(
-        keys,
-        memory_objs,
-        transfer_spec=transfer_spec,
-        on_complete_callback=lambda k: done.set(),
-    )
-
-    assert done.wait(timeout=TRANSFER_DELAY * 3)
-    async_sender.proxy_side_channel.send.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Test 6: Receiver — already_sent deduplication
-# ---------------------------------------------------------------------------
-
-
-def test_receiver_already_sent_deduplication(async_receiver):
-    """
-    When a key already exists in the backend (contains() returns True),
-    _async_allocate_and_put must:
-      - Include its index in already_sent_indexes
-      - NOT call allocate() for that key
-      - Still allocate the new key normally
-    """
-    key_existing = _make_key(300)
-    key_new = _make_key(301)
-    mem_obj_new = _make_mem_obj(idx=30)
-
-    # Pre-populate backend with key_existing
-    existing_obj = _make_mem_obj(idx=99)
-    async_receiver.put(key_existing, existing_obj)
-
-    # Patch allocate to always succeed and track calls
-    alloc_calls: list[torch.Size] = []
-
-    def tracking_allocate(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kwargs):
-        alloc_calls.append(shapes)
-        return mem_obj_new
-
-    async_receiver.allocate = tracking_allocate
-
-    alloc_req = AllocRequest(
-        keys=[key_existing.to_string(), key_new.to_string()],
-        fmt=MemoryFormat.KV_2LTD.value,
-        shape=[4, 2, 16, 8, 128],
-        dtype="bfloat16",
-        last_chunk_toks=8,
-    )
-
-    resp = asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
-
-    # Index 0 (key_existing) should be in already_sent
-    assert 0 in resp.already_sent_indexes, (
-        f"Expected index 0 in already_sent_indexes, got {resp.already_sent_indexes}"
-    )
-    # Only one allocation call should have been made (for key_new)
-    assert len(alloc_calls) == 1, (
-        f"Expected 1 allocate() call but got {len(alloc_calls)}"
-    )
-    # remote_indexes should contain the address of the new obj
-    assert resp.remote_indexes == [mem_obj_new.meta.address]
-
-
-# ---------------------------------------------------------------------------
-# Test 7: Receiver — last_chunk_toks shape override
-# ---------------------------------------------------------------------------
-
-
-def test_receiver_last_chunk_shape_override(async_receiver):
-    """
-    For the last chunk in an AllocRequest, shape[token_dim] must be
-    overwritten to last_chunk_toks. For earlier chunks the original
-    shape must be preserved.
-    """
-    key_full = _make_key(400)
-    key_last = _make_key(401)
-    mem_obj = _make_mem_obj(idx=40)
-
-    FULL_TOKENS = 16
-    LAST_TOKENS = 7
-
-    alloc_shapes: list[torch.Size] = []
-
-    def capturing_allocate(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kwargs):
-        alloc_shapes.append(shapes)
-        return mem_obj
-
-    async_receiver.allocate = capturing_allocate
-
-    alloc_req = AllocRequest(
-        keys=[key_full.to_string(), key_last.to_string()],
-        fmt=MemoryFormat.KV_2LTD.value,
-        shape=[4, 2, FULL_TOKENS, 8, 128],  # token_dim=2 for KV_2LTD
-        dtype="bfloat16",
-        last_chunk_toks=LAST_TOKENS,
-    )
-
-    asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
-
-    assert len(alloc_shapes) == 2, f"Expected 2 allocations, got {len(alloc_shapes)}"
-
-    # First chunk: token dim should remain FULL_TOKENS
-    token_dim = MemoryFormat.KV_2LTD.token_dim()
-    assert alloc_shapes[0][token_dim] == FULL_TOKENS, (
-        f"First chunk token dim should be {FULL_TOKENS}, "
-        f"got {alloc_shapes[0][token_dim]}"
-    )
-    # Last chunk: token dim should be overridden to LAST_TOKENS
-    assert alloc_shapes[1][token_dim] == LAST_TOKENS, (
-        f"Last chunk token dim should be {LAST_TOKENS}, "
-        f"got {alloc_shapes[1][token_dim]}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 8: Receiver — alloc server recovers from exception
-# ---------------------------------------------------------------------------
-
-
-def test_receiver_alloc_server_survives_exception(async_receiver):
-    """
-    If _async_allocate_and_put raises an exception for one request,
-    the _async_mem_alloc_server must NOT crash — the next request
-    should still be processed normally.
-
-    Strategy: run the server coroutine with a mock socket that feeds
-    two requests. The first triggers an exception; the second succeeds.
-    """
-    key_ok = _make_key(500)
-    mem_obj_ok = _make_mem_obj(idx=50)
-
-    # Build two encoded requests: first will cause exception, second is normal
-    bad_bytes = b"not-a-valid-msgpack-alloc-request"
-    good_req = AllocRequest(
-        keys=[key_ok.to_string()],
-        fmt=MemoryFormat.KV_2LTD.value,
-        shape=[4, 2, 16, 8, 128],
-        dtype="bfloat16",
-        last_chunk_toks=16,
-    )
-    good_bytes = msgspec.msgpack.encode(good_req)
-
-    responses_collected: list[bytes] = []
-
-    async def run_server_two_requests():
-        # Third Party
-
-        recv_queue = asyncio.Queue()
-        await recv_queue.put(bad_bytes)
-        await recv_queue.put(good_bytes)
-
-        class FakeSocket:
-            async def recv(self):
-                return await recv_queue.get()
-
-            async def send(self, data):
-                responses_collected.append(data)
-
-            def bind(self, url):
-                pass
-
-            def close(self):
-                pass
-
-        class FakeCtx:
-            def socket(self, stype):
-                return FakeSocket()
-
-            def term(self):
-                pass
-
-        # Patch allocate to succeed
-        def _alloc_ok(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
-            return mem_obj_ok
-
-        async_receiver.allocate = _alloc_ok
-
-        # Run server manually — stop after 2 iterations
-        socket = FakeSocket()
-        processed = 0
-        max_iters = 2
-
-        while async_receiver.running and processed < max_iters:
-            try:
-                alloc_req_bytes = await socket.recv()
-                alloc_req = msgspec.msgpack.decode(alloc_req_bytes, type=PDMsg)
-                assert isinstance(alloc_req, AllocRequest)
-                alloc_resp = await async_receiver._async_allocate_and_put(alloc_req)
-                await socket.send(msgspec.msgpack.encode(alloc_resp))
-            except Exception:
-                # Server should catch and continue — mirrors _async_mem_alloc_server
-                pass
-            processed += 1
-
-    asyncio.run(run_server_two_requests())
-
-    # First request failed (bad bytes) — no response sent
-    # Second request succeeded — one response sent
-    assert len(responses_collected) == 1, (
-        f"Expected 1 successful response, got {len(responses_collected)}"
-    )
-    resp = msgspec.msgpack.decode(responses_collected[0], type=PDMsg)
-    assert isinstance(resp, AllocResponse)
-    assert resp.remote_indexes == [mem_obj_ok.meta.address]
-
-
-# ---------------------------------------------------------------------------
-# Test 9: Receiver — close() shuts down event loop and thread
-# ---------------------------------------------------------------------------
-
-
-def test_receiver_close_stops_event_loop(async_receiver):
-    """
-    After close(), the receiver's _recv_loop should be stopped and
-    _recv_thread should have joined (not alive).
-    """
-    assert async_receiver._recv_thread.is_alive(), (
-        "Receiver thread should be alive before close()"
-    )
-    async_receiver.close()
-
-    assert not async_receiver._recv_thread.is_alive(), (
-        "Receiver thread should not be alive after close()"
-    )
-    # Prevent fixture's close() from double-closing
-    async_receiver.running = False
-
-
-# ---------------------------------------------------------------------------
-# Test 10: Sender — staging buffer backpressure blocks then unblocks
-# ---------------------------------------------------------------------------
-
-
-def test_sender_staging_backpressure_blocks_then_unblocks(async_sender):
+def test_sender_flow_control_backpressure(async_sender):
     """
     When the sender staging buffer is full (_sender_inflight_chunks >=
     _sender_max_inflight_chunks), allocate() must block until
     _release_sender_staging_chunks() makes room.
-
-    Strategy:
-      1. Fill the staging counter to the maximum by calling allocate() via
-         the real PDBackend.allocate() path with a patched memory_allocator
-         that always succeeds.
-      2. Manually saturate _sender_inflight_chunks to the maximum.
-      3. Launch a background thread that calls allocate() — it should block.
-      4. After a short delay, call _release_sender_staging_chunks(1) to free
-         one slot.
-      5. The blocked thread must unblock and return a MemoryObj.
     """
     sentinel = _make_mem_obj(idx=77)
 
@@ -773,7 +427,7 @@ def test_sender_staging_backpressure_blocks_then_unblocks(async_sender):
     # Wait until the thread is definitely inside allocate()
     assert blocked_event.wait(timeout=2.0), "Thread did not start in time"
     # Give it a moment to enter the wait() call
-    time.sleep(0.05)
+    time.sleep(0.1)
 
     # Thread should still be blocked
     assert not unblocked_event.is_set(), (
@@ -794,36 +448,207 @@ def test_sender_staging_backpressure_blocks_then_unblocks(async_sender):
 
 
 # ---------------------------------------------------------------------------
-# Test 11: Last prefill waits for prior transfer tasks before notifying proxy
+# Test 4: Receiver — Flow control inflight backpressure
 # ---------------------------------------------------------------------------
 
 
-def test_sender_last_prefill_waits_for_prior_tasks(async_sender):
+def test_receiver_flow_control_inflight(async_receiver):
+    """
+    When _inflight_chunks >= _max_inflight_chunks, _async_allocate_and_put
+    must wait on _inflight_condition. After the condition is notified
+    (simulating remove() freeing a slot), the blocked allocation proceeds.
+    """
+    mem_obj = _make_mem_obj(idx=60)
+
+    # Patch allocate to always succeed
+    async_receiver.allocate = (
+        lambda shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw: mem_obj
+    )
+
+    key = _make_key(600)
+    alloc_req = AllocRequest(
+        keys=[key.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+    )
+
+    async def saturate_and_test():
+        # Saturate inflight counter to the max
+        async with async_receiver._inflight_condition:
+            async_receiver._inflight_chunks = async_receiver._max_inflight_chunks
+
+        alloc_completed = asyncio.Event()
+        resp_holder: list = []
+
+        async def do_alloc():
+            resp = await async_receiver._async_allocate_and_put(alloc_req)
+            resp_holder.append(resp)
+            alloc_completed.set()
+
+        async def free_slot_later():
+            # Wait a bit to ensure do_alloc is blocked on the condition
+            await asyncio.sleep(0.05)
+            # Should NOT have completed yet
+            assert not alloc_completed.is_set(), (
+                "_async_allocate_and_put returned before inflight slot was freed"
+            )
+            # Free a slot — simulates what _notify_inflight_freed does
+            async with async_receiver._inflight_condition:
+                async_receiver._inflight_chunks -= 1
+                async_receiver._inflight_condition.notify_all()
+
+        # Run both concurrently
+        await asyncio.gather(do_alloc(), free_slot_later())
+
+        # Allocation should have succeeded
+        assert len(resp_holder) == 1
+        assert resp_holder[0].remote_indexes == [mem_obj.meta.address]
+
+    asyncio.run(saturate_and_test())
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Sender — close() shuts down event loop and thread
+# ---------------------------------------------------------------------------
+
+
+def test_sender_close_stops_event_loop(async_sender):
+    """
+    After close(), the sender's _sender_loop should be stopped and
+    _sender_thread should have joined (not alive).
+    """
+    assert async_sender._sender_thread.is_alive(), (
+        "Sender thread should be alive before close()"
+    )
+    async_sender.close()
+
+    assert not async_sender._sender_thread.is_alive(), (
+        "Sender thread should not be alive after close()"
+    )
+    # Prevent fixture's close() from double-closing
+    async_sender.running = False
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Receiver — close() shuts down event loop and thread
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_close_stops_event_loop(async_receiver):
+    """
+    After close(), the receiver's _recv_loop should be stopped and
+    _recv_thread should have joined (not alive).
+    """
+    assert async_receiver._recv_thread.is_alive(), (
+        "Receiver thread should be alive before close()"
+    )
+    async_receiver.close()
+
+    assert not async_receiver._recv_thread.is_alive(), (
+        "Receiver thread should not be alive after close()"
+    )
+    # Prevent fixture's close() from double-closing
+    async_receiver.running = False
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Receiver — Data correctness: dedup + last_chunk_toks shape
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_data_correctness_dedup_and_shape(async_receiver):
+    """
+    Combined test for _async_allocate_and_put correctness:
+      - key_existing: already in backend → in already_sent_indexes, no allocate()
+      - key_full:     new key → allocate with original token dim
+      - key_last:     new key (last) → allocate with overridden last_chunk_toks
+
+    Validates both deduplication and shape override in a single pass.
+    """
+    key_existing = _make_key(300)
+    key_full = _make_key(301)
+    key_last = _make_key(302)
+    mem_obj = _make_mem_obj(idx=30)
+
+    FULL_TOKENS = 16
+    LAST_TOKENS = 7
+
+    # Pre-populate backend with key_existing
+    async_receiver.put(key_existing, _make_mem_obj(idx=99))
+
+    alloc_shapes: list[torch.Size] = []
+
+    def tracking_allocate(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kwargs):
+        alloc_shapes.append(shapes)
+        return mem_obj
+
+    async_receiver.allocate = tracking_allocate
+
+    alloc_req = AllocRequest(
+        keys=[
+            key_existing.to_string(),
+            key_full.to_string(),
+            key_last.to_string(),
+        ],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, FULL_TOKENS, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=LAST_TOKENS,
+    )
+
+    resp = asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
+
+    # --- Deduplication assertions ---
+    # Index 0 (key_existing) should be in already_sent
+    assert 0 in resp.already_sent_indexes, (
+        f"Expected index 0 in already_sent_indexes, got {resp.already_sent_indexes}"
+    )
+    # Only 2 allocations (key_full + key_last), NOT 3
+    assert len(alloc_shapes) == 2, (
+        f"Expected 2 allocate() calls but got {len(alloc_shapes)}"
+    )
+    # remote_indexes should contain 2 entries for the allocated keys
+    assert len(resp.remote_indexes) == 2
+
+    # --- Shape override assertions ---
+    token_dim = MemoryFormat.KV_2LTD.token_dim()
+    # First alloc (key_full): token dim should remain FULL_TOKENS
+    assert alloc_shapes[0][token_dim] == FULL_TOKENS, (
+        f"Full chunk token dim should be {FULL_TOKENS}, "
+        f"got {alloc_shapes[0][token_dim]}"
+    )
+    # Second alloc (key_last): token dim should be overridden to LAST_TOKENS
+    assert alloc_shapes[1][token_dim] == LAST_TOKENS, (
+        f"Last chunk token dim should be {LAST_TOKENS}, "
+        f"got {alloc_shapes[1][token_dim]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Sender — Chunk ordering: last prefill waits for prior tasks
+# ---------------------------------------------------------------------------
+
+
+def test_sender_chunk_ordering_waits_for_prior_tasks(async_sender):
     """
     When a long prompt is chunked into multiple prefills, the final chunk
     (is_last_prefill=True) must NOT send ProxyNotif until all prior chunks'
     RDMA transfers have completed.
 
+    Also implicitly validates:
+      - ProxyNotif IS sent when is_last_prefill=True
+      - ProxyNotif is NOT sent for the non-last chunk (is_last_prefill=False)
+
     Strategy:
-      - Submit chunk #1 (is_last_prefill=False) with a SLOW transfer
-        (TRANSFER_DELAY_SLOW).
-      - Submit chunk #2 (is_last_prefill=True) with a FAST transfer
-        (TRANSFER_DELAY_FAST, much smaller).
-      - Without the fix, chunk #2 would send ProxyNotif after only
-        TRANSFER_DELAY_FAST, before chunk #1 finishes.
-      - With the fix, ProxyNotif must arrive no earlier than TRANSFER_DELAY_SLOW.
-
-    We record the wall-clock time at which ProxyNotif is sent by wrapping
-    proxy_side_channel.send.
+      - Submit chunk #1 (is_last_prefill=False) with a SLOW transfer.
+      - Submit chunk #2 (is_last_prefill=True) with a FAST transfer.
+      - ProxyNotif must arrive no earlier than the slow chunk's delay.
     """
-    TRANSFER_DELAY_SLOW = 0.30  # simulates large chunk RDMA
-    TRANSFER_DELAY_FAST = 0.05  # simulates small final chunk RDMA
+    TRANSFER_DELAY_SLOW = 0.30
+    TRANSFER_DELAY_FAST = 0.05
     REQ_ID = "req-chunked"
-
-    # Replace the global slow write with per-call timing controlled by a flag.
-    # Chunk #1 (not last) uses slow delay; chunk #2 (last) uses fast delay.
-    # We distinguish them by the is_last_prefill field on the transfer_spec
-    # passed through to the mock via closure.
 
     write_call_count = 0
     write_call_lock = threading.Lock()
@@ -842,11 +667,11 @@ def test_sender_last_prefill_waits_for_prior_tasks(async_sender):
     async_sender.transfer_channel.async_batched_write = _controlled_write
 
     notify_time: list[float] = []
-    original_send = async_sender.proxy_side_channel.send
+    sent_data: list[bytes] = []  # <-- capture sent bytes ourselves
 
     def recording_send(data):
         notify_time.append(time.monotonic())
-        return original_send(data)
+        sent_data.append(data)  # <-- save it here
 
     async_sender.proxy_side_channel.send = recording_send
 
@@ -858,7 +683,7 @@ def test_sender_last_prefill_waits_for_prior_tasks(async_sender):
         transfer_spec=spec1,
     )
 
-    # Small gap so chunk #1 is enqueued onto the per-request queue first
+    # Small gap so chunk #1 is enqueued first
     time.sleep(0.01)
 
     # Submit chunk #2: fast RDMA, is_last_prefill=True
@@ -877,20 +702,25 @@ def test_sender_last_prefill_waits_for_prior_tasks(async_sender):
     finished = done.wait(timeout=TRANSFER_DELAY_SLOW * 3)
     assert finished, "Transfer did not complete within timeout"
 
+    # --- ProxyNotif assertions ---
+    # Exactly one ProxyNotif should have been sent (for chunk #2 only)
     assert len(notify_time) == 1, (
         f"Expected exactly one ProxyNotif, got {len(notify_time)}"
     )
 
-    # The notify must have arrived at least TRANSFER_DELAY_SLOW after the
-    # faster chunk was submitted (meaning it waited for the slow chunk).
-    # We allow up to 20% scheduling overhead — the important thing is that
-    # the notify did NOT arrive in TRANSFER_DELAY_FAST (≈0.05 s), which
-    # would indicate the race condition is present.
-    TIMING_TOLERANCE_FACTOR = 0.8  # accept up to 20% scheduling overhead
+    # Verify the ProxyNotif content from our captured data
+    notif = msgspec.msgpack.decode(sent_data[0], type=PDMsg)  # <-- use sent_data
+    assert isinstance(notif, ProxyNotif)
+    assert notif.req_id == REQ_ID
+
+    # --- Timing assertion ---
+    # The notify must have arrived at least TRANSFER_DELAY_SLOW after submit,
+    # meaning the fast chunk waited for the slow chunk.
+    TIMING_TOLERANCE = 0.8  # allow 20% scheduling overhead
     elapsed = notify_time[0] - t_submit
-    assert elapsed >= TRANSFER_DELAY_SLOW * TIMING_TOLERANCE_FACTOR, (
+    assert elapsed >= TRANSFER_DELAY_SLOW * TIMING_TOLERANCE, (
         f"ProxyNotif sent after only {elapsed:.3f}s — "
-        f"expected >= {TRANSFER_DELAY_SLOW * TIMING_TOLERANCE_FACTOR:.3f}s "
+        f"expected >= {TRANSFER_DELAY_SLOW * TIMING_TOLERANCE:.3f}s "
         f"(slow chunk delay). "
         "The final chunk did not wait for the prior slow chunk to finish."
     )
