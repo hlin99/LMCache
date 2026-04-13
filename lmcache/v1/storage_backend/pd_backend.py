@@ -243,6 +243,7 @@ class PDBackend(AllocatorBackendInterface):
         if self.pd_config.role == "sender":
             self._init_sender()
             self.initialized_peers: set[str] = set()
+            self._peer_connection_lock = threading.Lock()
             # Separate async ZMQ context for sender coroutines
             self._async_zmq_context = zmq.asyncio.Context()
             self._async_alloc_sockets: dict[str, zmq.asyncio.Socket] = {}
@@ -251,6 +252,11 @@ class PDBackend(AllocatorBackendInterface):
             # We allow at most half of the total available chunks to be
             # in-flight at once, leaving headroom for chunks that have been
             # transferred but are still in use by the decoder.
+            # NOTE: The chunk semaphore limits sender-side in-flight chunks to
+            # total_chunks // 2.  The receiver independently enforces its own
+            # limit of total_chunks * 3 // 4.  If sender and receiver buffer
+            # sizes differ, the effective flow control may not be optimal.
+            # A future improvement could negotiate capacity via the alloc protocol.
             total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
             max_inflight = max(1, total_chunks // 2)
             self._chunk_semaphore = asyncio.Semaphore(max_inflight)
@@ -386,8 +392,11 @@ class PDBackend(AllocatorBackendInterface):
         alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"
 
         if self.pd_config.role == "sender":
-            # Block until the sender staging buffer has enough headroom.
-            # This runs in the vLLM worker thread so threading.Condition is used.
+            # Block until the sender staging buffer has enough headroom and a
+            # memory slot is available.  The entire sender branch runs under a
+            # single lock acquisition so that _release_sender_staging_chunks
+            # notifications wake both the flow-control wait and the allocation
+            # retry without releasing and re-acquiring the lock in between.
             with self._sender_staging_condition:
                 while self._sender_inflight_chunks >= self._sender_max_inflight_chunks:
                     logger.warning(
@@ -400,24 +409,25 @@ class PDBackend(AllocatorBackendInterface):
                     if not self.running:
                         return None
 
-            # Retry allocation with backoff in case the underlying allocator
-            # needs a moment to reclaim pages freed by just-completed transfers.
-            max_retries = 500
-            wait_time = 0.01
-            for attempt in range(max_retries + 1):
-                mem_obj = self.memory_allocator.allocate(
-                    shapes, dtypes, fmt=fmt, allocator_type=alloc_type
-                )
-                if mem_obj is not None:
-                    with self._sender_staging_condition:
+                # Event-driven retry: wait on the condition for notification
+                # instead of time.sleep polling so that the thread wakes up
+                # immediately when _release_sender_staging_chunks fires.
+                deadline = time.monotonic() + 5.0
+                while True:
+                    mem_obj = self.memory_allocator.allocate(
+                        shapes, dtypes, fmt=fmt, allocator_type=alloc_type
+                    )
+                    if mem_obj is not None:
                         self._sender_inflight_chunks += 1
-                    return mem_obj
-                if attempt < max_retries:
-                    time.sleep(wait_time)
+                        return mem_obj
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._sender_staging_condition.wait(timeout=min(remaining, 0.5))
+                    if not self.running:
+                        return None
 
-            logger.error(
-                "Sender staging allocation failed after %d retries", max_retries
-            )
+            logger.error("Sender staging allocation failed after timeout")
             return None
         else:
             return self.memory_allocator.allocate(
@@ -476,33 +486,39 @@ class PDBackend(AllocatorBackendInterface):
         receiver_init_port: int,
         receiver_alloc_port: int,
     ) -> None:
+        # Fast path: no lock required if already connected.
         if receiver_id in self.initialized_peers:
             return
+        with self._peer_connection_lock:
+            # Double-check under the lock to prevent duplicate connections when
+            # multiple vLLM worker threads call this concurrently.
+            if receiver_id in self.initialized_peers:
+                return
 
-        receiver_init_url = f"{receiver_host}:{receiver_init_port}"
-        receiver_mem_alloc_url = f"{receiver_host}:{receiver_alloc_port}"
+            receiver_init_url = f"{receiver_host}:{receiver_init_port}"
+            receiver_mem_alloc_url = f"{receiver_host}:{receiver_alloc_port}"
 
-        # Establish the connection with the receiver/decoder.
-        # The transfer channel uses an async ZMQ context (async_mode=True), so
-        # we must call the async version scheduled on the sender event loop.
-        future = asyncio.run_coroutine_threadsafe(
-            self.transfer_channel.async_lazy_init_peer_connection(
-                local_id=self.local_id,
-                peer_id=receiver_id,
-                peer_init_url=receiver_init_url,
-            ),
-            self._sender_loop,
-        )
-        future.result()  # Block until connection is established
+            # Establish the connection with the receiver/decoder.
+            # The transfer channel uses an async ZMQ context (async_mode=True), so
+            # we must call the async version scheduled on the sender event loop.
+            future = asyncio.run_coroutine_threadsafe(
+                self.transfer_channel.async_lazy_init_peer_connection(
+                    local_id=self.local_id,
+                    peer_id=receiver_id,
+                    peer_init_url=receiver_init_url,
+                ),
+                self._sender_loop,
+            )
+            future.result()  # Block until connection is established
 
-        # Schedule socket creation on the sender event loop to avoid cross-thread issues
-        future = asyncio.run_coroutine_threadsafe(
-            self._async_create_alloc_socket(receiver_id, receiver_mem_alloc_url),
-            self._sender_loop,
-        )
-        future.result(timeout=10)  # Wait for socket to be created
+            # Schedule socket creation on the sender event loop to avoid cross-thread issues
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_create_alloc_socket(receiver_id, receiver_mem_alloc_url),
+                self._sender_loop,
+            )
+            future.result(timeout=10)  # Wait for socket to be created
 
-        self.initialized_peers.add(receiver_id)
+            self.initialized_peers.add(receiver_id)
 
     async def _async_create_alloc_socket(
         self, receiver_id: str, receiver_mem_alloc_url: str
@@ -760,6 +776,36 @@ class PDBackend(AllocatorBackendInterface):
         )
         self._transfer_queues[req_id].put_nowait(item)
 
+    async def _drain_transfer_queue(self, req_id: str, q: "asyncio.Queue[_TransferItem]") -> None:
+        """Drain remaining items from a per-request transfer queue after failure.
+
+        Releases ref counts on all memory objects to prevent memory leaks and
+        releases sender staging chunks to unblock allocate() waiters.
+
+        :param req_id: The request identifier (used for logging).
+        :param q: The asyncio.Queue to drain.
+        """
+        drained = 0
+        while not q.empty():
+            try:
+                item = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            for mem_obj in item.memory_objs:
+                try:
+                    mem_obj.ref_count_down()
+                except Exception:
+                    pass
+            self._release_sender_staging_chunks(len(item.memory_objs))
+            q.task_done()
+            drained += 1
+        if drained > 0:
+            logger.warning(
+                "Drained %d remaining transfer items for req %s after failure.",
+                drained,
+                req_id,
+            )
+
     async def _transfer_consumer(
         self, req_id: str, q: "asyncio.Queue[_TransferItem]"
     ) -> None:
@@ -773,12 +819,17 @@ class PDBackend(AllocatorBackendInterface):
         flagged with ``is_last_prefill=True`` is processed and cleans up
         tracking dicts in the finally block.
 
+        If a chunk transfer fails, all remaining items in the queue are drained
+        (releasing their ref counts) and the consumer aborts the request, since
+        subsequent chunks would produce incomplete data on the receiver side.
+
         :param req_id: The request identifier (used for logging and cleanup).
         :param q: The asyncio.Queue feeding this consumer.
         """
         try:
             while True:
                 item: _TransferItem = await q.get()
+                transfer_failed = False
                 try:
                     await self._async_transfer_task(
                         keys=item.keys,
@@ -788,17 +839,28 @@ class PDBackend(AllocatorBackendInterface):
                         transfer_spec=item.transfer_spec,
                     )
                 except Exception as e:
-                    logger.error("Transfer consumer error for req %s: %s", req_id, e)
+                    logger.error(
+                        "Transfer consumer error for req %s: %s. "
+                        "Aborting remaining transfers for this request.",
+                        req_id,
+                        e,
+                    )
+                    transfer_failed = True
                 finally:
                     q.task_done()
 
                 is_last = item.transfer_spec is not None and getattr(
                     item.transfer_spec, "is_last_prefill", False
                 )
+                if transfer_failed:
+                    # Drain remaining items and release their memory to avoid leaks.
+                    await self._drain_transfer_queue(req_id, q)
+                    break
                 if is_last:
                     break
         finally:
-            # Only cleanup — ProxyNotif is sent inside _async_transfer_task.
+            # Drain any remaining items to prevent memory leaks on unexpected exit.
+            await self._drain_transfer_queue(req_id, q)
             self._transfer_queues.pop(req_id, None)
             self._transfer_consumers.pop(req_id, None)
 
@@ -921,8 +983,9 @@ class PDBackend(AllocatorBackendInterface):
     ) -> AllocResponse:
         """
         Async version of _allocate_and_put.
-        Uses `await asyncio.sleep` instead of `time.sleep` so the event loop
-        can continue processing while waiting for free memory.
+        Uses event-driven waiting on ``_inflight_condition`` instead of
+        ``asyncio.sleep`` polling so the event loop stays responsive while
+        waiting for free memory.
         pin=False: PDBackend has no eviction; pinning is unnecessary and
         causes ref_count leaks.
 
@@ -960,22 +1023,26 @@ class PDBackend(AllocatorBackendInterface):
                     await self._inflight_condition.wait()
 
             mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
-            # 500 retries × 10 ms = ~5 s timeout before giving up.
-            wait_time = 0.01
-            max_retries = 500
-            retries = 0
+            # Event-driven retry: wait on _inflight_condition for notification
+            # instead of asyncio.sleep polling so the coroutine wakes up
+            # immediately when _notify_inflight_freed fires.
+            deadline = asyncio.get_event_loop().time() + 5.0
             while mem_obj is None:
-                retries += 1
-                if retries > max_retries:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
                     logger.error(
-                        "Failed to allocate memory for key %s after %d "
-                        "retries (~%.0f s), aborting.",
+                        "Failed to allocate memory for key %s after timeout (~5s), aborting.",
                         key,
-                        max_retries,
-                        wait_time * max_retries,
                     )
                     break
-                await asyncio.sleep(wait_time)
+                async with self._inflight_condition:
+                    try:
+                        await asyncio.wait_for(
+                            self._inflight_condition.wait(),
+                            timeout=min(remaining, 0.5),
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
             if mem_obj is None:
@@ -1066,10 +1133,24 @@ class PDBackend(AllocatorBackendInterface):
     ############################################################
 
     @staticmethod
-    def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
-        """Cancel all pending tasks on *loop*, then stop it."""
+    def _shutdown_loop(
+        loop: asyncio.AbstractEventLoop,
+        thread: threading.Thread,
+        timeout: float = 5.0,
+    ) -> None:
+        """Cancel all pending tasks on *loop*, stop it, and join the thread.
 
-        async def _cancel_and_stop():
+        Uses a ``threading.Event`` to synchronize shutdown completion so that
+        ``thread.join`` is only called after the loop has actually stopped,
+        preventing thread or resource leaks when the loop takes time to drain.
+
+        :param loop: The event loop to shut down.
+        :param thread: The thread running the event loop.
+        :param timeout: Maximum seconds to wait for shutdown and thread join.
+        """
+        shutdown_done = threading.Event()
+
+        async def _cancel_and_stop() -> None:
             tasks = [
                 t
                 for t in asyncio.all_tasks(loop)
@@ -1079,15 +1160,29 @@ class PDBackend(AllocatorBackendInterface):
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             loop.stop()
+            shutdown_done.set()
 
         if loop.is_running():
             loop.call_soon_threadsafe(loop.create_task, _cancel_and_stop())
+            shutdown_done.wait(timeout=timeout)
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            logger.warning(
+                "Event loop thread %s did not terminate within %.1fs timeout.",
+                thread.name,
+                timeout,
+            )
 
     def close(self) -> None:
         """
         Close the storage backend.
         """
         self.running = False
+        # Wake up any threads blocked on the sender staging condition so they
+        # can observe running=False and exit cleanly.
+        if hasattr(self, "_sender_staging_condition"):
+            with self._sender_staging_condition:
+                self._sender_staging_condition.notify_all()
         for thread in self.running_threads:
             thread.join()
         # Shut down sender async loop if present
@@ -1095,8 +1190,7 @@ class PDBackend(AllocatorBackendInterface):
             # Cancel all in-flight transfer consumers before stopping the loop.
             for task in list(self._transfer_consumers.values()):
                 task.cancel()
-            self._shutdown_loop(self._sender_loop)
-            self._sender_thread.join(timeout=5)
+            self._shutdown_loop(self._sender_loop, self._sender_thread)
             # Close async alloc sockets
             for sock in self._async_alloc_sockets.values():
                 try:
@@ -1109,8 +1203,7 @@ class PDBackend(AllocatorBackendInterface):
                 pass
         # Shut down receiver async loop if present
         if hasattr(self, "_recv_loop"):
-            self._shutdown_loop(self._recv_loop)
-            self._recv_thread.join(timeout=5)
+            self._shutdown_loop(self._recv_loop, self._recv_thread)
         self.transfer_channel.close()
         self.zmq_context.term()
 
