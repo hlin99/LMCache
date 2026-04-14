@@ -962,7 +962,7 @@ class PDBackend(AllocatorBackendInterface):
         finally:
             # On ANY exit (including CancelledError), drain all remaining
             # transfer queues to prevent memory leaks.
-            for remaining_req_id, remaining_q in list(self._transfer_queues.items()):
+            for remaining_req_id, remaining_q in self._transfer_queues.items():
                 await self._drain_transfer_queue(remaining_req_id, remaining_q)
             self._transfer_queues.clear()
 
@@ -1211,7 +1211,7 @@ class PDBackend(AllocatorBackendInterface):
                 async with self._inflight_condition:
                     try:
                         await asyncio.wait_for(
-                            asyncio.shield(self._inflight_condition.wait()),
+                            self._inflight_condition.wait(),
                             timeout=min(remaining, self._condition_poll_interval),
                         )
                     except asyncio.TimeoutError:
@@ -1397,8 +1397,12 @@ class PDBackend(AllocatorBackendInterface):
                     asyncio.run_coroutine_threadsafe(
                         _wake_inflight(), self._recv_loop
                     )
-                except Exception:
-                    pass  # Loop may already be stopped
+                except Exception as exc:
+                    logger.debug(
+                        "Could not schedule _inflight_condition wake-up "
+                        "(loop may already be stopped): %s",
+                        exc,
+                    )
             self._shutdown_loop(
                 self._recv_loop,
                 self._recv_thread,
