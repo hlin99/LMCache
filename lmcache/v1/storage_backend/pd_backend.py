@@ -81,6 +81,10 @@ class PDConfig:
     buffer_size: int
     buffer_device: str
 
+    allocation_timeout_sec: float
+    shutdown_timeout_sec: float
+    condition_poll_interval_sec: float
+
     @staticmethod
     def from_cache_engine_config(
         config: LMCacheEngineConfig,
@@ -130,6 +134,9 @@ class PDConfig:
             proxy_port=config.pd_proxy_port,
             buffer_size=config.pd_buffer_size,
             buffer_device=corrected_device,
+            allocation_timeout_sec=config.pd_allocation_timeout_sec,
+            shutdown_timeout_sec=config.pd_shutdown_timeout_sec,
+            condition_poll_interval_sec=config.pd_condition_poll_interval_sec,
         )
 
 

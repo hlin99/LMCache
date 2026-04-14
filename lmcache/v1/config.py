@@ -216,6 +216,41 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "pd_proxy_host": {"type": Optional[str], "default": None, "env_converter": str},
     "pd_proxy_port": {"type": Optional[int], "default": None, "env_converter": int},
+    "pd_allocation_timeout_sec": {
+        "type": float,
+        "default": 5.0,
+        "env_converter": float,
+        "description": "Maximum seconds to retry memory allocation before giving up.",
+    },
+    "pd_shutdown_timeout_sec": {
+        "type": float,
+        "default": 5.0,
+        "env_converter": float,
+        "description": (
+            "Maximum seconds to wait for event loop shutdown and thread join."
+        ),
+    },
+    "pd_condition_poll_interval_sec": {
+        "type": float,
+        "default": 0.05,
+        "env_converter": float,
+        "description": (
+            "Polling interval in seconds when waiting on a threading/asyncio "
+            "Condition. Small enough to be responsive, large enough not to "
+            "spin-waste CPU."
+        ),
+    },
+    "pd_max_prefill_len": {
+        "type": int,
+        "default": 16384,
+        "env_converter": int,
+        "description": (
+            "Maximum prefill token length that the PD buffer must be able to "
+            "hold. If > 0, initialization raises ValueError when the buffer "
+            "capacity (in tokens) is smaller than this value. "
+            "Set to 0 (default) to skip the check."
+        ),
+    },
     # Transfer-related configurations
     "transfer_channel": {"type": Optional[str], "default": None, "env_converter": str},
     # Nixl-related configurations
