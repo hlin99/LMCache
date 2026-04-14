@@ -251,6 +251,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             "Set to 0 (default) to skip the check."
         ),
     },
+    "pd_backend_mode": {
+        "type": Optional[str],
+        "default": "async",
+        "env_converter": str,
+        "description": (
+            "Select the PD backend implementation: 'async' (default) uses the "
+            "asyncio-based implementation; 'sync' uses the original "
+            "thread-based synchronous implementation."
+        ),
+    },
     # Transfer-related configurations
     "transfer_channel": {"type": Optional[str], "default": None, "env_converter": str},
     # Nixl-related configurations
@@ -616,6 +626,9 @@ def _validate_config(self):
         assert self.pd_buffer_size is not None
         assert self.pd_buffer_device is not None
         assert self.enable_p2p is False, "PD only supports enable_p2p=False"
+        assert self.pd_backend_mode in ("sync", "async"), (
+            f"pd_backend_mode must be 'sync' or 'async', got {self.pd_backend_mode!r}"
+        )
 
         # PD requires save_unfull_chunk=True for complete KV cache transfer
         # from prefill node to decode node. Without this, partial chunks would

@@ -135,7 +135,10 @@ def CreateStorageBackends(
 
     if config.enable_pd and "PDBackend" not in _skip:
         # First Party
-        from lmcache.v1.storage_backend.pd_backend import PDBackend
+        if config.pd_backend_mode == "async":
+            from lmcache.v1.storage_backend.pd_backend_async import PDBackend
+        else:
+            from lmcache.v1.storage_backend.pd_backend import PDBackend
 
         storage_backends["PDBackend"] = PDBackend(config, metadata)
 

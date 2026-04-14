@@ -861,8 +861,11 @@ class LMCacheEngine:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
                 self.storage_manager.remove(key, self.retrieve_locations)
-                # PDBackend.remove() already calls ref_count_down(), so skip
-                # the decrement below to avoid a double-free.
+                # Async PDBackend.remove() already calls ref_count_down()
+                # internally, so only perform the manual decrement for sync
+                # mode to avoid a double-free.
+                if not self._is_async_pd_backend():
+                    memory_obj.ref_count_down()
             elif not self.async_loading:
                 memory_obj.ref_count_down()
 
@@ -1692,6 +1695,8 @@ class LMCacheEngine:
                     if self.remove_after_retrieve:
                         assert self.storage_manager is not None
                         self.storage_manager.remove(key, self.retrieve_locations)
+                        if not self._is_async_pd_backend():
+                            memory_obj.ref_count_down()
                     else:
                         memory_obj.ref_count_down()
             reordered_chunks = kept_chunks
@@ -1784,6 +1789,14 @@ class LMCacheEngine:
         the data directly, but from the "active" worker (i.e., rank 0 in MLA)
         """
         return self.save_only_first_rank and not self.metadata.is_first_rank()
+
+    def _is_async_pd_backend(self) -> bool:
+        """Check if the PD backend is the async variant.
+
+        :return: True when PD is enabled and ``pd_backend_mode`` is ``"async"``.
+        :rtype: bool
+        """
+        return self.config.enable_pd and self.config.pd_backend_mode == "async"
 
     def _get_slot_mapping_list(
         self,
