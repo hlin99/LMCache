@@ -221,7 +221,7 @@ class PDBackend(AllocatorBackendInterface):
         if (
             not self.local_id
             and self.pd_config.proxy_host
-            and self.pd_config.proxy_port
+            and self.pd_config.proxy_port is not None
         ):
             self.local_id = (
                 f"{self.pd_config.proxy_host}:{self.pd_config.proxy_port}"
@@ -993,7 +993,7 @@ class PDBackend(AllocatorBackendInterface):
         finally:
             # Drain any req_ids still in the per-receiver queue that we never
             # processed (e.g. enqueued during shutdown after our last get()).
-            while not req_queue.empty():
+            while True:
                 try:
                     remaining_id = req_queue.get_nowait()
                     receiver_req_ids.add(remaining_id)
