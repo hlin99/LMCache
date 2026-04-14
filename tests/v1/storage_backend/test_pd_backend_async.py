@@ -13,7 +13,8 @@ with asyncio.sleep() stubs so:
 
 Test matrix (behaviour × role)
 ------------------------------
-  1. Sender  — Non-blocking: N concurrent transfers complete in ≈1× delay
+  1. Sender  — Non-blocking FIFO: batched_submit_put_task returns immediately;
+               N requests processed serially in ≈ N× delay
   2. Receiver — Non-blocking: asyncio.sleep yields, not time.sleep
   3. Sender  — Flow control: allocate() blocks when staging buffer full
   4. Receiver — Flow control: _async_allocate_and_put blocks when inflight full
@@ -21,6 +22,7 @@ Test matrix (behaviour × role)
   6. Receiver — Close: close() stops _recv_loop and joins _recv_thread
   7. Receiver — Data correctness: already_sent dedup + last_chunk_toks shape
   8. Sender  — Chunk ordering: last prefill waits for prior slow chunk
+  9. Receiver — Fail-fast: C_req > max_inflight returns all -1
 """
 
 # Standard
@@ -250,12 +252,15 @@ def async_receiver():
 # ---------------------------------------------------------------------------
 
 
-def test_sender_nonblocking_concurrent_transfers(async_sender):
+def test_sender_nonblocking_fifo_transfers(async_sender):
     """
-    Submit N transfers simultaneously. If async works correctly, they run
-    concurrently on the event loop and finish in ≈ TRANSFER_DELAY total,
-    not N × TRANSFER_DELAY. This implicitly proves fire-and-forget (each
-    batched_submit_put_task returns before its transfer completes).
+    Submit N transfers with distinct req_ids.
+
+    Verifies two properties of the new global FIFO worker design:
+    1. ``batched_submit_put_task`` is fire-and-forget — all N calls return
+       well before any transfer completes.
+    2. All transfers eventually complete (the single worker processes them
+       serially in FIFO order, so the total time is ≈ N × TRANSFER_DELAY).
     """
     N = 4
     done_events = [threading.Event() for _ in range(N)]
@@ -278,21 +283,21 @@ def test_sender_nonblocking_concurrent_transfers(async_sender):
             on_complete_callback=make_callback(i),
         )
 
-    # Wait for all to complete
-    for ev in done_events:
-        finished = ev.wait(timeout=TRANSFER_DELAY * 3)
-        assert finished, (
-            "Transfer did not complete within timeout — event loop may be stalled"
-        )
-
-    total_elapsed = time.monotonic() - t0
-
-    # With true concurrency: total ≈ TRANSFER_DELAY
-    # With sequential execution: total ≈ N × TRANSFER_DELAY
-    max_allowed = TRANSFER_DELAY * 2.0  # generous margin for CI
-    assert total_elapsed < max_allowed, (
-        f"{N} transfers took {total_elapsed:.3f}s, expected < {max_allowed:.3f}s."
+    enqueue_elapsed = time.monotonic() - t0
+    # All enqueue calls should complete well before a single TRANSFER_DELAY
+    assert enqueue_elapsed < TRANSFER_DELAY / 4, (
+        f"batched_submit_put_task calls took {enqueue_elapsed:.3f}s — "
+        f"should be non-blocking (< {TRANSFER_DELAY / 4:.3f}s)"
     )
+
+    # With serial FIFO execution, all N requests complete in ≈ N × TRANSFER_DELAY.
+    serial_timeout = TRANSFER_DELAY * N * 3  # generous margin for CI
+    for i, ev in enumerate(done_events):
+        finished = ev.wait(timeout=serial_timeout)
+        assert finished, (
+            f"Transfer for req-{i} did not complete within "
+            f"{serial_timeout:.1f}s (serial FIFO timeout)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -724,3 +729,86 @@ def test_sender_chunk_ordering_waits_for_prior_tasks(async_sender):
         f"(slow chunk delay). "
         "The final chunk did not wait for the prior slow chunk to finish."
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Receiver — Fail-fast when C_req > max_inflight_chunks
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_fail_fast_request_too_large(async_receiver):
+    """
+    When a request's total chunk count (accumulated across batches) exceeds
+    ``max_inflight_chunks``, ``_async_allocate_and_put`` must return
+    ``remote_indexes`` filled with ``-1`` for the offending batch and log an
+    error rather than waiting indefinitely.
+
+    This prevents the deadlock scenario where the decoder cannot start
+    consuming (needs all chunks) but the buffer is full and no request
+    will ever complete.
+
+    Uses a small override for ``_max_inflight_chunks`` so the test runs fast
+    without allocating hundreds of real chunks.
+    """
+    # Override max_inflight so we don't need to allocate hundreds of real chunks.
+    MAX_T = 5
+    async_receiver._max_inflight_chunks = MAX_T
+    req_id = "req-too-large"
+
+    mem_obj = _make_mem_obj(idx=42)
+    async_receiver.allocate = lambda *a, **kw: mem_obj
+
+    def _make_req(n_keys: int, req_id_val: str = req_id) -> AllocRequest:
+        """Build an AllocRequest with *n_keys* distinct keys."""
+        keys = [_make_key(i).to_string() for i in range(n_keys)]
+        return AllocRequest(
+            keys=keys,
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=[4, 2, 16, 8, 128],
+            dtype="bfloat16",
+            last_chunk_toks=16,
+            req_id=req_id_val,
+        )
+
+    async def run():
+        # Batch 1: exactly MAX_T keys — should succeed (cumulative == MAX_T).
+        resp1 = await async_receiver._async_allocate_and_put(_make_req(MAX_T))
+        assert -1 not in resp1.remote_indexes, (
+            f"Batch 1 should succeed (cumulative == MAX_T={MAX_T}), "
+            f"but got remote_indexes={resp1.remote_indexes}"
+        )
+        assert async_receiver._req_chunk_counts.get(req_id) == MAX_T, (
+            "Cumulative chunk count should equal MAX_T after batch 1"
+        )
+
+        # Batch 2: 1 more key — cumulative = MAX_T + 1 > MAX_T → fail fast.
+        # The fail-fast check fires BEFORE inflight wait, so this returns
+        # immediately without blocking.
+        resp2 = await async_receiver._async_allocate_and_put(_make_req(1))
+        assert resp2.remote_indexes == [-1], (
+            f"Batch 2 should fail fast with [-1] when cumulative > MAX_T, "
+            f"but got remote_indexes={resp2.remote_indexes}"
+        )
+        assert resp2.already_sent_indexes == [], (
+            "Fail-fast response should have no already_sent_indexes"
+        )
+
+    asyncio.run(run())
+
+    # A different req_id should not be affected by the too-large req's tracking.
+    # Reset inflight counter (from batch 1's MAX_T allocations) so the
+    # backpressure wait for the new req doesn't block indefinitely.
+    async_receiver._inflight_chunks = 0
+
+    other_req_id = "req-small"
+
+    async def run_other():
+        resp = await async_receiver._async_allocate_and_put(
+            _make_req(1, req_id_val=other_req_id)
+        )
+        assert -1 not in resp.remote_indexes, (
+            "A different small request should not be affected by the fail-fast "
+            "tracking of an unrelated req_id"
+        )
+
+    asyncio.run(run_other())

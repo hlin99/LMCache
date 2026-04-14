@@ -41,6 +41,7 @@ _ALLOCATION_TIMEOUT_SECONDS = 5.0
 # enough to be responsive, large enough not to spin-waste CPU.
 _CONDITION_WAIT_INTERVAL = 0.5
 
+
 class PDMsgBase(msgspec.Struct, tag=True):
     """Base class for all PD-related messages"""
 
@@ -55,6 +56,10 @@ class AllocRequest(PDMsgBase):
     shape: list[int]  # The shape of the memory objects
     dtype: str
     last_chunk_toks: int
+    # req_id is used by the receiver for per-request chunk accounting and
+    # fail-fast detection when C_req > max_inflight_chunks.  An empty string
+    # means the sender does not provide an identifier (backwards-compatible).
+    req_id: str = ""
 
 
 class AllocResponse(PDMsgBase):
@@ -253,34 +258,12 @@ class PDBackend(AllocatorBackendInterface):
             self._async_zmq_context = zmq.asyncio.Context()
             self._async_alloc_sockets: dict[str, zmq.asyncio.Socket] = {}
             self._async_alloc_locks: dict[str, asyncio.Lock] = {}
-            # Chunk-level semaphore to limit decoder buffer pressure.
-            # We allow at most half of the total available chunks to be
-            # in-flight at once, leaving headroom for chunks that have been
-            # transferred but are still in use by the decoder.
-            # NOTE: The chunk semaphore limits sender-side in-flight chunks to
-            # total_chunks // 2.  The receiver independently enforces its own
-            # limit of total_chunks * 3 // 4.  If sender buffer size is smaller
-            # than receiver buffer size, the sender's limit will be reached
-            # before the receiver's, potentially underutilizing receiver capacity.
-            # If sender buffer is larger, the receiver may become the bottleneck.
-            # A future improvement could negotiate capacity via the alloc protocol.
-            total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
-            max_inflight = max(1, total_chunks // 2)
-            self._chunk_semaphore = asyncio.Semaphore(max_inflight)
-            logger.info(
-                "PDBackend sender: chunk semaphore initialized with "
-                "max_inflight=%d (total_chunks=%d, buffer=%d bytes, "
-                "chunk=%d bytes)",
-                max_inflight,
-                total_chunks,
-                self._aligned_buffer_size,
-                self._chunk_size_bytes,
-            )
             # Sender staging buffer flow control: block cache_engine.store()
             # (which runs in a vLLM worker thread) when the staging buffer is
             # near-full so that in-flight RDMA transfers can drain before new
             # allocations are allowed.  threading.Condition is required because
             # allocate() is called from a worker thread, not the asyncio loop.
+            total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
             self._sender_staging_lock = threading.Lock()
             self._sender_staging_condition = threading.Condition(
                 self._sender_staging_lock
@@ -294,12 +277,26 @@ class PDBackend(AllocatorBackendInterface):
                 self._sender_max_inflight_chunks,
                 total_chunks,
             )
-            # Per-request transfer queues and their consumer tasks.
-            # Each queue serialises chunk batches within the same request.
+            # Per-request transfer queues.  Each queue serialises chunk batches
+            # within the same request.  A single global FIFO worker drains
+            # requests one at a time (no concurrent multi-request allocation)
+            # to prevent decoder-buffer fragmentation and deadlock: the decoder
+            # requires all chunks for a request before it can start consuming,
+            # so allowing N requests to each partially fill the buffer would
+            # leave none of them complete.
             # Only ever accessed from coroutines running on _sender_loop, so
             # no additional lock is needed.
             self._transfer_queues: dict[str, asyncio.Queue] = {}
-            self._transfer_consumers: dict[str, asyncio.Task] = {}
+            # Global FIFO queue of req_ids to be processed by the single worker.
+            # _global_req_queue is an asyncio.Queue created on the sender loop.
+            self._global_req_queue: asyncio.Queue = asyncio.Queue()
+            self._global_req_worker_task: Optional[asyncio.Task] = None
+            # Start the single global FIFO worker on the sender event loop.
+            future = asyncio.run_coroutine_threadsafe(
+                self._start_global_req_worker(),
+                self._sender_loop,
+            )
+            future.result(timeout=5)
         elif self.pd_config.role == "receiver":
             self._init_receiver()
             # Decoder-side flow control: block allocation when buffer is near-full
@@ -323,6 +320,10 @@ class PDBackend(AllocatorBackendInterface):
                 self._aligned_buffer_size,
                 self._chunk_size_bytes,
             )
+            # Per-request cumulative chunk counter for fail-fast detection.
+            # If a request's total chunks exceed max_inflight_chunks, it can
+            # never complete (decoder requires all chunks before consuming).
+            self._req_chunk_counts: dict[str, int] = {}
 
         self.full_chunk_size_bytes = config.chunk_size
 
@@ -430,8 +431,7 @@ class PDBackend(AllocatorBackendInterface):
                         return None
 
                     at_threshold = (
-                        self._sender_inflight_chunks
-                        >= self._sender_max_inflight_chunks
+                        self._sender_inflight_chunks >= self._sender_max_inflight_chunks
                     )
 
                     if at_threshold:
@@ -557,7 +557,8 @@ class PDBackend(AllocatorBackendInterface):
             )
             future.result()  # Block until connection is established
 
-            # Schedule socket creation on the sender event loop to avoid cross-thread issues
+            # Schedule socket creation on the sender event loop to avoid
+            # cross-thread issues
             future = asyncio.run_coroutine_threadsafe(
                 self._async_create_alloc_socket(receiver_id, receiver_mem_alloc_url),
                 self._sender_loop,
@@ -586,7 +587,10 @@ class PDBackend(AllocatorBackendInterface):
         return alloc_response
 
     def _get_remote_alloc_request(
-        self, keys: Sequence[CacheEngineKey], mem_objs: List[MemoryObj]
+        self,
+        keys: Sequence[CacheEngineKey],
+        mem_objs: List[MemoryObj],
+        req_id: str = "",
     ) -> AllocRequest:
         """
         Get the allocation request given the keys and memory objects.
@@ -613,6 +617,7 @@ class PDBackend(AllocatorBackendInterface):
             shape=list(shape),
             dtype=dtype,
             last_chunk_toks=last_chunk_toks,
+            req_id=req_id,
         )
 
     async def _async_transfer_task(
@@ -635,19 +640,14 @@ class PDBackend(AllocatorBackendInterface):
         completed_indexes: set[int] = set()
         num_chunks = len(memory_objs)
 
-        # Acquire chunk-level permits to limit decoder buffer pressure.
-        # Acquired before remote allocation so that the total number of
-        # chunks simultaneously occupying decoder buffers is bounded.
-        # Track the actual number acquired so the finally block releases
-        # only as many as were successfully acquired (guards against
-        # cancellation mid-loop).
-        acquired_chunks = 0
-        for _ in range(num_chunks):
-            await self._chunk_semaphore.acquire()
-            acquired_chunks += 1
+        req_id: str = (
+            getattr(transfer_spec, "req_id", "") if transfer_spec is not None else ""
+        )
 
         try:
-            alloc_request = self._get_remote_alloc_request(keys, memory_objs)
+            alloc_request = self._get_remote_alloc_request(
+                keys, memory_objs, req_id=req_id
+            )
             alloc_response = await self._async_remote_allocate(
                 receiver_id, alloc_request
             )
@@ -708,7 +708,7 @@ class PDBackend(AllocatorBackendInterface):
                 )
 
             # Send ProxyNotif if this is the last prefill chunk, BEFORE invoking
-            # on_complete_callback.  The consumer processes chunks sequentially,
+            # on_complete_callback.  The worker processes chunks sequentially,
             # so all prior chunks have already completed by the time we reach
             # this point.  Sending here (inside _async_transfer_task) guarantees
             # the notification is observable the moment the callback fires.
@@ -748,11 +748,6 @@ class PDBackend(AllocatorBackendInterface):
                     except Exception:
                         pass
         finally:
-            # Always release the permits that were actually acquired so that
-            # other requests can proceed (guards against cancellation mid-loop
-            # leaving fewer than num_chunks permits held).
-            for _ in range(acquired_chunks):
-                self._chunk_semaphore.release()
             # Release sender staging buffer slots so that allocate() waiters
             # can proceed.  num_chunks equals the number of memory objects that
             # were allocated from the staging buffer via allocate().
@@ -785,10 +780,12 @@ class PDBackend(AllocatorBackendInterface):
     ) -> None:
         """Enqueue a transfer item onto the per-request asyncio.Queue.
 
-        If no queue exists for the request yet, one is created along with a
-        dedicated consumer coroutine that processes items sequentially.  This
-        guarantees that chunk batches for the same request are transferred in
-        FIFO order without any need for ``asyncio.gather`` or per-task tracking.
+        If no queue exists for the request yet, one is created and the req_id
+        is placed onto the global FIFO request queue so the single global
+        worker will process it.  This guarantees that chunk batches for the
+        same request are transferred in FIFO order and that only one request
+        occupies receiver buffer at a time (preventing decoder-buffer
+        fragmentation and deadlock).
 
         Must be called as a coroutine on ``_sender_loop`` (via
         ``asyncio.run_coroutine_threadsafe``).  All dict accesses are therefore
@@ -809,10 +806,9 @@ class PDBackend(AllocatorBackendInterface):
         if req_id not in self._transfer_queues:
             q: asyncio.Queue[_TransferItem] = asyncio.Queue()
             self._transfer_queues[req_id] = q
-            consumer: asyncio.Task = asyncio.create_task(
-                self._transfer_consumer(req_id, q)
-            )
-            self._transfer_consumers[req_id] = consumer
+            # Register this req_id with the global FIFO worker so it will be
+            # processed after all earlier requests have completed.
+            await self._global_req_queue.put(req_id)
         item = _TransferItem(
             keys=keys,
             memory_objs=memory_objs,
@@ -822,7 +818,9 @@ class PDBackend(AllocatorBackendInterface):
         )
         self._transfer_queues[req_id].put_nowait(item)
 
-    async def _drain_transfer_queue(self, req_id: str, q: "asyncio.Queue[_TransferItem]") -> None:
+    async def _drain_transfer_queue(
+        self, req_id: str, q: "asyncio.Queue[_TransferItem]"
+    ) -> None:
         """Drain remaining items from a per-request transfer queue after failure.
 
         Releases ref counts on all memory objects to prevent memory leaks and
@@ -856,63 +854,86 @@ class PDBackend(AllocatorBackendInterface):
                 req_id,
             )
 
-    async def _transfer_consumer(
-        self, req_id: str, q: "asyncio.Queue[_TransferItem]"
-    ) -> None:
-        """Drain a per-request transfer queue, processing items sequentially.
+    async def _start_global_req_worker(self) -> None:
+        """Create the global FIFO request worker task on the sender event loop.
 
-        Processes one ``_TransferItem`` at a time by calling
-        ``_async_transfer_task``.  ``_async_transfer_task`` is responsible for
-        sending ``ProxyNotif`` (when ``is_last_prefill=True``) before invoking
-        ``on_complete_callback``, guaranteeing the notification is observable
-        the moment the callback fires.  This consumer exits after the item
-        flagged with ``is_last_prefill=True`` is processed and cleans up
-        tracking dicts in the finally block.
-
-        If a chunk transfer fails, all remaining items in the queue are drained
-        (releasing their ref counts) and the consumer aborts the request, since
-        subsequent chunks would produce incomplete data on the receiver side.
-
-        :param req_id: The request identifier (used for logging and cleanup).
-        :param q: The asyncio.Queue feeding this consumer.
+        Must be called from within the sender event loop (via
+        ``asyncio.run_coroutine_threadsafe``) so that the task is bound to the
+        correct loop.
         """
-        try:
-            while True:
-                item: _TransferItem = await q.get()
-                transfer_failed = False
-                try:
-                    await self._async_transfer_task(
-                        keys=item.keys,
-                        memory_objs=item.memory_objs,
-                        receiver_id=item.receiver_id,
-                        on_complete_callback=item.on_complete_callback,
-                        transfer_spec=item.transfer_spec,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Transfer consumer error for req %s: %s. "
-                        "Aborting remaining transfers for this request.",
-                        req_id,
-                        e,
-                    )
-                    transfer_failed = True
-                finally:
-                    q.task_done()
+        self._global_req_worker_task = asyncio.create_task(self._global_req_worker())
 
-                is_last = item.transfer_spec is not None and getattr(
-                    item.transfer_spec, "is_last_prefill", False
-                )
-                if transfer_failed:
-                    # Drain remaining items and release their memory to avoid leaks.
-                    await self._drain_transfer_queue(req_id, q)
-                    break
-                if is_last:
-                    break
-        finally:
-            # Drain any remaining items to prevent memory leaks on unexpected exit.
-            await self._drain_transfer_queue(req_id, q)
-            self._transfer_queues.pop(req_id, None)
-            self._transfer_consumers.pop(req_id, None)
+    async def _global_req_worker(self) -> None:
+        """Single global FIFO worker: process one request at a time.
+
+        Pulls req_ids from ``_global_req_queue`` in arrival order and drains
+        each request's per-request transfer queue serially until the item
+        flagged with ``is_last_prefill=True`` is processed.  Only then is the
+        next req_id dequeued.
+
+        This prevents receiver-buffer fragmentation: at most one request's
+        chunks occupy the decoder buffer at any time, guaranteeing that the
+        decoder (which requires all chunks before it can start consuming) can
+        always find a complete request available to process.  Without this
+        guarantee, N requests each partially filling the buffer would leave
+        none of them completable, causing a deadlock.
+
+        If a transfer fails mid-request, remaining items are drained (ref
+        counts released) and the worker moves on to the next request.
+        """
+        while True:
+            try:
+                req_id: str = await self._global_req_queue.get()
+            except asyncio.CancelledError:
+                return
+
+            q = self._transfer_queues.get(req_id)
+            if q is None:
+                # Queue was removed before we could process it — skip.
+                continue
+
+            try:
+                while True:
+                    try:
+                        item: _TransferItem = await q.get()
+                    except asyncio.CancelledError:
+                        return
+
+                    transfer_failed = False
+                    try:
+                        await self._async_transfer_task(
+                            keys=item.keys,
+                            memory_objs=item.memory_objs,
+                            receiver_id=item.receiver_id,
+                            on_complete_callback=item.on_complete_callback,
+                            transfer_spec=item.transfer_spec,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Transfer worker error for req %s: %s. "
+                            "Aborting remaining transfers for this request.",
+                            req_id,
+                            e,
+                        )
+                        transfer_failed = True
+                    finally:
+                        q.task_done()
+
+                    is_last = item.transfer_spec is not None and getattr(
+                        item.transfer_spec, "is_last_prefill", False
+                    )
+                    if transfer_failed:
+                        # Drain remaining items and release their memory.
+                        await self._drain_transfer_queue(req_id, q)
+                        break
+                    if is_last:
+                        break
+            finally:
+                # Drain any remaining items to prevent memory leaks on
+                # unexpected exit (e.g. CancelledError between the try and
+                # the is_last check).
+                await self._drain_transfer_queue(req_id, q)
+                self._transfer_queues.pop(req_id, None)
 
     def batched_submit_put_task(
         self,
@@ -1042,8 +1063,46 @@ class PDBackend(AllocatorBackendInterface):
         ``remote_indexes`` always contains one entry per non-already-sent key
         so that the sender can match objects to addresses by position.
         A value of ``-1`` signals that allocation failed for that slot.
+
+        Timeout semantics:
+        - Backpressure wait (inflight >= max_inflight_chunks): indefinite while
+          ``self.running``.  The sender will not submit new chunks until the
+          decoder frees some, so this wait is expected to resolve.
+        - Allocator wait (allocate() returns None): bounded by
+          ``_ALLOCATION_TIMEOUT_SECONDS``.
         """
         total_allocs = len(alloc_request.keys)
+        req_id = alloc_request.req_id
+
+        # Fail-fast: detect if this request can never complete because it
+        # requires more chunks than the decoder buffer can ever hold at once.
+        # The decoder needs all chunks present before it can start consuming,
+        # so C_req > max_inflight_chunks is an impossible configuration.
+        if req_id:
+            prev_count = self._req_chunk_counts.get(req_id, 0)
+            new_total = prev_count + total_allocs
+            if new_total > self._max_inflight_chunks:
+                logger.error(
+                    "Request %s requires %d total chunks (already allocated %d, "
+                    "new batch %d) but max_inflight_chunks=%d. This request can "
+                    "never complete because the decoder requires all chunks before "
+                    "it can start consuming. Failing fast. "
+                    "To fix: increase pd_buffer_size so that "
+                    "max_inflight_chunks >= total chunks needed for the largest "
+                    "request, or reduce prompt length / chunk size.",
+                    req_id,
+                    new_total,
+                    prev_count,
+                    total_allocs,
+                    self._max_inflight_chunks,
+                )
+                return AllocResponse(
+                    already_sent_indexes=[],
+                    remote_indexes=[-1] * total_allocs,
+                )
+            # Update cumulative count for this request.
+            self._req_chunk_counts[req_id] = new_total
+
         fmt = MemoryFormat(alloc_request.fmt)
         dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
         shape = list(alloc_request.shape)  # copy — we mutate token_dim
@@ -1081,7 +1140,8 @@ class PDBackend(AllocatorBackendInterface):
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     logger.error(
-                        "Failed to allocate memory for key %s after timeout (~%.0fs), aborting.",
+                        "Failed to allocate memory for key %s after "
+                        "timeout (~%.0fs), aborting.",
                         key,
                         _ALLOCATION_TIMEOUT_SECONDS,
                     )
@@ -1238,9 +1298,14 @@ class PDBackend(AllocatorBackendInterface):
             thread.join()
         # Shut down sender async loop if present
         if hasattr(self, "_sender_loop"):
-            # Cancel all in-flight transfer consumers before stopping the loop.
-            for task in list(self._transfer_consumers.values()):
-                task.cancel()
+            # Cancel the global FIFO request worker before stopping the loop.
+            # _shutdown_loop also cancels all tasks, but being explicit here
+            # ensures the worker sees CancelledError promptly.
+            if (
+                hasattr(self, "_global_req_worker_task")
+                and self._global_req_worker_task is not None
+            ):
+                self._global_req_worker_task.cancel()
             self._shutdown_loop(self._sender_loop, self._sender_thread)
             # Close async alloc sockets
             for sock in self._async_alloc_sockets.values():
