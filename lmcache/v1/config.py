@@ -242,7 +242,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "pd_max_prefill_len": {
         "type": int,
-        "default": 16384,
+        "default": 0,
         "env_converter": int,
         "description": (
             "Maximum prefill token length that the PD buffer must be able to "

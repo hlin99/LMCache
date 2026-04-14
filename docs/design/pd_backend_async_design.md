@@ -15,6 +15,8 @@
 6. [Key Design Invariants](#6-key-design-invariants)
 7. [Inflight Flow-Control Counters](#7-inflight-flow-control-counters)
 8. [Before / After: `remove()` Comparison](#8-before--after-remove-comparison)
+9. [Allocation Side-Channel: ROUTER/DEALER Protocol](#9-allocation-side-channel-routerdealer-protocol)
+10. [Per-Receiver Request Workers (Sender Side)](#10-per-receiver-request-workers-sender-side)
 
 ---
 
@@ -425,3 +427,135 @@ elif not self.async_loading:                # ← elif! prevents double-free
 **Core change**: `remove()` evolves from "delete dict entry only, leave
 freeing to the caller" to "atomically delete + free + notify flow control".
 `cache_engine.py` changes `if` to `elif` to match.
+
+---
+
+## 9. Allocation Side-Channel: ROUTER/DEALER Protocol
+
+### Why ROUTER instead of REP
+
+The allocation side-channel is used by the Sender (Prefiller) to reserve KV
+cache slots on the Receiver (Decoder) before starting the RDMA transfer.  The
+original design used a synchronous ZMQ REP/REQ pair, which required a strict
+recv → process → send → recv cycle.
+
+In an xP1D topology (multiple Prefillers sharing one Decoder), all Senders
+connect to the same Receiver allocation socket.  Under REP:
+
+```
+Time  →
+REP:    recv(req-A)  ──── process (waits for admission) ────  send(resp-A)  recv(req-B)
+                                                                              ^^^^^^^^^ blocked until A finishes
+```
+
+If req-A triggers admission control (waits for another req to release), the
+socket stalls — no other Prefiller can submit its request, causing deadlock.
+
+With ZMQ ROUTER:
+
+```
+ROUTER:  recv(req-A)  →  spawn coroutine-A
+         recv(req-B)  →  spawn coroutine-B   ← does NOT wait for A
+         recv(req-C)  →  spawn coroutine-C
+
+  coroutine-A: await admission (owns lock) → allocate → send(identity-A, resp-A)
+  coroutine-B: await admission …              ← only this coroutine blocks
+  coroutine-C: await admission (same req as A) → allocate → release → send(identity-C)
+  coroutine-B: admission released → allocate → send(identity-B, resp-B)
+```
+
+The key properties:
+1. **Identity frames**: every ROUTER-received message includes the sender's
+   identity frame, so responses can be sent back to the correct DEALER.
+2. **Concurrent recv**: ROUTER never requires a matching send before the next
+   recv.
+3. **Admission serialization preserved**: only the per-request coroutine is
+   blocked, not the entire socket.
+
+### DEALER Identity
+
+The Sender creates a DEALER socket whose identity is:
+
+```
+identity = f"{local_id}-to-{receiver_id}"
+```
+
+`local_id` is derived from the Sender's own host/port, making it unique per
+Sender instance.  This avoids a ZMQ corner case: if two DEALER sockets share
+the same identity string, the ROUTER treats them as the same peer, and the
+second connection silently shadows the first.
+
+### Error Response on Exception
+
+If `_handle_alloc_request` encounters any exception (e.g. RuntimeError from
+the fail-fast check, allocation timeout, or msgpack decode error), it sends an
+error `AllocResponse` with `remote_indexes = [-1] * n_keys` before logging.
+Without this, the Sender's `_async_remote_allocate` would block indefinitely
+on `recv_multipart`.
+
+```
+_handle_alloc_request:
+
+  n_keys = 0
+  try:
+      alloc_req = decode(payload)       # n_keys becomes known here
+      n_keys = len(alloc_req.keys)
+      alloc_resp = await _async_allocate_and_put(alloc_req)
+      send(identity, "", alloc_resp)
+  except CancelledError:
+      raise
+  except Exception as e:
+      log error
+      try:
+          send(identity, "", AllocResponse([-1] * n_keys))  ← unblocks Sender
+      except:
+          log warning
+```
+
+---
+
+## 10. Per-Receiver Request Workers (Sender Side)
+
+### Problem with the Global FIFO Worker
+
+The original design used a single `_global_req_worker` that serialised **all**
+requests across **all** receivers.  This was safe (one request in the buffer
+at a time globally) but unnecessarily conservative for 1PxD topologies (one
+Prefiller, multiple Decoders):
+
+```
+Time  →
+Global worker:  req-A → Decoder-1 (SLOW)  ──────────────  req-B → Decoder-2 (FAST)
+                                                           ^^^^^^^^ blocked behind A
+```
+
+req-B to a completely different Decoder is blocked by req-A's slow transfer to
+another Decoder.
+
+### Per-Receiver Workers
+
+The replacement design keeps a separate FIFO worker **per receiver**.  Requests
+to different receivers proceed concurrently; requests to the *same* receiver
+remain serialized.
+
+Data structures:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `_receiver_req_queues` | `dict[str, asyncio.Queue]` | per-receiver FIFO of req_ids |
+| `_transfer_queues` | `dict[str, asyncio.Queue]` | per req_id queue of transfer items |
+| `_receiver_worker_tasks` | `dict[str, asyncio.Task]` | per-receiver worker task |
+
+Workers are **created on demand** when the first request for a given receiver is
+enqueued.  If a worker exits (all requests drained) it is restarted
+transparently on the next enqueue.
+
+```
+Time  →
+Worker(Decoder-1):  req-A (SLOW) ──────────────  req-C (after A)
+Worker(Decoder-2):              req-B (FAST)  ←  runs concurrently with A
+```
+
+**Invariant preserved**: within a single receiver, at most one request's chunks
+occupy the decoder buffer at any time, preventing the receiver-buffer
+fragmentation deadlock.
