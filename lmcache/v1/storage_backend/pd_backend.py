@@ -1089,13 +1089,24 @@ class PDBackend(AllocatorBackendInterface):
                 self._admission_owner = req_id
 
         async def _release_admission() -> None:
+            """Clear the admission owner and notify all waiting coroutines.
+
+            No-op when req_id is empty (legacy senders without a req_id).
+            """
             if req_id:
                 async with self._admission_condition:
                     self._admission_owner = ""
                     self._admission_condition.notify_all()
 
         async def _fail_all(rollback_current: list[str]) -> AllocResponse:
-            """Roll back current-batch and all prior-batch keys, release admission."""
+            """Roll back current-batch and all prior-batch keys, release admission.
+
+            :param rollback_current: Key strings from the current batch that were
+                successfully allocated (put into self.data) before the failure.
+                These are rolled back along with any keys from prior batches stored
+                in _req_allocated_keys[req_id].
+            :return: AllocResponse with all remote_indexes set to -1.
+            """
             for key_str in rollback_current:
                 self.remove(CacheEngineKey.from_string(key_str))
             for key_str in self._req_allocated_keys.pop(req_id, []):
@@ -1371,6 +1382,7 @@ class PDBackend(AllocatorBackendInterface):
                 try:
 
                     async def _wake_admission() -> None:
+                        """Notify all coroutines waiting on admission during shutdown."""
                         async with self._admission_condition:
                             self._admission_condition.notify_all()
 
