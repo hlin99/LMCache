@@ -69,7 +69,7 @@ class AllocResponse(PDMsgBase):
 
 
 class ProxyNotif(PDMsgBase):
-    req_id: str  # The request UUID to notify the proxy
+    req_id: str  # The request id to notify the proxy
 
 
 PDMsg = Union[AllocRequest, AllocResponse, ProxyNotif]
@@ -283,18 +283,24 @@ class PDBackend(AllocatorBackendInterface):
                 self._sender_max_inflight_chunks,
                 total_chunks,
             )
-            # Per-request transfer queues.  Each queue serialises chunk batches
-            # within the same request.  A single global FIFO worker drains
-            # requests one at a time (no concurrent multi-request allocation)
-            # to prevent decoder-buffer fragmentation and deadlock: the decoder
-            # requires all chunks for a request before it can start consuming,
-            # so allowing N requests to each partially fill the buffer would
-            # leave none of them complete.
-            # Only ever accessed from coroutines running on _sender_loop, so
-            # no additional lock is needed.
+            # Two-level queue structure:
+            #
+            #   _global_req_queue:  [ req-A,  req-B,  req-C ]
+            #                          │
+            #                          ▼
+            #   _transfer_queues:  {
+            #       "req-A": Queue([ chunk1, chunk2, chunk3 ]),
+            #       "req-B": Queue([ chunk1, chunk2 ]),
+            #       "req-C": Queue([ chunk1 ]),
+            #   }
+            #
+            # The single global worker picks req-A from _global_req_queue,
+            # drains all its chunks from _transfer_queues["req-A"], then
+            # moves on to req-B. This guarantees one request fully occupies
+            # the decoder buffer at a time, preventing deadlock.
+            #
+            # Only accessed from coroutines on _sender_loop, no lock needed.
             self._transfer_queues: dict[str, asyncio.Queue] = {}
-            # Global FIFO queue of req_ids to be processed by the single worker.
-            # _global_req_queue is an asyncio.Queue created on the sender loop.
             self._global_req_queue: asyncio.Queue = asyncio.Queue()
             self._global_req_worker_task: Optional[asyncio.Task] = None
             # Start the single global FIFO worker on the sender event loop.
@@ -305,10 +311,6 @@ class PDBackend(AllocatorBackendInterface):
             future.result(timeout=5)
         elif self.pd_config.role == "receiver":
             self._init_receiver()
-            # Decoder-side flow control: block allocation when buffer is near-full
-            assert self._chunk_size_bytes > 0, (
-                "chunk_size_bytes must be > 0 for inflight flow control"
-            )
             total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
             self._max_inflight_chunks = total_chunks
             self._inflight_chunks = 0
