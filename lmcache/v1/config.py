@@ -240,6 +240,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             "spin-waste CPU."
         ),
     },
+    "pd_max_prefill_len": {
+        "type": int,
+        "default": 0,
+        "env_converter": int,
+        "description": (
+            "Maximum prefill token length that the PD buffer must be able to "
+            "hold. If > 0, initialization raises ValueError when the buffer "
+            "capacity (in tokens) is smaller than this value. "
+            "Set to 0 (default) to skip the check."
+        ),
+    },
     # Transfer-related configurations
     "transfer_channel": {"type": Optional[str], "default": None, "env_converter": str},
     # Nixl-related configurations

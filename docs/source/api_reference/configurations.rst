@@ -269,6 +269,9 @@ Settings for disaggregated prefill functionality. The latest/default PD is imple
    * - pd_proxy_port
      - LMCACHE_PD_PROXY_PORT
      - Port for proxy server. Required for senders to connect to inform the proxy when transfer to decoder has been completed
+   * - pd_max_prefill_len
+     - LMCACHE_PD_MAX_PREFILL_LEN
+     - Maximum prefill token length the PD buffer must hold. If > 0, initialization raises ValueError when ``(aligned_buffer_size // chunk_size_bytes) * chunk_token_size < pd_max_prefill_len``. Default: 0 (check disabled).
 
 P2P Backend Configurations
 --------------------------
