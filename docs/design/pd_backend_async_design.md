@@ -127,7 +127,6 @@ available for subsequent `allocate()` calls.
            │                                                      │
            │  ┌────────────────────────────────────────────────┐  │
            │  │ finally (executes on ALL paths):               │  │
-           │  │   _chunk_semaphore.release()                   │  │
            │  │   _release_sender_staging_chunks()             │  │
            │  │     → _sender_inflight_chunks -= N             │  │
            │  │     → notify_all()                             │  │

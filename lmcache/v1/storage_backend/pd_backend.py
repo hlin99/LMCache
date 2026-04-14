@@ -4,8 +4,10 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
+import os
 import threading
 import time
+import uuid
 
 # Third Party
 import msgspec
@@ -217,15 +219,12 @@ class PDBackend(AllocatorBackendInterface):
             )
 
         # Fallback: ensure local_id is never empty so DEALER identity is unique.
-        # Senders don't set pd_peer_init_port, so use proxy_host:proxy_port instead.
-        if (
-            not self.local_id
-            and self.pd_config.proxy_host
-            and self.pd_config.proxy_port is not None
-        ):
-            self.local_id = (
-                f"{self.pd_config.proxy_host}:{self.pd_config.proxy_port}"
-            )
+        # Senders typically don't set pd_peer_init_port. In xP1D deployments
+        # multiple Prefillers may share the same proxy, so proxy_host:proxy_port
+        # alone is NOT unique. We include os.getpid() and a UUID fragment to
+        # guarantee a globally unique identity.
+        if not self.local_id:
+            self.local_id = f"sender-pid{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
         # Create the event loop before the transfer channel so it can be passed
         # into the channel constructor for async_mode initialization.
@@ -1166,7 +1165,7 @@ class PDBackend(AllocatorBackendInterface):
             # Send an error response so the sender is not left hanging
             # forever on recv_multipart().
             try:
-                error_resp = AllocResponse(remote_indexes=[-1] * n_keys)
+                error_resp = AllocResponse(remote_indexes=[-1] * max(n_keys, 1))
                 async with self._router_send_lock:
                     await socket.send_multipart(
                         [identity, b"", msgspec.msgpack.encode(error_resp)]
