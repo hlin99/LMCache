@@ -216,6 +216,17 @@ class PDBackend(AllocatorBackendInterface):
                 self.pd_config.peer_init_port
             )
 
+        # Fallback: ensure local_id is never empty so DEALER identity is unique.
+        # Senders don't set pd_peer_init_port, so use proxy_host:proxy_port instead.
+        if (
+            not self.local_id
+            and self.pd_config.proxy_host
+            and self.pd_config.proxy_port is not None
+        ):
+            self.local_id = (
+                f"{self.pd_config.proxy_host}:{self.pd_config.proxy_port}"
+            )
+
         # Create the event loop before the transfer channel so it can be passed
         # into the channel constructor for async_mode initialization.
         if self.pd_config.role == "sender":
@@ -980,6 +991,14 @@ class PDBackend(AllocatorBackendInterface):
                     self._transfer_queues.pop(req_id, None)
                     receiver_req_ids.discard(req_id)
         finally:
+            # Drain any req_ids still in the per-receiver queue that we never
+            # processed (e.g. enqueued during shutdown after our last get()).
+            while True:
+                try:
+                    remaining_id = req_queue.get_nowait()
+                    receiver_req_ids.add(remaining_id)
+                except asyncio.QueueEmpty:
+                    break
             # On ANY exit (including CancelledError), drain all remaining
             # transfer queues for this receiver to prevent memory leaks.
             for remaining_req_id in receiver_req_ids:

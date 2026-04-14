@@ -1363,6 +1363,7 @@ def test_sender_per_receiver_worker_concurrency(async_sender):
     async def _slow_transfer_task(**kwargs):
         recv_id = kwargs.get("receiver_id", "")
         delay = write_delays.get(recv_id, FAST)
+        num_chunks = len(kwargs.get("memory_objs", []))
         await asyncio.sleep(delay)
         # Minimal post-processing: trigger callback
         on_cb = kwargs.get("on_complete_callback")
@@ -1372,6 +1373,8 @@ def test_sender_per_receiver_worker_concurrency(async_sender):
                     on_cb(key)
                 except Exception:
                     pass
+        # Release staging chunks like the real _async_transfer_task does.
+        async_sender._release_sender_staging_chunks(num_chunks)
 
     async_sender._async_transfer_task = _slow_transfer_task
 
