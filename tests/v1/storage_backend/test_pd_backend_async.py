@@ -780,9 +780,11 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
     mem_obj = _make_mem_obj(idx=42)
     async_receiver.allocate = lambda *a, **kw: mem_obj
 
-    def _make_req(n_keys: int, req_id_val: str = req_id) -> AllocRequest:
+    def _make_req(
+        n_keys: int, req_id_val: str = req_id, key_offset: int = 0
+    ) -> AllocRequest:
         """Build an AllocRequest with *n_keys* distinct keys."""
-        keys = [_make_key(i).to_string() for i in range(n_keys)]
+        keys = [_make_key(key_offset + i).to_string() for i in range(n_keys)]
         return AllocRequest(
             keys=keys,
             fmt=MemoryFormat.KV_2LTD.value,
@@ -807,7 +809,10 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
         # Batch 2: 1 more key — cumulative = MAX_T + 1 > MAX_T → fail fast.
         # The fail-fast check fires BEFORE inflight wait, so this returns
         # immediately without blocking.
-        resp2 = await async_receiver._async_allocate_and_put(_make_req(1))
+        # Use key_offset=MAX_T to avoid overlap with Batch 1 keys (0..MAX_T-1).
+        resp2 = await async_receiver._async_allocate_and_put(
+            _make_req(1, key_offset=MAX_T)
+        )
         assert resp2.remote_indexes == [-1], (
             f"Batch 2 should fail fast with [-1] when cumulative > MAX_T, "
             f"but got remote_indexes={resp2.remote_indexes}"
@@ -829,8 +834,9 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
     other_req_id = "req-small"
 
     async def run_other():
+        # Use key_offset=2000 to avoid overlap with any keys used above.
         resp = await async_receiver._async_allocate_and_put(
-            _make_req(1, req_id_val=other_req_id)
+            _make_req(1, req_id_val=other_req_id, key_offset=2000)
         )
         assert -1 not in resp.remote_indexes, (
             "A different small request should not be affected by the fail-fast "
