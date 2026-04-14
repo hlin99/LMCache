@@ -1005,7 +1005,6 @@ class PDBackend(AllocatorBackendInterface):
                 if remaining_q is not None:
                     await self._drain_transfer_queue(remaining_req_id, remaining_q)
 
-
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -1171,9 +1170,7 @@ class PDBackend(AllocatorBackendInterface):
                         [identity, b"", msgspec.msgpack.encode(error_resp)]
                     )
             except Exception:
-                logger.warning(
-                    "Failed to send error response to %s", identity
-                )
+                logger.warning("Failed to send error response to %s", identity)
 
     async def _async_allocate_and_put(
         self, alloc_request: AllocRequest
@@ -1193,7 +1190,8 @@ class PDBackend(AllocatorBackendInterface):
           ``RuntimeError`` immediately; no rollback is performed.
         - Allocator timeout (allocate() returns None after
           ``self._allocation_timeout`` seconds): raises ``RuntimeError``;
-          no rollback is performed.
+          already-allocated chunks in the current batch are rolled back via
+          ``remove()`` to prevent memory and inflight counter leaks.
         - Backpressure wait (inflight >= max_inflight_chunks): indefinite
           while ``self.running``.  The sender will not submit new chunks
           until the decoder frees some, so this wait is expected to resolve.
@@ -1204,10 +1202,44 @@ class PDBackend(AllocatorBackendInterface):
         # Admission control: ensure only one req_id's batches are processed at
         # a time, preventing multi-sender interleaving deadlock.
         # Skip entirely for legacy senders that provide no req_id.
+        #
+        # Timeout guard: if the current admission owner's Sender crashes
+        # before sending is_last_batch=True, _admission_owner would never
+        # be cleared.  After ``_allocation_timeout`` seconds we forcibly
+        # evict the stale owner so subsequent requests can proceed.
         if req_id:
             async with self._admission_condition:
+                deadline = asyncio.get_running_loop().time() + self._allocation_timeout
                 while self._admission_owner and self._admission_owner != req_id:
-                    await self._admission_condition.wait()
+                    if not self.running:
+                        raise RuntimeError(
+                            f"Receiver shutting down while req {req_id} "
+                            f"waits for admission (owner={self._admission_owner})"
+                        )
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        stale_owner = self._admission_owner
+                        logger.warning(
+                            "Admission wait timed out for req %s after "
+                            "%.1fs (stale owner=%s). Forcibly evicting "
+                            "stale owner — its Sender likely crashed.",
+                            req_id,
+                            self._allocation_timeout,
+                            stale_owner,
+                        )
+                        # Clean up stale owner's per-request tracking to
+                        # prevent the fail-fast check from accumulating
+                        # ghost chunk counts.
+                        self._req_allocated_keys.pop(stale_owner, None)
+                        # Fall through to claim admission below.
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            self._admission_condition.wait(),
+                            timeout=min(remaining, self._condition_poll_interval),
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                 self._admission_owner = req_id
 
         async def _release_admission() -> None:
@@ -1255,61 +1287,79 @@ class PDBackend(AllocatorBackendInterface):
         alloc_indexes: list[int] = []
         current_batch_keys: list[str] = []
 
-        for idx, key_str in enumerate(alloc_request.keys):
-            key = CacheEngineKey.from_string(key_str)
+        try:
+            for idx, key_str in enumerate(alloc_request.keys):
+                key = CacheEngineKey.from_string(key_str)
 
-            if idx == total_allocs - 1:
-                token_dim = fmt.token_dim()
-                shape[token_dim] = alloc_request.last_chunk_toks
+                if idx == total_allocs - 1:
+                    token_dim = fmt.token_dim()
+                    shape[token_dim] = alloc_request.last_chunk_toks
 
-            # Wait until inflight count is below threshold before allocating.
-            async with self._inflight_condition:
-                while self._inflight_chunks >= self._max_inflight_chunks:
-                    if not self.running:
-                        # Release admission and return failure on shutdown.
-                        await _release_admission()
-                        remaining_allocs = total_allocs - len(alloc_indexes)
-                        alloc_indexes.extend([-1] * remaining_allocs)
-                        return AllocResponse(remote_indexes=alloc_indexes)
-                    logger.warning(
-                        "Decoder buffer near-full: inflight_chunks=%d >= max=%d, "
-                        "waiting for buffers to be freed...",
-                        self._inflight_chunks,
-                        self._max_inflight_chunks,
-                    )
-                    await self._inflight_condition.wait()
-
-            mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
-            # Event-driven retry: wait on _inflight_condition for notification
-            # instead of asyncio.sleep polling so the coroutine wakes up
-            # immediately when _notify_inflight_freed fires.
-            deadline = asyncio.get_event_loop().time() + self._allocation_timeout
-            while mem_obj is None:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    await _release_admission()
-                    raise RuntimeError(
-                        f"Failed to allocate memory for key {key} after "
-                        f"timeout (~{self._allocation_timeout:.0f}s). "
-                        f"req_id={req_id}, key_index={idx}/{total_allocs}, "
-                        f"inflight_chunks={self._inflight_chunks}, "
-                        f"max_inflight_chunks={self._max_inflight_chunks}."
-                    )
+                # Wait until inflight count is below threshold before allocating.
                 async with self._inflight_condition:
-                    try:
-                        await asyncio.wait_for(
-                            self._inflight_condition.wait(),
-                            timeout=min(remaining, self._condition_poll_interval),
+                    while self._inflight_chunks >= self._max_inflight_chunks:
+                        if not self.running:
+                            # Release admission and return failure on shutdown.
+                            await _release_admission()
+                            remaining_allocs = total_allocs - len(alloc_indexes)
+                            alloc_indexes.extend([-1] * remaining_allocs)
+                            return AllocResponse(remote_indexes=alloc_indexes)
+                        logger.warning(
+                            "Decoder buffer near-full: inflight_chunks=%d >= max=%d, "
+                            "waiting for buffers to be freed...",
+                            self._inflight_chunks,
+                            self._max_inflight_chunks,
                         )
-                    except asyncio.TimeoutError:
-                        pass
-                mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+                        await self._inflight_condition.wait()
 
-            alloc_indexes.append(mem_obj.meta.address)
-            self.put(key, mem_obj)
-            async with self._inflight_condition:
-                self._inflight_chunks += 1
-            current_batch_keys.append(key_str)
+                mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+                # Event-driven retry: wait on _inflight_condition for notification
+                # instead of asyncio.sleep polling so the coroutine wakes up
+                # immediately when _notify_inflight_freed fires.
+                deadline = asyncio.get_event_loop().time() + self._allocation_timeout
+                while mem_obj is None:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"Failed to allocate memory for key {key} after "
+                            f"timeout (~{self._allocation_timeout:.0f}s). "
+                            f"req_id={req_id}, key_index={idx}/{total_allocs}, "
+                            f"inflight_chunks={self._inflight_chunks}, "
+                            f"max_inflight_chunks={self._max_inflight_chunks}."
+                        )
+                    async with self._inflight_condition:
+                        try:
+                            await asyncio.wait_for(
+                                self._inflight_condition.wait(),
+                                timeout=min(remaining, self._condition_poll_interval),
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                    mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+
+                alloc_indexes.append(mem_obj.meta.address)
+                self.put(key, mem_obj)
+                async with self._inflight_condition:
+                    self._inflight_chunks += 1
+                current_batch_keys.append(key_str)
+        except Exception:
+            # Rollback: remove already-allocated chunks from this batch
+            # to prevent memory and inflight counter leaks.
+            for rollback_key_str in current_batch_keys:
+                try:
+                    rollback_key = CacheEngineKey.from_string(rollback_key_str)
+                    self.remove(rollback_key)
+                except Exception as re:
+                    logger.warning(
+                        "Rollback remove failed for key %s: %s",
+                        rollback_key_str,
+                        re,
+                    )
+            # Also clean up per-request tracking for this batch.
+            if req_id:
+                self._req_allocated_keys.pop(req_id, None)
+            await _release_admission()
+            raise
 
         # All allocations in this batch succeeded.
         if req_id:
@@ -1328,6 +1378,18 @@ class PDBackend(AllocatorBackendInterface):
         mem_obj: MemoryObj,
     ):
         with self.data_lock:
+            old = self.data.pop(key, None)
+            if old is not None:
+                logger.warning(
+                    "Overwriting existing MemoryObj for key %s in PDBackend.put(). "
+                    "Releasing old object to prevent memory leak.",
+                    key,
+                )
+                old.ref_count_down()
+                if self.pd_config.role == "receiver":
+                    asyncio.run_coroutine_threadsafe(
+                        self._notify_inflight_freed(), self._recv_loop
+                    )
             self.data[key] = mem_obj
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
@@ -1513,9 +1575,7 @@ class PDBackend(AllocatorBackendInterface):
                         async with self._admission_condition:
                             self._admission_condition.notify_all()
 
-                    asyncio.run_coroutine_threadsafe(
-                        _wake_admission(), self._recv_loop
-                    )
+                    asyncio.run_coroutine_threadsafe(_wake_admission(), self._recv_loop)
                 except Exception as exc:
                     logger.debug(
                         "Could not schedule _admission_condition wake-up "
@@ -1529,7 +1589,6 @@ class PDBackend(AllocatorBackendInterface):
             )
         self.transfer_channel.close()
         self.zmq_context.term()
-
 
     def pin(self, key: CacheEngineKey) -> bool:
         return True
