@@ -1461,6 +1461,9 @@ class PDBackend(AllocatorBackendInterface):
                         _wait_pending(), self._recv_loop
                     )
                     future.result(
+                        # Add 1 second buffer beyond the inner asyncio.wait timeout
+                        # so that future.result() does not expire before asyncio.wait
+                        # has a chance to return naturally.
                         timeout=self.pd_config.shutdown_timeout_sec + 1
                     )
                 except Exception:

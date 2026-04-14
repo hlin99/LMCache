@@ -1295,8 +1295,7 @@ def test_receiver_handle_alloc_request_sends_error_on_exception(async_receiver):
 
     # Exactly one send_multipart call (the error response)
     assert len(sent_frames) == 1, (
-        f"Expected exactly one send_multipart call (error response), "
-        f"got {len(sent_frames)}"
+        f"Expected exactly one send_multipart call (error response), got {len(sent_frames)}"
     )
     # Verify frame layout: [identity, empty_delimiter, payload]
     frames = sent_frames[0]
@@ -1357,16 +1356,6 @@ def test_sender_per_receiver_worker_concurrency(async_sender):
         receiver_1_id: SLOW,
         receiver_2_id: FAST,
     }
-
-    async def _write_with_delay(*args, receiver_id: str = "", **kwargs):
-        delay = write_delays.get(receiver_id, FAST)
-        await asyncio.sleep(delay)
-        return 1
-
-    original_write = async_sender.transfer_channel.async_batched_write
-
-    async def _patched_write(*args, **kwargs):
-        return await asyncio.sleep(FAST, result=1)
 
     # We need the delay to vary by receiver; patch _async_transfer_task instead
     original_async_transfer = async_sender._async_transfer_task
