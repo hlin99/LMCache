@@ -1209,14 +1209,14 @@ class PDBackend(AllocatorBackendInterface):
         # evict the stale owner so subsequent requests can proceed.
         if req_id:
             async with self._admission_condition:
-                deadline = asyncio.get_event_loop().time() + self._allocation_timeout
+                deadline = asyncio.get_running_loop().time() + self._allocation_timeout
                 while self._admission_owner and self._admission_owner != req_id:
                     if not self.running:
                         raise RuntimeError(
                             f"Receiver shutting down while req {req_id} "
                             f"waits for admission (owner={self._admission_owner})"
                         )
-                    remaining = deadline - asyncio.get_event_loop().time()
+                    remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         stale_owner = self._admission_owner
                         logger.warning(
