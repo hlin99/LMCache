@@ -61,10 +61,8 @@ class AllocRequest(PDMsgBase):
 class AllocResponse(PDMsgBase):
     """Allocation response message"""
 
-    # Indexes (local) of already sent memory objects
-    already_sent_indexes: list[int]
-
-    # Indexes (remote) of allocated memory objects (to be written)
+    # Indexes (remote) of allocated memory objects (to be written).
+    # One entry per key in the request; -1 means allocation failed for that slot.
     remote_indexes: list[int]
 
 
@@ -641,9 +639,10 @@ class PDBackend(AllocatorBackendInterface):
         remote alloc → async_batched_write → ref_count_down → callback.
         Runs in the dedicated sender event loop (_sender_loop).
 
-        ``remote_indexes`` may contain ``-1`` sentinels for keys whose
-        allocation failed on the receiver.  Those objects are released
-        immediately and excluded from the RDMA write.
+        ``remote_indexes`` has one entry per key (1:1 with memory_objs).
+        A value of ``-1`` means allocation failed on the receiver; in that
+        case the entire request is aborted — all local objects are released
+        and no RDMA write or ProxyNotif is sent.
         """
         completed_indexes: set[int] = set()
         num_chunks = len(memory_objs)
@@ -664,61 +663,40 @@ class PDBackend(AllocatorBackendInterface):
             alloc_response = await self._async_remote_allocate(
                 receiver_id, alloc_request
             )
-            already_sent_indexes = alloc_response.already_sent_indexes
             remote_indexes = alloc_response.remote_indexes
 
-            mem_objs_to_send: list[MemoryObj] = []
-            filtered_remote_indexes: list[int] = []
-            # Index into remote_indexes (one entry per non-already-sent key).
-            ri = 0
-            num_non_already_sent = len(memory_objs) - len(already_sent_indexes)
-            if len(remote_indexes) != num_non_already_sent:
-                logger.error(
-                    "Protocol mismatch: remote_indexes length (%d) != "
-                    "non-already-sent objects (%d). Some allocations may "
-                    "have been silently dropped by an older receiver.",
-                    len(remote_indexes),
-                    num_non_already_sent,
-                )
-            for idx, mem_obj in enumerate(memory_objs):
-                if idx in already_sent_indexes:
-                    mem_obj.ref_count_down()
-                    completed_indexes.add(idx)
-                else:
-                    remote_addr = remote_indexes[ri] if ri < len(remote_indexes) else -1
-                    ri += 1
-                    if remote_addr == -1:
-                        # Receiver failed to allocate for this key; skip it.
-                        logger.warning(
-                            "Receiver allocation failed for key %s "
-                            "(idx=%d), releasing local memory object.",
-                            keys[idx],
-                            idx,
-                        )
-                        mem_obj.ref_count_down()
-                        completed_indexes.add(idx)
-                    else:
-                        mem_objs_to_send.append(mem_obj)
-                        filtered_remote_indexes.append(remote_addr)
+            # Abort the whole request if any slot failed to allocate.
+            # The decoder requires all chunks before it can start consuming;
+            # a partial transfer wastes receiver buffer and can never complete.
+            for idx, (mem_obj, remote_addr) in enumerate(
+                zip(memory_objs, remote_indexes, strict=True)
+            ):
+                if remote_addr == -1:
+                    logger.warning(
+                        "Receiver allocation failed for key %s (idx=%d), "
+                        "aborting entire request.",
+                        keys[idx],
+                        idx,
+                    )
+                    for j, mo in enumerate(memory_objs):
+                        if j not in completed_indexes:
+                            mo.ref_count_down()
+                            completed_indexes.add(j)
+                    return
 
-            if mem_objs_to_send:
+            if memory_objs:
                 channel_transfer_spec = {
                     "receiver_id": receiver_id,
-                    "remote_indexes": filtered_remote_indexes,
+                    "remote_indexes": remote_indexes,
                 }
                 await self.transfer_channel.async_batched_write(
-                    objects=mem_objs_to_send,
+                    objects=memory_objs,
                     transfer_spec=channel_transfer_spec,
                 )
                 for idx, mem_obj in enumerate(memory_objs):
                     if idx not in completed_indexes:
                         mem_obj.ref_count_down()
                         completed_indexes.add(idx)
-            else:
-                logger.debug(
-                    "All memory objects have been already sent to the remote peer."
-                    " Skipping transfer."
-                )
 
             # Send ProxyNotif if this is the last prefill chunk, BEFORE invoking
             # on_complete_callback.  The worker processes chunks sequentially,
@@ -1076,8 +1054,7 @@ class PDBackend(AllocatorBackendInterface):
         pin=False: PDBackend has no eviction; pinning is unnecessary and
         causes ref_count leaks.
 
-        ``remote_indexes`` always contains one entry per non-already-sent key
-        so that the sender can match objects to addresses by position.
+        ``remote_indexes`` has exactly one entry per key in the request.
         A value of ``-1`` signals that allocation failed for that slot.
 
         Timeout semantics:
@@ -1112,10 +1089,7 @@ class PDBackend(AllocatorBackendInterface):
                     total_allocs,
                     self._max_inflight_chunks,
                 )
-                return AllocResponse(
-                    already_sent_indexes=[],
-                    remote_indexes=[-1] * total_allocs,
-                )
+                return AllocResponse(remote_indexes=[-1] * total_allocs)
             # Serial FIFO worker guarantees at most one active request at a time.
             # When a new req_id appears, all older entries are from completed
             # requests and can be safely discarded.
@@ -1136,13 +1110,9 @@ class PDBackend(AllocatorBackendInterface):
         shape = list(alloc_request.shape)  # copy — we mutate token_dim
 
         alloc_indexes: list[int] = []
-        already_send_indexes: list[int] = []
 
         for idx, key_str in enumerate(alloc_request.keys):
             key = CacheEngineKey.from_string(key_str)
-            if self.contains(key, pin=False):
-                already_send_indexes.append(idx)
-                continue
 
             if idx == total_allocs - 1:
                 token_dim = fmt.token_dim()
@@ -1153,16 +1123,9 @@ class PDBackend(AllocatorBackendInterface):
                 while self._inflight_chunks >= self._max_inflight_chunks:
                     if not self.running:
                         # Return a fail-fast response during shutdown
-                        remaining_allocs = (
-                            total_allocs
-                            - len(alloc_indexes)
-                            - len(already_send_indexes)
-                        )
+                        remaining_allocs = total_allocs - len(alloc_indexes)
                         alloc_indexes.extend([-1] * remaining_allocs)
-                        return AllocResponse(
-                            already_sent_indexes=already_send_indexes,
-                            remote_indexes=alloc_indexes,
-                        )
+                        return AllocResponse(remote_indexes=alloc_indexes)
                     logger.warning(
                         "Decoder buffer near-full: inflight_chunks=%d >= max=%d, "
                         "waiting for buffers to be freed...",
@@ -1203,8 +1166,6 @@ class PDBackend(AllocatorBackendInterface):
                     key,
                     idx,
                 )
-                # Use -1 sentinel so the sender can match objects to
-                # addresses by position and skip failed slots.
                 alloc_indexes.append(-1)
                 continue
             alloc_indexes.append(mem_obj.meta.address)
@@ -1213,9 +1174,7 @@ class PDBackend(AllocatorBackendInterface):
             async with self._inflight_condition:
                 self._inflight_chunks += 1
 
-        return AllocResponse(
-            already_sent_indexes=already_send_indexes, remote_indexes=alloc_indexes
-        )
+        return AllocResponse(remote_indexes=alloc_indexes)
 
     def put(
         self,
