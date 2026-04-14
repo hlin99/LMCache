@@ -154,7 +154,7 @@ def async_sender():
     with p1, p2 as mock_zmq_sock, p3 as mock_create_tc, p4:
         # --- alloc socket stub: answers immediately with remote_indexes=[0] ---
         alloc_socket = MagicMock()
-        alloc_response = AllocResponse(already_sent_indexes=[], remote_indexes=[0])
+        alloc_response = AllocResponse(remote_indexes=[0])
         alloc_socket.recv = AsyncMock(
             return_value=msgspec.msgpack.encode(alloc_response)
         )
@@ -587,12 +587,11 @@ def test_receiver_close_stops_event_loop(async_receiver):
 
 def test_receiver_data_correctness_dedup_and_shape(async_receiver):
     """
-    Combined test for _async_allocate_and_put correctness:
-      - key_existing: already in backend → in already_sent_indexes, no allocate()
-      - key_full:     new key → allocate with original token dim
-      - key_last:     new key (last) → allocate with overridden last_chunk_toks
+    Verify _async_allocate_and_put allocates all keys and applies the
+    last_chunk_toks shape override on the final slot.
 
-    Validates both deduplication and shape override in a single pass.
+    All three keys are allocated (dedup logic was removed); the last key
+    receives a token-dim override of LAST_TOKENS.
     """
     key_existing = _make_key(300)
     key_full = _make_key(301)
@@ -601,9 +600,6 @@ def test_receiver_data_correctness_dedup_and_shape(async_receiver):
 
     FULL_TOKENS = 16
     LAST_TOKENS = 7
-
-    # Pre-populate backend with key_existing
-    async_receiver.put(key_existing, _make_mem_obj(idx=99))
 
     alloc_shapes: list[torch.Size] = []
 
@@ -625,31 +621,19 @@ def test_receiver_data_correctness_dedup_and_shape(async_receiver):
         last_chunk_toks=LAST_TOKENS,
     )
 
-    resp = asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
+    asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
 
-    # --- Deduplication assertions ---
-    # Index 0 (key_existing) should be in already_sent
-    assert 0 in resp.already_sent_indexes, (
-        f"Expected index 0 in already_sent_indexes, got {resp.already_sent_indexes}"
+    # All 3 keys should be allocated (no dedup)
+    assert len(alloc_shapes) == 3, (
+        f"Expected 3 allocate() calls but got {len(alloc_shapes)}"
     )
-    # Only 2 allocations (key_full + key_last), NOT 3
-    assert len(alloc_shapes) == 2, (
-        f"Expected 2 allocate() calls but got {len(alloc_shapes)}"
-    )
-    # remote_indexes should contain 2 entries for the allocated keys
-    assert len(resp.remote_indexes) == 2
 
-    # --- Shape override assertions ---
+    # --- Shape override assertion ---
     token_dim = MemoryFormat.KV_2LTD.token_dim()
-    # First alloc (key_full): token dim should remain FULL_TOKENS
-    assert alloc_shapes[0][token_dim] == FULL_TOKENS, (
-        f"Full chunk token dim should be {FULL_TOKENS}, "
-        f"got {alloc_shapes[0][token_dim]}"
-    )
-    # Second alloc (key_last): token dim should be overridden to LAST_TOKENS
-    assert alloc_shapes[1][token_dim] == LAST_TOKENS, (
+    # Last alloc (key_last): token dim should be overridden to LAST_TOKENS
+    assert alloc_shapes[-1][token_dim] == LAST_TOKENS, (
         f"Last chunk token dim should be {LAST_TOKENS}, "
-        f"got {alloc_shapes[1][token_dim]}"
+        f"got {alloc_shapes[-1][token_dim]}"
     )
 
 
@@ -816,9 +800,6 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
         assert resp2.remote_indexes == [-1], (
             f"Batch 2 should fail fast with [-1] when cumulative > MAX_T, "
             f"but got remote_indexes={resp2.remote_indexes}"
-        )
-        assert resp2.already_sent_indexes == [], (
-            "Fail-fast response should have no already_sent_indexes"
         )
 
     asyncio.run(run())

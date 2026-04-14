@@ -56,6 +56,9 @@ class AllocRequest(PDMsgBase):
     # in that case per-request chunk accounting and fail-fast detection are
     # skipped for this allocation request.
     req_id: str = ""
+    # is_last_batch signals the final batch for this req_id so the receiver
+    # can release admission and clean up per-request tracking.
+    is_last_batch: bool = False
 
 
 class AllocResponse(PDMsgBase):
@@ -326,10 +329,11 @@ class PDBackend(AllocatorBackendInterface):
                 self._aligned_buffer_size,
                 self._chunk_size_bytes,
             )
-            # Per-request cumulative chunk counter for fail-fast detection.
-            # If a request's total chunks exceed max_inflight_chunks, it can
-            # never complete (decoder requires all chunks before consuming).
-            self._req_chunk_counts: dict[str, int] = {}
+            # Per-request key tracking for fail-fast detection and rollback.
+            # Maps req_id → list of key strings allocated across all batches.
+            self._req_allocated_keys: dict[str, list[str]] = {}
+            # Admission control: only one req_id's batches processed at a time.
+            self._admission_owner: str = ""
 
         self.full_chunk_size_bytes = config.chunk_size
 
@@ -597,6 +601,7 @@ class PDBackend(AllocatorBackendInterface):
         keys: Sequence[CacheEngineKey],
         mem_objs: List[MemoryObj],
         req_id: str = "",
+        is_last_batch: bool = False,
     ) -> AllocRequest:
         """
         Get the allocation request given the keys and memory objects.
@@ -624,6 +629,7 @@ class PDBackend(AllocatorBackendInterface):
             dtype=dtype,
             last_chunk_toks=last_chunk_toks,
             req_id=req_id,
+            is_last_batch=is_last_batch,
         )
 
     async def _async_transfer_task(
@@ -655,10 +661,15 @@ class PDBackend(AllocatorBackendInterface):
         req_id: str = (
             getattr(transfer_spec, "req_id", "") if transfer_spec is not None else ""
         )
+        is_last_batch: bool = (
+            getattr(transfer_spec, "is_last_prefill", False)
+            if transfer_spec is not None
+            else False
+        )
 
         try:
             alloc_request = self._get_remote_alloc_request(
-                keys, memory_objs, req_id=req_id
+                keys, memory_objs, req_id=req_id, is_last_batch=is_last_batch
             )
             alloc_response = await self._async_remote_allocate(
                 receiver_id, alloc_request
@@ -987,12 +998,13 @@ class PDBackend(AllocatorBackendInterface):
     # Decoder functions
     ############################################################
     async def _create_inflight_condition(self) -> None:
-        """Create the asyncio.Condition for inflight chunk flow control.
+        """Create asyncio.Conditions for inflight flow control and admission control.
 
         Must be called from within the receiver event loop so that the
-        Condition is bound to the correct loop.
+        Conditions are bound to the correct loop.
         """
         self._inflight_condition = asyncio.Condition()
+        self._admission_condition = asyncio.Condition()
 
     def _init_receiver(self):
         """
@@ -1067,12 +1079,36 @@ class PDBackend(AllocatorBackendInterface):
         total_allocs = len(alloc_request.keys)
         req_id = alloc_request.req_id
 
+        # Admission control: ensure only one req_id's batches are processed at
+        # a time, preventing multi-sender interleaving deadlock.
+        # Skip entirely for legacy senders that provide no req_id.
+        if req_id:
+            async with self._admission_condition:
+                while self._admission_owner and self._admission_owner != req_id:
+                    await self._admission_condition.wait()
+                self._admission_owner = req_id
+
+        async def _release_admission() -> None:
+            if req_id:
+                async with self._admission_condition:
+                    self._admission_owner = ""
+                    self._admission_condition.notify_all()
+
+        async def _fail_all(rollback_current: list[str]) -> AllocResponse:
+            """Roll back current-batch and all prior-batch keys, release admission."""
+            for key_str in rollback_current:
+                self.remove(CacheEngineKey.from_string(key_str))
+            for key_str in self._req_allocated_keys.pop(req_id, []):
+                self.remove(CacheEngineKey.from_string(key_str))
+            await _release_admission()
+            return AllocResponse(remote_indexes=[-1] * total_allocs)
+
         # Fail-fast: detect if this request can never complete because it
         # requires more chunks than the decoder buffer can ever hold at once.
         # The decoder needs all chunks present before it can start consuming,
         # so C_req > max_inflight_chunks is an impossible configuration.
         if req_id:
-            prev_count = self._req_chunk_counts.get(req_id, 0)
+            prev_count = len(self._req_allocated_keys.get(req_id, []))
             new_total = prev_count + total_allocs
             if new_total > self._max_inflight_chunks:
                 logger.error(
@@ -1089,13 +1125,7 @@ class PDBackend(AllocatorBackendInterface):
                     total_allocs,
                     self._max_inflight_chunks,
                 )
-                return AllocResponse(remote_indexes=[-1] * total_allocs)
-            # Serial FIFO worker guarantees at most one active request at a time.
-            # When a new req_id appears, all older entries are from completed
-            # requests and can be safely discarded.
-            if req_id not in self._req_chunk_counts:
-                self._req_chunk_counts.clear()
-            self._req_chunk_counts[req_id] = new_total
+                return await _fail_all([])
         else:
             # No req_id provided (legacy sender or untracked call); per-request
             # fail-fast detection is unavailable.  Log at debug level so operators
@@ -1110,6 +1140,7 @@ class PDBackend(AllocatorBackendInterface):
         shape = list(alloc_request.shape)  # copy — we mutate token_dim
 
         alloc_indexes: list[int] = []
+        current_batch_keys: list[str] = []  # keys successfully put in this batch
 
         for idx, key_str in enumerate(alloc_request.keys):
             key = CacheEngineKey.from_string(key_str)
@@ -1122,7 +1153,8 @@ class PDBackend(AllocatorBackendInterface):
             async with self._inflight_condition:
                 while self._inflight_chunks >= self._max_inflight_chunks:
                     if not self.running:
-                        # Return a fail-fast response during shutdown
+                        # Release admission and return failure on shutdown.
+                        await _release_admission()
                         remaining_allocs = total_allocs - len(alloc_indexes)
                         alloc_indexes.extend([-1] * remaining_allocs)
                         return AllocResponse(remote_indexes=alloc_indexes)
@@ -1160,19 +1192,23 @@ class PDBackend(AllocatorBackendInterface):
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
             if mem_obj is None:
-                logger.warning(
-                    "Allocation failed for key %s (idx=%d); "
-                    "marking as -1 in remote_indexes.",
-                    key,
-                    idx,
-                )
-                alloc_indexes.append(-1)
-                continue
+                # Rollback current batch and all prior batches, then fail.
+                return await _fail_all(current_batch_keys)
+
             alloc_indexes.append(mem_obj.meta.address)
             self.put(key, mem_obj)
-            # Increment the inflight counter now that a chunk is allocated.
             async with self._inflight_condition:
                 self._inflight_chunks += 1
+            current_batch_keys.append(key_str)
+
+        # All allocations in this batch succeeded.
+        if req_id:
+            if req_id not in self._req_allocated_keys:
+                self._req_allocated_keys[req_id] = []
+            self._req_allocated_keys[req_id].extend(current_batch_keys)
+            if alloc_request.is_last_batch:
+                self._req_allocated_keys.pop(req_id, None)
+                await _release_admission()
 
         return AllocResponse(remote_indexes=alloc_indexes)
 
@@ -1314,8 +1350,9 @@ class PDBackend(AllocatorBackendInterface):
                 pass
         # Shut down receiver async loop if present
         if hasattr(self, "_recv_loop"):
-            # Wake up any coroutines blocked on _inflight_condition so they can
-            # observe running=False and exit cleanly before the loop is stopped.
+            # Wake up any coroutines blocked on _inflight_condition or
+            # _admission_condition so they can observe running=False and exit
+            # cleanly before the loop is stopped.
             if hasattr(self, "_inflight_condition"):
                 try:
 
@@ -1327,6 +1364,22 @@ class PDBackend(AllocatorBackendInterface):
                 except Exception as exc:
                     logger.debug(
                         "Could not schedule _inflight_condition wake-up "
+                        "(loop may already be stopped): %s",
+                        exc,
+                    )
+            if hasattr(self, "_admission_condition"):
+                try:
+
+                    async def _wake_admission() -> None:
+                        async with self._admission_condition:
+                            self._admission_condition.notify_all()
+
+                    asyncio.run_coroutine_threadsafe(
+                        _wake_admission(), self._recv_loop
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Could not schedule _admission_condition wake-up "
                         "(loop may already be stopped): %s",
                         exc,
                     )
