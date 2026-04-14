@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
+import itertools
 import threading
 import time
 
@@ -65,7 +66,9 @@ class AllocRequest(PDMsgBase):
     last_chunk_toks: int
     # req_id is used by the receiver for per-request chunk accounting and
     # fail-fast detection when C_req > max_inflight_chunks.  An empty string
-    # means the sender does not provide an identifier (backwards-compatible).
+    # means the sender does not provide an identifier (backwards-compatible);
+    # in that case per-request chunk accounting and fail-fast detection are
+    # skipped for this allocation request.
     req_id: str = ""
 
 
@@ -1120,7 +1123,10 @@ class PDBackend(AllocatorBackendInterface):
             self._req_chunk_counts[req_id] = new_total
             if len(self._req_chunk_counts) > _MAX_REQ_CHUNK_COUNT_ENTRIES:
                 evict_count = _MAX_REQ_CHUNK_COUNT_ENTRIES // 2
-                for key_to_evict in list(self._req_chunk_counts.keys())[:evict_count]:
+                keys_to_evict = list(
+                    itertools.islice(self._req_chunk_counts.keys(), evict_count)
+                )
+                for key_to_evict in keys_to_evict:
                     del self._req_chunk_counts[key_to_evict]
         else:
             # No req_id provided (legacy sender or untracked call); per-request

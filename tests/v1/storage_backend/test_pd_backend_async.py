@@ -271,12 +271,17 @@ def test_sender_nonblocking_fifo_transfers(async_sender):
        well before any transfer completes.
     2. All transfers eventually complete (the single worker processes them
        serially in FIFO order, so the total time is ≈ N × TRANSFER_DELAY).
+    3. Transfers complete in FIFO order (req-0 before req-1 before ...).
     """
     N = 4
     done_events = [threading.Event() for _ in range(N)]
+    completion_order: list[int] = []
+    completion_lock = threading.Lock()
 
     def make_callback(i):
         def cb(key):
+            with completion_lock:
+                completion_order.append(i)
             done_events[i].set()
 
         return cb
@@ -309,6 +314,12 @@ def test_sender_nonblocking_fifo_transfers(async_sender):
             f"Transfer for req-{i} did not complete within "
             f"{serial_timeout:.1f}s (serial FIFO timeout)"
         )
+
+    # Verify FIFO completion order: req-0 must complete before req-1, etc.
+    assert completion_order == list(range(N)), (
+        f"Transfers did not complete in FIFO order: {completion_order} "
+        f"(expected {list(range(N))})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -788,8 +799,9 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
             f"Batch 1 should succeed (cumulative == MAX_T={MAX_T}), "
             f"but got remote_indexes={resp1.remote_indexes}"
         )
-        assert async_receiver._req_chunk_counts.get(req_id) == MAX_T, (
-            "Cumulative chunk count should equal MAX_T after batch 1"
+        assert len(resp1.remote_indexes) == MAX_T, (
+            f"Expected {MAX_T} remote_indexes in batch 1, "
+            f"got {len(resp1.remote_indexes)}"
         )
 
         # Batch 2: 1 more key — cumulative = MAX_T + 1 > MAX_T → fail fast.
@@ -807,8 +819,11 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
     asyncio.run(run())
 
     # A different req_id should not be affected by the too-large req's tracking.
-    # Reset inflight counter (from batch 1's MAX_T allocations) so the
-    # backpressure wait for the new req doesn't block indefinitely.
+    # Directly reset the inflight counter so the backpressure wait in run_other()
+    # doesn't block indefinitely.  This is consistent with the approach used in
+    # Test 4, which also directly writes _inflight_chunks for test setup; the
+    # alternative (calling remove() per key) would introduce a race since
+    # _notify_inflight_freed() is scheduled asynchronously on _recv_loop.
     async_receiver._inflight_chunks = 0
 
     other_req_id = "req-small"
