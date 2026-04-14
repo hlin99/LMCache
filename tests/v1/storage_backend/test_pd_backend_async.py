@@ -57,6 +57,16 @@ from lmcache.v1.storage_backend.pd_backend import (
 
 TRANSFER_DELAY = 0.15  # seconds – simulates a NIXL write taking 150 ms
 
+# Fraction of TRANSFER_DELAY used as the threshold for verifying that
+# batched_submit_put_task() is non-blocking (fire-and-forget).  All N
+# submit calls must complete in < TRANSFER_DELAY * NONBLOCKING_THRESHOLD_RATIO
+# of a single TRANSFER_DELAY.
+NONBLOCKING_THRESHOLD_RATIO = 0.25
+
+# Multiplier applied to N × TRANSFER_DELAY for the serial FIFO completion
+# timeout in CI environments (generous to accommodate scheduling jitter).
+CI_SERIAL_TIMEOUT_MARGIN = 3
+
 
 def _make_key(i: int) -> CacheEngineKey:
     return CacheEngineKey(
@@ -284,14 +294,15 @@ def test_sender_nonblocking_fifo_transfers(async_sender):
         )
 
     enqueue_elapsed = time.monotonic() - t0
-    # All enqueue calls should complete well before a single TRANSFER_DELAY
-    assert enqueue_elapsed < TRANSFER_DELAY / 4, (
+    # All enqueue calls should complete well before a single TRANSFER_DELAY.
+    nonblocking_threshold = TRANSFER_DELAY * NONBLOCKING_THRESHOLD_RATIO
+    assert enqueue_elapsed < nonblocking_threshold, (
         f"batched_submit_put_task calls took {enqueue_elapsed:.3f}s — "
-        f"should be non-blocking (< {TRANSFER_DELAY / 4:.3f}s)"
+        f"should be non-blocking (< {nonblocking_threshold:.3f}s)"
     )
 
     # With serial FIFO execution, all N requests complete in ≈ N × TRANSFER_DELAY.
-    serial_timeout = TRANSFER_DELAY * N * 3  # generous margin for CI
+    serial_timeout = TRANSFER_DELAY * N * CI_SERIAL_TIMEOUT_MARGIN
     for i, ev in enumerate(done_events):
         finished = ev.wait(timeout=serial_timeout)
         assert finished, (

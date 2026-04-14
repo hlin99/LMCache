@@ -40,6 +40,13 @@ _ALLOCATION_TIMEOUT_SECONDS = 5.0
 # Polling interval used when waiting on a threading/asyncio Condition; small
 # enough to be responsive, large enough not to spin-waste CPU.
 _CONDITION_WAIT_INTERVAL = 0.5
+# Maximum number of per-request chunk-count entries to retain in the receiver's
+# _req_chunk_counts dict.  Entries from completed requests are safe to evict
+# (with the serial global sender worker only one req is active at a time, so
+# old entries are always for finished requests).  When this limit is exceeded,
+# the oldest half of entries are removed to prevent unbounded growth in
+# long-running servers.
+_MAX_REQ_CHUNK_COUNT_ENTRIES = 1000
 
 
 class PDMsgBase(msgspec.Struct, tag=True):
@@ -640,6 +647,11 @@ class PDBackend(AllocatorBackendInterface):
         completed_indexes: set[int] = set()
         num_chunks = len(memory_objs)
 
+        # Extract req_id for per-request allocation accounting on the receiver.
+        # Using getattr with a default of "" keeps this backwards-compatible with
+        # any transfer_spec that pre-dates the req_id field.  An empty string
+        # causes the receiver to skip per-request chunk counting (no fail-fast
+        # detection), which is acceptable for legacy callers.
         req_id: str = (
             getattr(transfer_spec, "req_id", "") if transfer_spec is not None else ""
         )
@@ -1100,8 +1112,24 @@ class PDBackend(AllocatorBackendInterface):
                     already_sent_indexes=[],
                     remote_indexes=[-1] * total_allocs,
                 )
-            # Update cumulative count for this request.
+            # Update cumulative count for this request.  Evict oldest entries
+            # when the dict exceeds _MAX_REQ_CHUNK_COUNT_ENTRIES to prevent
+            # unbounded growth in long-running servers.  With the serial FIFO
+            # sender worker, old entries are always from completed requests and
+            # are safe to remove.
             self._req_chunk_counts[req_id] = new_total
+            if len(self._req_chunk_counts) > _MAX_REQ_CHUNK_COUNT_ENTRIES:
+                evict_count = _MAX_REQ_CHUNK_COUNT_ENTRIES // 2
+                for key_to_evict in list(self._req_chunk_counts.keys())[:evict_count]:
+                    del self._req_chunk_counts[key_to_evict]
+        else:
+            # No req_id provided (legacy sender or untracked call); per-request
+            # fail-fast detection is unavailable.  Log at debug level so operators
+            # can diagnose potential buffer exhaustion if needed.
+            logger.debug(
+                "AllocRequest has no req_id — per-request chunk accounting "
+                "is disabled for this batch (C_req > T fail-fast will not fire)."
+            )
 
         fmt = MemoryFormat(alloc_request.fmt)
         dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
