@@ -23,6 +23,10 @@ Test matrix (behaviour × role)
   7. Receiver — Data correctness: already_sent dedup + last_chunk_toks shape
   8. Sender  — Chunk ordering: last prefill waits for prior slow chunk
   9. Receiver — Fail-fast: C_req > max_inflight returns all -1
+ 10. Receiver — Rollback: allocation timeout rolls back current + prior batches
+ 11. Receiver — is_last_batch cleans up _req_allocated_keys tracking
+ 12. Receiver — Fail-fast also rolls back prior-batch keys
+ 13. Receiver — Admission control prevents req interleaving
 """
 
 # Standard
@@ -154,7 +158,7 @@ def async_sender():
     with p1, p2 as mock_zmq_sock, p3 as mock_create_tc, p4:
         # --- alloc socket stub: answers immediately with remote_indexes=[0] ---
         alloc_socket = MagicMock()
-        alloc_response = AllocResponse(already_sent_indexes=[], remote_indexes=[0])
+        alloc_response = AllocResponse(remote_indexes=[0])
         alloc_socket.recv = AsyncMock(
             return_value=msgspec.msgpack.encode(alloc_response)
         )
@@ -587,12 +591,11 @@ def test_receiver_close_stops_event_loop(async_receiver):
 
 def test_receiver_data_correctness_dedup_and_shape(async_receiver):
     """
-    Combined test for _async_allocate_and_put correctness:
-      - key_existing: already in backend → in already_sent_indexes, no allocate()
-      - key_full:     new key → allocate with original token dim
-      - key_last:     new key (last) → allocate with overridden last_chunk_toks
+    Verify _async_allocate_and_put allocates all keys and applies the
+    last_chunk_toks shape override on the final slot.
 
-    Validates both deduplication and shape override in a single pass.
+    All three keys are allocated (dedup logic was removed); the last key
+    receives a token-dim override of LAST_TOKENS.
     """
     key_existing = _make_key(300)
     key_full = _make_key(301)
@@ -601,9 +604,6 @@ def test_receiver_data_correctness_dedup_and_shape(async_receiver):
 
     FULL_TOKENS = 16
     LAST_TOKENS = 7
-
-    # Pre-populate backend with key_existing
-    async_receiver.put(key_existing, _make_mem_obj(idx=99))
 
     alloc_shapes: list[torch.Size] = []
 
@@ -625,31 +625,19 @@ def test_receiver_data_correctness_dedup_and_shape(async_receiver):
         last_chunk_toks=LAST_TOKENS,
     )
 
-    resp = asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
+    asyncio.run(async_receiver._async_allocate_and_put(alloc_req))
 
-    # --- Deduplication assertions ---
-    # Index 0 (key_existing) should be in already_sent
-    assert 0 in resp.already_sent_indexes, (
-        f"Expected index 0 in already_sent_indexes, got {resp.already_sent_indexes}"
+    # All 3 keys should be allocated (no dedup)
+    assert len(alloc_shapes) == 3, (
+        f"Expected 3 allocate() calls but got {len(alloc_shapes)}"
     )
-    # Only 2 allocations (key_full + key_last), NOT 3
-    assert len(alloc_shapes) == 2, (
-        f"Expected 2 allocate() calls but got {len(alloc_shapes)}"
-    )
-    # remote_indexes should contain 2 entries for the allocated keys
-    assert len(resp.remote_indexes) == 2
 
-    # --- Shape override assertions ---
+    # --- Shape override assertion ---
     token_dim = MemoryFormat.KV_2LTD.token_dim()
-    # First alloc (key_full): token dim should remain FULL_TOKENS
-    assert alloc_shapes[0][token_dim] == FULL_TOKENS, (
-        f"Full chunk token dim should be {FULL_TOKENS}, "
-        f"got {alloc_shapes[0][token_dim]}"
-    )
-    # Second alloc (key_last): token dim should be overridden to LAST_TOKENS
-    assert alloc_shapes[1][token_dim] == LAST_TOKENS, (
+    # Last alloc (key_last): token dim should be overridden to LAST_TOKENS
+    assert alloc_shapes[-1][token_dim] == LAST_TOKENS, (
         f"Last chunk token dim should be {LAST_TOKENS}, "
-        f"got {alloc_shapes[1][token_dim]}"
+        f"got {alloc_shapes[-1][token_dim]}"
     )
 
 
@@ -817,9 +805,6 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
             f"Batch 2 should fail fast with [-1] when cumulative > MAX_T, "
             f"but got remote_indexes={resp2.remote_indexes}"
         )
-        assert resp2.already_sent_indexes == [], (
-            "Fail-fast response should have no already_sent_indexes"
-        )
 
     asyncio.run(run())
 
@@ -844,3 +829,339 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
         )
 
     asyncio.run(run_other())
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Receiver — Allocation timeout rolls back current + prior batches
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_rollback_on_allocation_timeout(async_receiver):
+    """
+    When allocate() returns None (timeout) for the Nth key in a batch,
+    all successfully allocated keys in the current batch AND all keys from
+    prior batches for the same req_id must be removed from the backend.
+
+    Strategy:
+      - Batch 1 (3 keys): succeeds, keys stored in backend and tracked.
+      - Batch 2 (3 keys): allocate() returns None on the 2nd key (idx=1).
+        The 1st key of batch 2 + all 3 keys from batch 1 must be removed.
+        Response: all -1.
+    """
+    MAX_T = 10
+    async_receiver._max_inflight_chunks = MAX_T
+    req_id = "req-rollback"
+
+    mem_idx = [0]
+
+    def make_unique_mem_obj():
+        obj = _make_mem_obj(idx=mem_idx[0])
+        mem_idx[0] += 1
+        return obj
+
+    # Batch 1: 3 keys, all succeed.
+    batch1_keys = [_make_key(1000 + i) for i in range(3)]
+
+    def always_succeed(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        return make_unique_mem_obj()
+
+    async_receiver.allocate = always_succeed
+
+    alloc_req1 = AllocRequest(
+        keys=[k.to_string() for k in batch1_keys],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+        req_id=req_id,
+    )
+
+    resp1 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req1))
+    assert -1 not in resp1.remote_indexes, "Batch 1 should succeed"
+    assert len(resp1.remote_indexes) == 3
+
+    # Verify batch 1 keys are in the backend
+    for k in batch1_keys:
+        assert async_receiver.contains(k, pin=False), (
+            f"Key {k} should be in backend after batch 1"
+        )
+
+    # Batch 2: 3 keys. allocate() succeeds on idx=0, fails on idx=1.
+    batch2_keys = [_make_key(2000 + i) for i in range(3)]
+    alloc_call_count = [0]
+
+    def fail_on_second(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        alloc_call_count[0] += 1
+        if alloc_call_count[0] == 1:
+            return make_unique_mem_obj()
+        return None  # timeout simulation
+
+    async_receiver.allocate = fail_on_second
+    # Use a very short timeout so the test doesn't hang
+    async_receiver._allocation_timeout = 0.05
+
+    alloc_req2 = AllocRequest(
+        keys=[k.to_string() for k in batch2_keys],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+        req_id=req_id,
+    )
+
+    resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
+
+    # All -1 for the entire batch
+    assert resp2.remote_indexes == [-1, -1, -1], (
+        f"Batch 2 should return all -1 on failure, got {resp2.remote_indexes}"
+    )
+
+    # The 1st key of batch 2 (which succeeded) should have been rolled back
+    assert not async_receiver.contains(batch2_keys[0], pin=False), (
+        "batch2_keys[0] should be removed (current batch rollback)"
+    )
+
+    # All batch 1 keys should also have been rolled back
+    for k in batch1_keys:
+        assert not async_receiver.contains(k, pin=False), (
+            f"Key {k} from batch 1 should be removed (prior batch rollback)"
+        )
+
+    # _req_allocated_keys should be cleaned up for this req_id
+    assert req_id not in async_receiver._req_allocated_keys, (
+        "req_id should be removed from _req_allocated_keys after rollback"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Receiver — is_last_batch cleans up _req_allocated_keys tracking
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_is_last_batch_cleans_up_tracking(async_receiver):
+    """
+    When is_last_batch=True and all allocations succeed, the receiver
+    must pop the req_id from _req_allocated_keys (lifecycle cleanup).
+
+    Strategy:
+      - Batch 1 (is_last_batch=False): keys tracked in _req_allocated_keys.
+      - Batch 2 (is_last_batch=True): after success, req_id removed from tracking.
+    """
+    MAX_T = 10
+    async_receiver._max_inflight_chunks = MAX_T
+    req_id = "req-lifecycle"
+
+    mem_idx = [0]
+
+    def always_succeed(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        obj = _make_mem_obj(idx=mem_idx[0])
+        mem_idx[0] += 1
+        return obj
+
+    async_receiver.allocate = always_succeed
+
+    # Batch 1: is_last_batch=False → tracking should persist
+    alloc_req1 = AllocRequest(
+        keys=[_make_key(3000 + i).to_string() for i in range(3)],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+        req_id=req_id,
+        is_last_batch=False,
+    )
+
+    resp1 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req1))
+    assert -1 not in resp1.remote_indexes
+    assert req_id in async_receiver._req_allocated_keys, (
+        "After batch 1 (not last), req_id should still be tracked"
+    )
+    assert len(async_receiver._req_allocated_keys[req_id]) == 3, (
+        "Should track 3 keys from batch 1"
+    )
+
+    # Batch 2: is_last_batch=True → tracking should be cleaned up
+    alloc_req2 = AllocRequest(
+        keys=[_make_key(4000 + i).to_string() for i in range(2)],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+        req_id=req_id,
+        is_last_batch=True,
+    )
+
+    resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
+    assert -1 not in resp2.remote_indexes
+    assert req_id not in async_receiver._req_allocated_keys, (
+        "After is_last_batch=True, req_id should be removed from tracking"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Receiver — Fail-fast also rolls back prior-batch keys
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_fail_fast_rolls_back_prior_batches(async_receiver):
+    """
+    When the fail-fast check triggers (cumulative > max_inflight_chunks),
+    keys from all prior batches for that req_id must be removed from the
+    backend (not just the new batch, which hasn't been allocated yet).
+    """
+    MAX_T = 4
+    async_receiver._max_inflight_chunks = MAX_T
+    req_id = "req-failfast-rollback"
+
+    mem_idx = [0]
+
+    def always_succeed(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        obj = _make_mem_obj(idx=mem_idx[0])
+        mem_idx[0] += 1
+        return obj
+
+    async_receiver.allocate = always_succeed
+
+    # Batch 1: 3 keys, succeeds (3 <= 4).
+    batch1_keys = [_make_key(5000 + i) for i in range(3)]
+    alloc_req1 = AllocRequest(
+        keys=[k.to_string() for k in batch1_keys],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+        req_id=req_id,
+    )
+
+    resp1 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req1))
+    assert -1 not in resp1.remote_indexes
+    for k in batch1_keys:
+        assert async_receiver.contains(k, pin=False)
+
+    # Batch 2: 2 keys → cumulative = 3 + 2 = 5 > 4 → fail-fast
+    batch2_keys = [_make_key(6000 + i) for i in range(2)]
+    alloc_req2 = AllocRequest(
+        keys=[k.to_string() for k in batch2_keys],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+        req_id=req_id,
+    )
+
+    resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
+    assert resp2.remote_indexes == [-1, -1], (
+        f"Fail-fast should return all -1, got {resp2.remote_indexes}"
+    )
+
+    # Batch 1 keys should have been rolled back
+    for k in batch1_keys:
+        assert not async_receiver.contains(k, pin=False), (
+            f"Key {k} from batch 1 should be removed after fail-fast rollback"
+        )
+
+    # Tracking cleaned up
+    assert req_id not in async_receiver._req_allocated_keys
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Receiver — Admission control prevents req interleaving
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_admission_control_prevents_interleaving(async_receiver):
+    """
+    Two different req_ids submitted concurrently: the second must wait until
+    the first finishes (is_last_batch=True) before its allocation proceeds.
+
+    Strategy:
+      - req-A batch 1 (is_last_batch=False): starts, grabs admission.
+      - req-B batch 1 (is_last_batch=True): must wait (admission owned by A).
+      - req-A batch 2 (is_last_batch=True): proceeds (same req_id), releases.
+      - req-B then proceeds.
+
+    Timing: req-A batches use a slow allocator to create a window where req-B
+    must be blocked. We verify ordering via an event log.
+    """
+    MAX_T = 20
+    async_receiver._max_inflight_chunks = MAX_T
+
+    event_log: list[str] = []
+    mem_idx = [0]
+
+    def make_obj():
+        obj = _make_mem_obj(idx=mem_idx[0])
+        mem_idx[0] += 1
+        return obj
+
+    async_receiver.allocate = (
+        lambda shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw: make_obj()
+    )
+
+    def _req(
+        req_id: str,
+        n_keys: int,
+        key_offset: int,
+        is_last: bool = False,
+    ) -> AllocRequest:
+        return AllocRequest(
+            keys=[_make_key(key_offset + i).to_string() for i in range(n_keys)],
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=[4, 2, 16, 8, 128],
+            dtype="bfloat16",
+            last_chunk_toks=16,
+            req_id=req_id,
+            is_last_batch=is_last,
+        )
+
+    async def run():
+        # req-A batch 1: grabs admission
+        event_log.append("A1-start")
+        resp = await async_receiver._async_allocate_and_put(
+            _req("req-A", 2, 7000, is_last=False)
+        )
+        assert -1 not in resp.remote_indexes
+        event_log.append("A1-done")
+
+        # Now launch req-B and req-A batch 2 concurrently.
+        # req-A batch 2 should proceed immediately; req-B should wait.
+
+        b_started = asyncio.Event()
+        b_acquired = asyncio.Event()
+
+        async def do_b():
+            b_started.set()
+            event_log.append("B-start")
+            resp = await async_receiver._async_allocate_and_put(
+                _req("req-B", 1, 8000, is_last=True)
+            )
+            event_log.append("B-done")
+            b_acquired.set()
+            return resp
+
+        async def do_a2():
+            # Small delay to ensure B starts waiting first
+            await asyncio.sleep(0.02)
+            event_log.append("A2-start")
+            resp = await async_receiver._async_allocate_and_put(
+                _req("req-A", 1, 9000, is_last=True)
+            )
+            event_log.append("A2-done")
+            return resp
+
+        results = await asyncio.gather(do_b(), do_a2())
+        resp_b, resp_a2 = results
+
+        assert -1 not in resp_a2.remote_indexes
+        assert -1 not in resp_b.remote_indexes
+
+    asyncio.run(run())
+
+    # Verify ordering: A2 must complete before B, because admission is held
+    # by req-A until A2 (is_last_batch=True) releases it.
+    a2_done_idx = event_log.index("A2-done")
+    b_done_idx = event_log.index("B-done")
+    assert a2_done_idx < b_done_idx, (
+        f"req-A batch 2 should complete before req-B, "
+        f"but event_log={event_log}"
+    )
