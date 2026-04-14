@@ -399,40 +399,79 @@ class PDBackend(AllocatorBackendInterface):
         alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"
 
         if self.pd_config.role == "sender":
-            # Block until the sender staging buffer has enough headroom and a
-            # memory slot is available.  The entire sender branch runs under a
-            # single lock acquisition so that _release_sender_staging_chunks
-            # notifications wake both the flow-control wait and the allocation
-            # retry without releasing and re-acquiring the lock in between.
+            # Single unified loop: flow-control check and allocation attempt are
+            # combined so a thread can never pass flow control only to have
+            # another thread steal the last memory slot before it allocates.
+            #
+            # The loop body, executed under _sender_staging_condition, does:
+            #   1. Check running flag — exit immediately on shutdown.
+            #   2. Check flow-control threshold — only attempt allocation when
+            #      inflight_chunks < max; otherwise fall through to wait.
+            #   3. Attempt allocation — on success, increment the counter and
+            #      return; the check + allocate + increment form an atomic unit
+            #      protected by the condition lock.
+            #   4. Wait — either the threshold is exceeded or allocation failed
+            #      (fragmentation / pool exhausted).  In both cases we wait for
+            #      _release_sender_staging_chunks to call notify_all().
+            #
+            # Flow-control waits are not counted against the allocation deadline:
+            # they loop back to the top and re-check the threshold, so a long
+            # backpressure pause does not consume the 5-second allocation budget.
+            # Once the threshold is satisfied we start a fresh deadline for the
+            # actual allocation attempts.
             with self._sender_staging_condition:
-                while self._sender_inflight_chunks >= self._sender_max_inflight_chunks:
-                    logger.warning(
-                        "Sender staging buffer near-full: inflight_chunks=%d >= "
-                        "max=%d, waiting for transfers to complete...",
-                        self._sender_inflight_chunks,
-                        self._sender_max_inflight_chunks,
-                    )
-                    self._sender_staging_condition.wait(timeout=1.0)
+                # deadline is initialised here and reset whenever backpressure
+                # is active so that flow-control waits do not consume the
+                # allocation budget.
+                deadline: float = time.monotonic() + _ALLOCATION_TIMEOUT_SECONDS
+                last_near_full_log = 0.0
+                while True:
                     if not self.running:
                         return None
 
-                # Event-driven retry: wait on the condition for notification
-                # instead of time.sleep polling so that the thread wakes up
-                # immediately when _release_sender_staging_chunks fires.
-                deadline = time.monotonic() + _ALLOCATION_TIMEOUT_SECONDS
-                while True:
+                    at_threshold = (
+                        self._sender_inflight_chunks
+                        >= self._sender_max_inflight_chunks
+                    )
+
+                    if at_threshold:
+                        # Log near-full warning at most once per second to avoid
+                        # spamming.
+                        now = time.monotonic()
+                        if now - last_near_full_log >= 1.0:
+                            logger.warning(
+                                "Sender staging buffer near-full: "
+                                "inflight_chunks=%d >= max=%d, waiting for "
+                                "transfers to complete...",
+                                self._sender_inflight_chunks,
+                                self._sender_max_inflight_chunks,
+                            )
+                            last_near_full_log = now
+                        # Reset the allocation deadline so that once
+                        # backpressure clears the thread gets a fresh
+                        # 5-second window for actual allocation attempts.
+                        deadline = time.monotonic() + _ALLOCATION_TIMEOUT_SECONDS
+                        self._sender_staging_condition.wait(
+                            timeout=_CONDITION_WAIT_INTERVAL
+                        )
+                        continue
+
+                    # Under threshold: attempt allocation.  deadline is always
+                    # a valid float at this point (set above or reset in the
+                    # at_threshold branch on a previous iteration).
                     mem_obj = self.memory_allocator.allocate(
                         shapes, dtypes, fmt=fmt, allocator_type=alloc_type
                     )
                     if mem_obj is not None:
                         self._sender_inflight_chunks += 1
                         return mem_obj
+
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
-                    self._sender_staging_condition.wait(timeout=min(remaining, _CONDITION_WAIT_INTERVAL))
-                    if not self.running:
-                        return None
+                    self._sender_staging_condition.wait(
+                        timeout=min(remaining, _CONDITION_WAIT_INTERVAL)
+                    )
 
             logger.error("Sender staging allocation failed after timeout")
             return None
