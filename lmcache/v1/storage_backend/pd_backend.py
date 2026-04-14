@@ -1153,7 +1153,7 @@ class PDBackend(AllocatorBackendInterface):
         shape = list(alloc_request.shape)  # copy — we mutate token_dim
 
         alloc_indexes: list[int] = []
-        current_batch_allocated_keys: list[str] = []
+        current_batch_keys: list[str] = []
 
         for idx, key_str in enumerate(alloc_request.keys):
             key = CacheEngineKey.from_string(key_str)
@@ -1209,13 +1209,13 @@ class PDBackend(AllocatorBackendInterface):
             self.put(key, mem_obj)
             async with self._inflight_condition:
                 self._inflight_chunks += 1
-            current_batch_allocated_keys.append(key_str)
+            current_batch_keys.append(key_str)
 
         # All allocations in this batch succeeded.
         if req_id:
             if req_id not in self._req_allocated_keys:
                 self._req_allocated_keys[req_id] = []
-            self._req_allocated_keys[req_id].extend(current_batch_allocated_keys)
+            self._req_allocated_keys[req_id].extend(current_batch_keys)
             if alloc_request.is_last_batch:
                 self._req_allocated_keys.pop(req_id, None)
                 await _release_admission()
