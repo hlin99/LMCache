@@ -22,10 +22,10 @@ Test matrix (behaviour × role)
   6. Receiver — Close: close() stops _recv_loop and joins _recv_thread
   7. Receiver — Data correctness: already_sent dedup + last_chunk_toks shape
   8. Sender  — Chunk ordering: last prefill waits for prior slow chunk
-  9. Receiver — Fail-fast: C_req > max_inflight returns all -1
- 10. Receiver — Rollback: allocation timeout rolls back current + prior batches
- 11. Receiver — is_last_batch cleans up _req_allocated_keys tracking
- 12. Receiver — Fail-fast also rolls back prior-batch keys
+  9. Receiver — Fail-fast: C_req > max_inflight raises RuntimeError
+ 10. Receiver — Allocation timeout raises RuntimeError (current batch rolled back)
+ 11. Receiver — is_last_batch cleans up _req_chunk_counts tracking
+ 12. Receiver — Fail-fast raises RuntimeError (prior-batch keys NOT rolled back)
  13. Receiver — Admission control prevents req interleaving
 """
 
@@ -749,9 +749,8 @@ def test_sender_chunk_ordering_waits_for_prior_tasks(async_sender):
 def test_receiver_fail_fast_request_too_large(async_receiver):
     """
     When a request's total chunk count (accumulated across batches) exceeds
-    ``max_inflight_chunks``, ``_async_allocate_and_put`` must return
-    ``remote_indexes`` filled with ``-1`` for the offending batch and log an
-    error rather than waiting indefinitely.
+    ``max_inflight_chunks``, ``_async_allocate_and_put`` must raise
+    ``RuntimeError`` rather than waiting indefinitely or returning -1.
 
     This prevents the deadlock scenario where the decoder cannot start
     consuming (needs all chunks) but the buffer is full and no request
@@ -795,16 +794,13 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
         )
 
         # Batch 2: 1 more key — cumulative = MAX_T + 1 > MAX_T → fail fast.
-        # The fail-fast check fires BEFORE inflight wait, so this returns
+        # The fail-fast check fires BEFORE inflight wait, so this raises
         # immediately without blocking.
         # Use key_offset=MAX_T to avoid overlap with Batch 1 keys (0..MAX_T-1).
-        resp2 = await async_receiver._async_allocate_and_put(
-            _make_req(1, key_offset=MAX_T)
-        )
-        assert resp2.remote_indexes == [-1], (
-            f"Batch 2 should fail fast with [-1] when cumulative > MAX_T, "
-            f"but got remote_indexes={resp2.remote_indexes}"
-        )
+        with pytest.raises(RuntimeError, match="max_inflight_chunks"):
+            await async_receiver._async_allocate_and_put(
+                _make_req(1, key_offset=MAX_T)
+            )
 
     asyncio.run(run())
 
@@ -839,14 +835,17 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
 def test_receiver_rollback_on_allocation_timeout(async_receiver):
     """
     When allocate() returns None (timeout) for the Nth key in a batch,
-    all successfully allocated keys in the current batch AND all keys from
-    prior batches for the same req_id must be removed from the backend.
+    ``_async_allocate_and_put`` must raise ``RuntimeError`` and roll back
+    the successfully allocated keys in the CURRENT batch only.
+
+    Prior-batch keys are NOT rolled back to avoid use-after-free: the sender
+    may still be writing RDMA data to those previously allocated remote buffers.
 
     Strategy:
-      - Batch 1 (3 keys): succeeds, keys stored in backend and tracked.
+      - Batch 1 (3 keys): succeeds, keys stored in backend.
       - Batch 2 (3 keys): allocate() returns None on the 2nd key (idx=1).
-        The 1st key of batch 2 + all 3 keys from batch 1 must be removed.
-        Response: all -1.
+        RuntimeError is raised; only the 1st key of batch 2 is rolled back.
+        Batch 1 keys remain in the backend.
     """
     MAX_T = 10
     async_receiver._max_inflight_chunks = MAX_T
@@ -909,42 +908,40 @@ def test_receiver_rollback_on_allocation_timeout(async_receiver):
         req_id=req_id,
     )
 
-    resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
-
-    # All -1 for the entire batch
-    assert resp2.remote_indexes == [-1, -1, -1], (
-        f"Batch 2 should return all -1 on failure, got {resp2.remote_indexes}"
-    )
+    with pytest.raises(RuntimeError, match="timed out allocating"):
+        asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
 
     # The 1st key of batch 2 (which succeeded) should have been rolled back
+    # (current-batch rollback).
     assert not async_receiver.contains(batch2_keys[0], pin=False), (
         "batch2_keys[0] should be removed (current batch rollback)"
     )
 
-    # All batch 1 keys should also have been rolled back
+    # Batch 1 keys must NOT be rolled back: the sender may still be writing
+    # RDMA data to those remote buffers (rolling them back would be UAF).
     for k in batch1_keys:
-        assert not async_receiver.contains(k, pin=False), (
-            f"Key {k} from batch 1 should be removed (prior batch rollback)"
+        assert async_receiver.contains(k, pin=False), (
+            f"Key {k} from batch 1 must remain in backend (no prior-batch rollback)"
         )
 
-    # _req_allocated_keys should be cleaned up for this req_id
-    assert req_id not in async_receiver._req_allocated_keys, (
-        "req_id should be removed from _req_allocated_keys after rollback"
+    # _req_chunk_counts should be cleaned up for this req_id
+    assert req_id not in async_receiver._req_chunk_counts, (
+        "req_id should be removed from _req_chunk_counts after rollback"
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 11: Receiver — is_last_batch cleans up _req_allocated_keys tracking
+# Test 11: Receiver — is_last_batch cleans up _req_chunk_counts tracking
 # ---------------------------------------------------------------------------
 
 
 def test_receiver_is_last_batch_cleans_up_tracking(async_receiver):
     """
     When is_last_batch=True and all allocations succeed, the receiver
-    must pop the req_id from _req_allocated_keys (lifecycle cleanup).
+    must pop the req_id from _req_chunk_counts (lifecycle cleanup).
 
     Strategy:
-      - Batch 1 (is_last_batch=False): keys tracked in _req_allocated_keys.
+      - Batch 1 (is_last_batch=False): chunk count tracked in _req_chunk_counts.
       - Batch 2 (is_last_batch=True): after success, req_id removed from tracking.
     """
     MAX_T = 10
@@ -973,11 +970,11 @@ def test_receiver_is_last_batch_cleans_up_tracking(async_receiver):
 
     resp1 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req1))
     assert -1 not in resp1.remote_indexes
-    assert req_id in async_receiver._req_allocated_keys, (
+    assert req_id in async_receiver._req_chunk_counts, (
         "After batch 1 (not last), req_id should still be tracked"
     )
-    assert len(async_receiver._req_allocated_keys[req_id]) == 3, (
-        "Should track 3 keys from batch 1"
+    assert async_receiver._req_chunk_counts[req_id] == 3, (
+        "Should track chunk count of 3 from batch 1"
     )
 
     # Batch 2: is_last_batch=True → tracking should be cleaned up
@@ -993,21 +990,25 @@ def test_receiver_is_last_batch_cleans_up_tracking(async_receiver):
 
     resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
     assert -1 not in resp2.remote_indexes
-    assert req_id not in async_receiver._req_allocated_keys, (
+    assert req_id not in async_receiver._req_chunk_counts, (
         "After is_last_batch=True, req_id should be removed from tracking"
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 12: Receiver — Fail-fast also rolls back prior-batch keys
+# Test 12: Receiver — Fail-fast raises RuntimeError (no prior-batch rollback)
 # ---------------------------------------------------------------------------
 
 
-def test_receiver_fail_fast_rolls_back_prior_batches(async_receiver):
+def test_receiver_fail_fast_raises_runtime_error(async_receiver):
     """
     When the fail-fast check triggers (cumulative > max_inflight_chunks),
-    keys from all prior batches for that req_id must be removed from the
-    backend (not just the new batch, which hasn't been allocated yet).
+    ``_async_allocate_and_put`` must raise ``RuntimeError``.
+
+    Prior-batch keys are NOT rolled back to avoid use-after-free: the sender
+    may still be writing RDMA data to the previously allocated remote buffers.
+    Only current-batch keys (none, since fail-fast fires before allocation)
+    would be rolled back.
     """
     MAX_T = 4
     async_receiver._max_inflight_chunks = MAX_T
@@ -1038,7 +1039,7 @@ def test_receiver_fail_fast_rolls_back_prior_batches(async_receiver):
     for k in batch1_keys:
         assert async_receiver.contains(k, pin=False)
 
-    # Batch 2: 2 keys → cumulative = 3 + 2 = 5 > 4 → fail-fast
+    # Batch 2: 2 keys → cumulative = 3 + 2 = 5 > 4 → fail-fast → RuntimeError
     batch2_keys = [_make_key(6000 + i) for i in range(2)]
     alloc_req2 = AllocRequest(
         keys=[k.to_string() for k in batch2_keys],
@@ -1049,19 +1050,18 @@ def test_receiver_fail_fast_rolls_back_prior_batches(async_receiver):
         req_id=req_id,
     )
 
-    resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
-    assert resp2.remote_indexes == [-1, -1], (
-        f"Fail-fast should return all -1, got {resp2.remote_indexes}"
-    )
+    with pytest.raises(RuntimeError, match="max_inflight_chunks"):
+        asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
 
-    # Batch 1 keys should have been rolled back
+    # Batch 1 keys must remain in the backend: no prior-batch rollback
+    # (rolling them back would risk UAF since sender may still be writing).
     for k in batch1_keys:
-        assert not async_receiver.contains(k, pin=False), (
-            f"Key {k} from batch 1 should be removed after fail-fast rollback"
+        assert async_receiver.contains(k, pin=False), (
+            f"Key {k} from batch 1 must remain in backend (no prior-batch rollback)"
         )
 
     # Tracking cleaned up
-    assert req_id not in async_receiver._req_allocated_keys
+    assert req_id not in async_receiver._req_chunk_counts
 
 
 # ---------------------------------------------------------------------------

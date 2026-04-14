@@ -329,9 +329,9 @@ class PDBackend(AllocatorBackendInterface):
                 self._aligned_buffer_size,
                 self._chunk_size_bytes,
             )
-            # Per-request key tracking for fail-fast detection and rollback.
-            # Maps req_id → list of key strings allocated across all batches.
-            self._req_allocated_keys: dict[str, list[str]] = {}
+            # Per-request chunk count for fail-fast detection.
+            # Maps req_id → cumulative number of chunks allocated across batches.
+            self._req_chunk_counts: dict[str, int] = {}
             # Admission control: only one req_id's batches processed at a time.
             self._admission_owner: str = ""
 
@@ -1067,14 +1067,25 @@ class PDBackend(AllocatorBackendInterface):
         causes ref_count leaks.
 
         ``remote_indexes`` has exactly one entry per key in the request.
-        A value of ``-1`` signals that allocation failed for that slot.
 
         Timeout semantics:
         - Backpressure wait (inflight >= max_inflight_chunks): indefinite while
           ``self.running``.  The sender will not submit new chunks until the
           decoder frees some, so this wait is expected to resolve.
         - Allocator wait (allocate() returns None): bounded by
-          ``self._allocation_timeout``.
+          ``self._allocation_timeout``.  A RuntimeError is raised on timeout.
+
+        Failure semantics:
+        - If the cumulative chunk count for a req_id exceeds max_inflight_chunks,
+          a RuntimeError is raised immediately (fail-fast).  Users must configure
+          the receiver buffer large enough to hold the largest request.
+        - If allocate() times out (returns None), a RuntimeError is raised with
+          diagnostic information.
+        - On RuntimeError, only keys allocated in the CURRENT batch are rolled
+          back (removed from self.data).  Prior-batch keys are NOT rolled back
+          to avoid use-after-free (the sender may still be writing to them).
+        - Admission ownership is always released when raising (ensures waiting
+          coroutines are unblocked).
         """
         total_allocs = len(alloc_request.keys)
         req_id = alloc_request.req_id
@@ -1088,55 +1099,41 @@ class PDBackend(AllocatorBackendInterface):
                     await self._admission_condition.wait()
                 self._admission_owner = req_id
 
+        _admission_released = False
+
         async def _release_admission() -> None:
             """Clear the admission owner and notify all waiting coroutines.
 
             No-op when req_id is empty (legacy senders without a req_id).
+            Idempotent: safe to call multiple times.
             """
-            if req_id:
+            nonlocal _admission_released
+            if req_id and not _admission_released:
+                _admission_released = True
                 async with self._admission_condition:
                     self._admission_owner = ""
                     self._admission_condition.notify_all()
-
-        async def _fail_all(rollback_current: list[str]) -> AllocResponse:
-            """Roll back current-batch and all prior-batch keys, release admission.
-
-            :param rollback_current: Key strings from the current batch that were
-                successfully allocated (put into self.data) before the failure.
-                These are rolled back along with any keys from prior batches stored
-                in _req_allocated_keys[req_id].
-            :return: AllocResponse with all remote_indexes set to -1.
-            """
-            for key_str in rollback_current:
-                self.remove(CacheEngineKey.from_string(key_str))
-            for key_str in self._req_allocated_keys.pop(req_id, []):
-                self.remove(CacheEngineKey.from_string(key_str))
-            await _release_admission()
-            return AllocResponse(remote_indexes=[-1] * total_allocs)
 
         # Fail-fast: detect if this request can never complete because it
         # requires more chunks than the decoder buffer can ever hold at once.
         # The decoder needs all chunks present before it can start consuming,
         # so C_req > max_inflight_chunks is an impossible configuration.
+        # Users must configure pd_buffer_size large enough.
         if req_id:
-            prev_count = len(self._req_allocated_keys.get(req_id, []))
+            prev_count = self._req_chunk_counts.get(req_id, 0)
             new_total = prev_count + total_allocs
             if new_total > self._max_inflight_chunks:
-                logger.error(
-                    "Request %s requires %d total chunks (already allocated %d, "
-                    "new batch %d) but max_inflight_chunks=%d. This request can "
-                    "never complete because the decoder requires all chunks before "
-                    "it can start consuming. Failing fast. "
-                    "To fix: increase pd_buffer_size so that "
-                    "max_inflight_chunks >= total chunks needed for the largest "
-                    "request, or reduce prompt length / chunk size.",
-                    req_id,
-                    new_total,
-                    prev_count,
-                    total_allocs,
-                    self._max_inflight_chunks,
+                self._req_chunk_counts.pop(req_id, None)
+                await _release_admission()
+                raise RuntimeError(
+                    f"req_id={req_id!r} batch_size={total_allocs}: cumulative "
+                    f"chunk count {new_total} (prev_count={prev_count}, "
+                    f"this_batch={total_allocs}) exceeds "
+                    f"max_inflight_chunks={self._max_inflight_chunks}. "
+                    "Increase pd_buffer_size so that max_inflight_chunks >= "
+                    "total chunks needed for the largest request, or reduce "
+                    "prompt length / chunk size."
                 )
-                return await _fail_all([])
         else:
             # No req_id provided (legacy sender or untracked call); per-request
             # fail-fast detection is unavailable.  Log at debug level so operators
@@ -1153,72 +1150,81 @@ class PDBackend(AllocatorBackendInterface):
         alloc_indexes: list[int] = []
         current_batch_keys: list[str] = []  # keys successfully put in this batch
 
-        for idx, key_str in enumerate(alloc_request.keys):
-            key = CacheEngineKey.from_string(key_str)
+        try:
+            for idx, key_str in enumerate(alloc_request.keys):
+                key = CacheEngineKey.from_string(key_str)
 
-            if idx == total_allocs - 1:
-                token_dim = fmt.token_dim()
-                shape[token_dim] = alloc_request.last_chunk_toks
+                if idx == total_allocs - 1:
+                    token_dim = fmt.token_dim()
+                    shape[token_dim] = alloc_request.last_chunk_toks
 
-            # Wait until inflight count is below threshold before allocating.
-            async with self._inflight_condition:
-                while self._inflight_chunks >= self._max_inflight_chunks:
-                    if not self.running:
-                        # Release admission and return failure on shutdown.
-                        await _release_admission()
-                        remaining_allocs = total_allocs - len(alloc_indexes)
-                        alloc_indexes.extend([-1] * remaining_allocs)
-                        return AllocResponse(remote_indexes=alloc_indexes)
-                    logger.warning(
-                        "Decoder buffer near-full: inflight_chunks=%d >= max=%d, "
-                        "waiting for buffers to be freed...",
-                        self._inflight_chunks,
-                        self._max_inflight_chunks,
-                    )
-                    await self._inflight_condition.wait()
-
-            mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
-            # Event-driven retry: wait on _inflight_condition for notification
-            # instead of asyncio.sleep polling so the coroutine wakes up
-            # immediately when _notify_inflight_freed fires.
-            deadline = asyncio.get_event_loop().time() + self._allocation_timeout
-            while mem_obj is None:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    logger.error(
-                        "Failed to allocate memory for key %s after "
-                        "timeout (~%.0fs), aborting.",
-                        key,
-                        self._allocation_timeout,
-                    )
-                    break
+                # Wait until inflight count is below threshold before allocating.
                 async with self._inflight_condition:
-                    try:
-                        await asyncio.wait_for(
-                            self._inflight_condition.wait(),
-                            timeout=min(remaining, self._condition_poll_interval),
+                    while self._inflight_chunks >= self._max_inflight_chunks:
+                        if not self.running:
+                            # Release admission and return failure on shutdown.
+                            await _release_admission()
+                            remaining_allocs = total_allocs - len(alloc_indexes)
+                            alloc_indexes.extend([-1] * remaining_allocs)
+                            return AllocResponse(remote_indexes=alloc_indexes)
+                        logger.warning(
+                            "Decoder buffer near-full: inflight_chunks=%d >= max=%d, "
+                            "waiting for buffers to be freed...",
+                            self._inflight_chunks,
+                            self._max_inflight_chunks,
                         )
-                    except asyncio.TimeoutError:
-                        pass
+                        await self._inflight_condition.wait()
+
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
+                # Event-driven retry: wait on _inflight_condition for notification
+                # instead of asyncio.sleep polling so the coroutine wakes up
+                # immediately when _notify_inflight_freed fires.
+                deadline = asyncio.get_event_loop().time() + self._allocation_timeout
+                while mem_obj is None:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"req_id={req_id!r}: timed out allocating "
+                            f"key[{idx}]={key_str!r} after "
+                            f"~{self._allocation_timeout:.0f}s. "
+                            f"inflight_chunks={self._inflight_chunks}, "
+                            f"max_inflight_chunks={self._max_inflight_chunks}."
+                        )
+                    async with self._inflight_condition:
+                        try:
+                            await asyncio.wait_for(
+                                self._inflight_condition.wait(),
+                                timeout=min(remaining, self._condition_poll_interval),
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                    mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
-            if mem_obj is None:
-                # Rollback current batch and all prior batches, then fail.
-                return await _fail_all(current_batch_keys)
+                alloc_indexes.append(mem_obj.meta.address)
+                self.put(key, mem_obj)
+                async with self._inflight_condition:
+                    self._inflight_chunks += 1
+                current_batch_keys.append(key_str)
 
-            alloc_indexes.append(mem_obj.meta.address)
-            self.put(key, mem_obj)
-            async with self._inflight_condition:
-                self._inflight_chunks += 1
-            current_batch_keys.append(key_str)
+        except RuntimeError:
+            # Best-effort rollback: only current-batch keys (allocated in this
+            # call but not yet returned to the sender).  Prior-batch keys are NOT
+            # rolled back to avoid use-after-free — the sender may still be
+            # writing RDMA data to the previously allocated remote buffers.
+            for k_str in current_batch_keys:
+                self.remove(CacheEngineKey.from_string(k_str))
+            if req_id:
+                self._req_chunk_counts.pop(req_id, None)
+            await _release_admission()
+            raise
 
         # All allocations in this batch succeeded.
         if req_id:
-            if req_id not in self._req_allocated_keys:
-                self._req_allocated_keys[req_id] = []
-            self._req_allocated_keys[req_id].extend(current_batch_keys)
+            self._req_chunk_counts[req_id] = (
+                self._req_chunk_counts.get(req_id, 0) + total_allocs
+            )
             if alloc_request.is_last_batch:
-                self._req_allocated_keys.pop(req_id, None)
+                self._req_chunk_counts.pop(req_id, None)
                 await _release_admission()
 
         return AllocResponse(remote_indexes=alloc_indexes)
