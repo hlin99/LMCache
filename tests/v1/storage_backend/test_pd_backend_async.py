@@ -14,7 +14,7 @@ with asyncio.sleep() stubs so:
 Test matrix (behaviour × role)
 ------------------------------
   1. Sender  — Non-blocking FIFO: batched_submit_put_task returns immediately;
-               N requests processed serially in ≈ N× delay
+               N requests to same receiver processed serially (per-receiver FIFO)
   2. Receiver — Non-blocking: asyncio.sleep yields, not time.sleep
   3. Sender  — Flow control: allocate() blocks when staging buffer full
   4. Receiver — Flow control: _async_allocate_and_put blocks when inflight full
@@ -28,6 +28,9 @@ Test matrix (behaviour × role)
  12. Receiver — Fail-fast raises RuntimeError (no rollback of prior batches)
  13. Receiver — Admission control prevents req interleaving
  14. Receiver/Sender — pd_max_prefill_len capacity check raises ValueError on init
+ 15. Receiver — _handle_alloc_request sends error response on exception
+ 16. Sender  — Per-receiver workers: different-receiver requests run concurrently;
+               same-receiver requests are serialized
 """
 
 # Standard
@@ -271,13 +274,13 @@ def async_receiver():
 
 def test_sender_nonblocking_fifo_transfers(async_sender):
     """
-    Submit N transfers with distinct req_ids.
+    Submit N transfers with distinct req_ids, all targeting the same receiver.
 
-    Verifies two properties of the new global FIFO worker design:
+    Verifies two properties of the per-receiver FIFO worker design:
     1. ``batched_submit_put_task`` is fire-and-forget — all N calls return
        well before any transfer completes.
-    2. All transfers eventually complete (the single worker processes them
-       serially in FIFO order, so the total time is ≈ N × TRANSFER_DELAY).
+    2. All transfers eventually complete.  Since all requests go to the same
+       receiver they are serialized by that receiver's worker (FIFO order).
     3. Transfers complete in FIFO order (req-0 before req-1 before ...).
     """
     N = 4
@@ -1235,4 +1238,205 @@ def test_pd_max_prefill_len_capacity_check():
     with p1, p2, p3, p4:
         backend = PDBackend(_make_receiver_config(0), metadata)
         backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Receiver — _handle_alloc_request sends error response on exception
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_handle_alloc_request_sends_error_on_exception(async_receiver):
+    """
+    When ``_async_allocate_and_put`` raises an exception inside
+    ``_handle_alloc_request``, the method must send an error AllocResponse
+    (all -1 remote_indexes) back to the sender rather than silently dropping
+    the reply.  Without this, the sender would hang forever on
+    ``recv_multipart``.
+
+    Strategy: patch ``_async_allocate_and_put`` to raise RuntimeError, capture
+    calls to the ROUTER send, and verify an error response is sent.
+    """
+    key = _make_key(0)
+    alloc_req = AllocRequest(
+        keys=[key.to_string()],
+        fmt=MemoryFormat.KV_2LTD.value,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=16,
+        req_id="req-err",
+    )
+    payload = msgspec.msgpack.encode(alloc_req)
+    identity = b"fake-sender-identity"
+
+    sent_frames: list[list[bytes]] = []
+
+    # Mock ROUTER socket
+    mock_socket = MagicMock()
+
+    async def capture_send(frames):
+        sent_frames.append(frames)
+
+    mock_socket.send_multipart = AsyncMock(side_effect=capture_send)
+
+    # Patch _async_allocate_and_put to raise
+    original_allocate = async_receiver._async_allocate_and_put
+
+    async def _failing_allocate(req):
+        raise RuntimeError("injected failure")
+
+    async_receiver._async_allocate_and_put = _failing_allocate
+
+    async def run():
+        await async_receiver._handle_alloc_request(mock_socket, identity, payload)
+
+    asyncio.run(run())
+
+    async_receiver._async_allocate_and_put = original_allocate
+
+    # Exactly one send_multipart call (the error response)
+    assert len(sent_frames) == 1, (
+        f"Expected exactly one send_multipart call (error response), got {len(sent_frames)}"
+    )
+    # Verify frame layout: [identity, empty_delimiter, payload]
+    frames = sent_frames[0]
+    assert frames[0] == identity, "First frame should be the sender identity"
+    assert frames[1] == b"", "Second frame should be the empty delimiter"
+    # Decode the error response
+    resp = msgspec.msgpack.decode(frames[2], type=PDMsg)
+    assert isinstance(resp, AllocResponse), (
+        f"Expected AllocResponse, got {type(resp)}"
+    )
+    assert resp.remote_indexes == [-1], (
+        f"Expected all -1 remote_indexes, got {resp.remote_indexes}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Sender — per-receiver workers allow concurrent transfers to
+#          different receivers while serializing within the same receiver
+# ---------------------------------------------------------------------------
+
+
+def test_sender_per_receiver_worker_concurrency(async_sender):
+    """
+    Verify that requests to *different* receivers proceed concurrently, while
+    requests to the *same* receiver are still serialized (FIFO).
+
+    Setup:
+      - req-A and req-C target receiver-1 (SLOW transfer).
+      - req-B targets receiver-2 (FAST transfer).
+
+    With per-receiver workers:
+      - req-B (receiver-2) should complete BEFORE req-A (receiver-1) because
+        it does not wait for receiver-1's slow worker.
+      - req-C (receiver-1) should complete AFTER req-A, not before.
+
+    With the old global single worker, req-B would have been blocked behind
+    req-A, and its completion would be delayed by the slow transfer.
+    """
+    SLOW = 0.25
+    FAST = 0.05
+
+    # Add a second receiver to the sender
+    receiver_1_id = "127.0.0.1" + str(9100)  # already injected by fixture
+    receiver_2_id = "127.0.0.1" + str(9200)
+
+    alloc_response = AllocResponse(remote_indexes=[0])
+
+    alloc_socket_2 = MagicMock()
+    alloc_socket_2.recv_multipart = AsyncMock(
+        return_value=[b"", msgspec.msgpack.encode(alloc_response)]
+    )
+    alloc_socket_2.send_multipart = AsyncMock()
+    async_sender.initialized_peers.add(receiver_2_id)
+    async_sender._async_alloc_sockets[receiver_2_id] = alloc_socket_2
+
+    # Patch transfer_channel.async_batched_write per-receiver
+    write_delays: dict[str, float] = {
+        receiver_1_id: SLOW,
+        receiver_2_id: FAST,
+    }
+
+    # We need the delay to vary by receiver; patch _async_transfer_task instead
+    original_async_transfer = async_sender._async_transfer_task
+
+    async def _slow_transfer_task(**kwargs):
+        recv_id = kwargs.get("receiver_id", "")
+        delay = write_delays.get(recv_id, FAST)
+        await asyncio.sleep(delay)
+        # Minimal post-processing: trigger callback
+        on_cb = kwargs.get("on_complete_callback")
+        for key in kwargs.get("keys", []):
+            if on_cb:
+                try:
+                    on_cb(key)
+                except Exception:
+                    pass
+
+    async_sender._async_transfer_task = _slow_transfer_task
+
+    done_events: dict[str, threading.Event] = {
+        "req-A": threading.Event(),
+        "req-B": threading.Event(),
+        "req-C": threading.Event(),
+    }
+    completion_times: dict[str, float] = {}
+    lock = threading.Lock()
+
+    def make_cb(req_name: str):
+        def cb(key):
+            with lock:
+                completion_times[req_name] = time.monotonic()
+            done_events[req_name].set()
+
+        return cb
+
+    # Submit req-A → receiver-1 (slow), req-B → receiver-2 (fast),
+    # req-C → receiver-1 (slow, after A)
+    spec_a = _make_transfer_spec(
+        receiver_host="127.0.0.1", init_port=9100, alloc_port=9101,
+        req_id="req-A", is_last_prefill=True,
+    )
+    spec_b = _make_transfer_spec(
+        receiver_host="127.0.0.1", init_port=9200, alloc_port=9201,
+        req_id="req-B", is_last_prefill=True,
+    )
+    spec_c = _make_transfer_spec(
+        receiver_host="127.0.0.1", init_port=9100, alloc_port=9101,
+        req_id="req-C", is_last_prefill=True,
+    )
+
+    async_sender.batched_submit_put_task(
+        [_make_key(10)], [_make_mem_obj(10)], transfer_spec=spec_a,
+        on_complete_callback=make_cb("req-A"),
+    )
+    async_sender.batched_submit_put_task(
+        [_make_key(20)], [_make_mem_obj(20)], transfer_spec=spec_b,
+        on_complete_callback=make_cb("req-B"),
+    )
+    async_sender.batched_submit_put_task(
+        [_make_key(30)], [_make_mem_obj(30)], transfer_spec=spec_c,
+        on_complete_callback=make_cb("req-C"),
+    )
+
+    # Wait for all to complete
+    for req_name, ev in done_events.items():
+        finished = ev.wait(timeout=SLOW * 6)
+        assert finished, f"{req_name} did not complete within timeout"
+
+    # req-B (fast, different receiver) should finish before req-A (slow, receiver-1)
+    assert completion_times["req-B"] < completion_times["req-A"], (
+        f"Expected req-B (fast, receiver-2) to finish before req-A (slow, "
+        f"receiver-1), but req-B={completion_times['req-B']:.3f} >= "
+        f"req-A={completion_times['req-A']:.3f}. "
+        "Per-receiver workers should not block each other."
+    )
+    # req-C should finish after req-A (both on receiver-1, serialized)
+    assert completion_times["req-C"] >= completion_times["req-A"], (
+        f"Expected req-C to finish after req-A (same receiver-1, FIFO), "
+        f"but req-C={completion_times['req-C']:.3f} < "
+        f"req-A={completion_times['req-A']:.3f}"
+    )
+
+    async_sender._async_transfer_task = original_async_transfer
 

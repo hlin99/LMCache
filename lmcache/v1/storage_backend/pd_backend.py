@@ -286,7 +286,10 @@ class PDBackend(AllocatorBackendInterface):
             )
             # Two-level queue structure:
             #
-            #   _global_req_queue:  [ req-A,  req-B,  req-C ]
+            #   _receiver_req_queues:  {
+            #       "recv-1": Queue([ req-A, req-C ]),   # requests for Decoder-1
+            #       "recv-2": Queue([ req-B ]),           # requests for Decoder-2
+            #   }
             #                          │
             #                          ▼
             #   _transfer_queues:  {
@@ -295,21 +298,20 @@ class PDBackend(AllocatorBackendInterface):
             #       "req-C": Queue([ chunk1 ]),
             #   }
             #
-            # The single global worker picks req-A from _global_req_queue,
-            # drains all its chunks from _transfer_queues["req-A"], then
-            # moves on to req-B. This guarantees one request fully occupies
-            # the decoder buffer at a time, preventing deadlock.
+            # A per-receiver worker picks req-A from _receiver_req_queues[recv-1],
+            # drains all its chunks from _transfer_queues["req-A"], then moves on
+            # to req-C.  A separate worker does the same for recv-2.  This lets
+            # req-B→Decoder-2 proceed concurrently with req-A→Decoder-1 (1PxD),
+            # while still guaranteeing that req-A and req-C to the same Decoder-1
+            # are serialized (preventing receiver-buffer fragmentation/deadlock).
+            #
+            # Workers are created on demand in _enqueue_transfer when a new
+            # receiver_id is first seen.
             #
             # Only accessed from coroutines on _sender_loop, no lock needed.
             self._transfer_queues: dict[str, asyncio.Queue] = {}
-            self._global_req_queue: asyncio.Queue = asyncio.Queue()
-            self._global_req_worker_task: Optional[asyncio.Task] = None
-            # Start the single global FIFO worker on the sender event loop.
-            future = asyncio.run_coroutine_threadsafe(
-                self._start_global_req_worker(),
-                self._sender_loop,
-            )
-            future.result(timeout=5)
+            self._receiver_req_queues: dict[str, asyncio.Queue] = {}
+            self._receiver_worker_tasks: dict[str, asyncio.Task] = {}
         elif self.pd_config.role == "receiver":
             self._init_receiver()
             total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
@@ -601,7 +603,11 @@ class PDBackend(AllocatorBackendInterface):
         self, receiver_id: str, receiver_mem_alloc_url: str
     ):
         async_alloc_socket = self._async_zmq_context.socket(zmq.DEALER)
-        async_alloc_socket.setsockopt(zmq.IDENTITY, receiver_id.encode())
+        # Use a sender-unique identity so multiple Senders connecting to the
+        # same Receiver ROUTER have distinct identities (avoids undefined ZMQ
+        # behavior when two DEALER sockets share the same identity string).
+        sender_identity = f"{self.local_id}-to-{receiver_id}".encode()
+        async_alloc_socket.setsockopt(zmq.IDENTITY, sender_identity)
         async_alloc_socket.connect(f"tcp://{receiver_mem_alloc_url}")
         self._async_alloc_sockets[receiver_id] = async_alloc_socket
 
@@ -805,11 +811,16 @@ class PDBackend(AllocatorBackendInterface):
         """Enqueue a transfer item onto the per-request asyncio.Queue.
 
         If no queue exists for the request yet, one is created and the req_id
-        is placed onto the global FIFO request queue so the single global
-        worker will process it.  This guarantees that chunk batches for the
-        same request are transferred in FIFO order and that only one request
-        occupies receiver buffer at a time (preventing decoder-buffer
-        fragmentation and deadlock).
+        is placed onto the per-receiver FIFO queue so the receiver's worker
+        will process it.  Within a single receiver, requests are serialized in
+        FIFO order (one request fully occupies the decoder buffer at a time,
+        preventing fragmentation/deadlock).  Requests to *different* receivers
+        are handled by independent workers and proceed concurrently (1PxD).
+
+        Workers are created on demand: the first time a new receiver_id is
+        seen a worker task is started; if an existing worker has already
+        finished (e.g. after draining all queued requests) a new one is
+        started transparently.
 
         Must be called as a coroutine on ``_sender_loop`` (via
         ``asyncio.run_coroutine_threadsafe``).  All dict accesses are therefore
@@ -830,9 +841,16 @@ class PDBackend(AllocatorBackendInterface):
         if req_id not in self._transfer_queues:
             q: asyncio.Queue[_TransferItem] = asyncio.Queue()
             self._transfer_queues[req_id] = q
-            # Register this req_id with the global FIFO worker so it will be
-            # processed after all earlier requests have completed.
-            await self._global_req_queue.put(req_id)
+            # Ensure a per-receiver queue exists and register this req_id.
+            if receiver_id not in self._receiver_req_queues:
+                self._receiver_req_queues[receiver_id] = asyncio.Queue()
+            await self._receiver_req_queues[receiver_id].put(req_id)
+            # Start (or restart) the per-receiver worker if needed.
+            existing = self._receiver_worker_tasks.get(receiver_id)
+            if existing is None or existing.done():
+                self._receiver_worker_tasks[receiver_id] = asyncio.create_task(
+                    self._receiver_req_worker(receiver_id)
+                )
         item = _TransferItem(
             keys=keys,
             memory_objs=memory_objs,
@@ -878,43 +896,41 @@ class PDBackend(AllocatorBackendInterface):
                 req_id,
             )
 
-    async def _start_global_req_worker(self) -> None:
-        """Create the global FIFO request worker task on the sender event loop.
+    async def _receiver_req_worker(self, receiver_id: str) -> None:
+        """Per-receiver FIFO worker: process one request at a time for a receiver.
 
-        Must be called from within the sender event loop (via
-        ``asyncio.run_coroutine_threadsafe``) so that the task is bound to the
-        correct loop.
-        """
-        self._global_req_worker_task = asyncio.create_task(self._global_req_worker())
-
-    async def _global_req_worker(self) -> None:
-        """Single global FIFO worker: process one request at a time.
-
-        Pulls req_ids from ``_global_req_queue`` in arrival order and drains
-        each request's per-request transfer queue serially until the item
-        flagged with ``is_last_prefill=True`` is processed.  Only then is the
-        next req_id dequeued.
+        Pulls req_ids from ``_receiver_req_queues[receiver_id]`` in arrival
+        order and drains each request's per-request transfer queue serially
+        until the item flagged with ``is_last_prefill=True`` is processed.
+        Only then is the next req_id dequeued.
 
         This prevents receiver-buffer fragmentation: at most one request's
-        chunks occupy the decoder buffer at any time, guaranteeing that the
-        decoder (which requires all chunks before it can start consuming) can
-        always find a complete request available to process.  Without this
-        guarantee, N requests each partially filling the buffer would leave
-        none of them completable, causing a deadlock.
+        chunks occupy a given decoder's buffer at any time, guaranteeing that
+        the decoder can always find a complete request to process.  Having
+        independent workers per receiver means req-A→Decoder-1 and
+        req-B→Decoder-2 proceed concurrently (1PxD), while req-A and req-C
+        to the same Decoder-1 remain serialized.
 
         If a transfer fails mid-request, remaining items are drained (ref
         counts released) and the worker moves on to the next request.
 
         On ANY exit (including CancelledError), the outer finally block drains
-        all remaining transfer queues to prevent memory leaks.
+        all remaining transfer queues for this receiver to prevent memory leaks.
+
+        :param receiver_id: Identifier of the remote receiver this worker
+            services.
         """
+        req_queue = self._receiver_req_queues[receiver_id]
+        # Collect req_ids belonging to this receiver for cleanup in finally.
+        receiver_req_ids: set[str] = set()
         try:
             while True:
                 try:
-                    req_id: str = await self._global_req_queue.get()
+                    req_id: str = await req_queue.get()
                 except asyncio.CancelledError:
                     return
 
+                receiver_req_ids.add(req_id)
                 q = self._transfer_queues.get(req_id)
                 if q is None:
                     # Queue was removed before we could process it — skip.
@@ -962,12 +978,15 @@ class PDBackend(AllocatorBackendInterface):
                     # the is_last check).
                     await self._drain_transfer_queue(req_id, q)
                     self._transfer_queues.pop(req_id, None)
+                    receiver_req_ids.discard(req_id)
         finally:
             # On ANY exit (including CancelledError), drain all remaining
-            # transfer queues to prevent memory leaks.
-            for remaining_req_id, remaining_q in self._transfer_queues.items():
-                await self._drain_transfer_queue(remaining_req_id, remaining_q)
-            self._transfer_queues.clear()
+            # transfer queues for this receiver to prevent memory leaks.
+            for remaining_req_id in receiver_req_ids:
+                remaining_q = self._transfer_queues.pop(remaining_req_id, None)
+                if remaining_q is not None:
+                    await self._drain_transfer_queue(remaining_req_id, remaining_q)
+
 
     def batched_submit_put_task(
         self,
@@ -1095,15 +1114,21 @@ class PDBackend(AllocatorBackendInterface):
         memory at a time, but blocking on admission no longer prevents the
         ROUTER socket from receiving other messages.
 
+        On any exception (including allocation failures), an error response
+        with all ``-1`` remote_indexes is sent back so the sender is never
+        left waiting indefinitely on ``recv_multipart``.
+
         :param socket: The ROUTER socket to send the response on.
         :param identity: The sender identity frame returned by ROUTER.
         :param payload: The raw msgpack-encoded AllocRequest bytes.
         """
+        n_keys = 0
         try:
             alloc_req = msgspec.msgpack.decode(payload, type=PDMsg)
             assert isinstance(alloc_req, AllocRequest), (
                 "The request from the remote peer is not an AllocRequest"
             )
+            n_keys = len(alloc_req.keys)
             # NOTE: it's okay to put the memory objs into the storage backend
             # first because decode vllm will not be able to see the decode
             # request until proxy receives the ack.
@@ -1119,6 +1144,18 @@ class PDBackend(AllocatorBackendInterface):
                 identity,
                 str(e),
             )
+            # Send an error response so the sender is not left hanging
+            # forever on recv_multipart().
+            try:
+                error_resp = AllocResponse(remote_indexes=[-1] * n_keys)
+                async with self._router_send_lock:
+                    await socket.send_multipart(
+                        [identity, b"", msgspec.msgpack.encode(error_resp)]
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to send error response to %s", identity
+                )
 
     async def _async_allocate_and_put(
         self, alloc_request: AllocRequest
@@ -1380,14 +1417,13 @@ class PDBackend(AllocatorBackendInterface):
             thread.join()
         # Shut down sender async loop if present
         if hasattr(self, "_sender_loop"):
-            # Cancel the global FIFO request worker before stopping the loop.
+            # Cancel all per-receiver worker tasks before stopping the loop.
             # _shutdown_loop also cancels all tasks, but being explicit here
-            # ensures the worker sees CancelledError promptly.
-            if (
-                hasattr(self, "_global_req_worker_task")
-                and self._global_req_worker_task is not None
-            ):
-                self._global_req_worker_task.cancel()
+            # ensures each worker sees CancelledError promptly.
+            if hasattr(self, "_receiver_worker_tasks"):
+                for task in self._receiver_worker_tasks.values():
+                    if task is not None:
+                        task.cancel()
             self._shutdown_loop(
                 self._sender_loop,
                 self._sender_thread,
@@ -1405,6 +1441,35 @@ class PDBackend(AllocatorBackendInterface):
                 pass
         # Shut down receiver async loop if present
         if hasattr(self, "_recv_loop"):
+            # Wait for any in-flight allocation tasks to finish gracefully
+            # before tearing down the loop.  This lets _async_allocate_and_put
+            # complete (and release admission) rather than being cancelled mid-
+            # allocation, which would leak the admission lock on graceful restart.
+            if hasattr(self, "_pending_alloc_tasks"):
+                try:
+
+                    async def _wait_pending() -> None:
+                        """Await all pending alloc tasks with a timeout."""
+                        pending = list(self._pending_alloc_tasks)
+                        if pending:
+                            await asyncio.wait(
+                                pending,
+                                timeout=self.pd_config.shutdown_timeout_sec,
+                            )
+
+                    future = asyncio.run_coroutine_threadsafe(
+                        _wait_pending(), self._recv_loop
+                    )
+                    future.result(
+                        # Add 1 second buffer beyond the inner asyncio.wait timeout
+                        # so that future.result() does not expire before asyncio.wait
+                        # has a chance to return naturally.
+                        timeout=self.pd_config.shutdown_timeout_sec + 1
+                    )
+                except Exception:
+                    logger.debug(
+                        "Timed out waiting for pending alloc tasks during shutdown"
+                    )
             # Wake up any coroutines blocked on _inflight_condition or
             # _admission_condition so they can observe running=False and exit
             # cleanly before the loop is stopped.
@@ -1446,6 +1511,7 @@ class PDBackend(AllocatorBackendInterface):
             )
         self.transfer_channel.close()
         self.zmq_context.term()
+
 
     def pin(self, key: CacheEngineKey) -> bool:
         return True
