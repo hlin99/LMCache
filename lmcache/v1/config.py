@@ -232,7 +232,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "pd_condition_poll_interval_sec": {
         "type": float,
-        "default": 0.5,
+        "default": 0.05,
         "env_converter": float,
         "description": (
             "Polling interval in seconds when waiting on a threading/asyncio "
@@ -242,7 +242,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "pd_max_prefill_len": {
         "type": int,
-        "default": 0,
+        "default": 16384,
         "env_converter": int,
         "description": (
             "Maximum prefill token length that the PD buffer must be able to "
