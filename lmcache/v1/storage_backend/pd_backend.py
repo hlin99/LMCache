@@ -1108,11 +1108,12 @@ class PDBackend(AllocatorBackendInterface):
             Idempotent: safe to call multiple times.
             """
             nonlocal _admission_released
-            if req_id and not _admission_released:
-                _admission_released = True
+            if req_id:
                 async with self._admission_condition:
-                    self._admission_owner = ""
-                    self._admission_condition.notify_all()
+                    if not _admission_released:
+                        _admission_released = True
+                        self._admission_owner = ""
+                        self._admission_condition.notify_all()
 
         # Fail-fast: detect if this request can never complete because it
         # requires more chunks than the decoder buffer can ever hold at once.
