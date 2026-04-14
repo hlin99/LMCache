@@ -380,6 +380,26 @@ class PDBackend(AllocatorBackendInterface):
 
         self._chunk_size_bytes = chunk_size_bytes
         self._aligned_buffer_size = aligned_buffer_size
+        # Number of tokens per chunk (used for capacity checks).
+        self._chunk_token_size = metadata.kv_shape[2]
+
+        pd_max_prefill_len = config.pd_max_prefill_len
+        if pd_max_prefill_len > 0:
+            capacity_tokens = (
+                aligned_buffer_size // chunk_size_bytes
+            ) * self._chunk_token_size
+            if capacity_tokens < pd_max_prefill_len:
+                raise ValueError(
+                    f"PD buffer too small for the configured pd_max_prefill_len "
+                    f"(role={self.pd_config.role}): "
+                    f"capacity_tokens={capacity_tokens} < "
+                    f"pd_max_prefill_len={pd_max_prefill_len}. "
+                    f"Inputs: aligned_buffer_size={aligned_buffer_size}, "
+                    f"chunk_size={chunk_size_bytes}, "
+                    f"chunk_token_size={self._chunk_token_size}. "
+                    f"Increase pd_buffer_size so that the buffer holds at least "
+                    f"pd_max_prefill_len={pd_max_prefill_len} tokens."
+                )
 
         init_func(
             aligned_buffer_size,
@@ -1067,14 +1087,16 @@ class PDBackend(AllocatorBackendInterface):
         causes ref_count leaks.
 
         ``remote_indexes`` has exactly one entry per key in the request.
-        A value of ``-1`` signals that allocation failed for that slot.
 
-        Timeout semantics:
-        - Backpressure wait (inflight >= max_inflight_chunks): indefinite while
-          ``self.running``.  The sender will not submit new chunks until the
-          decoder frees some, so this wait is expected to resolve.
-        - Allocator wait (allocate() returns None): bounded by
-          ``self._allocation_timeout``.
+        Error semantics:
+        - Fail-fast (cumulative chunks > max_inflight_chunks): raises
+          ``RuntimeError`` immediately; no rollback is performed.
+        - Allocator timeout (allocate() returns None after
+          ``self._allocation_timeout`` seconds): raises ``RuntimeError``;
+          no rollback is performed.
+        - Backpressure wait (inflight >= max_inflight_chunks): indefinite
+          while ``self.running``.  The sender will not submit new chunks
+          until the decoder frees some, so this wait is expected to resolve.
         """
         total_allocs = len(alloc_request.keys)
         req_id = alloc_request.req_id
@@ -1098,22 +1120,6 @@ class PDBackend(AllocatorBackendInterface):
                     self._admission_owner = ""
                     self._admission_condition.notify_all()
 
-        async def _fail_all(rollback_current: list[str]) -> AllocResponse:
-            """Roll back current-batch and all prior-batch keys, release admission.
-
-            :param rollback_current: Key strings from the current batch that were
-                successfully allocated (put into self.data) before the failure.
-                These are rolled back along with any keys from prior batches stored
-                in _req_allocated_keys[req_id].
-            :return: AllocResponse with all remote_indexes set to -1.
-            """
-            for key_str in rollback_current:
-                self.remove(CacheEngineKey.from_string(key_str))
-            for key_str in self._req_allocated_keys.pop(req_id, []):
-                self.remove(CacheEngineKey.from_string(key_str))
-            await _release_admission()
-            return AllocResponse(remote_indexes=[-1] * total_allocs)
-
         # Fail-fast: detect if this request can never complete because it
         # requires more chunks than the decoder buffer can ever hold at once.
         # The decoder needs all chunks present before it can start consuming,
@@ -1122,21 +1128,17 @@ class PDBackend(AllocatorBackendInterface):
             prev_count = len(self._req_allocated_keys.get(req_id, []))
             new_total = prev_count + total_allocs
             if new_total > self._max_inflight_chunks:
-                logger.error(
-                    "Request %s requires %d total chunks (already allocated %d, "
-                    "new batch %d) but max_inflight_chunks=%d. This request can "
-                    "never complete because the decoder requires all chunks before "
-                    "it can start consuming. Failing fast. "
-                    "To fix: increase pd_buffer_size so that "
-                    "max_inflight_chunks >= total chunks needed for the largest "
-                    "request, or reduce prompt length / chunk size.",
-                    req_id,
-                    new_total,
-                    prev_count,
-                    total_allocs,
-                    self._max_inflight_chunks,
+                await _release_admission()
+                raise RuntimeError(
+                    f"Request {req_id} requires {new_total} total chunks "
+                    f"(already allocated {prev_count}, new batch {total_allocs}) "
+                    f"but max_inflight_chunks={self._max_inflight_chunks}. "
+                    f"This request can never complete because the decoder requires "
+                    f"all chunks before it can start consuming. "
+                    f"To fix: increase pd_buffer_size so that "
+                    f"max_inflight_chunks >= total chunks needed for the largest "
+                    f"request, or reduce prompt length / chunk size."
                 )
-                return await _fail_all([])
         else:
             # No req_id provided (legacy sender or untracked call); per-request
             # fail-fast detection is unavailable.  Log at debug level so operators
@@ -1151,7 +1153,7 @@ class PDBackend(AllocatorBackendInterface):
         shape = list(alloc_request.shape)  # copy — we mutate token_dim
 
         alloc_indexes: list[int] = []
-        current_batch_keys: list[str] = []  # keys successfully put in this batch
+        current_batch_keys: list[str] = []
 
         for idx, key_str in enumerate(alloc_request.keys):
             key = CacheEngineKey.from_string(key_str)
@@ -1185,13 +1187,14 @@ class PDBackend(AllocatorBackendInterface):
             while mem_obj is None:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
-                    logger.error(
-                        "Failed to allocate memory for key %s after "
-                        "timeout (~%.0fs), aborting.",
-                        key,
-                        self._allocation_timeout,
+                    await _release_admission()
+                    raise RuntimeError(
+                        f"Failed to allocate memory for key {key} after "
+                        f"timeout (~{self._allocation_timeout:.0f}s). "
+                        f"req_id={req_id}, key_index={idx}/{total_allocs}, "
+                        f"inflight_chunks={self._inflight_chunks}, "
+                        f"max_inflight_chunks={self._max_inflight_chunks}."
                     )
-                    break
                 async with self._inflight_condition:
                     try:
                         await asyncio.wait_for(
@@ -1201,10 +1204,6 @@ class PDBackend(AllocatorBackendInterface):
                     except asyncio.TimeoutError:
                         pass
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
-
-            if mem_obj is None:
-                # Rollback current batch and all prior batches, then fail.
-                return await _fail_all(current_batch_keys)
 
             alloc_indexes.append(mem_obj.meta.address)
             self.put(key, mem_obj)

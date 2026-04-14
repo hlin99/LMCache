@@ -22,11 +22,12 @@ Test matrix (behaviour × role)
   6. Receiver — Close: close() stops _recv_loop and joins _recv_thread
   7. Receiver — Data correctness: already_sent dedup + last_chunk_toks shape
   8. Sender  — Chunk ordering: last prefill waits for prior slow chunk
-  9. Receiver — Fail-fast: C_req > max_inflight returns all -1
- 10. Receiver — Rollback: allocation timeout rolls back current + prior batches
+  9. Receiver — Fail-fast: C_req > max_inflight raises RuntimeError
+ 10. Receiver — Alloc timeout raises RuntimeError (no rollback)
  11. Receiver — is_last_batch cleans up _req_allocated_keys tracking
- 12. Receiver — Fail-fast also rolls back prior-batch keys
+ 12. Receiver — Fail-fast raises RuntimeError (no rollback of prior batches)
  13. Receiver — Admission control prevents req interleaving
+ 14. Receiver/Sender — pd_max_prefill_len capacity check raises ValueError on init
 """
 
 # Standard
@@ -749,9 +750,8 @@ def test_sender_chunk_ordering_waits_for_prior_tasks(async_sender):
 def test_receiver_fail_fast_request_too_large(async_receiver):
     """
     When a request's total chunk count (accumulated across batches) exceeds
-    ``max_inflight_chunks``, ``_async_allocate_and_put`` must return
-    ``remote_indexes`` filled with ``-1`` for the offending batch and log an
-    error rather than waiting indefinitely.
+    ``max_inflight_chunks``, ``_async_allocate_and_put`` must raise a
+    ``RuntimeError`` for the offending batch rather than waiting indefinitely.
 
     This prevents the deadlock scenario where the decoder cannot start
     consuming (needs all chunks) but the buffer is full and no request
@@ -794,17 +794,13 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
             f"got {len(resp1.remote_indexes)}"
         )
 
-        # Batch 2: 1 more key — cumulative = MAX_T + 1 > MAX_T → fail fast.
-        # The fail-fast check fires BEFORE inflight wait, so this returns
-        # immediately without blocking.
+        # Batch 2: 1 more key — cumulative = MAX_T + 1 > MAX_T → RuntimeError.
+        # The fail-fast check fires BEFORE inflight wait.
         # Use key_offset=MAX_T to avoid overlap with Batch 1 keys (0..MAX_T-1).
-        resp2 = await async_receiver._async_allocate_and_put(
-            _make_req(1, key_offset=MAX_T)
-        )
-        assert resp2.remote_indexes == [-1], (
-            f"Batch 2 should fail fast with [-1] when cumulative > MAX_T, "
-            f"but got remote_indexes={resp2.remote_indexes}"
-        )
+        with pytest.raises(RuntimeError, match="max_inflight_chunks"):
+            await async_receiver._async_allocate_and_put(
+                _make_req(1, key_offset=MAX_T)
+            )
 
     asyncio.run(run())
 
@@ -832,25 +828,24 @@ def test_receiver_fail_fast_request_too_large(async_receiver):
 
 
 # ---------------------------------------------------------------------------
-# Test 10: Receiver — Allocation timeout rolls back current + prior batches
+# Test 10: Receiver — Allocation timeout raises RuntimeError (no rollback)
 # ---------------------------------------------------------------------------
 
 
-def test_receiver_rollback_on_allocation_timeout(async_receiver):
+def test_receiver_alloc_timeout_raises_runtime_error(async_receiver):
     """
     When allocate() returns None (timeout) for the Nth key in a batch,
-    all successfully allocated keys in the current batch AND all keys from
-    prior batches for the same req_id must be removed from the backend.
+    _async_allocate_and_put must raise RuntimeError. No rollback is performed;
+    previously allocated keys are left in place.
 
     Strategy:
       - Batch 1 (3 keys): succeeds, keys stored in backend and tracked.
       - Batch 2 (3 keys): allocate() returns None on the 2nd key (idx=1).
-        The 1st key of batch 2 + all 3 keys from batch 1 must be removed.
-        Response: all -1.
+        RuntimeError must be raised; batch 1 keys remain in the backend.
     """
     MAX_T = 10
     async_receiver._max_inflight_chunks = MAX_T
-    req_id = "req-rollback"
+    req_id = "req-timeout"
 
     mem_idx = [0]
 
@@ -886,7 +881,7 @@ def test_receiver_rollback_on_allocation_timeout(async_receiver):
             f"Key {k} should be in backend after batch 1"
         )
 
-    # Batch 2: 3 keys. allocate() succeeds on idx=0, fails on idx=1.
+    # Batch 2: 3 keys. allocate() succeeds on idx=0, fails (None) on idx=1.
     batch2_keys = [_make_key(2000 + i) for i in range(3)]
     alloc_call_count = [0]
 
@@ -909,28 +904,17 @@ def test_receiver_rollback_on_allocation_timeout(async_receiver):
         req_id=req_id,
     )
 
-    resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
+    async def run_batch2():
+        with pytest.raises(RuntimeError, match="timeout"):
+            await async_receiver._async_allocate_and_put(alloc_req2)
 
-    # All -1 for the entire batch
-    assert resp2.remote_indexes == [-1, -1, -1], (
-        f"Batch 2 should return all -1 on failure, got {resp2.remote_indexes}"
-    )
+    asyncio.run(run_batch2())
 
-    # The 1st key of batch 2 (which succeeded) should have been rolled back
-    assert not async_receiver.contains(batch2_keys[0], pin=False), (
-        "batch2_keys[0] should be removed (current batch rollback)"
-    )
-
-    # All batch 1 keys should also have been rolled back
+    # Batch 1 keys should NOT have been rolled back (no rollback on hard error).
     for k in batch1_keys:
-        assert not async_receiver.contains(k, pin=False), (
-            f"Key {k} from batch 1 should be removed (prior batch rollback)"
+        assert async_receiver.contains(k, pin=False), (
+            f"Key {k} from batch 1 should remain in backend (no rollback on error)"
         )
-
-    # _req_allocated_keys should be cleaned up for this req_id
-    assert req_id not in async_receiver._req_allocated_keys, (
-        "req_id should be removed from _req_allocated_keys after rollback"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -999,19 +983,19 @@ def test_receiver_is_last_batch_cleans_up_tracking(async_receiver):
 
 
 # ---------------------------------------------------------------------------
-# Test 12: Receiver — Fail-fast also rolls back prior-batch keys
+# Test 12: Receiver — Fail-fast raises RuntimeError (no rollback of prior batches)
 # ---------------------------------------------------------------------------
 
 
-def test_receiver_fail_fast_rolls_back_prior_batches(async_receiver):
+def test_receiver_fail_fast_raises_runtime_error(async_receiver):
     """
     When the fail-fast check triggers (cumulative > max_inflight_chunks),
-    keys from all prior batches for that req_id must be removed from the
-    backend (not just the new batch, which hasn't been allocated yet).
+    _async_allocate_and_put must raise RuntimeError. Prior-batch keys must NOT
+    be rolled back (hard-error, no rollback).
     """
     MAX_T = 4
     async_receiver._max_inflight_chunks = MAX_T
-    req_id = "req-failfast-rollback"
+    req_id = "req-failfast-error"
 
     mem_idx = [0]
 
@@ -1038,7 +1022,7 @@ def test_receiver_fail_fast_rolls_back_prior_batches(async_receiver):
     for k in batch1_keys:
         assert async_receiver.contains(k, pin=False)
 
-    # Batch 2: 2 keys → cumulative = 3 + 2 = 5 > 4 → fail-fast
+    # Batch 2: 2 keys → cumulative = 3 + 2 = 5 > 4 → fail-fast RuntimeError
     batch2_keys = [_make_key(6000 + i) for i in range(2)]
     alloc_req2 = AllocRequest(
         keys=[k.to_string() for k in batch2_keys],
@@ -1049,19 +1033,17 @@ def test_receiver_fail_fast_rolls_back_prior_batches(async_receiver):
         req_id=req_id,
     )
 
-    resp2 = asyncio.run(async_receiver._async_allocate_and_put(alloc_req2))
-    assert resp2.remote_indexes == [-1, -1], (
-        f"Fail-fast should return all -1, got {resp2.remote_indexes}"
-    )
+    async def run_batch2():
+        with pytest.raises(RuntimeError, match="max_inflight_chunks"):
+            await async_receiver._async_allocate_and_put(alloc_req2)
 
-    # Batch 1 keys should have been rolled back
+    asyncio.run(run_batch2())
+
+    # Batch 1 keys should NOT have been rolled back (no rollback on hard error).
     for k in batch1_keys:
-        assert not async_receiver.contains(k, pin=False), (
-            f"Key {k} from batch 1 should be removed after fail-fast rollback"
+        assert async_receiver.contains(k, pin=False), (
+            f"Key {k} from batch 1 should remain in backend (no rollback on error)"
         )
-
-    # Tracking cleaned up
-    assert req_id not in async_receiver._req_allocated_keys
 
 
 # ---------------------------------------------------------------------------
@@ -1165,3 +1147,90 @@ def test_receiver_admission_control_prevents_interleaving(async_receiver):
         f"req-A batch 2 should complete before req-B, "
         f"but event_log={event_log}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Receiver/Sender — pd_max_prefill_len capacity check on init
+# ---------------------------------------------------------------------------
+
+
+def test_pd_max_prefill_len_capacity_check():
+    """
+    When pd_max_prefill_len > capacity_tokens, PDBackend.__init__ must raise
+    ValueError for both receiver and sender roles.
+
+    The capacity formula is:
+        capacity_tokens = (aligned_buffer_size // chunk_size_bytes) * chunk_token_size
+
+    With the test fixtures:
+        kv_shape = (4, 2, 16, 8, 128)
+        kv_dtype = bfloat16 (2 bytes)
+        chunk_size_bytes = 4 * 2 * 16 * 8 * 128 * 2 = 262144
+        pd_buffer_size = 64 MiB = 67108864
+        aligned_buffer_size = (67108864 // 262144) * 262144 = 67108864
+        chunk_token_size = kv_shape[2] = 16
+        capacity_tokens = (67108864 // 262144) * 16 = 256 * 16 = 4096
+
+    So pd_max_prefill_len=5000 must trigger ValueError (5000 > 4096),
+    while pd_max_prefill_len=4096 must succeed (== capacity_tokens),
+    and pd_max_prefill_len=0 must skip the check.
+    """
+    # First Party
+    from lmcache.v1.config import LMCacheEngineConfig
+    from lmcache.v1.metadata import LMCacheMetadata
+
+    p1, p2, p3, p4 = _pd_backend_patches()
+
+    def _make_receiver_config(pd_max_prefill_len: int) -> LMCacheEngineConfig:
+        return LMCacheEngineConfig.from_defaults(
+            chunk_size=16,
+            pd_role="receiver",
+            pd_peer_host="127.0.0.1",
+            pd_peer_init_port=[9200],
+            pd_peer_alloc_port=[9201],
+            pd_buffer_size=64 * 1024 * 1024,
+            pd_buffer_device="cpu",
+            pd_max_prefill_len=pd_max_prefill_len,
+        )
+
+    def _make_sender_config(pd_max_prefill_len: int) -> LMCacheEngineConfig:
+        return LMCacheEngineConfig.from_defaults(
+            chunk_size=16,
+            pd_role="sender",
+            pd_proxy_host="127.0.0.1",
+            pd_proxy_port=5555,
+            pd_buffer_size=64 * 1024 * 1024,
+            pd_buffer_device="cpu",
+            pd_max_prefill_len=pd_max_prefill_len,
+        )
+
+    metadata = LMCacheMetadata(
+        model_name="test",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(4, 2, 16, 8, 128),
+    )
+
+    # pd_max_prefill_len > capacity_tokens → ValueError for receiver
+    with p1, p2, p3, p4:
+        with pytest.raises(ValueError, match="pd_max_prefill_len"):
+            PDBackend(_make_receiver_config(5000), metadata)
+
+    # pd_max_prefill_len > capacity_tokens → ValueError for sender
+    with p1, p2, p3, p4:
+        with pytest.raises(ValueError, match="pd_max_prefill_len"):
+            PDBackend(_make_sender_config(5000), metadata)
+
+    # pd_max_prefill_len == capacity_tokens → success (boundary: exactly fits)
+    with p1, p2, p3, p4:
+        backend = PDBackend(_make_receiver_config(4096), metadata)
+        backend.close()
+
+    # pd_max_prefill_len = 0 → check skipped (default, legacy behaviour)
+    with p1, p2, p3, p4:
+        backend = PDBackend(_make_receiver_config(0), metadata)
+        backend.close()
+
