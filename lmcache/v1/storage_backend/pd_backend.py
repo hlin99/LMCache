@@ -279,8 +279,7 @@ class PDBackend(AllocatorBackendInterface):
                 self._sender_staging_lock
             )
             self._sender_inflight_chunks = 0
-            # Leave headroom: allow at most 3/4 of total chunks to be in-flight
-            self._sender_max_inflight_chunks = max(1, total_chunks * 3 // 4)
+            self._sender_max_inflight_chunks = total_chunks
             logger.info(
                 "PDBackend sender: staging flow control initialized with "
                 "max_inflight=%d (total_chunks=%d)",
@@ -314,7 +313,7 @@ class PDBackend(AllocatorBackendInterface):
                 "chunk_size_bytes must be > 0 for inflight flow control"
             )
             total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
-            self._max_inflight_chunks = max(1, total_chunks * 3 // 4)
+            self._max_inflight_chunks = total_chunks
             self._inflight_chunks = 0
             # The condition must be created on the receiver event loop
             future = asyncio.run_coroutine_threadsafe(
