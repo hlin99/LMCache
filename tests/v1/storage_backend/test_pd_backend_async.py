@@ -158,12 +158,14 @@ def async_sender():
 
     with p1, p2 as mock_zmq_sock, p3 as mock_create_tc, p4:
         # --- alloc socket stub: answers immediately with remote_indexes=[0] ---
+        # DEALER socket uses send_multipart/recv_multipart (DEALER-ROUTER protocol).
+        # recv_multipart returns [empty_delimiter, payload].
         alloc_socket = MagicMock()
         alloc_response = AllocResponse(remote_indexes=[0])
-        alloc_socket.recv = AsyncMock(
-            return_value=msgspec.msgpack.encode(alloc_response)
+        alloc_socket.recv_multipart = AsyncMock(
+            return_value=[b"", msgspec.msgpack.encode(alloc_response)]
         )
-        alloc_socket.send = AsyncMock()
+        alloc_socket.send_multipart = AsyncMock()
         mock_zmq_sock.return_value = alloc_socket
 
         # --- transfer channel stub: async_batched_write sleeps TRANSFER_DELAY ---

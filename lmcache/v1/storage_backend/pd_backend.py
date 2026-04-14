@@ -600,7 +600,8 @@ class PDBackend(AllocatorBackendInterface):
     async def _async_create_alloc_socket(
         self, receiver_id: str, receiver_mem_alloc_url: str
     ):
-        async_alloc_socket = self._async_zmq_context.socket(zmq.REQ)
+        async_alloc_socket = self._async_zmq_context.socket(zmq.DEALER)
+        async_alloc_socket.setsockopt(zmq.IDENTITY, receiver_id.encode())
         async_alloc_socket.connect(f"tcp://{receiver_mem_alloc_url}")
         self._async_alloc_sockets[receiver_id] = async_alloc_socket
 
@@ -611,8 +612,9 @@ class PDBackend(AllocatorBackendInterface):
             self._async_alloc_locks[receiver_id] = asyncio.Lock()
         async with self._async_alloc_locks[receiver_id]:
             socket = self._async_alloc_sockets[receiver_id]
-            await socket.send(msgspec.msgpack.encode(alloc_request))
-            msg = await socket.recv()
+            await socket.send_multipart([b"", msgspec.msgpack.encode(alloc_request)])
+            frames = await socket.recv_multipart()
+            msg = frames[-1]
         alloc_response = msgspec.msgpack.decode(msg, type=PDMsg)
         return alloc_response
 
@@ -1025,6 +1027,8 @@ class PDBackend(AllocatorBackendInterface):
         """
         self._inflight_condition = asyncio.Condition()
         self._admission_condition = asyncio.Condition()
+        self._router_send_lock = asyncio.Lock()
+        self._pending_alloc_tasks: set[asyncio.Task] = set()
 
     def _init_receiver(self):
         """
@@ -1037,32 +1041,34 @@ class PDBackend(AllocatorBackendInterface):
 
     async def _async_mem_alloc_server(self):
         """
-        Async ZMQ REP server for memory allocation requests.
+        Async ZMQ ROUTER server for memory allocation requests.
         Replaces the blocking _mem_alloc_loop / _mem_alloc_thread.
-        When _async_allocate_and_put needs to wait for free memory it yields
-        via `await asyncio.sleep`, keeping the event loop responsive.
+        Uses a ROUTER socket instead of REP so that multiple concurrent
+        senders (xP1D topology) can each have their requests received and
+        dispatched independently — admission control inside
+        ``_handle_alloc_request`` only blocks the per-request coroutine, not
+        the receive loop.
         """
         # Third Party
         import zmq.asyncio as azmq
 
         async_ctx = azmq.Context()
-        socket = async_ctx.socket(zmq.REP)
+        socket = async_ctx.socket(zmq.ROUTER)
         alloc_port = self.pd_config.peer_alloc_port
         socket.bind(f"tcp://*:{alloc_port}")
         logger.info(f"Async mem alloc server listening on port {alloc_port}")
         try:
             while self.running:
                 try:
-                    alloc_req_bytes = await socket.recv()
-                    alloc_req = msgspec.msgpack.decode(alloc_req_bytes, type=PDMsg)
-                    assert isinstance(alloc_req, AllocRequest), (
-                        "The request from the remote peer is not an AllocRequest"
+                    frames = await socket.recv_multipart()
+                    # ROUTER frames: [identity, empty_delimiter, payload]
+                    identity = frames[0]
+                    payload = frames[-1]
+                    task = asyncio.create_task(
+                        self._handle_alloc_request(socket, identity, payload)
                     )
-                    # NOTE: it's okay to put the memory objs into the storage backend
-                    # first because decode vllm will not be able to see the decode
-                    # request until proxy receives the ack.
-                    alloc_resp = await self._async_allocate_and_put(alloc_req)
-                    await socket.send(msgspec.msgpack.encode(alloc_resp))
+                    self._pending_alloc_tasks.add(task)
+                    task.add_done_callback(self._pending_alloc_tasks.discard)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -1074,6 +1080,45 @@ class PDBackend(AllocatorBackendInterface):
         finally:
             socket.close()
             async_ctx.term()
+
+    async def _handle_alloc_request(
+        self,
+        socket: zmq.asyncio.Socket,
+        identity: bytes,
+        payload: bytes,
+    ) -> None:
+        """Handle a single allocation request from a sender.
+
+        Runs as an independent coroutine so that multiple requests from
+        different senders can be processed concurrently. Admission control
+        inside ``_async_allocate_and_put`` ensures only one req_id allocates
+        memory at a time, but blocking on admission no longer prevents the
+        ROUTER socket from receiving other messages.
+
+        :param socket: The ROUTER socket to send the response on.
+        :param identity: The sender identity frame returned by ROUTER.
+        :param payload: The raw msgpack-encoded AllocRequest bytes.
+        """
+        try:
+            alloc_req = msgspec.msgpack.decode(payload, type=PDMsg)
+            assert isinstance(alloc_req, AllocRequest), (
+                "The request from the remote peer is not an AllocRequest"
+            )
+            # NOTE: it's okay to put the memory objs into the storage backend
+            # first because decode vllm will not be able to see the decode
+            # request until proxy receives the ack.
+            alloc_resp = await self._async_allocate_and_put(alloc_req)
+            resp_bytes = msgspec.msgpack.encode(alloc_resp)
+            async with self._router_send_lock:
+                await socket.send_multipart([identity, b"", resp_bytes])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                "Failed to process alloc request from %s: %s",
+                identity,
+                str(e),
+            )
 
     async def _async_allocate_and_put(
         self, alloc_request: AllocRequest
