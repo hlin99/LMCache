@@ -968,16 +968,9 @@ class PDBackend(AllocatorBackendInterface):
         """
         Submit batched put tasks to transfer KV caches to peer.
 
-        Non-blocking: fires the async transfer coroutine to the background
-        event loop and returns immediately. The caller's ref_count_down will
-        happen concurrently with the async transfer, so we ref_count_up here
-        to keep objects alive until the async task completes.
-
         :param on_complete_callback: Optional callback invoked once per key
             after the transfer completes. Callback exceptions are caught and logged.
         """
-        # Bump ref counts so objects stay alive while async transfer is in-flight.
-        # The async task (_async_transfer_task) will call ref_count_down when done.
         for mem_obj in memory_objs:
             mem_obj.ref_count_up()
 
@@ -1246,17 +1239,9 @@ class PDBackend(AllocatorBackendInterface):
         force: bool = True,
     ) -> bool:
         """
-        Remove the key from the storage backend and free the associated page.
-
-        Unconditionally deletes the key from the data store and calls
-        ``ref_count_down()`` so that the underlying paged memory is returned
-        to the free-block pool.  The caller (``cache_engine.py``) must NOT
-        call ``ref_count_down()`` again for the same object after invoking
-        this method — the ``elif`` guard in ``cache_engine.py`` ensures this.
+        Remove the key from the storage backend.
 
         :param key: The key to remove.
-        :param force: Unused; retained for interface compatibility.
-        :return: True if the key existed and was removed, False otherwise.
         """
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
