@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
-import itertools
 import threading
 import time
 
@@ -35,14 +34,6 @@ from lmcache.v1.transfer_channel import CreateTransferChannel
 from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
-
-# Maximum number of per-request chunk-count entries to retain in the receiver's
-# _req_chunk_counts dict.  Entries from completed requests are safe to evict
-# (with the serial global sender worker only one req is active at a time, so
-# old entries are always for finished requests).  When this limit is exceeded,
-# the oldest half of entries are removed to prevent unbounded growth in
-# long-running servers.
-_MAX_REQ_CHUNK_COUNT_ENTRIES = 1000
 
 
 class PDMsgBase(msgspec.Struct, tag=True):
@@ -1130,19 +1121,12 @@ class PDBackend(AllocatorBackendInterface):
                     already_sent_indexes=[],
                     remote_indexes=[-1] * total_allocs,
                 )
-            # Update cumulative count for this request.  Evict oldest entries
-            # when the dict exceeds _MAX_REQ_CHUNK_COUNT_ENTRIES to prevent
-            # unbounded growth in long-running servers.  With the serial FIFO
-            # sender worker, old entries are always from completed requests and
-            # are safe to remove.
+            # Serial FIFO worker guarantees at most one active request at a time.
+            # When a new req_id appears, all older entries are from completed
+            # requests and can be safely discarded.
+            if req_id not in self._req_chunk_counts:
+                self._req_chunk_counts.clear()
             self._req_chunk_counts[req_id] = new_total
-            if len(self._req_chunk_counts) > _MAX_REQ_CHUNK_COUNT_ENTRIES:
-                evict_count = _MAX_REQ_CHUNK_COUNT_ENTRIES // 2
-                keys_to_evict = list(
-                    itertools.islice(self._req_chunk_counts.keys(), evict_count)
-                )
-                for key_to_evict in keys_to_evict:
-                    del self._req_chunk_counts[key_to_evict]
         else:
             # No req_id provided (legacy sender or untracked call); per-request
             # fail-fast detection is unavailable.  Log at debug level so operators
@@ -1393,9 +1377,7 @@ class PDBackend(AllocatorBackendInterface):
                         async with self._inflight_condition:
                             self._inflight_condition.notify_all()
 
-                    asyncio.run_coroutine_threadsafe(
-                        _wake_inflight(), self._recv_loop
-                    )
+                    asyncio.run_coroutine_threadsafe(_wake_inflight(), self._recv_loop)
                 except Exception as exc:
                     logger.debug(
                         "Could not schedule _inflight_condition wake-up "
