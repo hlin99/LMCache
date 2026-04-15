@@ -51,11 +51,23 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.storage_backend.pd_backend import AllocRequest as SyncAllocRequest
+from lmcache.v1.storage_backend.pd_backend import AllocResponse as SyncAllocResponse
+from lmcache.v1.storage_backend.pd_backend import PDMsg as SyncPDMsg
+from lmcache.v1.storage_backend.pd_backend_async import AllocRequest
 from lmcache.v1.storage_backend.pd_backend_async import (
-    AllocRequest,
-    AllocResponse,
+    AllocRequest as AsyncAllocRequest,
+)
+from lmcache.v1.storage_backend.pd_backend_async import AllocResponse
+from lmcache.v1.storage_backend.pd_backend_async import (
+    AllocResponse as AsyncAllocResponse,
+)
+from lmcache.v1.storage_backend.pd_backend_async import (
     PDBackendAsync,
-    PDMsg,
+)
+from lmcache.v1.storage_backend.pd_backend_async import PDMsg
+from lmcache.v1.storage_backend.pd_backend_async import PDMsg as AsyncPDMsg
+from lmcache.v1.storage_backend.pd_backend_async import (
     ProxyNotif,
 )
 
@@ -1453,3 +1465,42 @@ def test_sender_per_receiver_worker_concurrency(async_sender):
     )
 
     async_sender._async_transfer_task = original_async_transfer
+
+
+# ---------------------------------------------------------------------------
+# Test 12-14: Wire-format compatibility sync <-> async
+# ---------------------------------------------------------------------------
+
+
+def test_sync_alloc_request_decoded_by_async():
+    """Sync AllocRequest (no req_id/is_last_batch) decoded by async PDMsg."""
+    req = SyncAllocRequest(
+        keys=["k0", "k1"],
+        fmt=0,
+        shape=[4, 2, 16, 8, 128],
+        dtype="bfloat16",
+        last_chunk_toks=7,
+    )
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(req), type=AsyncPDMsg)
+    assert isinstance(decoded, AsyncAllocRequest)
+    assert decoded.keys == ["k0", "k1"]
+    assert decoded.req_id == ""
+    assert decoded.is_last_batch is False
+
+
+def test_async_alloc_response_decoded_by_sync():
+    """Async AllocResponse (already_sent_indexes=[]) decoded by sync PDMsg."""
+    resp = AsyncAllocResponse(remote_indexes=[100, 200])
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(resp), type=SyncPDMsg)
+    assert isinstance(decoded, SyncAllocResponse)
+    assert decoded.already_sent_indexes == []
+    assert decoded.remote_indexes == [100, 200]
+
+
+def test_sync_alloc_response_decoded_by_async():
+    """Sync AllocResponse (with already_sent_indexes) decoded by async PDMsg."""
+    resp = SyncAllocResponse(already_sent_indexes=[0], remote_indexes=[100])
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(resp), type=AsyncPDMsg)
+    assert isinstance(decoded, AsyncAllocResponse)
+    assert decoded.already_sent_indexes == [0]
+    assert decoded.remote_indexes == [100]

@@ -70,6 +70,11 @@ class AllocResponse(PDMsgBase):
     # One entry per key in the request; -1 means allocation failed for that slot.
     remote_indexes: list[int]
 
+    # Indexes (local) of already sent memory objects.
+    # Always empty for PDBackendAsync (no dedup), but included for
+    # wire-compatibility with sync PDBackend senders that expect this field.
+    already_sent_indexes: list[int] = []
+
 
 class ProxyNotif(PDMsgBase):
     req_id: str  # The request id to notify the proxy
