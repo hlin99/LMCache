@@ -51,7 +51,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
-from lmcache.v1.storage_backend.pd_backend import (
+from lmcache.v1.storage_backend.pd_backend_async import (
     AllocRequest,
     AllocResponse,
     PDBackend,
