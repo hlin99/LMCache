@@ -126,19 +126,19 @@ def _pd_backend_patches():
     """Return a combined patch context that mocks out all external deps."""
     return (
         patch(
-            "lmcache.v1.storage_backend.pd_backend.get_zmq_context",
+            "lmcache.v1.storage_backend.pd_backend_async.get_zmq_context",
             return_value=MagicMock(),
         ),
         patch(
-            "lmcache.v1.storage_backend.pd_backend.get_zmq_socket",
+            "lmcache.v1.storage_backend.pd_backend_async.get_zmq_socket",
             return_value=MagicMock(),
         ),
         patch(
-            "lmcache.v1.storage_backend.pd_backend.CreateTransferChannel",
+            "lmcache.v1.storage_backend.pd_backend_async.CreateTransferChannel",
             return_value=MagicMock(),
         ),
         patch(
-            "lmcache.v1.storage_backend.pd_backend.get_correct_device",
+            "lmcache.v1.storage_backend.pd_backend_async.get_correct_device",
             return_value="cpu",
         ),
     )
