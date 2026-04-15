@@ -861,10 +861,10 @@ class LMCacheEngine:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
                 self.storage_manager.remove(key, self.retrieve_locations)
-                # Async PDBackend.remove() already calls ref_count_down()
-                # internally, so only perform the manual decrement for sync
-                # mode to avoid a double-free.
-                if not self._is_async_pd_backend():
+                # Sync PDBackend.remove() does NOT call ref_count_down() internally
+                # (unlike async PD and other backends), so we must call it manually.
+                # See pd_backend.py line 605 TODO comment.
+                if self._is_sync_pd_backend():
                     memory_obj.ref_count_down()
             elif not self.async_loading:
                 memory_obj.ref_count_down()
@@ -1686,16 +1686,18 @@ class LMCacheEngine:
                 if end < last_failed_block_start:
                     kept_chunks.append((key, memory_obj, start, end))
                 else:
-                    # This chunk will not be used.  If the engine is
-                    # configured to remove-after-retrieve the caller would
-                    # normally call remove (which frees the block), but
-                    # since we are dropping these chunks here, we must
-                    # free them ourselves to avoid leaking PD buffer pool
-                    # memory.
+                    # This chunk will not be used. If the engine is configured
+                    # to remove-after-retrieve, the caller would normally call
+                    # remove (which frees the block), but since we are dropping
+                    # these chunks here, we must free them ourselves to avoid
+                    # leaking PD buffer pool memory.
                     if self.remove_after_retrieve:
                         assert self.storage_manager is not None
                         self.storage_manager.remove(key, self.retrieve_locations)
-                        if not self._is_async_pd_backend():
+                        # Sync PDBackend.remove() does NOT call ref_count_down()
+                        # internally (unlike async PD and other backends), so we
+                        # must call it manually. See pd_backend.py line 605.
+                        if self._is_sync_pd_backend():
                             memory_obj.ref_count_down()
                     else:
                         memory_obj.ref_count_down()
@@ -1797,6 +1799,14 @@ class LMCacheEngine:
         :rtype: bool
         """
         return self.config.enable_pd and self.config.pd_backend_mode == "async"
+
+    def _is_sync_pd_backend(self) -> bool:
+        """Check if the PD backend is the sync variant.
+
+        :return: True when PD is enabled and ``pd_backend_mode`` is ``"sync"``.
+        :rtype: bool
+        """
+        return self.config.enable_pd and self.config.pd_backend_mode == "sync"
 
     def _get_slot_mapping_list(
         self,
