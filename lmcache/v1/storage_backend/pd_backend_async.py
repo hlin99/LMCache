@@ -299,31 +299,11 @@ class PDBackendAsync(AllocatorBackendInterface):
                 self._sender_max_inflight_chunks,
                 total_chunks,
             )
-            # Two-level queue structure:
-            #
-            #   _receiver_req_queues:  {
-            #       "recv-1": Queue([ req-A, req-C ]),   # requests for Decoder-1
-            #       "recv-2": Queue([ req-B ]),           # requests for Decoder-2
-            #   }
-            #                          │
-            #                          ▼
-            #   _transfer_queues:  {
-            #       "req-A": Queue([ chunk1, chunk2, chunk3 ]),
-            #       "req-B": Queue([ chunk1, chunk2 ]),
-            #       "req-C": Queue([ chunk1 ]),
-            #   }
-            #
-            # A per-receiver worker picks req-A from _receiver_req_queues[recv-1],
-            # drains all its chunks from _transfer_queues["req-A"], then moves on
-            # to req-C.  A separate worker does the same for recv-2.  This lets
-            # req-B→Decoder-2 proceed concurrently with req-A→Decoder-1 (1PxD),
-            # while still guaranteeing that req-A and req-C to the same Decoder-1
-            # are serialized (preventing receiver-buffer fragmentation/deadlock).
-            #
-            # Workers are created on demand in _enqueue_transfer when a new
-            # receiver_id is first seen.
-            #
-            # Only accessed from coroutines on _sender_loop, no lock needed.
+            # Two-level queue: per-receiver FIFO of req_ids, each
+            # mapping to a per-request chunk queue.  Requests to the
+            # same receiver are serialized; different receivers run
+            # concurrently.  Workers created on demand.
+            # Only accessed from _sender_loop coroutines, no lock.
             self._transfer_queues: dict[str, asyncio.Queue] = {}
             self._receiver_req_queues: dict[str, asyncio.Queue] = {}
             self._receiver_worker_tasks: dict[str, asyncio.Task] = {}
@@ -447,26 +427,9 @@ class PDBackendAsync(AllocatorBackendInterface):
         alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"
 
         if self.pd_config.role == "sender":
-            # Single unified loop: flow-control check and allocation attempt are
-            # combined so a thread can never pass flow control only to have
-            # another thread steal the last memory slot before it allocates.
-            #
-            # The loop body, executed under _sender_staging_condition, does:
-            #   1. Check running flag — exit immediately on shutdown.
-            #   2. Check flow-control threshold — only attempt allocation when
-            #      inflight_chunks < max; otherwise fall through to wait.
-            #   3. Attempt allocation — on success, increment the counter and
-            #      return; the check + allocate + increment form an atomic unit
-            #      protected by the condition lock.
-            #   4. Wait — either the threshold is exceeded or allocation failed
-            #      (fragmentation / pool exhausted).  In both cases we wait for
-            #      _release_sender_staging_chunks to call notify_all().
-            #
-            # Flow-control waits are not counted against the allocation deadline:
-            # they loop back to the top and re-check the threshold, so a long
-            # backpressure pause does not consume the 5-second allocation budget.
-            # Once the threshold is satisfied we start a fresh deadline for the
-            # actual allocation attempts.
+            # Flow-control + allocate under one lock so no other thread
+            # can steal the slot between threshold check and allocation.
+            # Backpressure waits reset the deadline (don't eat alloc budget).
             with self._sender_staging_condition:
                 # deadline is initialised here and reset whenever backpressure
                 # is active so that flow-control waits do not consume the
@@ -683,24 +646,15 @@ class PDBackendAsync(AllocatorBackendInterface):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
         transfer_spec: Any = None,
     ) -> None:
-        """
-        Async coroutine that performs the full KV transfer:
-        remote alloc → async_batched_write → ref_count_down → callback.
-        Runs in the dedicated sender event loop (_sender_loop).
+        """Execute one transfer batch: remote alloc, RDMA write,
+        ref release, callback.  Called by _receiver_req_worker.
 
-        ``remote_indexes`` has one entry per key (1:1 with memory_objs).
-        A value of ``-1`` means allocation failed on the receiver; in that
-        case the entire request is aborted — all local objects are released
-        and no RDMA write or ProxyNotif is sent.
+        Aborts the entire batch if any remote_index is -1.
         """
         completed_indexes: set[int] = set()
         num_chunks = len(memory_objs)
 
-        # Extract req_id for per-request allocation accounting on the receiver.
-        # Using getattr with a default of "" keeps this backwards-compatible with
-        # any transfer_spec that pre-dates the req_id field.  An empty string
-        # causes the receiver to skip per-request chunk counting (no fail-fast
-        # detection), which is acceptable for legacy callers.
+        # Fallback to "" for legacy transfer_specs without req_id.
         req_id: str = (
             getattr(transfer_spec, "req_id", "") if transfer_spec is not None else ""
         )
@@ -799,15 +753,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             self._release_sender_staging_chunks(num_chunks)
 
     def _release_sender_staging_chunks(self, count: int) -> None:
-        """Decrement sender staging inflight counter and notify waiters.
-
-        Called from ``_async_transfer_task`` (asyncio) after all staging
-        buffers for a transfer have been freed via ``ref_count_down()``.
-        ``threading.Condition.notify_all()`` is non-blocking and safe to call
-        from an asyncio coroutine.
-
-        :param count: Number of staging slots to release.
-        """
+        """Decrement sender staging inflight counter and wake waiters."""
         if self.pd_config.role == "sender" and count > 0:
             with self._sender_staging_condition:
                 self._sender_inflight_chunks = max(
@@ -823,30 +769,10 @@ class PDBackendAsync(AllocatorBackendInterface):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
         transfer_spec: Any,
     ) -> None:
-        """Enqueue a transfer item onto the per-request asyncio.Queue.
+        """Enqueue a transfer onto the per-request queue.
 
-        If no queue exists for the request yet, one is created and the req_id
-        is placed onto the per-receiver FIFO queue so the receiver's worker
-        will process it.  Within a single receiver, requests are serialized in
-        FIFO order (one request fully occupies the decoder buffer at a time,
-        preventing fragmentation/deadlock).  Requests to *different* receivers
-        are handled by independent workers and proceed concurrently (1PxD).
-
-        Workers are created on demand: the first time a new receiver_id is
-        seen a worker task is started; if an existing worker has already
-        finished (e.g. after draining all queued requests) a new one is
-        started transparently.
-
-        Must be called as a coroutine on ``_sender_loop`` (via
-        ``asyncio.run_coroutine_threadsafe``).  All dict accesses are therefore
-        single-threaded on the event loop.
-
-        :param keys: Cache keys for this transfer batch.
-        :param memory_objs: Memory objects to transfer.
-        :param receiver_id: Identifier of the remote receiver.
-        :param on_complete_callback: Optional per-key completion callback.
-        :param transfer_spec: Transfer specification (carries ``req_id`` and
-            ``is_last_prefill``).
+        Creates the queue and per-receiver worker on first use.
+        Must run on _sender_loop.
         """
         req_id: str = (
             getattr(transfer_spec, "req_id", "unknown")
@@ -878,13 +804,9 @@ class PDBackendAsync(AllocatorBackendInterface):
     async def _drain_transfer_queue(
         self, req_id: str, q: "asyncio.Queue[_TransferItem]"
     ) -> None:
-        """Drain remaining items from a per-request transfer queue after failure.
+        """Drain remaining items from a per-request queue after failure.
 
-        Releases ref counts on all memory objects to prevent memory leaks and
-        releases sender staging chunks to unblock allocate() waiters.
-
-        :param req_id: The request identifier (used for logging).
-        :param q: The asyncio.Queue to drain.
+        Releases ref counts and sender staging chunks.
         """
         drained = 0
         while not q.empty():
@@ -912,28 +834,10 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
 
     async def _receiver_req_worker(self, receiver_id: str) -> None:
-        """Per-receiver FIFO worker: process one request at a time for a receiver.
+        """Per-receiver FIFO worker: process one request at a time.
 
-        Pulls req_ids from ``_receiver_req_queues[receiver_id]`` in arrival
-        order and drains each request's per-request transfer queue serially
-        until the item flagged with ``is_last_prefill=True`` is processed.
-        Only then is the next req_id dequeued.
-
-        This prevents receiver-buffer fragmentation: at most one request's
-        chunks occupy a given decoder's buffer at any time, guaranteeing that
-        the decoder can always find a complete request to process.  Having
-        independent workers per receiver means req-A→Decoder-1 and
-        req-B→Decoder-2 proceed concurrently (1PxD), while req-A and req-C
-        to the same Decoder-1 remain serialized.
-
-        If a transfer fails mid-request, remaining items are drained (ref
-        counts released) and the worker moves on to the next request.
-
-        On ANY exit (including CancelledError), the outer finally block drains
-        all remaining transfer queues for this receiver to prevent memory leaks.
-
-        :param receiver_id: Identifier of the remote receiver this worker
-            services.
+        Serializes requests to the same receiver to prevent buffer
+        fragmentation.  Drains remaining items on any exit.
         """
         req_queue = self._receiver_req_queues[receiver_id]
         # Collect req_ids belonging to this receiver for cleanup in finally.
@@ -1193,26 +1097,11 @@ class PDBackendAsync(AllocatorBackendInterface):
     async def _async_allocate_and_put(
         self, alloc_request: AllocRequest
     ) -> AllocResponse:
-        """
-        Async version of _allocate_and_put.
-        Uses event-driven waiting on ``_inflight_condition`` instead of
-        ``asyncio.sleep`` polling so the event loop stays responsive while
-        waiting for free memory.
-        pin=False: PDBackendAsync has no eviction; pinning is unnecessary and
-        causes ref_count leaks.
+        """Allocate remote memory for each key and store.
 
-        ``remote_indexes`` has exactly one entry per key in the request.
-
-        Error semantics:
-        - Fail-fast (cumulative chunks > max_inflight_chunks): raises
-          ``RuntimeError`` immediately; no rollback is performed.
-        - Allocator timeout (allocate() returns None after
-          ``self._allocation_timeout`` seconds): raises ``RuntimeError``;
-          already-allocated chunks in the current batch are rolled back via
-          ``remove()`` to prevent memory and inflight counter leaks.
-        - Backpressure wait (inflight >= max_inflight_chunks): indefinite
-          while ``self.running``.  The sender will not submit new chunks
-          until the decoder frees some, so this wait is expected to resolve.
+        Uses event-driven waiting on _inflight_condition.
+        Rolls back on failure; raises RuntimeError on timeout
+        or if the request exceeds max_inflight_chunks.
         """
         total_allocs = len(alloc_request.keys)
         req_id = alloc_request.req_id
@@ -1424,10 +1313,10 @@ class PDBackendAsync(AllocatorBackendInterface):
         key: CacheEngineKey,
         force: bool = True,
     ) -> bool:
-        """
-        Remove the key from the storage backend.
+        """Remove the key from the storage backend.
 
         :param key: The key to remove.
+        :param force: Unused, kept for interface compatibility.
         """
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
@@ -1441,12 +1330,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             return False
 
     async def _notify_inflight_freed(self) -> None:
-        """Decrement the inflight chunk counter and notify waiting allocations.
-
-        Scheduled on the receiver event loop from ``remove()`` (which runs in
-        a vLLM worker thread) so that asyncio.Condition operations are always
-        called from within the correct event loop.
-        """
+        """Decrement inflight counter and notify waiting allocations."""
         async with self._inflight_condition:
             if self._inflight_chunks == 0:
                 logger.warning(
@@ -1467,16 +1351,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         thread: threading.Thread,
         timeout: float = 5.0,
     ) -> None:
-        """Cancel all pending tasks on *loop*, stop it, and join the thread.
-
-        Uses a ``threading.Event`` to synchronize shutdown completion so that
-        ``thread.join`` is only called after the loop has actually stopped,
-        preventing thread or resource leaks when the loop takes time to drain.
-
-        :param loop: The event loop to shut down.
-        :param thread: The thread running the event loop.
-        :param timeout: Maximum seconds to wait for shutdown and thread join.
-        """
+        """Cancel all tasks on *loop*, stop it, and join *thread*."""
         shutdown_done = threading.Event()
 
         async def _cancel_and_stop() -> None:
@@ -1503,8 +1378,10 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
 
     def close(self) -> None:
-        """
-        Close the storage backend.
+        """Shut down loops, sockets, and transfer channel.
+
+        Order: sender loop -> alloc sockets -> receiver pending
+        tasks -> receiver loop -> transfer channel -> zmq context.
         """
         self.running = False
         # Wake up any threads blocked on the sender staging condition so they
