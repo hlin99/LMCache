@@ -393,7 +393,7 @@ class PDBackend(AllocatorBackendInterface):
         self._chunk_size_bytes = chunk_size_bytes
         self._aligned_buffer_size = aligned_buffer_size
         # Number of tokens per chunk (used for capacity checks).
-        self._chunk_token_size = metadata.kv_shape[2]
+        self._chunk_token_size = metadata.kv_shape[MemoryFormat.KV_2LTD.token_dim()]
 
         pd_max_prefill_len = config.pd_max_prefill_len
         if pd_max_prefill_len > 0:
@@ -949,7 +949,20 @@ class PDBackend(AllocatorBackendInterface):
                 try:
                     while True:
                         try:
-                            item: _TransferItem = await q.get()
+                            item: _TransferItem = await asyncio.wait_for(
+                                q.get(),
+                                timeout=self._allocation_timeout * 2,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                "Timed out waiting for next chunk of req %s "
+                                "(no chunk arrived within %.1fs). "
+                                "Sender may have crashed. Draining and moving on.",
+                                req_id,
+                                self._allocation_timeout * 2,
+                            )
+                            await self._drain_transfer_queue(req_id, q)
+                            break
                         except asyncio.CancelledError:
                             return
 
@@ -1316,9 +1329,9 @@ class PDBackend(AllocatorBackendInterface):
                 # Event-driven retry: wait on _inflight_condition for notification
                 # instead of asyncio.sleep polling so the coroutine wakes up
                 # immediately when _notify_inflight_freed fires.
-                deadline = asyncio.get_event_loop().time() + self._allocation_timeout
+                deadline = asyncio.get_running_loop().time() + self._allocation_timeout
                 while mem_obj is None:
-                    remaining = deadline - asyncio.get_event_loop().time()
+                    remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         raise RuntimeError(
                             f"Failed to allocate memory for key {key} after "
