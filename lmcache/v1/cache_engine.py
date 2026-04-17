@@ -864,6 +864,8 @@ class LMCacheEngine:
                 # Sync PDBackend.remove() does NOT call ref_count_down() internally
                 # (unlike async PD and other backends), so we must call it manually.
                 # See pd_backend.py line 605 TODO comment.
+                # For PDBackendAsync, remove() already calls ref_count_down(), so we
+                # should not call it again here.
                 if self._is_sync_pd_backend():
                     memory_obj.ref_count_down()
             elif not self.async_loading:
@@ -1697,6 +1699,8 @@ class LMCacheEngine:
                         # Sync PDBackend.remove() does NOT call ref_count_down()
                         # internally (unlike async PD and other backends), so we
                         # must call it manually. See pd_backend.py line 605.
+                        # For PDBackendAsync, remove() already calls ref_count_down(),
+                        # so we should not call it again here.
                         if self._is_sync_pd_backend():
                             memory_obj.ref_count_down()
                     else:
