@@ -1903,6 +1903,7 @@ class LMCacheEngineBuilder:
             )
 
             if corrected_device == "cpu":
+                # Not all backends support cudart() (CUDA runtime, XPU/HPU may lack it)
                 if hasattr(torch_dev, "cudart"):
                     torch_dev.cudart().cudaHostRegister(
                         buffer.data_ptr(), config.nixl_buffer_size, 0

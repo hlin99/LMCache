@@ -73,6 +73,7 @@ class CudaIPCWrapper:
         assert_contiguous(tensor)
 
         storage = tensor.untyped_storage()
+        # Not all backends support _share_cuda_() (CUDA shared memory specific)
         if not hasattr(storage, "_share_cuda_"):
             raise RuntimeError(
                 "The current accelerator does not support CUDA IPC "
@@ -98,6 +99,7 @@ class CudaIPCWrapper:
         """
         device_index = CudaIPCWrapper._get_device_index_from_uuid(self.device_uuid)
 
+        # Not all backends support _new_shared_cuda() (CUDA shared memory specific)
         if not hasattr(torch.UntypedStorage, "_new_shared_cuda"):
             raise RuntimeError(
                 "The current accelerator does not support CUDA IPC "

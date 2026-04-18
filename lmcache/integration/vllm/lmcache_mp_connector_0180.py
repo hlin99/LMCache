@@ -545,6 +545,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             return
 
         with torch_dev.stream(torch_dev.current_stream()):
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
                     "The current accelerator does not support GPU events "
@@ -612,6 +613,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             return
 
         with torch_dev.stream(torch_dev.current_stream()):
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
                     "The current accelerator does not support GPU events "

@@ -292,6 +292,7 @@ class MPCacheEngine:
             torch_dev.device(gpu_context.device),
             torch_dev.stream(gpu_context.stream),
         ):
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
                     "The current accelerator does not support GPU events "
@@ -303,6 +304,7 @@ class MPCacheEngine:
             all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
             # Wait for vLLM to finish
+            # Not all backends support Event.from_ipc_handle() (CUDA IPC specific)
             if not hasattr(torch_dev.Event, "from_ipc_handle"):
                 raise RuntimeError(
                     "The current accelerator does not support IPC event handles "
@@ -541,6 +543,7 @@ class MPCacheEngine:
             # Stage all block_ids to GPU once before the loop
             all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
                     "The current accelerator does not support GPU events "
@@ -1087,6 +1090,7 @@ def run_cache_server(
         mp_config.port,
     )
     # Start the ZMQ server
+    # Not all backends support init() explicitly
     if hasattr(torch_dev, "init"):
         torch_dev.init()
     server.start()
