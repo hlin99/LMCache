@@ -9,6 +9,9 @@ import threading
 import msgspec
 import torch
 
+# First Party
+from lmcache import torch_dev, torch_device_type
+
 """
 Defines the types and the customized encoder/decoders for inter-process
 communications.
@@ -27,17 +30,17 @@ class CudaIPCWrapper:
     @staticmethod
     def _get_device_uuid(device_index: int) -> str:
         """Get the UUID of a GPU device given its index."""
-        return str(torch.cuda.get_device_properties(device_index).uuid)
+        return str(torch_dev.get_device_properties(device_index).uuid)
 
     @staticmethod
     def _discover_gpu_devices():
         """Discover all available GPU devices and map their UUIDs to
         the physical device ordinals.
         """
-        if not torch.cuda.is_available():
+        if not torch_dev.is_available():
             return
 
-        num_devices = torch.cuda.device_count()
+        num_devices = torch_dev.device_count()
         with CudaIPCWrapper._device_mapping_lock:
             if CudaIPCWrapper._discovered_device_mapping:
                 return  # Already discovered
@@ -70,7 +73,12 @@ class CudaIPCWrapper:
         assert_contiguous(tensor)
 
         storage = tensor.untyped_storage()
-        handle = storage._share_cuda_()
+        if not hasattr(storage, "_share_cuda_"):
+            raise RuntimeError(
+                "The current accelerator does not support CUDA IPC "
+                "(_share_cuda_ is not available)."
+            )
+        handle = storage._share_cuda_()  # noqa: SLF001
 
         self.handle = handle
         self.dtype = tensor.dtype
@@ -84,16 +92,24 @@ class CudaIPCWrapper:
     def to_tensor(self) -> torch.Tensor:
         """
         Note:
-            This function may break if torch cuda is not initialized.
-            We should call `torch.cuda.init()` before using this function.
+            This function may break if the accelerator is not initialized.
+            We should call `torch_dev.init()` before using this function
+            (guarded by hasattr since not all backends expose init()).
         """
         device_index = CudaIPCWrapper._get_device_index_from_uuid(self.device_uuid)
 
+        if not hasattr(torch.UntypedStorage, "_new_shared_cuda"):
+            raise RuntimeError(
+                "The current accelerator does not support CUDA IPC "
+                "(_new_shared_cuda is not available)."
+            )
         storage = torch.UntypedStorage._new_shared_cuda(  # noqa: SLF001
             device_index, *self.handle[1:]
         )
 
-        t = torch.empty((), device=f"cuda:{device_index}", dtype=self.dtype)
+        t = torch.empty(
+            (), device=f"{torch_device_type}:{device_index}", dtype=self.dtype
+        )
         t.set_(storage, self.storage_offset, self.shape, self.stride)
         return t
 

@@ -6,6 +6,7 @@ from typing import Dict, Tuple
 import torch
 
 # First Party
+from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.storage_backend.serde.cachegen_basics import (
     CacheGenConfig,
@@ -370,8 +371,8 @@ class CacheGenSerializer(Serializer):
         # Temporary fix for issue #83: encoder will have the default device 0
         # on all the ray workers. Need to set it to the correct device.
         # Also need to figure out why this happens.
-        if torch.cuda.current_device != tensor.device:
-            torch.cuda.set_device(tensor.device)
+        if torch_dev.current_device != tensor.device:
+            torch_dev.set_device(tensor.device)
         if tensor.device != self.key_bins.device:
             self.key_bins = self.key_bins.to(tensor.device)
         if tensor.device != self.value_bins.device:
