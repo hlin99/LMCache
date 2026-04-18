@@ -482,6 +482,7 @@ class PlainGPUCacheContext:
 
     @property
     def stream(self) -> Any:
+        """Returns the device-specific GPU stream (e.g., torch.cuda.Stream)."""
         return self._cuda_stream
 
     @property

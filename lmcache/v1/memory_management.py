@@ -16,7 +16,7 @@ from sortedcontainers import SortedList
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
@@ -2393,9 +2393,7 @@ class CuFileMemoryAllocator(GPUMemoryAllocator):
             # TODO(Serapheim): Ideally we'd get the device from the upper
             # layer - for now just use the current device.
             if torch_dev.is_available():
-                from lmcache import torch_device_type as _tdt
-
-                device = f"{_tdt}:{torch_dev.current_device()}"
+                device = f"{torch_device_type}:{torch_dev.current_device()}"
             else:
                 device = "cpu:0"
         super().__init__(size, device, align_bytes=4096)
@@ -2420,9 +2418,7 @@ class HipFileMemoryAllocator(GPUMemoryAllocator):
         if device is None:
             if torch_dev.is_available():
                 # TODO: On ROCm, PyTorch still uses the CUDA API internally
-                from lmcache import torch_device_type as _tdt
-
-                device = f"{_tdt}:{torch_dev.current_device()}"
+                device = f"{torch_device_type}:{torch_dev.current_device()}"
             else:
                 device = "cpu:0"
 

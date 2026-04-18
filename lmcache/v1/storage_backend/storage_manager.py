@@ -76,7 +76,8 @@ def allocate_and_copy_objects(
           objects
         keys: the cache engine keys corresponding to the memory objects
         src_memory_objs: the memory objects to copy from
-        stream: the GPU stream to run the copy in
+        stream: the device-specific GPU stream to run the copy in
+            (e.g., torch.cuda.Stream on CUDA or torch.xpu.Stream on XPU)
 
     Returns:
         - list of cache engine keys that corresponds to the memory objects

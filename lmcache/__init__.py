@@ -34,7 +34,7 @@ def _detect_device() -> tuple[Any, str]:
             e.g. ``(torch.cuda, "cuda")`` or ``(torch.xpu, "xpu")``.
 
     Raises:
-        RuntimeError: If no supported accelerator is found.
+        RuntimeError: If no supported accelerator is found (checked CUDA, XPU, HPU).
     """
     if torch.cuda.is_available():
         return torch.cuda, "cuda"
@@ -42,7 +42,9 @@ def _detect_device() -> tuple[Any, str]:
         return torch.xpu, "xpu"
     elif hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu, "hpu"
-    raise RuntimeError("No supported accelerator found")
+    raise RuntimeError(
+        "No supported accelerator found. Checked for: CUDA, XPU, HPU."
+    )
 
 
 torch_dev, torch_device_type = _detect_device()

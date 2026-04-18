@@ -10,7 +10,7 @@ import msgspec
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 
 """
 Defines the types and the customized encoder/decoders for inter-process
@@ -92,13 +92,10 @@ class CudaIPCWrapper:
     def to_tensor(self) -> torch.Tensor:
         """
         Note:
-            This function may break if torch cuda is not initialized.
+            This function may break if the accelerator is not initialized.
             We should call `torch_dev.init()` before using this function
             (guarded by hasattr since not all backends expose init()).
         """
-        # First Party
-        from lmcache import torch_device_type
-
         device_index = CudaIPCWrapper._get_device_index_from_uuid(self.device_uuid)
 
         if not hasattr(torch.UntypedStorage, "_new_shared_cuda"):
