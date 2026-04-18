@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import zmq
+from lmcache import torch_dev
 from lmcache.integration.vllm.utils import mla_enabled
 from lmcache.utils import init_logger as lmcache_init_logger
 
@@ -543,8 +544,13 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         if len(request_ids) == 0:
             return
 
-        with torch.cuda.stream(torch.cuda.current_stream()):
-            event = torch.cuda.Event(interprocess=True)
+        with torch_dev.stream(torch_dev.current_stream()):
+            if not hasattr(torch_dev, "Event"):
+                raise RuntimeError(
+                    "The current accelerator does not support GPU events "
+                    "(torch_dev.Event is not available)."
+                )
+            event = torch_dev.Event(interprocess=True)
             event.record()
 
         self.worker_adapter.batched_submit_retrieve_requests(request_ids, ops, event)
@@ -605,8 +611,13 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         if len(request_ids) == 0:
             return
 
-        with torch.cuda.stream(torch.cuda.current_stream()):
-            event = torch.cuda.Event(interprocess=True)
+        with torch_dev.stream(torch_dev.current_stream()):
+            if not hasattr(torch_dev, "Event"):
+                raise RuntimeError(
+                    "The current accelerator does not support GPU events "
+                    "(torch_dev.Event is not available)."
+                )
+            event = torch_dev.Event(interprocess=True)
             event.record()
 
         self.worker_adapter.batched_submit_store_requests(request_ids, ops, event)
