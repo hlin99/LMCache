@@ -103,7 +103,7 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         self.result_ = result
 
         # Deserialize the IPC event
-        # Not all backends support interprocess Events (CUDA IPC specific)
+        # Not all backends support Events/Event.from_ipc_handle() (CUDA IPC specific)
         if not hasattr(torch_dev, "Event") or not hasattr(
             torch_dev.Event, "from_ipc_handle"
         ):
