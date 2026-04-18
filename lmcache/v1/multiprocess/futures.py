@@ -4,7 +4,7 @@ from typing import Any, Generic, Optional, TypeVar
 import threading
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 
 T = TypeVar("T")
 
@@ -102,13 +102,14 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         event_bytes, result = self.raw_future_.result()
         self.result_ = result
 
-        # Deserialize the IPC event
+        # Not all backends support interprocess Events (CUDA IPC specific)
         if not hasattr(torch_dev, "Event") or not hasattr(
             torch_dev.Event, "from_ipc_handle"
         ):
             raise RuntimeError(
-                "The current accelerator does not support IPC events "
-                "(torch_dev.Event.from_ipc_handle is not available)."
+                f"Backend '{torch_device_type}' does not support interprocess "
+                "Events (Event.from_ipc_handle not available). "
+                "Multiprocess IPC requires CUDA."
             )
         self.event_ = torch_dev.Event.from_ipc_handle(self.device_, event_bytes)
 

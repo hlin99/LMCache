@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import zmq
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.integration.vllm.utils import mla_enabled
 from lmcache.utils import init_logger as lmcache_init_logger
 
@@ -545,10 +545,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             return
 
         with torch_dev.stream(torch_dev.current_stream()):
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
-                    "The current accelerator does not support GPU events "
-                    "(torch_dev.Event is not available)."
+                    f"Backend '{torch_device_type}' does not support "
+                    "interprocess Events (torch_dev.Event not available). "
+                    "Multiprocess IPC requires CUDA."
                 )
             event = torch_dev.Event(interprocess=True)
             event.record()
@@ -612,10 +614,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             return
 
         with torch_dev.stream(torch_dev.current_stream()):
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
-                    "The current accelerator does not support GPU events "
-                    "(torch_dev.Event is not available)."
+                    f"Backend '{torch_device_type}' does not support "
+                    "interprocess Events (torch_dev.Event not available). "
+                    "Multiprocess IPC requires CUDA."
                 )
             event = torch_dev.Event(interprocess=True)
             event.record()

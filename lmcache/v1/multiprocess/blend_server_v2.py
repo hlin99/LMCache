@@ -46,7 +46,7 @@ import numpy as np
 import zmq
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
@@ -486,18 +486,22 @@ class BlendEngineV2(MPCacheEngine):
             torch_dev.device(gpu_context.device),
             torch_dev.stream(gpu_context.stream),
         ):
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
-                    "The current accelerator does not support GPU events "
-                    "(torch_dev.Event is not available)."
+                    f"Backend '{torch_device_type}' does not support interprocess "
+                    "Events (torch_dev.Event not available). "
+                    "Multiprocess IPC requires CUDA."
                 )
             event = torch_dev.Event(interprocess=True)
 
             # Wait for vLLM event to finish
+            # Not all backends support IPC event handles (CUDA IPC specific)
             if not hasattr(torch_dev.Event, "from_ipc_handle"):
                 raise RuntimeError(
-                    "The current accelerator does not support IPC event handles "
-                    "(torch_dev.Event.from_ipc_handle is not available)."
+                    f"Backend '{torch_device_type}' does not support IPC event "
+                    "handles (Event.from_ipc_handle not available). "
+                    "Multiprocess IPC requires CUDA."
                 )
             vllm_event = torch_dev.Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
@@ -654,10 +658,12 @@ class BlendEngineV2(MPCacheEngine):
             torch_dev.device(gpu_context.device),
             torch_dev.stream(gpu_context.stream),
         ):
+            # Not all backends support interprocess Events (CUDA IPC specific)
             if not hasattr(torch_dev, "Event"):
                 raise RuntimeError(
-                    "The current accelerator does not support GPU events "
-                    "(torch_dev.Event is not available)."
+                    f"Backend '{torch_device_type}' does not support interprocess "
+                    "Events (torch_dev.Event not available). "
+                    "Multiprocess IPC requires CUDA."
                 )
             event = torch_dev.Event(interprocess=True)
 
@@ -870,7 +876,13 @@ def run_cache_server(
         mp_config.port,
     )
     # Start the ZMQ server
-    if hasattr(torch_dev, "init"):
+    # Not all backends expose init(); some auto-initialize on first use
+    if not hasattr(torch_dev, "init"):
+        logger.warning(
+            "Backend '%s' does not support init(), skipping device init",
+            torch_device_type,
+        )
+    else:
         torch_dev.init()
     server.start()
 

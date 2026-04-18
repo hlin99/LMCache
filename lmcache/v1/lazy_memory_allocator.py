@@ -8,7 +8,7 @@ import threading
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.v1.memory_management import (
     AddressManager,
@@ -91,11 +91,16 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         self._final_size = align_to(final_size, self.PIN_CHUNK_SIZE)
         # Underlying buffer for the memory allocation
         self._buffer: torch.Tensor
-        # Accelerator runtime API (guarded: not all backends expose cudart)
-        if hasattr(torch_dev, "cudart"):
-            self._cudart = torch_dev.cudart()
-        else:
+        # Not all backends support cudart() for host memory pinning (CUDA-specific)
+        if not hasattr(torch_dev, "cudart"):
+            logger.warning(
+                "Backend '%s' does not support cudart(), "
+                "skipping host memory registration",
+                torch_device_type,
+            )
             self._cudart = None
+        else:
+            self._cudart = torch_dev.cudart()
 
         # List of (ptr, size) for pinned memory chunks
         self._pin_record: list[tuple[int, int]] = []
