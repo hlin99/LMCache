@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.storage_backend.serde.cachegen_basics import (
     CacheGenConfig,
@@ -213,7 +213,9 @@ class CacheGenEncoderImpl:
             results = []
             for x in X:
                 """do permute here"""
-                batch_counts = process_batch(x.cuda().permute(1, 0), max_val)
+                batch_counts = process_batch(
+                    x.to(torch_device_type).permute(1, 0), max_val
+                )
                 results.append(batch_counts)
 
             final_counts = torch.cat(results, dim=0)
@@ -347,13 +349,13 @@ class CacheGenSerializer(Serializer):
         ret = torch.zeros(config.nlayers)
         for spec in config.kspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     def make_value_bins(self, config: CacheGenConfig) -> torch.Tensor:
         ret = torch.zeros(config.nlayers)
         for spec in config.vspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     @_lmcache_nvtx_annotate
     def to_bytes(self, tensor: torch.Tensor) -> bytes:
@@ -386,7 +388,7 @@ class CacheGenSerializer(Serializer):
         [num_layers, 2, num_tokens, num_heads, head_size] """
         ntokens = tensor.shape[2]
         output_dict = encode_function(
-            tensor.cuda(),
+            tensor.to(torch_device_type),
             self.cachegen_config,
             self.key_bins,
             self.value_bins,

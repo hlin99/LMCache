@@ -3,7 +3,7 @@
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.storage_backend.serde.cachegen_encoder import encode_function
 from lmcache.utils import _lmcache_nvtx_annotate
@@ -29,13 +29,13 @@ class CacheGenSerializer(Serializer):
         ret = torch.zeros(config.nlayers)
         for spec in config.kspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     def make_value_bins(self, config: CacheGenConfig) -> torch.Tensor:
         ret = torch.zeros(config.nlayers)
         for spec in config.vspecs:
             ret[spec.start_layer : spec.end_layer] = spec.bins
-        return ret.cuda()
+        return ret.to(torch_device_type)
 
     # TODO(Jiayi): A lot of memory copies can be avoided in this function.
     @_lmcache_nvtx_annotate
@@ -53,7 +53,7 @@ class CacheGenSerializer(Serializer):
         # TODO(Jiayi): please avoid this copy by directly performing
         # serialization inside gpu connector.
         assert memory_obj.tensor is not None
-        tensor = memory_obj.tensor.cuda()
+        tensor = memory_obj.tensor.to(torch_device_type)
 
         # Temporary fix for issue #83: encoder will have the default device 0
         # on all the ray workers. Need to set it to the correct device.
