@@ -2210,7 +2210,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
     def __init__(
         self,
         size: int,
-        device="cuda",
+        device=torch_device_type,
         align_bytes: Optional[int] = None,
         use_paging: bool = False,
         **kwargs,
@@ -2449,7 +2449,7 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         shapes: list[torch.Size],
         dtypes: list[torch.dtype],
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
-        device: str = "cuda",
+        device: str = torch_device_type,
     ):
         self.gpu_buffer = torch.empty(
             size,

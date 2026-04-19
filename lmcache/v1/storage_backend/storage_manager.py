@@ -23,7 +23,7 @@ import threading
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
@@ -1227,7 +1227,9 @@ class StorageManager:
                 self.config,
                 self.metadata,
                 self.loop,
-                dst_device=("cuda" if is_cuda_worker(self.metadata) else "cpu"),
+                dst_device=(
+                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                ),
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,
@@ -1289,7 +1291,9 @@ class StorageManager:
                 self.config,
                 self.metadata,
                 self.loop,
-                dst_device=("cuda" if is_cuda_worker(self.metadata) else "cpu"),
+                dst_device=(
+                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                ),
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,

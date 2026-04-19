@@ -112,7 +112,7 @@ def CreateStorageBackends(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
     loop: asyncio.AbstractEventLoop,
-    dst_device: str = "cuda",
+    dst_device: str = torch_device_type,
     lmcache_worker: Optional["LMCacheWorker"] = None,
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,

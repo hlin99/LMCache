@@ -9,7 +9,7 @@ import time
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
@@ -47,7 +47,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self,
         config: LMCacheEngineConfig,
         metadata: Optional[LMCacheMetadata] = None,
-        dst_device: str = "cuda",
+        dst_device: str = torch_device_type,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
     ):

@@ -18,7 +18,7 @@ import requests
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.connections import global_http_connection
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
@@ -70,7 +70,7 @@ class EnvMessage:
 class EngineMessage:
     def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheMetadata):
         self.chunksize = config.chunk_size
-        self.local_device = "cpu" if config.local_cpu else "cuda"
+        self.local_device = "cpu" if config.local_cpu else torch_device_type
         self.max_local_cache_size = int(config.max_local_cpu_size)
         self.remote_url = config.remote_url
         self.remote_serde = config.remote_serde

@@ -419,7 +419,7 @@ class LMCacheEngine:
             )
             num_to_store_tokens = sum(offsets)
             kwargs["slot_mapping"] = torch.tensor(
-                kwargs["slot_mapping"], dtype=torch.long, device="cuda"
+                kwargs["slot_mapping"], dtype=torch.long, device=torch_device_type
             )
 
         assert tokens is not None or hashes is not None, (
@@ -1747,7 +1747,9 @@ class LMCacheEngine:
                 # Broadcast tensor data
                 raw_tensor = memory_obj.raw_tensor
                 assert raw_tensor is not None
-                tensor_to_broadcast = raw_tensor.to(f"cuda:{self.metadata.worker_id}")
+                tensor_to_broadcast = raw_tensor.to(
+                    f"{torch_device_type}:{self.metadata.worker_id}"
+                )
                 self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
         else:
             # Receive total chunk count
