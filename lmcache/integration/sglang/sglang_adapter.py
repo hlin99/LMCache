@@ -112,7 +112,10 @@ class LMCacheConnector:
         if not k_pool:
             raise ValueError("k_pool cannot be empty during initialization.")
         kv_dtype = k_pool[0].dtype
-        if k_pool[0].device.type != "cpu" and k_pool[0].device.index is not None:
+        if (
+            k_pool[0].device.type == torch_device_type
+            and k_pool[0].device.index is not None
+        ):
             local_rank = k_pool[0].device.index
         else:
             # Fallback for CPU / odd cases
