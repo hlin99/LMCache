@@ -12,7 +12,6 @@ from typing import Any
 import array
 
 # Third Party
-import cupy
 import torch
 
 # First Party
@@ -37,6 +36,7 @@ from lmcache.v1.gpu_connector.utils import (
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 
 if torch_dev.is_available():
+    import cupy
     import lmcache.c_ops as lmc_ops
 
 # First Party
