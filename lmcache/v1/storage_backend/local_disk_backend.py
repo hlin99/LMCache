@@ -11,6 +11,7 @@ import time
 import torch
 
 # First Party
+from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
@@ -105,7 +106,7 @@ class LocalDiskBackend(StorageBackendInterface):
         lmcache_worker: Optional["LMCacheWorker"] = None,
         metadata: Optional[LMCacheMetadata] = None,
     ):
-        if torch.cuda.is_available():
+        if torch_dev.is_available():
             super().__init__(dst_device)
         else:
             super().__init__("cpu")
