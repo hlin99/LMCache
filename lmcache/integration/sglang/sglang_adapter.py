@@ -150,7 +150,6 @@ class LMCacheConnector:
         assert isinstance(slot_mapping, torch.Tensor)
         assert (len(token_ids) - offset) == len(slot_mapping)
 
-        slot_mapping = slot_mapping.to(torch_device_type)
         load_mask = torch.ones_like(token_ids, dtype=torch.bool)
         load_mask[:offset] = False
 
@@ -177,7 +176,6 @@ class LMCacheConnector:
         assert isinstance(slot_mapping, torch.Tensor)
         assert len(token_ids) == len(slot_mapping)
 
-        slot_mapping = slot_mapping.to(torch_device_type)
         store_mask = torch.ones_like(token_ids, dtype=torch.bool)
 
         self.lmcache_engine.store(
