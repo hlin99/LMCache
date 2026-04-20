@@ -829,3 +829,66 @@ def test_sync_response_decoded_as_async():
     decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(resp), type=AsyncPDMsg)
     assert isinstance(decoded, AsyncAllocResponse)
     assert decoded.already_sent_indexes == [0] and decoded.remote_indexes == [100]
+
+
+def test_receiver_global_inflight_precheck_prevents_deadlock(async_receiver):
+    """Global inflight pre-check waits for enough free slots before the loop.
+
+    Regression test for the 16P8D deadlock scenario:
+    - Req 42 finishes and releases admission, but its chunks are still counted
+      in _inflight_chunks (decoder hasn't consumed them yet).
+    - Req 43 acquires admission.  The per-request fail-fast passes (e.g. 2 chunks
+      needed < 5 max), but global inflight is already 4 (residual from Req 42),
+      so only 1 free slot remains — not enough for the entire batch.
+    - Without the pre-check, Req 43 would enter the per-chunk loop, allocate 1
+      chunk, then block mid-loop waiting for a free slot.  Since the batch is
+      incomplete, no ProxyNotif is ever sent and the decoder never starts
+      consuming — deadlock.
+    - With the pre-check, Req 43 waits *before* entering the loop until all 2
+      free slots are available, then allocates the full batch atomically.
+    """
+    async_receiver._max_inflight_chunks = 5
+    async_receiver.allocate = _auto_alloc()
+    req_id = "req-precheck"
+
+    async def run():
+        # Simulate residual inflight from a previous request: 4 out of 5 slots used.
+        async with async_receiver._inflight_condition:
+            async_receiver._inflight_chunks = 4  # only 1 free slot
+
+        completed = asyncio.Event()
+        holder = []
+
+        async def do_alloc():
+            # Request 2 chunks — more than the 1 free slot currently available.
+            holder.append(
+                await async_receiver._async_allocate_and_put(
+                    _make_alloc_req(
+                        [_make_key(50000 + i) for i in range(2)],
+                        req_id=req_id,
+                        is_last_batch=True,
+                    )
+                )
+            )
+            completed.set()
+
+        async def drain_later():
+            await asyncio.sleep(0.05)
+            # Confirm the allocation is still blocked (pre-check is waiting).
+            assert not completed.is_set(), (
+                "Allocation should be blocked in pre-check until enough free slots"
+            )
+            # Free enough slots so the pre-check can proceed (need 2 free, have 4
+            # occupied → free 1 more to get 2 free slots total).
+            async with async_receiver._inflight_condition:
+                async_receiver._inflight_chunks -= 1  # now 3 used, 2 free
+                async_receiver._inflight_condition.notify_all()
+
+        await asyncio.gather(do_alloc(), drain_later())
+
+        assert completed.is_set()
+        resp = holder[0]
+        assert len(resp.remote_indexes) == 2
+        assert -1 not in resp.remote_indexes
+
+    asyncio.run(run())
