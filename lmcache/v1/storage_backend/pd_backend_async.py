@@ -539,6 +539,12 @@ class PDBackendAsync(AllocatorBackendInterface):
                     )
                     if mem_obj is not None:
                         self._sender_inflight_chunks += 1
+                        logger.warning(
+                            "[PD-ALLOC] sender alloc, sender_inflight=%d, "
+                            "free_chunks=%d",
+                            self._sender_inflight_chunks,
+                            self._get_free_chunks(),
+                        )
                         return mem_obj
 
                     remaining = deadline - time.monotonic()
@@ -1447,6 +1453,14 @@ class PDBackendAsync(AllocatorBackendInterface):
                 alloc_indexes.append(mem_obj.meta.address)
                 self.put(key, mem_obj)
                 current_batch_keys.append(key_str)
+                logger.warning(
+                    "[PD-ALLOC] req=%s alloc chunk %d/%d, "
+                    "free_chunks=%d, inflight=%d, data_size=%d",
+                    req_id, idx + 1, total_allocs,
+                    self._get_free_chunks(),
+                    self._inflight_chunks,
+                    len(self.data),
+                )
         except BaseException:
             # Rollback: remove already-allocated chunks from this batch
             # to prevent memory and inflight counter leaks.
@@ -1538,13 +1552,37 @@ class PDBackendAsync(AllocatorBackendInterface):
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
             if mem_obj is not None:
+                logger.warning(
+                    "[PD-FREE] remove key=%s, data_size=%d, "
+                    "free_chunks_before=%d",
+                    key, len(self.data),
+                    self._get_free_chunks(),
+                )
                 mem_obj.ref_count_down()
                 if self.pd_config.role == "receiver":
+                    logger.warning(
+                        "[PD-FREE] after ref_count_down, free_chunks=%d",
+                        self._get_free_chunks(),
+                    )
                     asyncio.run_coroutine_threadsafe(
                         self._notify_inflight_freed(), self._recv_loop
                     )
                 return True
+            logger.warning("[PD-FREE] remove: key=%s NOT FOUND", key)
             return False
+
+    def _get_free_chunks(self) -> int:
+        """Return number of free chunks in the PD buffer allocator."""
+        alloc = (
+            self.memory_allocator.cpu_allocator
+            if self.corrected_device == "cpu"
+            else self.memory_allocator.gpu_allocator
+        )
+        return len(alloc.free_blocks)
+
+    def _get_total_chunks(self) -> int:
+        """Return total number of chunks in the PD buffer."""
+        return self._aligned_buffer_size // self._chunk_size_bytes
 
     async def _notify_inflight_freed(self) -> None:
         """Decrement the inflight chunk counter and notify waiting allocations.
@@ -1554,6 +1592,12 @@ class PDBackendAsync(AllocatorBackendInterface):
         called from within the correct event loop.
         """
         async with self._inflight_condition:
+            logger.warning(
+                "[PD-FREE] _notify_inflight_freed: "
+                "inflight_before=%d, free_chunks=%d",
+                self._inflight_chunks,
+                self._get_free_chunks(),
+            )
             if self._inflight_chunks == 0:
                 logger.warning(
                     "inflight_chunks is already 0 before decrement; "
