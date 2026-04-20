@@ -1453,6 +1453,8 @@ class PDBackendAsync(AllocatorBackendInterface):
                 alloc_indexes.append(mem_obj.meta.address)
                 self.put(key, mem_obj)
                 current_batch_keys.append(key_str)
+                # Best-effort diagnostic snapshot: values may not be
+                # perfectly in sync since no lock is held here.
                 logger.warning(
                     "[PD-ALLOC] req=%s alloc chunk %d/%d, "
                     "free_chunks=%d, inflight=%d, data_size=%d",
@@ -1572,16 +1574,37 @@ class PDBackendAsync(AllocatorBackendInterface):
             return False
 
     def _get_free_chunks(self) -> int:
-        """Return number of free chunks in the PD buffer allocator."""
+        """Return number of free chunks in the PD buffer allocator.
+
+        Reads ``free_blocks`` from the appropriate underlying allocator
+        (CPU or GPU depending on ``corrected_device``).  This is a
+        best-effort diagnostic value: it is read without holding any
+        additional lock, so the count may be stale by the time it is logged.
+
+        :return: Number of currently free blocks in the allocator, or -1 if
+            the allocator does not expose a ``free_blocks`` attribute.
+        :rtype: int
+        """
         alloc = (
             self.memory_allocator.cpu_allocator
             if self.corrected_device == "cpu"
             else self.memory_allocator.gpu_allocator
         )
-        return len(alloc.free_blocks)
+        try:
+            return len(alloc.free_blocks)
+        except AttributeError:
+            return -1
 
     def _get_total_chunks(self) -> int:
-        """Return total number of chunks in the PD buffer."""
+        """Return total number of chunks in the PD buffer.
+
+        Computed as ``_aligned_buffer_size // _chunk_size_bytes``, which
+        matches the value used to initialise ``_max_inflight_chunks`` and
+        ``_sender_max_inflight_chunks``.
+
+        :return: Total number of fixed-size chunks in the PD buffer.
+        :rtype: int
+        """
         return self._aligned_buffer_size // self._chunk_size_bytes
 
     async def _notify_inflight_freed(self) -> None:
