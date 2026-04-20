@@ -878,8 +878,8 @@ def test_receiver_global_inflight_precheck_prevents_deadlock(async_receiver):
             assert not completed.is_set(), (
                 "Allocation should be blocked in pre-check until enough free slots"
             )
-            # Free enough slots so the pre-check can proceed (need 2 free, have 4
-            # occupied → free 1 more to get 2 free slots total).
+            # Decrement by 1 (4→3 occupied) to provide 2 free slots (5-3=2),
+            # satisfying the pre-check's requirement of 2 free slots.
             async with async_receiver._inflight_condition:
                 async_receiver._inflight_chunks -= 1  # now 3 used, 2 free
                 async_receiver._inflight_condition.notify_all()

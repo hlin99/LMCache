@@ -1409,13 +1409,13 @@ class PDBackendAsync(AllocatorBackendInterface):
                         alloc_indexes.extend([-1] * remaining_allocs)
                         return AllocResponse(remote_indexes=alloc_indexes)
                     logger.info(
-                        "Req %s admitted but waiting for %d free slots "
-                        "(inflight=%d, max=%d, need=%d)",
+                        "Req %s admitted but waiting to allocate %d chunks "
+                        "(inflight=%d, max=%d, free=%d)",
                         req_id,
                         total_allocs,
                         self._inflight_chunks,
                         self._max_inflight_chunks,
-                        total_allocs,
+                        self._max_inflight_chunks - self._inflight_chunks,
                     )
                     await self._inflight_condition.wait()
 
