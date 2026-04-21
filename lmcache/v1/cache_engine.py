@@ -855,12 +855,22 @@ class LMCacheEngine:
                     list(memory_objs), list(starts), list(ends), **kwargs
                 )
 
+        logger.warning(
+            "[PD-DEBUG] retrieve: reordered_chunks=%d, remove_after_retrieve=%s, "
+            "is_passive=%s, retrieve_locations=%s",
+            len(reordered_chunks),
+            self.remove_after_retrieve,
+            self._is_passive(),
+            self.retrieve_locations,
+        )
         # TODO(Jiayi): Remove the following for loop with batched operations
         # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
         for key, memory_obj, _, _ in reordered_chunks:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
-                self.storage_manager.remove(key, self.retrieve_locations)
+                logger.warning("[PD-DEBUG] calling remove for key=%s", key)
+                removed = self.storage_manager.remove(key, self.retrieve_locations)
+                logger.warning("[PD-DEBUG] remove returned %d", removed)
                 # Sync PDBackend.remove() does NOT call ref_count_down() internally
                 # (unlike async PD and other backends), so we must call it manually.
                 # See pd_backend.py line 605 TODO comment.

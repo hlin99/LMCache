@@ -778,6 +778,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         num_chunks = len(memory_objs)
         staging_released = False
 
+        logger.warning("[PD-XFER] start, %d chunks to %s", num_chunks, receiver_id)
         # Extract req_id for per-request allocation accounting on the receiver.
         # Using getattr with a default of "" keeps this backwards-compatible with
         # any transfer_spec that pre-dates the req_id field.  An empty string
@@ -837,6 +838,8 @@ class PDBackendAsync(AllocatorBackendInterface):
                 )
                 for idx, mem_obj in enumerate(memory_objs):
                     if idx not in completed_indexes:
+                        logger.warning("[PD-XFER] ref_count_down idx=%d",
+                                   idx)
                         mem_obj.ref_count_down()
                         completed_indexes.add(idx)
 
@@ -874,7 +877,8 @@ class PDBackendAsync(AllocatorBackendInterface):
                         )
         except BaseException as e:
             if not isinstance(e, asyncio.CancelledError):
-                logger.error("Async transfer task failed: %s", str(e))
+                import traceback
+                logger.error("Async transfer task failed: %s\n%s", str(e), traceback.format_exc())
             # Release ref counts on error to avoid leaks (only those not yet released)
             for idx, mem_obj in enumerate(memory_objs):
                 if idx not in completed_indexes:
@@ -904,8 +908,14 @@ class PDBackendAsync(AllocatorBackendInterface):
         """
         if self.pd_config.role == "sender" and count > 0:
             with self._sender_staging_condition:
+                beforex = self._sender_inflight_chunks
                 self._sender_inflight_chunks = max(
                     0, self._sender_inflight_chunks - count
+                )
+                logger.warning(
+                    "[PD-FREE] sender release %d chunks, "
+                    "inflight: %d -> %d",
+                    count, beforex, self._sender_inflight_chunks,
                 )
                 self._sender_staging_condition.notify_all()
 

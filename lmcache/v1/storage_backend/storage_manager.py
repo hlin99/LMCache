@@ -429,7 +429,9 @@ class StorageManager:
             backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
 
         for cname, (ks, objs) in obj_dict.items():
-            for memory_obj in objs:
+            for i, memory_obj in enumerate(objs):
+                logger.warning("[REF-TRACE] batched_put cleanup %d/%d, ", 
+                               i, len(objs))
                 memory_obj.ref_count_down()
 
     def get(
