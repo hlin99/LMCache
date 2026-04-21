@@ -761,9 +761,16 @@ class PDBackendAsync(AllocatorBackendInterface):
         A value of ``-1`` means allocation failed on the receiver; in that
         case the entire request is aborted — all local objects are released
         and no RDMA write or ProxyNotif is sent.
+
+        DEADLOCK FIX: Sender staging chunks are released immediately after
+        the memory objects are allocated and before attempting receiver
+        allocation. This prevents deadlock when both sender and receiver
+        buffers become full simultaneously - the sender can continue
+        allocating new chunks even while waiting for receiver space.
         """
         completed_indexes: set[int] = set()
         num_chunks = len(memory_objs)
+        staging_released = False
 
         # Extract req_id for per-request allocation accounting on the receiver.
         # Using getattr with a default of "" keeps this backwards-compatible with
@@ -780,6 +787,12 @@ class PDBackendAsync(AllocatorBackendInterface):
         )
 
         try:
+            # Release sender staging chunks BEFORE attempting receiver allocation.
+            # This is critical to prevent deadlock: if receiver allocation blocks
+            # waiting for space, we want other prefill threads to continue
+            # allocating from the sender staging buffer so the pipeline stays full.
+            self._release_sender_staging_chunks(num_chunks)
+            staging_released = True
             alloc_request = self._get_remote_alloc_request(
                 keys, memory_objs, req_id=req_id, is_last_batch=is_last_batch
             )
@@ -866,10 +879,12 @@ class PDBackendAsync(AllocatorBackendInterface):
             if isinstance(e, asyncio.CancelledError):
                 raise
         finally:
-            # Release sender staging buffer slots so that allocate() waiters
-            # can proceed.  num_chunks equals the number of memory objects that
-            # were allocated from the staging buffer via allocate().
-            self._release_sender_staging_chunks(num_chunks)
+            # Release sender staging buffer slots if not already released.
+            # With the deadlock fix, staging_released will be True in the normal
+            # case (chunks released before receiver allocation). Only release here
+            # if an error occurred before we could release them earlier.
+            if not staging_released:
+                self._release_sender_staging_chunks(num_chunks)
 
     def _release_sender_staging_chunks(self, count: int) -> None:
         """Decrement sender staging inflight counter and notify waiters.
