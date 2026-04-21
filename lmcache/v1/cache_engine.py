@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 # Standard
 import asyncio
+import copy
 import gc
 import multiprocessing
 import time
@@ -455,6 +456,63 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        # Detect PD sender backend: if the allocator backend exposes
+        # pd_sender_max_inflight_chunks (a positive integer), we are in
+        # the PD sender role and must use the sliding-window sub-batch path
+        # when N > T (more chunks than the PD buffer can hold at once).
+        transfer_spec = kwargs.get("transfer_spec", None)
+        pd_backend = getattr(
+            getattr(self.storage_manager, "allocator_backend", None),
+            "wait_for_pd_sender_slots",
+            None,
+        )
+        pd_sender_max: Optional[int] = None
+        if pd_backend is not None:
+            pd_sender_max = getattr(
+                self.storage_manager.allocator_backend,
+                "pd_sender_max_inflight_chunks",
+                None,
+            )
+
+        # For PD sender with a non-None pd_sender_max we need a partial
+        # transfer spec (is_last_prefill=False) for all but the last sub-batch.
+        # We build it once here so each flush loop below can use it directly.
+        partial_transfer_spec = None
+        if pd_sender_max is not None and transfer_spec is not None:
+            partial_transfer_spec = copy.copy(transfer_spec)
+            if hasattr(partial_transfer_spec, "is_last_prefill"):
+                partial_transfer_spec.is_last_prefill = False
+
+        def _flush_partial_batch(
+            cur_starts: List[int],
+            cur_ends: List[int],
+            cur_keys: List[CacheEngineKey],
+            cur_objs: List[MemoryObj],
+            spec: Any,
+        ) -> None:
+            """Copy GPU data and enqueue transfer for a partial batch.
+
+            Called during the allocation loop when the PD buffer is full and
+            we need to flush what we have so far to free slots for the next
+            sub-batch.
+
+            :param cur_starts: Start token indices for this partial batch.
+            :param cur_ends: End token indices for this partial batch.
+            :param cur_keys: Cache keys for this partial batch.
+            :param cur_objs: Pre-allocated memory objects for this batch.
+            :param spec: Transfer spec to use (typically partial_transfer_spec
+                with is_last_prefill=False).
+            """
+            self.gpu_connector.batched_from_gpu(
+                cur_objs, cur_starts, cur_ends, **kwargs
+            )
+            self.storage_manager.batched_put(
+                cur_keys,
+                cur_objs,
+                transfer_spec=spec,
+                location=self.store_location,
+            )
+
         with store_stats.profile_process_tokens():
             prev_key = 0
             for start, end, key in self.token_database.process_tokens(
@@ -479,6 +537,43 @@ class LMCacheEngine:
                     ),
                     fmt=self.fmt,
                 )
+
+                if memory_obj is None and pd_sender_max is not None and memory_objs:
+                    # PD sender sliding-window: the pool is full (allocate()
+                    # returned None immediately without blocking).  Flush the
+                    # current partial batch to start the RDMA transfer, then
+                    # wait for at least one slot to free up before retrying.
+                    logger.info(
+                        "[req_id=%s] PD sender buffer full after %d chunks; "
+                        "flushing partial batch and waiting for slots.",
+                        req_id,
+                        len(memory_objs),
+                    )
+                    _flush_partial_batch(
+                        starts, ends, keys, memory_objs, partial_transfer_spec
+                    )
+                    # Clear the accumulators — ownership transferred to the
+                    # async transfer task via batched_put.
+                    starts = []
+                    ends = []
+                    keys = []
+                    memory_objs = []
+
+                    # Block until at least one PD buffer slot is free.
+                    self.storage_manager.allocator_backend.wait_for_pd_sender_slots(
+                        n=1
+                    )
+
+                    # Retry the allocation now that a slot should be available.
+                    memory_obj = self.storage_manager.allocate(
+                        kv_shapes,
+                        kv_dtypes,
+                        busy_loop=self.config.get_extra_config_value(
+                            "force_store_wait", False
+                        ),
+                        fmt=self.fmt,
+                    )
+
                 if memory_obj is None:
                     logger.warning(
                         "Local cpu memory under pressure so"
@@ -533,7 +628,6 @@ class LMCacheEngine:
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
         with store_stats.profile_put():
-            transfer_spec = kwargs.get("transfer_spec", None)
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(

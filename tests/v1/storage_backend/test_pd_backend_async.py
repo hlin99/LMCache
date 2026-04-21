@@ -65,7 +65,12 @@ def _make_mem_obj(idx: int = 0) -> MemoryObj:
         fmt=MemoryFormat.KV_2LTD,
         shape=torch.Size(_DEFAULT_SHAPE),
         dtype=torch.bfloat16,
+        shapes=[torch.Size(_DEFAULT_SHAPE)],
+        dtypes=[torch.bfloat16],
     )
+    # Provide a real CPU tensor so the receiver staging path can call
+    # torch.empty_like() and .copy_() without hitting a MagicMock.
+    obj.tensor = torch.zeros(_DEFAULT_SHAPE, dtype=torch.bfloat16)
     obj.get_ref_count.return_value = 1
     return obj
 
@@ -276,32 +281,49 @@ def test_sender_nonblocking_fifo_transfers(async_sender):
     assert completion_order == list(range(N))
 
 
-def test_sender_flow_control_backpressure(async_sender):
-    """allocate() blocks when staging buffer is full, unblocks on release."""
+def test_sender_non_blocking_when_pool_full(async_sender):
+    """allocate() returns None immediately (non-blocking) when pool is full.
+
+    The old implementation blocked the caller until a slot was freed; the
+    new sliding-window design returns None instantly so cache_engine.store()
+    can flush its current partial batch and retry.
+    """
+    with async_sender._sender_staging_condition:
+        async_sender._sender_inflight_chunks = async_sender._sender_max_inflight_chunks
+
+    t0 = time.monotonic()
+    result = async_sender.allocate(torch.Size(_DEFAULT_SHAPE), torch.bfloat16)
+    elapsed = time.monotonic() - t0
+
+    assert result is None, "allocate() must return None when pool is full"
+    assert elapsed < TRANSFER_DELAY * NONBLOCKING_THRESHOLD_RATIO, (
+        f"allocate() took {elapsed:.3f}s — should return immediately"
+    )
+
+
+def test_sender_wait_for_slots_blocks_and_unblocks(async_sender):
+    """wait_for_pd_sender_slots() blocks when pool full, unblocks on release."""
     sentinel = _make_mem_obj(idx=77)
     async_sender.memory_allocator.allocate = MagicMock(return_value=sentinel)
 
     with async_sender._sender_staging_condition:
         async_sender._sender_inflight_chunks = async_sender._sender_max_inflight_chunks
 
-    result = []
-    blocked = threading.Event()
     unblocked = threading.Event()
 
     def worker():
-        blocked.set()
-        result.append(async_sender.allocate(torch.Size(_DEFAULT_SHAPE), torch.bfloat16))
+        async_sender.wait_for_pd_sender_slots(n=1)
         unblocked.set()
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
-    assert blocked.wait(timeout=2.0)
     time.sleep(0.1)
-    assert not unblocked.is_set(), "allocate() should be blocked"
+    assert not unblocked.is_set(), "wait_for_pd_sender_slots() should be blocked"
 
     async_sender._release_sender_staging_chunks(1)
-    assert unblocked.wait(timeout=2.0)
-    assert result[0] is sentinel
+    assert unblocked.wait(timeout=2.0), (
+        "should unblock after _release_sender_staging_chunks"
+    )
     t.join(timeout=1.0)
 
 
@@ -555,47 +577,83 @@ def test_receiver_last_chunk_shape_override(async_receiver):
     assert shapes_seen[-1][tok_dim] == LAST_TOKS
 
 
-@pytest.mark.parametrize(
-    "max_t, b1_n, b2_n, b1_off, b2_off",
-    [(5, 5, 1, 0, 5), (4, 3, 2, 5000, 6000)],
-    ids=["exact-then-overflow", "partial-then-overflow"],
-)
-def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, b2_off):
-    """Cumulative chunks > max_inflight → RuntimeError; prior batch kept."""
+def test_receiver_single_batch_overflow(async_receiver):
+    """Single AllocRequest with size > max_inflight_chunks raises RuntimeError."""
+    max_t = 3
     async_receiver._max_inflight_chunks = max_t
     async_receiver.allocate = _auto_alloc()
-    req_id = "req-failfast"
-
-    b1_keys = [_make_key(b1_off + i) for i in range(b1_n)]
+    req_id = "req-overflow"
 
     async def run():
-        r1 = await async_receiver._async_allocate_and_put(
-            _make_alloc_req(b1_keys, req_id=req_id)
-        )
-        assert -1 not in r1.remote_indexes and len(r1.remote_indexes) == b1_n
-
         with pytest.raises(RuntimeError, match="max_inflight_chunks"):
             await async_receiver._async_allocate_and_put(
                 _make_alloc_req(
-                    [_make_key(b2_off + i) for i in range(b2_n)], req_id=req_id
+                    [_make_key(i) for i in range(max_t + 1)],  # size > max
+                    req_id=req_id,
                 )
             )
 
     asyncio.run(run())
 
-    for k in b1_keys:
-        assert async_receiver.contains(k, pin=False)
 
-    # unrelated req_id should work fine
-    async_receiver._inflight_chunks = 0
+def test_receiver_sliding_window_multi_batch(async_receiver):
+    """Multiple sub-batches for the same req_id work via staging (N > T path).
 
-    async def check_other():
-        r = await async_receiver._async_allocate_and_put(
-            _make_alloc_req([_make_key(20000)], req_id="req-other")
+    When N > T, the sender splits into sub-batches.  Each AllocRequest for
+    sub-batch k+1 tells the receiver that sub-batch k's RDMA write is complete,
+    so the receiver stages k's data (PD buffer → CPU staging) and frees the PD
+    slots for k+1.  All keys remain accessible after the full transfer.
+    """
+    max_t = 2
+    async_receiver._max_inflight_chunks = max_t
+    async_receiver.allocate = _auto_alloc()
+    req_id = "req-sliding-window"
+
+    b1_keys = [_make_key(100 + i) for i in range(max_t)]
+    b2_keys = [_make_key(200 + i) for i in range(max_t)]
+
+    async def run():
+        # Sub-batch 1 (not last): fills PD buffer
+        r1 = await async_receiver._async_allocate_and_put(
+            _make_alloc_req(b1_keys, req_id=req_id, is_last_batch=False)
         )
-        assert -1 not in r.remote_indexes
+        assert -1 not in r1.remote_indexes
+        assert len(r1.remote_indexes) == max_t
 
-    asyncio.run(check_other())
+        # inflight should be max_t (buffer full)
+        async with async_receiver._inflight_condition:
+            assert async_receiver._inflight_chunks == max_t
+
+        # Sub-batch 2 (last): staging of sub-batch 1 happens automatically,
+        # freeing the PD slots before allocating for sub-batch 2.
+        r2 = await async_receiver._async_allocate_and_put(
+            _make_alloc_req(b2_keys, req_id=req_id, is_last_batch=True)
+        )
+        assert -1 not in r2.remote_indexes
+        assert len(r2.remote_indexes) == max_t
+
+        # After staging batch 1 and allocating batch 2, inflight = max_t
+        # (batch 1 freed during staging, batch 2 now occupies the slots)
+        async with async_receiver._inflight_condition:
+            assert async_receiver._inflight_chunks == max_t
+
+    asyncio.run(run())
+
+    # Both batches' keys must be accessible
+    for k in b1_keys:
+        assert async_receiver.contains(k, pin=False), f"{k} not found (batch 1)"
+    for k in b2_keys:
+        assert async_receiver.contains(k, pin=False), f"{k} not found (batch 2)"
+
+    # Batch 1 keys are in CPU staging; batch 2 keys are still in PD buffer
+    for k in b1_keys:
+        assert k.to_string() in async_receiver._staging_keys
+    for k in b2_keys:
+        assert k.to_string() not in async_receiver._staging_keys
+
+    # req_id should have been cleaned up (is_last_batch=True)
+    assert req_id not in async_receiver._req_allocated_keys
+
 
 
 def test_receiver_alloc_timeout(async_receiver):

@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
+import ctypes
 import os
 import threading
 import time
@@ -27,6 +28,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
+    MemoryObjMetadata,
     PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
@@ -36,6 +38,141 @@ from lmcache.v1.transfer_channel import CreateTransferChannel
 from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
 logger = init_logger(__name__)
+
+
+class _ReceiverStagingMemoryObj(MemoryObj):
+    """Lightweight CPU staging object for the receiver slow-path (N > T).
+
+    When a request needs more chunks than the PD buffer can hold
+    simultaneously (N > T), completed sub-batches are moved from the PD
+    buffer to these CPU-backed objects immediately after each RDMA write
+    completes.  This frees PD buffer slots for subsequent sub-batches while
+    keeping data accessible for the decoder's ``to_gpu`` retrieval step.
+
+    Unlike ``TensorMemoryObj``, this class does **not** own any allocator
+    pool slot.  Memory is Python-managed (``torch.Tensor``) and released when
+    the object is garbage-collected.
+
+    :param data: A CPU tensor holding the KV chunk data (already shaped and
+        typed; copied from the corresponding PD buffer slice).
+    :param meta: Metadata copied from the original PD ``MemoryObj`` (shape,
+        dtype, fmt, etc.).
+    """
+
+    def __init__(self, data: torch.Tensor, meta: MemoryObjMetadata) -> None:
+        super().__init__(meta)
+        self.raw_data = data
+        self._valid = True
+
+    # ------------------------------------------------------------------ #
+    # MemoryObj abstract interface                                         #
+    # ------------------------------------------------------------------ #
+
+    def invalidate(self) -> None:
+        self._valid = False
+
+    def is_valid(self) -> bool:
+        return self._valid
+
+    def get_size(self) -> int:
+        return self.raw_data.nbytes
+
+    def get_shape(self) -> torch.Size:
+        return self.meta.shape
+
+    def get_shapes(self) -> list:
+        return [self.meta.shape]
+
+    def get_dtypes(self) -> list:
+        return [self.meta.dtype]
+
+    def get_memory_format(self) -> MemoryFormat:
+        return self.meta.fmt
+
+    def get_physical_size(self) -> int:
+        return self.raw_data.nbytes
+
+    def pin(self) -> bool:
+        return True
+
+    def unpin(self) -> bool:
+        return True
+
+    def ref_count_up(self) -> None:
+        # No-op: staging objects are not ref-counted via allocator pools.
+        pass
+
+    def ref_count_down(self) -> None:
+        # No-op: the underlying tensor is released when the Python object is
+        # garbage-collected (when the last reference is dropped).
+        pass
+
+    def get_ref_count(self) -> int:
+        return 1
+
+    def get_num_tokens(self) -> int:
+        return self.meta.shape[self.meta.fmt.token_dim()]
+
+    @property
+    def metadata(self) -> MemoryObjMetadata:
+        return self.meta
+
+    @property
+    def tensor(self) -> Optional[torch.Tensor]:
+        """Return the staged CPU tensor (already shaped and typed)."""
+        if not self._valid:
+            return None
+        return self.raw_data
+
+    @property
+    def byte_array(self) -> memoryview:
+        """Return a memoryview of the raw bytes of the staging tensor."""
+        num_bytes = self.raw_data.nbytes
+        ptr = self.raw_data.data_ptr()
+        ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
+        byte_arr = (ctypes.c_ubyte * num_bytes).from_address(
+            ctypes.addressof(ubyte_ptr.contents)
+        )
+        return memoryview(byte_arr)
+
+    @property
+    def data_ptr(self) -> int:
+        """Return the raw data pointer of the staging tensor."""
+        return self.raw_data.data_ptr()
+
+    @property
+    def is_pinned(self) -> bool:
+        """Staging objects are never pinned."""
+        return False
+
+    @property
+    def can_evict(self) -> bool:
+        """Staging objects cannot be evicted through the normal eviction path."""
+        return False
+
+    @property
+    def raw_tensor(self) -> Optional[torch.Tensor]:
+        """Return the raw staging tensor."""
+        if not self._valid:
+            return None
+        return self.raw_data
+
+    def get_tensor(self, index: int) -> Optional[torch.Tensor]:
+        """Return the tensor for group *index*.
+
+        For PD staging objects the data is a single shaped tensor (index=0).
+
+        :param index: Group index (0 for primary group).
+        :return: The staging tensor for index 0; None for all other indices.
+        :rtype: Optional[torch.Tensor]
+        """
+        if not self._valid or index != 0:
+            return None
+        return self.raw_data
+
+    def parent(self) -> None:  # type: ignore[override]
+        """Staging objects have no parent allocator."""
+        return None
 
 
 class PDMsgBase(msgspec.Struct, tag=True):
@@ -346,10 +483,18 @@ class PDBackendAsync(AllocatorBackendInterface):
                 self._chunk_size_bytes,
             )
             # Per-request key tracking for fail-fast detection and rollback.
-            # Maps req_id → list of key strings allocated across all batches.
+            # Maps req_id → list of key strings *currently in PD buffer* for
+            # this req_id (NOT yet staged to CPU staging objects).  When the
+            # next sub-batch AllocRequest arrives we know the prior sub-batch's
+            # RDMA write is complete and we can safely stage those keys.
             self._req_allocated_keys: dict[str, list[str]] = {}
             # Admission control: only one req_id's batches processed at a time.
             self._admission_owner: str = ""
+            # Set of key strings whose data has been moved from the PD buffer
+            # to a _ReceiverStagingMemoryObj.  remove() uses this set to skip
+            # the inflight counter decrement (the PD slot was already freed
+            # during the staging step, not at decoder-consumption time).
+            self._staging_keys: set[str] = set()
 
         self.full_chunk_size_bytes = config.chunk_size
 
@@ -479,61 +624,49 @@ class PDBackendAsync(AllocatorBackendInterface):
             # combined so a thread can never pass flow control only to have
             # another thread steal the last memory slot before it allocates.
             #
+            # Sliding-window behaviour for N > T:
+            # When inflight_chunks >= max (pool full), return None immediately
+            # instead of blocking.  cache_engine.store() detects None, flushes
+            # its current partial batch (from_gpu + batched_put), then calls
+            # wait_for_pd_sender_slots() to block until a slot frees up before
+            # retrying.  This breaks the deadlock that occurred when store()
+            # tried to allocate all N chunks upfront while no transfer had
+            # started yet to release any slots.
+            #
             # The loop body, executed under _sender_staging_condition, does:
             #   1. Check running flag — exit immediately on shutdown.
-            #   2. Check flow-control threshold — only attempt allocation when
-            #      inflight_chunks < max; otherwise fall through to wait.
+            #   2. Check flow-control threshold — if at threshold, return None
+            #      immediately (caller handles the retry).
             #   3. Attempt allocation — on success, increment the counter and
             #      return; the check + allocate + increment form an atomic unit
             #      protected by the condition lock.
-            #   4. Wait — either the threshold is exceeded or allocation failed
-            #      (fragmentation / pool exhausted).  In both cases we wait for
-            #      _release_sender_staging_chunks to call notify_all().
-            #
-            # Flow-control waits are not counted against the allocation deadline:
-            # they loop back to the top and re-check the threshold, so a long
-            # backpressure pause does not consume the 5-second allocation budget.
-            # Once the threshold is satisfied we start a fresh deadline for the
-            # actual allocation attempts.
+            #   4. Wait — if allocation failed (fragmentation / pool exhausted
+            #      but counter is below max), wait for _release_sender_staging_chunks
+            #      to call notify_all().
             with self._sender_staging_condition:
-                # deadline is initialised here and reset whenever backpressure
-                # is active so that flow-control waits do not consume the
-                # allocation budget.
-                deadline: float = time.monotonic() + self._allocation_timeout
-                last_near_full_log = 0.0
-                while True:
-                    if not self.running:
-                        return None
+                if not self.running:
+                    return None
 
-                    at_threshold = (
-                        self._sender_inflight_chunks >= self._sender_max_inflight_chunks
+                at_threshold = (
+                    self._sender_inflight_chunks >= self._sender_max_inflight_chunks
+                )
+
+                if at_threshold:
+                    # Pool full: return None so the caller can flush its
+                    # partial batch and wait for slots to free up via
+                    # wait_for_pd_sender_slots().
+                    logger.debug(
+                        "Sender staging buffer full: "
+                        "inflight_chunks=%d >= max=%d, returning None "
+                        "(caller should flush partial batch and retry).",
+                        self._sender_inflight_chunks,
+                        self._sender_max_inflight_chunks,
                     )
+                    return None
 
-                    if at_threshold:
-                        # Log near-full warning at most once per second to avoid
-                        # spamming.
-                        now = time.monotonic()
-                        if now - last_near_full_log >= 1.0:
-                            logger.warning(
-                                "Sender staging buffer near-full: "
-                                "inflight_chunks=%d >= max=%d, waiting for "
-                                "transfers to complete...",
-                                self._sender_inflight_chunks,
-                                self._sender_max_inflight_chunks,
-                            )
-                            last_near_full_log = now
-                        # Reset the allocation deadline so that once
-                        # backpressure clears the thread gets a fresh
-                        # 5-second window for actual allocation attempts.
-                        deadline = time.monotonic() + self._allocation_timeout
-                        self._sender_staging_condition.wait(
-                            timeout=self._condition_poll_interval
-                        )
-                        continue
-
-                    # Under threshold: attempt allocation.  deadline is always
-                    # a valid float at this point (set above or reset in the
-                    # at_threshold branch on a previous iteration).
+                # Under threshold: attempt allocation with timeout.
+                deadline: float = time.monotonic() + self._allocation_timeout
+                while True:
                     mem_obj = self.memory_allocator.allocate(
                         shapes, dtypes, fmt=fmt, allocator_type=alloc_type
                     )
@@ -626,6 +759,72 @@ class PDBackendAsync(AllocatorBackendInterface):
         :rtype: bool
         """
         return False
+
+    @property
+    def pd_sender_max_inflight_chunks(self) -> Optional[int]:
+        """Return the maximum inflight chunks for the sender, or None.
+
+        Used by ``cache_engine.store()`` to detect the PD sender backend and
+        decide whether to use the sliding-window sub-batch allocation path.
+
+        :return: ``_sender_max_inflight_chunks`` (= PD buffer capacity in
+            chunks) when this instance is a sender, ``None`` otherwise.
+        :rtype: Optional[int]
+        """
+        if self.pd_config.role == "sender":
+            return self._sender_max_inflight_chunks
+        return None
+
+    def wait_for_pd_sender_slots(
+        self,
+        n: int = 1,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Block until at least *n* PD buffer slots are available on the sender.
+
+        Called by ``cache_engine.store()`` after it submits a partial batch
+        (from_gpu + batched_put) to wait for the in-flight RDMA transfers to
+        complete and free their slots before allocating the next sub-batch.
+
+        Uses the same ``_sender_staging_condition`` that
+        ``_release_sender_staging_chunks`` notifies, so the wait resolves as
+        soon as the async transfer task calls ``_release_sender_staging_chunks``.
+
+        :param n: Minimum number of free slots required before returning.
+            Defaults to 1.
+        :param timeout: Maximum wall-clock seconds to wait.  Defaults to
+            ``_allocation_timeout * 10``.
+        :return: ``True`` if the required slots became available, ``False``
+            on timeout or shutdown.
+        :rtype: bool
+        """
+        if self.pd_config.role != "sender":
+            return True
+        effective_timeout = (
+            timeout if timeout is not None else self._allocation_timeout * 10
+        )
+        deadline = time.monotonic() + effective_timeout
+        with self._sender_staging_condition:
+            while True:
+                if not self.running:
+                    return False
+                free = self._sender_max_inflight_chunks - self._sender_inflight_chunks
+                if free >= n:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "wait_for_pd_sender_slots timed out after %.1fs "
+                        "(inflight=%d, max=%d, need %d free).",
+                        effective_timeout,
+                        self._sender_inflight_chunks,
+                        self._sender_max_inflight_chunks,
+                        n,
+                    )
+                    return False
+                self._sender_staging_condition.wait(
+                    timeout=min(remaining, self._condition_poll_interval)
+                )
 
     ############################################################
     # Prefiller functions
@@ -1289,15 +1488,27 @@ class PDBackendAsync(AllocatorBackendInterface):
         ``remote_indexes`` has exactly one entry per key in the request.
 
         Error semantics:
-        - Fail-fast (cumulative chunks > max_inflight_chunks): raises
+        - Fail-fast (current batch > max_inflight_chunks): raises
           ``RuntimeError`` immediately; no rollback is performed.
         - Allocator timeout (allocate() returns None after
           ``self._allocation_timeout`` seconds): raises ``RuntimeError``;
           already-allocated chunks in the current batch are rolled back via
           ``remove()`` to prevent memory and inflight counter leaks.
         - Backpressure wait (inflight >= max_inflight_chunks): indefinite
-          while ``self.running``.  The sender will not submit new chunks
-          until the decoder frees some, so this wait is expected to resolve.
+          while ``self.running``.  With sub-batching, prior sub-batches are
+          staged (moved to CPU staging) before this wait runs, so free slots
+          become available immediately.
+
+        Sliding-window (N > T) support:
+        When the sender sends multiple sub-batches for the same ``req_id``
+        (``is_last_batch=False`` on intermediate batches), the receiver uses
+        the RDMA ordering guarantee: by the time AllocRequest for sub-batch k+1
+        arrives, sub-batch k's RDMA write is guaranteed to be complete.  The
+        receiver therefore stages all keys in ``_req_allocated_keys[req_id]``
+        (the prior PD-buffer keys) before allocating new PD slots for the
+        current sub-batch.  Staging copies PD buffer data to a
+        ``_ReceiverStagingMemoryObj`` and immediately frees the PD slot,
+        making room for the next sub-batch.
         """
         total_allocs = len(alloc_request.keys)
         req_id = alloc_request.req_id
@@ -1355,24 +1566,19 @@ class PDBackendAsync(AllocatorBackendInterface):
                     self._admission_owner = ""
                     self._admission_condition.notify_all()
 
-        # Fail-fast: detect if this request can never complete because it
-        # requires more chunks than the decoder buffer can ever hold at once.
-        # The decoder needs all chunks present before it can start consuming,
-        # so C_req > max_inflight_chunks is an impossible configuration.
+        # Fail-fast: detect if the *current* batch exceeds the buffer limit.
+        # With the sliding-window design, each AllocRequest carries at most T
+        # chunks (one sub-batch).  We only check total_allocs against the
+        # maximum, not the cumulative count across sub-batches (which would
+        # wrongly reject all multi-batch requests).
         if req_id:
-            prev_count = len(self._req_allocated_keys.get(req_id, []))
-            new_total = prev_count + total_allocs
-            if new_total > self._max_inflight_chunks:
+            if total_allocs > self._max_inflight_chunks:
                 await _release_admission()
                 raise RuntimeError(
-                    f"Request {req_id} requires {new_total} total chunks "
-                    f"(already allocated {prev_count}, new batch {total_allocs}) "
-                    f"but max_inflight_chunks={self._max_inflight_chunks}. "
-                    f"This request can never complete because the decoder requires "
-                    f"all chunks before it can start consuming. "
-                    f"To fix: increase pd_buffer_size so that "
-                    f"max_inflight_chunks >= total chunks needed for the largest "
-                    f"request, or reduce prompt length / chunk size."
+                    f"Request {req_id} sub-batch size {total_allocs} exceeds "
+                    f"max_inflight_chunks={self._max_inflight_chunks}. "
+                    f"Each sub-batch must fit within the PD buffer.  "
+                    f"Increase pd_buffer_size or reduce chunk size."
                 )
         else:
             # No req_id provided (legacy sender or untracked call); per-request
@@ -1382,6 +1588,72 @@ class PDBackendAsync(AllocatorBackendInterface):
                 "AllocRequest has no req_id — per-request chunk accounting "
                 "is disabled for this batch (C_req > T fail-fast will not fire)"
             )
+
+        # ------------------------------------------------------------------ #
+        # Sliding-window staging: if prior sub-batches exist for this req_id,
+        # their RDMA writes are guaranteed complete (the sender only sends the
+        # next AllocRequest after the previous async_batched_write returns).
+        # Move those PD-buffer objects to CPU staging now to free the slots
+        # before we try to allocate new ones below.
+        # ------------------------------------------------------------------ #
+        if req_id and self._req_allocated_keys.get(req_id):
+            prior_keys = list(self._req_allocated_keys[req_id])
+            # Clear the PD-buffer key list; the keys are being staged.
+            self._req_allocated_keys[req_id].clear()
+            logger.info(
+                "Req %s: staging %d prior PD-buffer chunk(s) to CPU before "
+                "allocating sub-batch of %d.",
+                req_id,
+                len(prior_keys),
+                total_allocs,
+            )
+            for key_str in prior_keys:
+                key = CacheEngineKey.from_string(key_str)
+                # Bump ref-count under the lock so the PD object cannot be
+                # freed between the get and the copy.
+                with self.data_lock:
+                    pd_obj = self.data.get(key)
+                    if pd_obj is None or isinstance(pd_obj, _ReceiverStagingMemoryObj):
+                        # Already staged or removed — nothing to do.
+                        continue
+                    pd_obj.ref_count_up()  # prevent free during tensor copy
+
+                # Perform the tensor copy *outside* the lock so we don't hold
+                # data_lock across a potentially slow memcpy.
+                pd_tensor = pd_obj.tensor
+                if pd_tensor is None:
+                    pd_obj.ref_count_down()
+                    continue
+                staging_tensor = torch.empty_like(pd_tensor, device="cpu")
+                staging_tensor.copy_(pd_tensor)
+
+                staging_meta = MemoryObjMetadata(
+                    shape=pd_obj.meta.shape,
+                    dtype=pd_obj.meta.dtype,
+                    address=0,  # Not backed by a PD pool slot
+                    phy_size=staging_tensor.nbytes,
+                    ref_count=1,
+                    pin_count=0,
+                    fmt=pd_obj.meta.fmt,
+                    shapes=pd_obj.meta.shapes,
+                    dtypes=pd_obj.meta.dtypes,
+                )
+                staging_obj = _ReceiverStagingMemoryObj(staging_tensor, staging_meta)
+
+                # Under the lock: replace PD obj with staging obj and record
+                # the key as staged so remove() skips the inflight decrement.
+                with self.data_lock:
+                    if self.data.get(key) is pd_obj:
+                        self.data[key] = staging_obj
+                        self._staging_keys.add(key_str)
+
+                # Release the PD buffer slot.  Two decrements:
+                #   1. Undo the ref_count_up() above (2 → 1).
+                #   2. Release the allocation ref (1 → 0 → free PD slot).
+                pd_obj.ref_count_down()
+                pd_obj.ref_count_down()
+                # Notify the inflight condition that a PD slot was freed.
+                await self._notify_inflight_freed()
 
         fmt = MemoryFormat(alloc_request.fmt)
         dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
@@ -1399,6 +1671,9 @@ class PDBackendAsync(AllocatorBackendInterface):
             # block mid-loop on _inflight_condition.  Since the request hasn't
             # finished sending, no ProxyNotif is issued, the decoder never starts
             # consuming, inflight never decreases, and the system deadlocks.
+            #
+            # With sliding-window staging the prior sub-batch's PD slots were
+            # freed above, so this wait normally resolves immediately.
             async with self._inflight_condition:
                 while (
                     self._max_inflight_chunks - self._inflight_chunks
@@ -1495,11 +1770,15 @@ class PDBackendAsync(AllocatorBackendInterface):
             raise
 
         # All allocations in this batch succeeded.
+        # Track the new PD-buffer keys so they can be staged when the next
+        # sub-batch arrives (or cleaned up if this is the last batch).
         if req_id:
             if req_id not in self._req_allocated_keys:
                 self._req_allocated_keys[req_id] = []
             self._req_allocated_keys[req_id].extend(current_batch_keys)
             if alloc_request.is_last_batch:
+                # Last sub-batch: these PD slots will be freed by the decoder
+                # via remove() in the normal (fast-path) way.
                 self._req_allocated_keys.pop(req_id, None)
                 await _release_admission()
 
@@ -1561,16 +1840,31 @@ class PDBackendAsync(AllocatorBackendInterface):
         """
         Remove the key from the storage backend.
 
+        For staging keys (those moved from PD buffer to CPU staging during the
+        sliding-window slow path), the inflight counter is **not** decremented
+        because the PD buffer slot was already freed during the staging step in
+        ``_async_allocate_and_put``.  For regular PD-buffer keys, the inflight
+        counter is decremented as usual.
+
         :param key: The key to remove.
+        :param force: Unused; kept for interface compatibility.
+        :return: True if the key was present and removed, False otherwise.
+        :rtype: bool
         """
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
             if mem_obj is not None:
                 mem_obj.ref_count_down()
                 if self.pd_config.role == "receiver":
-                    asyncio.run_coroutine_threadsafe(
-                        self._notify_inflight_freed(), self._recv_loop
-                    )
+                    key_str = key.to_string()
+                    if key_str in self._staging_keys:
+                        # Staging key: PD slot was already freed during staging.
+                        # Just discard the tracking entry; no inflight decrement.
+                        self._staging_keys.discard(key_str)
+                    else:
+                        asyncio.run_coroutine_threadsafe(
+                            self._notify_inflight_freed(), self._recv_loop
+                        )
                 return True
             return False
 
