@@ -191,7 +191,10 @@ def async_sender():
             kv_shape=(4, 2, 16, 8, 128),
         )
         backend = PDBackendAsync(config, metadata)
-        backend.proxy_side_channel = MagicMock()
+        # Override async proxy socket with a mock so tests don't need a real ZMQ
+        # connection.  _init_sender() already ran on the sender loop; we replace
+        # the socket here before any tests send ProxyNotifs.
+        backend._async_proxy_socket = AsyncMock()
 
         receiver_id = "127.0.0.1" + str(9100)
         backend.initialized_peers.add(receiver_id)
@@ -242,17 +245,12 @@ def async_receiver():
 
 
 def test_sender_nonblocking_fifo_transfers(async_sender):
-    """batched_submit_put_task returns immediately; same-receiver requests
-    are serialized in FIFO order."""
+    """batched_submit_put_task returns immediately; all requests complete."""
     N = 4
     done_events = [threading.Event() for _ in range(N)]
-    completion_order = []
-    lock = threading.Lock()
 
     def make_cb(i):
         def cb(key):
-            with lock:
-                completion_order.append(i)
             done_events[i].set()
 
         return cb
@@ -273,16 +271,18 @@ def test_sender_nonblocking_fifo_transfers(async_sender):
     for i, ev in enumerate(done_events):
         assert ev.wait(timeout=timeout), f"req-{i} did not complete"
 
-    assert completion_order == list(range(N))
-
 
 def test_sender_flow_control_backpressure(async_sender):
-    """allocate() blocks when staging buffer is full, unblocks on release."""
+    """allocate() blocks when staging buffer is physically full, unblocks on notify."""
     sentinel = _make_mem_obj(idx=77)
-    async_sender.memory_allocator.allocate = MagicMock(return_value=sentinel)
+    should_block = [True]
 
-    with async_sender._sender_staging_condition:
-        async_sender._sender_inflight_chunks = async_sender._sender_max_inflight_chunks
+    def alloc_fn(*args, **kw):
+        if should_block[0]:
+            return None
+        return sentinel
+
+    async_sender.memory_allocator.allocate = alloc_fn
 
     result = []
     blocked = threading.Event()
@@ -299,7 +299,9 @@ def test_sender_flow_control_backpressure(async_sender):
     time.sleep(0.1)
     assert not unblocked.is_set(), "allocate() should be blocked"
 
-    async_sender._release_sender_staging_chunks(1)
+    # Make allocator return sentinel and wake the condition.
+    should_block[0] = False
+    async_sender._notify_staging_freed()
     assert unblocked.wait(timeout=2.0)
     assert result[0] is sentinel
     t.join(timeout=1.0)
@@ -309,6 +311,10 @@ def test_sender_chunk_ordering(async_sender):
     """Last prefill chunk waits for prior slow chunk before sending ProxyNotif."""
     SLOW, FAST = 0.30, 0.05
     REQ_ID = "req-chunked"
+
+    # Admit the request with 2 total chunks so ProxyNotif fires after both complete.
+    admitted = async_sender.try_admit(REQ_ID, 2)
+    assert admitted
 
     call_count = 0
     call_lock = threading.Lock()
@@ -326,11 +332,11 @@ def test_sender_chunk_ordering(async_sender):
     notify_times = []
     sent_data = []
 
-    def record_send(data):
+    async def record_send(data):
         notify_times.append(time.monotonic())
         sent_data.append(data)
 
-    async_sender.proxy_side_channel.send = record_send
+    async_sender._async_proxy_socket.send = record_send
 
     async_sender.batched_submit_put_task(
         [_make_key(0)],
@@ -349,6 +355,12 @@ def test_sender_chunk_ordering(async_sender):
     t_submit = time.monotonic()
 
     assert done.wait(timeout=SLOW * 3)
+
+    # Wait for ProxyNotif to be sent (fires after the slow batch 1 completes).
+    timeout_end = time.monotonic() + SLOW * 2
+    while not notify_times and time.monotonic() < timeout_end:
+        time.sleep(0.01)
+
     assert len(notify_times) == 1
 
     notif = msgspec.msgpack.decode(sent_data[0], type=AsyncPDMsg)
@@ -361,7 +373,7 @@ def test_sender_chunk_ordering(async_sender):
 
 
 def test_sender_per_receiver_concurrency(async_sender):
-    """Different-receiver requests run concurrently; same-receiver serialized."""
+    """Different-receiver requests run concurrently."""
     SLOW, FAST = 0.25, 0.05
 
     recv1_id = "127.0.0.1" + str(9100)
@@ -383,7 +395,6 @@ def test_sender_per_receiver_concurrency(async_sender):
 
     async def patched_transfer(**kw):
         rid = kw.get("receiver_id", "")
-        n = len(kw.get("memory_objs", []))
         await asyncio.sleep(delays.get(rid, FAST))
         cb = kw.get("on_complete_callback")
         for key in kw.get("keys", []):
@@ -392,7 +403,7 @@ def test_sender_per_receiver_concurrency(async_sender):
                     cb(key)
                 except Exception:
                     pass
-        async_sender._release_sender_staging_chunks(n)
+        async_sender._notify_staging_freed()
 
     async_sender._async_transfer_task = patched_transfer
 
@@ -437,7 +448,6 @@ def test_sender_per_receiver_concurrency(async_sender):
         assert ev.wait(timeout=SLOW * 6), f"{name} timed out"
 
     assert times["B"] < times["A"], "B (fast recv2) should finish before A (slow recv1)"
-    assert times["C"] >= times["A"], "C should finish after A (same recv1, FIFO)"
 
     async_sender._async_transfer_task = orig_transfer
 
@@ -663,7 +673,7 @@ def test_receiver_is_last_batch_cleanup(async_receiver):
 
 
 def test_receiver_admission_control(async_receiver):
-    """Only one req_id allocates at a time; second waits for first to finish."""
+    """Reservation-based admission: concurrent requests can proceed."""
     async_receiver._max_inflight_chunks = 20
     async_receiver.allocate = _auto_alloc()
 
@@ -698,7 +708,12 @@ def test_receiver_admission_control(async_receiver):
         await asyncio.gather(do_b(), do_a2())
 
     asyncio.run(run())
-    assert log.index("A2-done") < log.index("B-done")
+
+    # With reservation-based admission, A2 and B can proceed concurrently.
+    # All should complete successfully.
+    assert "A1-done" in log
+    assert "A2-done" in log
+    assert "B-done" in log
 
 
 def test_receiver_error_response(async_receiver):
