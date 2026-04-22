@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import math
 import os
 
 # Third Party
@@ -42,6 +43,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.storage_backend.pd_backend_async import PDBackendAsync
 
 if TYPE_CHECKING:
     # Third Party
@@ -85,6 +87,8 @@ class DisaggSpec:
     receiver_alloc_port: int
     is_last_prefill: bool = False
     num_transferred_tokens: int = 0
+    total_chunks: int = 0  # total KV chunks for admission control
+    admitted: bool = False  # True after try_admit() succeeds for this request
 
 
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
@@ -413,7 +417,7 @@ class ReqMeta:
             )
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
-        return ReqMeta(
+        req_meta = ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
@@ -423,6 +427,17 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
         )
+
+        # For disagg requests, compute total_chunks for sender admission control.
+        if tracker.disagg_spec is not None:
+            actual_store_tokens = num_tokens_to_save - skip_leading_tokens
+            if actual_store_tokens > 0:
+                total_chunks_for_req = math.ceil(
+                    actual_store_tokens / lmcache_chunk_size
+                )
+                tracker.disagg_spec.total_chunks = total_chunks_for_req
+
+        return req_meta
 
 
 @dataclass
@@ -1172,6 +1187,24 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
+            # Disagg admission control: reserve sender buffer before store().
+            if request.disagg_spec is not None and request.disagg_spec.total_chunks > 0:
+                if not request.disagg_spec.admitted:
+                    pd_backend = self._get_pd_backend()
+                    if pd_backend is not None:
+                        admitted = pd_backend.try_admit(
+                            request.req_id, request.disagg_spec.total_chunks
+                        )
+                        if not admitted:
+                            logger.warning(
+                                "[DISAGG] req=%s try_admit failed "
+                                "(total_chunks=%d), skipping store",
+                                request.req_id,
+                                request.disagg_spec.total_chunks,
+                            )
+                            continue
+                        request.disagg_spec.admitted = True
+
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1196,6 +1229,15 @@ class LMCacheConnectorV1Impl:
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         return None, None
+
+    def _get_pd_backend(self) -> PDBackendAsync | None:
+        """Return the PDBackendAsync instance if this is a disagg sender, else None."""
+        if self.lmcache_engine is None:
+            return None
+        backend = getattr(self.lmcache_engine, "storage_backend", None)
+        if isinstance(backend, PDBackendAsync) and backend.pd_config.role == "sender":
+            return backend
+        return None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid_blocks = self._invalid_block_ids.copy()
@@ -1679,6 +1721,12 @@ class LMCacheConnectorV1Impl:
             lookup_id = request.request_id
             assert self.lookup_client is not None
             self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
+
+        # Notify PDBackend of aborted disagg requests.
+        if request.status == RequestStatus.FINISHED_ABORTED:
+            pd_backend = self._get_pd_backend()
+            if pd_backend is not None:
+                pd_backend.cancel_request(request.request_id)
 
         params = (
             request.kv_transfer_params
