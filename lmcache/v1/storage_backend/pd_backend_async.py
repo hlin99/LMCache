@@ -140,6 +140,10 @@ class ReservationManager:
         # Threading variant (sender, called from worker threads)
         self._threading_lock = threading.Lock()
         self._threading_condition = threading.Condition(self._threading_lock)
+        # Separate lock for _aborted_reqs to avoid deadlock: try_admit holds
+        # _threading_condition (whose lock IS _threading_lock) and calls
+        # is_aborted() which must not re-acquire _threading_lock.
+        self._abort_lock = threading.Lock()
 
         # Asyncio variant (receiver, created lazily on receiver event loop)
         self._async_condition: asyncio.Condition | None = None
@@ -170,7 +174,7 @@ class ReservationManager:
                 if available >= total_chunks:
                     self._reservations[req_id] = total_chunks
                     self._total_reserved += total_chunks
-                    logger.info(
+                    logger.warning(
                         "[ADMIT] req=%s admitted, reserved=%d, "
                         "total_reserved=%d/%d, available=%d",
                         req_id,
@@ -216,7 +220,7 @@ class ReservationManager:
                 if available >= total_chunks:
                     self._reservations[req_id] = total_chunks
                     self._total_reserved += total_chunks
-                    logger.info(
+                    logger.warning(
                         "[ADMIT] req=%s admitted (async), reserved=%d, "
                         "total_reserved=%d/%d",
                         req_id,
@@ -254,7 +258,7 @@ class ReservationManager:
             count = self._reservations.pop(req_id, 0)
             if count > 0:
                 self._total_reserved -= count
-                logger.info(
+                logger.warning(
                     "[ADMIT] req=%s reservation released, freed=%d, "
                     "total_reserved=%d/%d",
                     req_id,
@@ -274,7 +278,7 @@ class ReservationManager:
             count = self._reservations.pop(req_id, 0)
             if count > 0:
                 self._total_reserved -= count
-                logger.info(
+                logger.warning(
                     "[ADMIT] req=%s reservation released (async), freed=%d, "
                     "total_reserved=%d/%d",
                     req_id,
@@ -289,7 +293,7 @@ class ReservationManager:
 
         :param req_id: The request identifier to abort.
         """
-        with self._threading_lock:
+        with self._abort_lock:
             self._aborted_reqs.add(req_id)
         with self._threading_condition:
             self._threading_condition.notify_all()
@@ -299,7 +303,7 @@ class ReservationManager:
 
         :param req_id: The request identifier to clear.
         """
-        with self._threading_lock:
+        with self._abort_lock:
             self._aborted_reqs.discard(req_id)
 
     def is_aborted(self, req_id: str) -> bool:
@@ -308,7 +312,7 @@ class ReservationManager:
         :param req_id: The request identifier to check.
         :return: True if aborted, False otherwise.
         """
-        with self._threading_lock:
+        with self._abort_lock:
             return req_id in self._aborted_reqs
 
     def get_reserved(self, req_id: str) -> int:
@@ -326,12 +330,16 @@ class ReservationManager:
         :return: Dict with total_chunks, total_reserved, reservations, aborted_reqs.
         """
         with self._threading_lock:
-            return {
-                "total_chunks": self._total_chunks,
-                "total_reserved": self._total_reserved,
-                "reservations": dict(self._reservations),
-                "aborted_reqs": set(self._aborted_reqs),
-            }
+            reservations = dict(self._reservations)
+            total_reserved = self._total_reserved
+        with self._abort_lock:
+            aborted_reqs = set(self._aborted_reqs)
+        return {
+            "total_chunks": self._total_chunks,
+            "total_reserved": total_reserved,
+            "reservations": reservations,
+            "aborted_reqs": aborted_reqs,
+        }
 
     def wake_all(self) -> None:
         """Wake all threading waiters (for shutdown)."""
@@ -973,6 +981,21 @@ class PDBackendAsync(AllocatorBackendInterface):
         if req_id:
             self._req_receiver[req_id] = receiver_id
 
+        # Lazily initialize per-request tracking on first batch seen by the
+        # sender loop. This avoids the race condition where try_admit() (called
+        # from worker threads) would write to dicts exclusively owned by the
+        # sender loop coroutines.
+        if req_id and req_id not in self._req_total_chunks:
+            tc = (
+                getattr(transfer_spec, "total_chunks", 0)
+                if transfer_spec is not None
+                else 0
+            )
+            self._req_total_chunks[req_id] = tc
+            self._completed_chunks[req_id] = 0
+            self._req_has_last[req_id] = False
+            self._sent_keys[req_id] = []
+
         try:
             alloc_request = self._get_remote_alloc_request(
                 keys, memory_objs, req_id=req_id, is_last_batch=is_last_batch
@@ -1085,6 +1108,10 @@ class PDBackendAsync(AllocatorBackendInterface):
         1. All reserved chunks have completed RDMA (_completed_chunks >= total).
         2. The is_last_prefill batch has been seen (_req_has_last is True).
 
+        Also releases the sender reservation at this point so that the buffer
+        space is freed only after RDMA is complete (not prematurely at store
+        time).
+
         :param req_id: The request identifier.
         :param transfer_spec: Used to extract req_id for the notification.
         """
@@ -1094,6 +1121,8 @@ class PDBackendAsync(AllocatorBackendInterface):
 
         if has_last and total > 0 and completed >= total:
             await self._send_proxy_notif(transfer_spec)
+            # Release sender reservation now that RDMA is complete.
+            self._reservation_mgr.release_reservation(req_id)
             # Clean up per-request state.
             self._completed_chunks.pop(req_id, None)
             self._req_has_last.pop(req_id, None)
@@ -1180,25 +1209,25 @@ class PDBackendAsync(AllocatorBackendInterface):
         Called by the adapter before store() to prevent over-subscription of
         the sender staging buffer. Blocks until space is available or timeout.
 
+        Per-request tracking dicts (_req_total_chunks, _completed_chunks,
+        _req_has_last, _sent_keys) are intentionally NOT initialized here
+        because this method is called from vLLM worker threads while those
+        dicts are exclusively owned by _sender_loop coroutines. Initialization
+        happens lazily in _async_transfer_task on first access.
+
         :param req_id: The request identifier to admit.
         :param total_chunks: Total number of chunks this request will transfer.
         :return: True if admitted (reservation created), False on timeout/abort.
         """
-        if not self._reservation_mgr.try_admit(req_id, total_chunks):
-            return False
-        # Initialize per-request tracking on admission.
-        self._req_total_chunks[req_id] = total_chunks
-        self._completed_chunks[req_id] = 0
-        self._req_has_last[req_id] = False
-        self._sent_keys[req_id] = []
-        return True
+        return self._reservation_mgr.try_admit(req_id, total_chunks)
 
     def release_reservation(self, req_id: str) -> None:
         """Release the sender-side reservation for a request.
 
-        Called by the adapter after all batches have been submitted for
-        transfer. This allows new requests to be admitted even while RDMA
-        writes for this request are still in flight.
+        Under normal operation, reservations are released automatically inside
+        _check_and_send_proxy_notif() after all RDMA transfers complete.
+        This method is provided for external/emergency use (e.g., error recovery
+        paths that bypass normal completion tracking).
 
         :param req_id: The request identifier whose reservation to release.
         """

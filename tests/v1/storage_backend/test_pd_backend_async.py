@@ -77,6 +77,7 @@ def _make_transfer_spec(
     req_id="req-0",
     is_last_prefill=True,
     num_transferred_tokens=0,
+    total_chunks=0,
 ):
     return SimpleNamespace(
         receiver_host=receiver_host,
@@ -85,6 +86,7 @@ def _make_transfer_spec(
         req_id=req_id,
         is_last_prefill=is_last_prefill,
         num_transferred_tokens=num_transferred_tokens,
+        total_chunks=total_chunks,
     )
 
 
@@ -123,10 +125,6 @@ def _pd_backend_patches():
             return_value=MagicMock(),
         ),
         patch(
-            "lmcache.v1.storage_backend.pd_backend_async.get_zmq_socket",
-            return_value=MagicMock(),
-        ),
-        patch(
             "lmcache.v1.storage_backend.pd_backend_async.CreateTransferChannel",
             return_value=MagicMock(),
         ),
@@ -139,8 +137,8 @@ def _pd_backend_patches():
 
 @contextmanager
 def _patched_pd():
-    p1, p2, p3, p4 = _pd_backend_patches()
-    with p1, p2, p3, p4:
+    p1, p2, p3 = _pd_backend_patches()
+    with p1, p2, p3:
         yield
 
 
@@ -149,16 +147,15 @@ def _patched_pd():
 
 @pytest.fixture
 def async_sender():
-    p1, p2, p3, p4 = _pd_backend_patches()
+    p1, p2, p3 = _pd_backend_patches()
 
-    with p1, p2 as mock_zmq_sock, p3 as mock_create_tc, p4:
+    with p1, p2 as mock_create_tc, p3:
         alloc_socket = MagicMock()
         alloc_response = AsyncAllocResponse(remote_indexes=[0])
         alloc_socket.recv_multipart = AsyncMock(
             return_value=[b"", msgspec.msgpack.encode(alloc_response)]
         )
         alloc_socket.send_multipart = AsyncMock()
-        mock_zmq_sock.return_value = alloc_socket
 
         tc = MagicMock()
 
@@ -206,9 +203,9 @@ def async_sender():
 
 @pytest.fixture
 def async_receiver():
-    p1, p2, p3, p4 = _pd_backend_patches()
+    p1, p2, p3 = _pd_backend_patches()
 
-    with p1, p2, p3, p4:
+    with p1, p2, p3:
         # First Party
         from lmcache.v1.config import LMCacheEngineConfig
         from lmcache.v1.metadata import LMCacheMetadata
@@ -312,9 +309,9 @@ def test_sender_chunk_ordering(async_sender):
     SLOW, FAST = 0.30, 0.05
     REQ_ID = "req-chunked"
 
-    # Admit the request with 2 total chunks so ProxyNotif fires after both complete.
-    admitted = async_sender.try_admit(REQ_ID, 2)
-    assert admitted
+    # total_chunks=2 is passed via transfer_spec so the sender loop initializes
+    # per-request tracking internally (try_admit is not called from test code
+    # because it belongs to the sender loop, not caller threads).
 
     call_count = 0
     call_lock = threading.Lock()
@@ -341,7 +338,9 @@ def test_sender_chunk_ordering(async_sender):
     async_sender.batched_submit_put_task(
         [_make_key(0)],
         [_make_mem_obj(0)],
-        transfer_spec=_make_transfer_spec(req_id=REQ_ID, is_last_prefill=False),
+        transfer_spec=_make_transfer_spec(
+            req_id=REQ_ID, is_last_prefill=False, total_chunks=2
+        ),
     )
     time.sleep(0.01)
 
@@ -349,7 +348,9 @@ def test_sender_chunk_ordering(async_sender):
     async_sender.batched_submit_put_task(
         [_make_key(1)],
         [_make_mem_obj(1)],
-        transfer_spec=_make_transfer_spec(req_id=REQ_ID, is_last_prefill=True),
+        transfer_spec=_make_transfer_spec(
+            req_id=REQ_ID, is_last_prefill=True, total_chunks=2
+        ),
         on_complete_callback=lambda k: done.set(),
     )
     t_submit = time.monotonic()
