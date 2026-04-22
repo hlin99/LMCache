@@ -1234,7 +1234,10 @@ class LMCacheConnectorV1Impl:
         """Return the PDBackendAsync instance if this is a disagg sender, else None."""
         if self.lmcache_engine is None:
             return None
-        backend = getattr(self.lmcache_engine, "storage_backend", None)
+        sm = self.lmcache_engine.storage_manager
+        if sm is None:
+            return None
+        backend = sm.storage_backends.get("PDBackend")
         if isinstance(backend, PDBackendAsync) and backend.pd_config.role == "sender":
             return backend
         return None
