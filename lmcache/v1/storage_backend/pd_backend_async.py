@@ -762,6 +762,117 @@ class PDBackendAsync(AllocatorBackendInterface):
         Async coroutine that performs the full KV transfer:
         remote alloc → async_batched_write → ref_count_down → callback.
         Runs in the dedicated sender event loop (_sender_loop).
+        """
+        completed_indexes: set[int] = set()
+        num_chunks = len(memory_objs)
+
+        req_id: str = (
+            getattr(transfer_spec, "req_id", "") if transfer_spec is not None else ""
+        )
+        is_last_batch: bool = (
+            getattr(transfer_spec, "is_last_prefill", False)
+            if transfer_spec is not None
+            else False
+        )
+
+        try:
+            alloc_request = self._get_remote_alloc_request(
+                keys, memory_objs, req_id=req_id, is_last_batch=is_last_batch
+            )
+            alloc_response = await self._async_remote_allocate(
+                receiver_id, alloc_request
+            )
+            remote_indexes = alloc_response.remote_indexes
+
+            # Abort the whole request if any slot failed to allocate.
+            for idx, (mem_obj, remote_addr) in enumerate(
+                zip(memory_objs, remote_indexes, strict=True)
+            ):
+                if remote_addr == -1:
+                    logger.warning(
+                        "Receiver allocation failed for key %s (idx=%d), "
+                        "aborting entire request.",
+                        keys[idx],
+                        idx,
+                    )
+                    for j, mo in enumerate(memory_objs):
+                        if j not in completed_indexes:
+                            mo.ref_count_down()
+                            completed_indexes.add(j)
+                    return
+
+            if memory_objs:
+                channel_transfer_spec = {
+                    "receiver_id": receiver_id,
+                    "remote_indexes": remote_indexes,
+                }
+                await self.transfer_channel.async_batched_write(
+                    objects=memory_objs,
+                    transfer_spec=channel_transfer_spec,
+                )
+                for idx, mem_obj in enumerate(memory_objs):
+                    if idx not in completed_indexes:
+                        mem_obj.ref_count_down()
+                        completed_indexes.add(idx)
+
+            # Send ProxyNotif if this is the last prefill chunk.
+            is_last_prefill = transfer_spec is not None and getattr(
+                transfer_spec, "is_last_prefill", False
+            )
+            if is_last_prefill:
+                try:
+                    notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
+                    notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+                    async with self._proxy_send_lock:
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(
+                            None, self.proxy_side_channel.send, notif_msg_bytes
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Failed to send ProxyNotif for req %s: %s",
+                        transfer_spec.req_id,
+                        e,
+                    )
+
+            if on_complete_callback is not None:
+                for key in keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            f"on_complete_callback failed for key {key}: {e}"
+                        )
+        except BaseException as e:
+            if not isinstance(e, asyncio.CancelledError):
+                import traceback
+                logger.error(
+                    "Async transfer task failed: %s\n%s",
+                    str(e), traceback.format_exc(),
+                )
+            for idx, mem_obj in enumerate(memory_objs):
+                if idx not in completed_indexes:
+                    try:
+                        mem_obj.ref_count_down()
+                    except Exception:
+                        pass
+            if isinstance(e, asyncio.CancelledError):
+                raise
+        finally:
+            self._release_sender_staging_chunks(num_chunks)
+
+    async def _async_transfer_task_x(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        receiver_id: str,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+        transfer_spec: Any = None,
+    ) -> None:
+        """
+        Async coroutine that performs the full KV transfer:
+        remote alloc → async_batched_write → ref_count_down → callback.
+        Runs in the dedicated sender event loop (_sender_loop).
 
         ``remote_indexes`` has one entry per key (1:1 with memory_objs).
         A value of ``-1`` means allocation failed on the receiver; in that
@@ -914,8 +1025,9 @@ class PDBackendAsync(AllocatorBackendInterface):
                 )
                 logger.warning(
                     "[PD-FREE] sender release %d chunks, "
-                    "inflight: %d -> %d",
+                    "inflight: %d -> %d, free_chunks=%d",
                     count, beforex, self._sender_inflight_chunks,
+                    self._get_free_chunks(),
                 )
                 self._sender_staging_condition.notify_all()
 
@@ -1430,6 +1542,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             # block mid-loop on _inflight_condition.  Since the request hasn't
             # finished sending, no ProxyNotif is issued, the decoder never starts
             # consuming, inflight never decreases, and the system deadlocks.
+            '''
             async with self._inflight_condition:
                 while (
                     self._max_inflight_chunks - self._inflight_chunks
@@ -1449,7 +1562,7 @@ class PDBackendAsync(AllocatorBackendInterface):
                         self._max_inflight_chunks - self._inflight_chunks,
                     )
                     await self._inflight_condition.wait()
-
+            '''
             for idx, key_str in enumerate(alloc_request.keys):
                 key = CacheEngineKey.from_string(key_str)
 
