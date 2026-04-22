@@ -2,7 +2,7 @@
 
 ## Problem
 
-Chunked-prefill with concurrent requests causes a deadlock: N requests each partially fill the staging buffer, none can complete their full chunk set, and the buffer never drains.
+In chunked-prefill mode, large prompts are split into multiple sequential batches. Each batch allocates physical buffer slots on the receiver before the RDMA write. With multiple concurrent requests, this interleaved allocation creates a deadlock: N requests each partially fill the staging buffer, none can complete their full chunk set, and the buffer never drains.
 
 **Example (buffer = 10 chunks):**
 ```
@@ -85,8 +85,10 @@ Key invariant: `total_reserved <= total_chunks` at all times.
 ### ProxyNotif Ordering
 
 Since batches run concurrently, `is_last_prefill` batch may complete RDMA before earlier batches. ProxyNotif fires only when BOTH:
-1. `completed_chunks >= total_chunks` (all RDMA done), or `total_chunks == 0` (legacy sender)
+1. `completed_chunks >= total_chunks` (all RDMA done), or `total_chunks == 0` (legacy sender — see below)
 2. `req_has_last == True` (is_last_prefill batch completed)
+
+For **legacy senders** (`total_chunks == 0`), no reservation tracking exists so ProxyNotif fires immediately when the `is_last_prefill` batch completes, regardless of how many chunks were transferred. A warning is logged when a legacy sender is detected on the receiver side.
 
 ### Abort Flow
 

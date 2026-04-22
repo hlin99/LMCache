@@ -324,6 +324,14 @@ class ReservationManager:
         with self._threading_lock:
             return self._reservations.get(req_id, 0)
 
+    def get_total_chunks(self) -> int:
+        """Return the total buffer capacity in chunks.
+
+        :return: Total number of chunks this manager was initialised with.
+        :rtype: int
+        """
+        return self._total_chunks
+
     def get_status(self) -> dict:
         """Return diagnostic status dict.
 
@@ -566,7 +574,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
             # The asyncio primitives must be created on the receiver event loop.
             future = asyncio.run_coroutine_threadsafe(
-                self._create_recv_conditions(), self._recv_loop
+                self._create_recv_primitives(), self._recv_loop
             )
             future.result(timeout=5)
             logger.info(
@@ -1287,7 +1295,7 @@ class PDBackendAsync(AllocatorBackendInterface):
     ############################################################
     # Decoder functions
     ############################################################
-    async def _create_recv_conditions(self) -> None:
+    async def _create_recv_primitives(self) -> None:
         """Create asyncio primitives bound to the receiver event loop.
 
         Must be called from within the receiver event loop.
@@ -1461,7 +1469,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         if req_id:
             prev_count = len(self._req_allocated_keys.get(req_id, []))
             new_total = prev_count + total_allocs
-            total_capacity = self._recv_reservation_mgr._total_chunks
+            total_capacity = self._recv_reservation_mgr.get_total_chunks()
             if new_total > total_capacity:
                 if alloc_request.total_chunks > 0:
                     await self._recv_reservation_mgr.async_release_reservation(req_id)
