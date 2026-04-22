@@ -55,7 +55,7 @@ class AllocRequest(PDMsgBase):
     dtype: str
     last_chunk_toks: int
     # req_id is used by the receiver for per-request chunk accounting and
-    # fail-fast detection when C_req > max_inflight_chunks.  An empty string
+    # fail-fast detection when C_req > total_chunks.  An empty string
     # means the sender does not provide an identifier (backwards-compatible);
     # in that case per-request chunk accounting and fail-fast detection are
     # skipped for this allocation request.
@@ -558,24 +558,21 @@ class PDBackendAsync(AllocatorBackendInterface):
             self._init_sender()
         elif self.pd_config.role == "receiver":
             total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
-            self._max_inflight_chunks = total_chunks
-            self._inflight_chunks = 0
             # Reservation-based admission control for receiver.
             self._recv_reservation_mgr = ReservationManager(
                 total_chunks,
                 self._allocation_timeout,
                 self._condition_poll_interval,
             )
-            # The conditions must be created on the receiver event loop.
+            # The asyncio primitives must be created on the receiver event loop.
             future = asyncio.run_coroutine_threadsafe(
-                self._create_inflight_condition(), self._recv_loop
+                self._create_recv_conditions(), self._recv_loop
             )
             future.result(timeout=5)
             logger.info(
-                "PDBackendAsync receiver: reservation-based inflight control "
-                "initialized with max_inflight_chunks=%d (total_chunks=%d, "
-                "buffer=%d bytes, chunk=%d bytes)",
-                self._max_inflight_chunks,
+                "PDBackendAsync receiver: reservation-based admission control "
+                "initialized with total_chunks=%d "
+                "(buffer=%d bytes, chunk=%d bytes)",
                 total_chunks,
                 self._aligned_buffer_size,
                 self._chunk_size_bytes,
@@ -1105,7 +1102,8 @@ class PDBackendAsync(AllocatorBackendInterface):
         """Send ProxyNotif once all RDMA batches for req_id are complete.
 
         Fires only when both conditions hold:
-        1. All reserved chunks have completed RDMA (_completed_chunks >= total).
+        1. All reserved chunks have completed RDMA (completed >= total), OR
+           total_chunks==0 (legacy sender without reservation).
         2. The is_last_prefill batch has been seen (_req_has_last is True).
 
         Also releases the sender reservation at this point so that the buffer
@@ -1119,7 +1117,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         completed = self._completed_chunks.get(req_id, 0)
         has_last = self._req_has_last.get(req_id, False)
 
-        if has_last and total > 0 and completed >= total:
+        if has_last and (total == 0 or completed >= total):
             await self._send_proxy_notif(transfer_spec)
             # Release sender reservation now that RDMA is complete.
             self._reservation_mgr.release_reservation(req_id)
@@ -1289,12 +1287,11 @@ class PDBackendAsync(AllocatorBackendInterface):
     ############################################################
     # Decoder functions
     ############################################################
-    async def _create_inflight_condition(self) -> None:
+    async def _create_recv_conditions(self) -> None:
         """Create asyncio primitives bound to the receiver event loop.
 
         Must be called from within the receiver event loop.
         """
-        self._inflight_condition = asyncio.Condition()
         self._router_send_lock = asyncio.Lock()
         self._pending_alloc_tasks: set[asyncio.Task] = set()
         # Initialize the async condition for reservation-based admission.
@@ -1440,7 +1437,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         req_id = alloc_request.req_id
 
         # Reservation-based admission: admit on first batch for this req_id.
-        # Legacy senders with total_chunks==0 skip reservation.
+        # Legacy senders with total_chunks==0 skip reservation (deprecated path).
         is_first_batch = req_id and (req_id not in self._req_allocated_keys)
         if is_first_batch and alloc_request.total_chunks > 0:
             admitted = await self._recv_reservation_mgr.async_try_admit(
@@ -1452,18 +1449,26 @@ class PDBackendAsync(AllocatorBackendInterface):
                     f"for req {req_id} (total_chunks={alloc_request.total_chunks}). "
                     f"Buffer may be over-subscribed."
                 )
+        elif is_first_batch and alloc_request.total_chunks == 0:
+            logger.warning(
+                "[PD-ADMIT] req=%s: legacy sender detected (total_chunks=0). "
+                "No buffer reservation — buffer over-commitment is possible. "
+                "Upgrade sender to pass total_chunks.",
+                req_id,
+            )
 
-        # Fail-fast: detect if cumulative chunks exceed max capacity.
+        # Fail-fast: detect if cumulative chunks exceed total buffer capacity.
         if req_id:
             prev_count = len(self._req_allocated_keys.get(req_id, []))
             new_total = prev_count + total_allocs
-            if new_total > self._max_inflight_chunks:
+            total_capacity = self._recv_reservation_mgr._total_chunks
+            if new_total > total_capacity:
                 if alloc_request.total_chunks > 0:
                     await self._recv_reservation_mgr.async_release_reservation(req_id)
                 raise RuntimeError(
                     f"Request {req_id} requires {new_total} total chunks "
                     f"(already allocated {prev_count}, new batch {total_allocs}) "
-                    f"but max_inflight_chunks={self._max_inflight_chunks}. "
+                    f"but total_chunks={total_capacity}. "
                     f"This request can never complete. "
                     f"Increase pd_buffer_size or reduce prompt length / chunk size."
                 )
@@ -1488,45 +1493,19 @@ class PDBackendAsync(AllocatorBackendInterface):
                     token_dim = fmt.token_dim()
                     shape[token_dim] = alloc_request.last_chunk_toks
 
-                # Wait until there is a free inflight slot.
-                async with self._inflight_condition:
-                    while self._inflight_chunks >= self._max_inflight_chunks:
-                        if not self.running:
-                            remaining_allocs = total_allocs - len(alloc_indexes)
-                            alloc_indexes.extend([-1] * remaining_allocs)
-                            return AllocResponse(remote_indexes=alloc_indexes)
-                        logger.warning(
-                            "Decoder buffer near-full: inflight_chunks=%d >= max=%d, "
-                            "waiting for buffers to be freed...",
-                            self._inflight_chunks,
-                            self._max_inflight_chunks,
-                        )
-                        await self._inflight_condition.wait()
-                    self._inflight_chunks += 1
-
                 mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
                 deadline = asyncio.get_running_loop().time() + self._allocation_timeout
                 while mem_obj is None:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
-                        async with self._inflight_condition:
-                            self._inflight_chunks -= 1
-                            self._inflight_condition.notify_all()
                         raise RuntimeError(
                             f"Failed to allocate memory for key {key} after "
                             f"timeout (~{self._allocation_timeout:.0f}s). "
-                            f"req_id={req_id}, key_index={idx}/{total_allocs}, "
-                            f"inflight_chunks={self._inflight_chunks}, "
-                            f"max_inflight_chunks={self._max_inflight_chunks}."
+                            f"req_id={req_id}, key_index={idx}/{total_allocs}."
                         )
-                    async with self._inflight_condition:
-                        try:
-                            await asyncio.wait_for(
-                                self._inflight_condition.wait(),
-                                timeout=min(remaining, self._condition_poll_interval),
-                            )
-                        except asyncio.TimeoutError:
-                            pass
+                    await asyncio.sleep(
+                        min(remaining, self._condition_poll_interval)
+                    )
                     mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
                 alloc_indexes.append(mem_obj.meta.address)
@@ -1534,12 +1513,11 @@ class PDBackendAsync(AllocatorBackendInterface):
                 current_batch_keys.append(key_str)
                 logger.warning(
                     "[PD-ALLOC] req=%s alloc chunk %d/%d, "
-                    "free_chunks=%d, inflight=%d, data_size=%d",
+                    "free_chunks=%d, data_size=%d",
                     req_id,
                     idx + 1,
                     total_allocs,
                     self._get_free_chunks(),
-                    self._inflight_chunks,
                     len(self.data),
                 )
         except BaseException:
@@ -1579,8 +1557,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         """Store a memory object in the local data dictionary.
 
         If a memory object already exists for the given key, the old object is
-        released (ref_count_down) and the inflight counter is decremented on
-        the receiver side to prevent memory leaks.
+        released (ref_count_down) to prevent memory leaks.
 
         :param key: The cache engine key to associate with the memory object.
         :param mem_obj: The memory object to store.
@@ -1595,10 +1572,6 @@ class PDBackendAsync(AllocatorBackendInterface):
                     key,
                 )
                 old.ref_count_down()
-                if self.pd_config.role == "receiver":
-                    asyncio.run_coroutine_threadsafe(
-                        self._notify_inflight_freed(), self._recv_loop
-                    )
             self.data[key] = mem_obj
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
@@ -1639,14 +1612,6 @@ class PDBackendAsync(AllocatorBackendInterface):
                     self._get_free_chunks(),
                 )
                 mem_obj.ref_count_down()
-                if self.pd_config.role == "receiver":
-                    logger.warning(
-                        "[PD-FREE] after ref_count_down, free_chunks=%d",
-                        self._get_free_chunks(),
-                    )
-                    asyncio.run_coroutine_threadsafe(
-                        self._notify_inflight_freed(), self._recv_loop
-                    )
                 return True
             logger.warning("[PD-FREE] remove: key=%s NOT FOUND", key)
             return False
@@ -1676,37 +1641,12 @@ class PDBackendAsync(AllocatorBackendInterface):
     def _get_total_chunks(self) -> int:
         """Return total number of chunks in the PD buffer.
 
-        Computed as ``_aligned_buffer_size // _chunk_size_bytes``, which
-        matches the value used to initialise ``_max_inflight_chunks`` and
-        ``_sender_max_inflight_chunks``.
+        Computed as ``_aligned_buffer_size // _chunk_size_bytes``.
 
         :return: Total number of fixed-size chunks in the PD buffer.
         :rtype: int
         """
         return self._aligned_buffer_size // self._chunk_size_bytes
-
-    async def _notify_inflight_freed(self) -> None:
-        """Decrement the inflight chunk counter and notify waiting allocations.
-
-        Scheduled on the receiver event loop from ``remove()`` (which runs in
-        a vLLM worker thread) so that asyncio.Condition operations are always
-        called from within the correct event loop.
-        """
-        async with self._inflight_condition:
-            logger.warning(
-                "[PD-FREE] _notify_inflight_freed: "
-                "inflight_before=%d, free_chunks=%d",
-                self._inflight_chunks,
-                self._get_free_chunks(),
-            )
-            if self._inflight_chunks == 0:
-                logger.warning(
-                    "inflight_chunks is already 0 before decrement; "
-                    "this indicates a counter synchronization bug."
-                )
-            else:
-                self._inflight_chunks -= 1
-            self._inflight_condition.notify_all()
 
     ############################################################
     # Decoder functions end
@@ -1810,22 +1750,6 @@ class PDBackendAsync(AllocatorBackendInterface):
                 except Exception:
                     logger.debug(
                         "Timed out waiting for pending alloc tasks during shutdown"
-                    )
-            # Wake up any coroutines blocked on _inflight_condition so they
-            # can observe running=False and exit cleanly before the loop stops.
-            if hasattr(self, "_inflight_condition"):
-                try:
-
-                    async def _wake_inflight() -> None:
-                        async with self._inflight_condition:
-                            self._inflight_condition.notify_all()
-
-                    asyncio.run_coroutine_threadsafe(_wake_inflight(), self._recv_loop)
-                except Exception as exc:
-                    logger.debug(
-                        "Could not schedule _inflight_condition wake-up "
-                        "(loop may already be stopped): %s",
-                        exc,
                     )
             self._shutdown_loop(
                 self._recv_loop,
