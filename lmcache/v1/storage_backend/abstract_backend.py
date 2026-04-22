@@ -306,6 +306,35 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    def try_admit(self, req_id: str, total_chunks: int) -> bool:
+        """
+        Admit a request for transfer by reserving buffer space.
+
+        This method is used by backends that implement admission control
+        to prevent over-subscription of buffers (e.g., PDBackendAsync).
+        For backends that do not implement admission control, this method
+        returns True by default.
+
+        :param str req_id: The request identifier to admit.
+        :param int total_chunks: Total number of chunks this request will transfer.
+        :return: True if admitted (reservation created), False on timeout/abort.
+        :rtype: bool
+        """
+        return True
+
+    def cancel_request(self, req_id: str) -> None:
+        """
+        Cancel an in-flight or pending request.
+
+        This method is used by backends that track per-request state
+        (e.g., PDBackendAsync for disaggregation). For backends that
+        do not track request state, this method is a no-op.
+
+        :param str req_id: The request identifier to cancel.
+        :return: None
+        """
+        pass
+
 
 class AllocatorBackendInterface(StorageBackendInterface):
     """
