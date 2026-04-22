@@ -333,7 +333,8 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         :param str req_id: The request identifier to cancel.
         :return: None
         """
-        pass
+        # Default implementation is no-op
+        return
 
 
 class AllocatorBackendInterface(StorageBackendInterface):
