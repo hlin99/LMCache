@@ -1188,10 +1188,10 @@ class LMCacheConnectorV1Impl:
                     slot_mapping = slot_mapping[:aligned_token_len]
 
             # Disagg admission control: reserve sender buffer before store().
-            if request.disagg_spec is not None and request.is_last_prefill:
-                pd_backend = self._get_pd_backend()
-                if pd_backend is not None and request.disagg_spec.total_chunks > 0:
-                    if not request.disagg_spec.admitted:
+            if request.disagg_spec is not None and request.disagg_spec.total_chunks > 0:
+                if not request.disagg_spec.admitted:
+                    pd_backend = self._get_pd_backend()
+                    if pd_backend is not None:
                         admitted = pd_backend.try_admit(
                             request.req_id, request.disagg_spec.total_chunks
                         )
@@ -1215,13 +1215,6 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
-
-            # Release sender reservation after all batches submitted.
-            if request.is_last_prefill and request.disagg_spec is not None:
-                pd_backend = self._get_pd_backend()
-                if pd_backend is not None and request.disagg_spec.admitted:
-                    pd_backend.release_reservation(request.req_id)
-                    request.disagg_spec.admitted = False
 
             # Update skip_leading_tokens only on last rank to ensure
             # each PP stage stores its own KV cache
