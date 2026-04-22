@@ -920,6 +920,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         mem_objs: List[MemoryObj],
         req_id: str = "",
         is_last_batch: bool = False,
+        total_chunks: int = 0,
     ) -> AllocRequest:
         """
         Get the allocation request given the keys and memory objects.
@@ -948,6 +949,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             last_chunk_toks=last_chunk_toks,
             req_id=req_id,
             is_last_batch=is_last_batch,
+            total_chunks=total_chunks,
         )
 
     async def _async_transfer_task(
@@ -1003,7 +1005,10 @@ class PDBackendAsync(AllocatorBackendInterface):
 
         try:
             alloc_request = self._get_remote_alloc_request(
-                keys, memory_objs, req_id=req_id, is_last_batch=is_last_batch
+                keys, memory_objs,
+                req_id=req_id,
+                is_last_batch=is_last_batch,
+                total_chunks=self._req_total_chunks.get(req_id, 0),
             )
             alloc_response = await self._async_remote_allocate(
                 receiver_id, alloc_request
