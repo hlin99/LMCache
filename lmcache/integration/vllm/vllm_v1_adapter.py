@@ -43,6 +43,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.storage_backend.pd_backend_async import PDBackendAsync
 
 if TYPE_CHECKING:
     # Third Party
@@ -1236,11 +1237,8 @@ class LMCacheConnectorV1Impl:
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         return None, None
 
-    def _get_pd_backend(self):
+    def _get_pd_backend(self) -> PDBackendAsync | None:
         """Return the PDBackendAsync instance if this is a disagg sender, else None."""
-        # Third Party
-        from lmcache.v1.storage_backend.pd_backend_async import PDBackendAsync
-
         if self.lmcache_engine is None:
             return None
         backend = getattr(self.lmcache_engine, "storage_backend", None)

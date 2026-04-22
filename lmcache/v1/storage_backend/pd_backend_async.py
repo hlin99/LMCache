@@ -7,6 +7,7 @@ import asyncio
 import os
 import threading
 import time
+import traceback
 import uuid
 
 # Third Party
@@ -140,7 +141,7 @@ class ReservationManager:
         self._threading_condition = threading.Condition(self._threading_lock)
 
         # Asyncio variant (receiver, created lazily on receiver event loop)
-        self._async_condition: Optional[asyncio.Condition] = None
+        self._async_condition: asyncio.Condition | None = None
 
     def init_async_condition(self) -> None:
         """Create asyncio.Condition bound to the current event loop.
@@ -1038,8 +1039,6 @@ class PDBackendAsync(AllocatorBackendInterface):
                         )
         except BaseException as e:
             if not isinstance(e, asyncio.CancelledError):
-                import traceback
-
                 logger.error(
                     "Async transfer task failed: %s\n%s",
                     str(e),
@@ -1213,7 +1212,7 @@ class PDBackendAsync(AllocatorBackendInterface):
 
         :param req_id: The request identifier to cancel.
         """
-        logger.warning("[CANCEL] req=%s cancel_request called", req_id)
+        logger.info("[CANCEL] req=%s cancel_request called", req_id)
         self._reservation_mgr.mark_abort(req_id)
         if hasattr(self, "_staging_condition"):
             with self._staging_condition:
@@ -1232,7 +1231,7 @@ class PDBackendAsync(AllocatorBackendInterface):
 
         :param req_id: The request identifier to abort.
         """
-        logger.warning("[ABORT] req=%s _abort_request starting", req_id)
+        logger.info("[ABORT] req=%s _abort_request starting", req_id)
         sent_keys = self._sent_keys.get(req_id, [])
         if sent_keys:
             receiver_id = self._req_receiver.get(req_id)
@@ -1368,9 +1367,10 @@ class PDBackendAsync(AllocatorBackendInterface):
                     )
                 return
 
-            assert isinstance(msg, AllocRequest), (
-                "The request from the remote peer is not an AllocRequest"
-            )
+            if not isinstance(msg, AllocRequest):
+                raise ValueError(
+                    f"Expected AllocRequest from remote peer, got {type(msg).__name__}"
+                )
             n_keys = len(msg.keys)
             alloc_resp = await self._async_allocate_and_put(msg)
             resp_bytes = msgspec.msgpack.encode(alloc_resp)
