@@ -588,6 +588,15 @@ class PDBackendAsync(AllocatorBackendInterface):
             # Per-request key tracking for rollback.
             # Maps req_id → list of key strings allocated across all batches.
             self._req_allocated_keys: dict[str, list[str]] = {}
+            # Reverse mapping: key_string → req_id, so remove() knows which
+            # request a chunk belongs to.  Protected by data_lock.
+            self._key_to_req_id: dict[str, str] = {}
+            # req_id → total chunks expected to be removed via remove() (set
+            # when is_last_batch arrives).  Protected by data_lock.
+            self._req_expected_removes: dict[str, int] = {}
+            # req_id → number of chunks removed so far via remove().
+            # Protected by data_lock.
+            self._req_removed_count: dict[str, int] = {}
             self._init_receiver()
 
         self.full_chunk_size_bytes = config.chunk_size
@@ -1397,6 +1406,12 @@ class PDBackendAsync(AllocatorBackendInterface):
                             req_id,
                             exc,
                         )
+                # Clean up any remaining deferred-release tracking for this
+                # request (e.g. entries not yet removed via retrieve).
+                with self.data_lock:
+                    self._drop_req_from_key_to_req_id(req_id)
+                    self._req_expected_removes.pop(req_id, None)
+                    self._req_removed_count.pop(req_id, None)
                 await self._recv_reservation_mgr.async_release_reservation(req_id)
                 self._req_allocated_keys.pop(req_id, None)
                 # Send a no-op response so the sender's recv_multipart unblocks.
@@ -1546,6 +1561,11 @@ class PDBackendAsync(AllocatorBackendInterface):
                     )
             if req_id:
                 self._req_allocated_keys.pop(req_id, None)
+                # Clean up deferred-release tracking for this request.
+                with self.data_lock:
+                    self._drop_req_from_key_to_req_id(req_id)
+                    self._req_expected_removes.pop(req_id, None)
+                    self._req_removed_count.pop(req_id, None)
                 if alloc_request.total_chunks > 0:
                     await self._recv_reservation_mgr.async_release_reservation(req_id)
             raise
@@ -1555,10 +1575,40 @@ class PDBackendAsync(AllocatorBackendInterface):
             if req_id not in self._req_allocated_keys:
                 self._req_allocated_keys[req_id] = []
             self._req_allocated_keys[req_id].extend(current_batch_keys)
+            # Populate reverse mapping under data_lock (shared with remove()).
+            with self.data_lock:
+                for key_str in current_batch_keys:
+                    self._key_to_req_id[key_str] = req_id
             if alloc_request.is_last_batch:
-                self._req_allocated_keys.pop(req_id, None)
+                all_keys_for_req = self._req_allocated_keys.pop(req_id, [])
                 if alloc_request.total_chunks > 0:
-                    await self._recv_reservation_mgr.async_release_reservation(req_id)
+                    # Defer reservation release until all physical chunks are
+                    # freed via remove(), not here.  Record the expected count.
+                    total_allocated = len(all_keys_for_req)
+                    should_release_now = False
+                    with self.data_lock:
+                        if total_allocated > 0:
+                            self._req_expected_removes[req_id] = total_allocated
+                            already_removed = self._req_removed_count.get(req_id, 0)
+                            if already_removed >= total_allocated:
+                                # Defensive path: all chunks were removed via
+                                # remove() before is_last_batch arrived.  This
+                                # can happen if retrieve() races ahead of the
+                                # sender's final AllocRequest (e.g., the last
+                                # RDMA write completes and retrieve() removes
+                                # chunks before the is_last_batch message is
+                                # processed by the receiver loop).
+                                should_release_now = True
+                                self._req_expected_removes.pop(req_id, None)
+                                self._req_removed_count.pop(req_id, None)
+                                self._drop_req_from_key_to_req_id(req_id)
+                        else:
+                            # No chunks allocated for this request; release now.
+                            should_release_now = True
+                    if should_release_now:
+                        await self._recv_reservation_mgr.async_release_reservation(
+                            req_id
+                        )
 
         return AllocResponse(remote_indexes=alloc_indexes)
 
@@ -1613,21 +1663,63 @@ class PDBackendAsync(AllocatorBackendInterface):
         """
         Remove the key from the storage backend.
 
+        On the receiver side, tracks per-request chunk removal counts and
+        schedules a deferred reservation release (via
+        ``asyncio.run_coroutine_threadsafe``) once all physical chunks for a
+        request have been freed.
+
         :param key: The key to remove.
+        :param force: Unused; kept for interface compatibility.
+        :return: True if the key was found and removed, False otherwise.
+        :rtype: bool
         """
+        release_req_id: Optional[str] = None
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
             if mem_obj is not None:
                 logger.warning(
                     "[PD-FREE] remove key=%s, data_size=%d, "
                     "free_chunks_before=%d",
-                    key, len(self.data),
+                    key,
+                    len(self.data),
                     self._get_free_chunks(),
                 )
                 mem_obj.ref_count_down()
-                return True
-            logger.warning("[PD-FREE] remove: key=%s NOT FOUND", key)
-            return False
+                # Deferred reservation release (receiver only).
+                if self.pd_config.role == "receiver":
+                    key_str = key.to_string()
+                    req_id = self._key_to_req_id.pop(key_str, None)
+                    if req_id is not None:
+                        self._req_removed_count[req_id] = (
+                            self._req_removed_count.get(req_id, 0) + 1
+                        )
+                        expected = self._req_expected_removes.get(req_id)
+                        if (
+                            expected is not None
+                            and self._req_removed_count[req_id] >= expected
+                        ):
+                            logger.warning(
+                                "[PD-FREE] req=%s all %d chunks removed, "
+                                "releasing reservation",
+                                req_id,
+                                expected,
+                            )
+                            release_req_id = req_id
+                            self._req_expected_removes.pop(req_id, None)
+                            self._req_removed_count.pop(req_id, None)
+            else:
+                logger.warning("[PD-FREE] remove: key=%s NOT FOUND", key)
+        # Schedule deferred reservation release outside the lock so the lock
+        # is not held across a cross-thread asyncio call.
+        if release_req_id is not None:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._recv_reservation_mgr.async_release_reservation(release_req_id),
+                self._recv_loop,
+            )
+            fut.add_done_callback(
+                lambda f: self._on_deferred_release_done(f, release_req_id)
+            )
+        return mem_obj is not None
 
     def _get_free_chunks(self) -> int:
         """Return number of free chunks in the PD buffer allocator.
@@ -1660,6 +1752,43 @@ class PDBackendAsync(AllocatorBackendInterface):
         :rtype: int
         """
         return self._aligned_buffer_size // self._chunk_size_bytes
+
+    def _on_deferred_release_done(
+        self,
+        fut: "asyncio.Future[None]",
+        req_id: str,
+    ) -> None:
+        """Callback for the deferred reservation-release future.
+
+        Logs a warning if the coroutine raised an exception.  A failure here
+        means the reservation may be leaked (``_total_reserved`` won't
+        decrease), which can cause subsequent requests to stall waiting for
+        admission.  The condition is non-fatal but should be investigated.
+
+        :param fut: The future returned by ``run_coroutine_threadsafe``.
+        :param req_id: The request identifier whose reservation was being
+            released.
+        :return: None
+        """
+        if not fut.cancelled() and fut.exception() is not None:
+            logger.warning(
+                "[PD-FREE] deferred reservation release failed for req=%s: %s. "
+                "The reservation may be leaked; subsequent requests may stall.",
+                req_id,
+                fut.exception(),
+            )
+
+    def _drop_req_from_key_to_req_id(self, req_id: str) -> None:
+        """Remove all entries for *req_id* from ``_key_to_req_id``.
+
+        Must be called while ``data_lock`` is held.
+
+        :param req_id: The request identifier whose entries to remove.
+        :return: None
+        """
+        self._key_to_req_id = {
+            k: v for k, v in self._key_to_req_id.items() if v != req_id
+        }
 
     ############################################################
     # Decoder functions end

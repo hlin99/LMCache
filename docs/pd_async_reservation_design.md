@@ -134,7 +134,25 @@ The receiver uses a single `ReservationManager` (`_recv_reservation_mgr`) as the
 
 Legacy senders that do not set `total_chunks` (i.e., `total_chunks == 0`) skip the reservation path. A warning is logged when such senders are detected, as they provide no deadlock protection. Legacy senders are deprecated; all new senders should pass `total_chunks`.
 
-The reservation is released on the receiver side when the last batch of a request is successfully allocated (signaled by `is_last_batch == True` in the `AllocRequest`), or on abort via `CancelNotif`.
+### Deferred Reservation Release
+
+The reservation is **not** released when `is_last_batch == True` arrives. It is released only after all physical chunks for the request have been freed from `self.data` via `remove()`. This prevents the following race condition:
+
+```
+1. is_last_batch arrives → reservation released (logical buffer "empty")
+2. New request admitted by reservation (no space conflict detected)
+3. retrieve() hasn't started yet → physical chunks still occupy the allocator
+4. New request calls allocate() → returns None → timeout
+```
+
+**Implementation:** Three auxiliary dicts, all protected by `data_lock`, track this lifecycle:
+- `_key_to_req_id`: reverse map from key string → req_id, populated after each successful batch allocation.
+- `_req_expected_removes`: req_id → total chunks that must be removed before the reservation is released (set when `is_last_batch` arrives).
+- `_req_removed_count`: req_id → number of chunks removed so far via `remove()`.
+
+When `remove()` increments `_req_removed_count[req_id]` to equal `_req_expected_removes[req_id]`, it schedules `async_release_reservation(req_id)` on the receiver event loop via `asyncio.run_coroutine_threadsafe`.
+
+On abort (`CancelNotif`) or allocation rollback, all three dicts are cleaned up and the reservation is released immediately (since the physical chunks are also freed at that point).
 
 ## Fail-Fast Detection
 
