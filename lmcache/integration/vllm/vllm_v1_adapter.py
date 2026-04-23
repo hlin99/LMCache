@@ -87,7 +87,6 @@ class DisaggSpec:
     is_last_prefill: bool = False
     num_transferred_tokens: int = 0
     total_chunks: int = 0  # total KV chunks for admission control
-    admitted: bool = False  # True after try_admit() succeeds for this request
 
 
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
@@ -415,6 +414,12 @@ class ReqMeta:
                 tracker.req_id,
             )
 
+        # For disagg requests, compute total_chunks for sender admission control.
+        if tracker.disagg_spec is not None and tracker.disagg_spec.total_chunks == 0:
+            # Only compute once (on first batch)
+            total_chunks_for_req = math.ceil(tracker.prompt_len / lmcache_chunk_size)
+            tracker.disagg_spec.total_chunks = total_chunks_for_req
+
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         req_meta = ReqMeta(
             req_id=tracker.req_id,
@@ -426,15 +431,6 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
         )
-
-        # For disagg requests, compute total_chunks for sender admission control.
-        if tracker.disagg_spec is not None:
-            actual_store_tokens = num_tokens_to_save - skip_leading_tokens
-            if actual_store_tokens > 0:
-                total_chunks_for_req = math.ceil(
-                    actual_store_tokens / lmcache_chunk_size
-                )
-                tracker.disagg_spec.total_chunks = total_chunks_for_req
 
         return req_meta
 
@@ -1688,18 +1684,18 @@ class LMCacheConnectorV1Impl:
             self._layerwise_save_storers.pop(request.request_id, None)
 
         # Cleanup if request was aborted
-        if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
-            # Cancel any ongoing async lookup and prefetch tasks on workers
-            lookup_id = request.request_id
-            assert self.lookup_client is not None
-            self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
-
-        # Notify storage backends of aborted disagg requests.
         if request.status == RequestStatus.FINISHED_ABORTED:
+            # Notify storage backends of aborted requests
             assert self.lmcache_engine is not None
             sm = self.lmcache_engine.storage_manager
             if sm is not None:
                 sm.cancel_request(request.request_id)
+
+            if self.async_loading:
+                # Cancel any ongoing async lookup and prefetch tasks on workers
+                lookup_id = request.request_id
+                assert self.lookup_client is not None
+                self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
 
         params = (
             request.kv_transfer_params
