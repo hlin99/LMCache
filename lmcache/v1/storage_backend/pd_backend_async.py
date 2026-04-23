@@ -160,7 +160,7 @@ class ReservationManager:
                 if available >= total_chunks:
                     self._reservations[req_id] = total_chunks
                     self._total_reserved += total_chunks
-                    logger.debug(
+                    logger.warning(
                         "[ADMIT] req=%s admitted (async), reserved=%d, "
                         "total_reserved=%d/%d",
                         req_id,
@@ -171,7 +171,7 @@ class ReservationManager:
                     return True
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    logger.debug(
+                    logger.warning(
                         "[ADMIT] req=%s async admission timed out: need=%d, "
                         "available=%d, total_reserved=%d/%d",
                         req_id,
@@ -199,7 +199,7 @@ class ReservationManager:
             count = self._reservations.pop(req_id, 0)
             if count > 0:
                 self._total_reserved -= count
-                logger.debug(
+                logger.warning(
                     "[ADMIT] req=%s reservation released (async), freed=%d, "
                     "total_reserved=%d/%d",
                     req_id,
@@ -1236,7 +1236,7 @@ class PDBackendAsync(AllocatorBackendInterface):
                     f"Buffer may be over-subscribed."
                 )
         elif is_first_batch and alloc_request.total_chunks == 0:
-            logger.debug(
+            logger.warning(
                 "[PD-ADMIT] req=%s: legacy sender detected (total_chunks=0). "
                 "No buffer reservation — buffer over-commitment is possible. "
                 "Upgrade sender to pass total_chunks.",
@@ -1302,7 +1302,7 @@ class PDBackendAsync(AllocatorBackendInterface):
                 alloc_indexes.append(mem_obj.meta.address)
                 self.put(key, mem_obj)
                 current_batch_keys.append(key_str)
-                logger.debug(
+                logger.warning(
                     "[PD-ALLOC] req=%s alloc chunk %d/%d, "
                     "free_chunks=%d, data_size=%d",
                     req_id,
@@ -1396,7 +1396,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
             if mem_obj is not None:
-                logger.debug(
+                logger.warning(
                     "[PD-FREE] remove key=%s, data_size=%d, "
                     "free_chunks_before=%d",
                     key, len(self.data),
@@ -1421,7 +1421,7 @@ class PDBackendAsync(AllocatorBackendInterface):
 
                         asyncio.run_coroutine_threadsafe(_notify_freed(), loop)
                 return True
-            logger.debug("[PD-FREE] remove: key=%s NOT FOUND", key)
+            logger.warning("[PD-FREE] remove: key=%s NOT FOUND", key)
             return False
 
     def _get_free_chunks(self) -> int:
