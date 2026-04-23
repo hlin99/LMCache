@@ -86,7 +86,6 @@ class DisaggSpec:
     receiver_alloc_port: int
     is_last_prefill: bool = False
     num_transferred_tokens: int = 0
-    total_chunks: int = 0  # total KV chunks for admission control
 
 
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
