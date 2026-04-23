@@ -509,18 +509,18 @@ def test_receiver_nonblocking_async_sleep(async_receiver):
 
 
 def test_receiver_flow_control_inflight(async_receiver):
-    """Allocation blocks when inflight is saturated, unblocks on notify."""
+    """Allocation blocks when memory is full, unblocks when remove() frees a chunk."""
     mem_obj = _make_mem_obj(idx=60)
-    async_receiver.allocate = (
-        lambda shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw: mem_obj
-    )
+    freed = [False]  # Controls when allocate succeeds
+
+    def patched_alloc(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        return mem_obj if freed[0] else None
+
+    async_receiver.allocate = patched_alloc
 
     alloc_req = _make_alloc_req([_make_key(600)])
 
     async def run():
-        async with async_receiver._inflight_condition:
-            async_receiver._inflight_chunks = async_receiver._max_inflight_chunks
-
         completed = asyncio.Event()
         holder = []
 
@@ -529,11 +529,14 @@ def test_receiver_flow_control_inflight(async_receiver):
             completed.set()
 
         async def free_later():
-            await asyncio.sleep(0.05)
+            # Wait longer than two poll intervals so retries from timeout
+            # still return None (freed[0] is still False).
+            await asyncio.sleep(0.25)
             assert not completed.is_set(), "should still be blocked"
-            async with async_receiver._inflight_condition:
-                async_receiver._inflight_chunks -= 1
-                async_receiver._inflight_condition.notify_all()
+            freed[0] = True
+            # Notify the alloc freed condition to wake the blocked coroutine.
+            async with async_receiver._alloc_freed_condition:
+                async_receiver._alloc_freed_condition.notify_all()
 
         await asyncio.gather(do_alloc(), free_later())
         assert holder[0].remote_indexes == [mem_obj.meta.address]
@@ -572,8 +575,9 @@ def test_receiver_last_chunk_shape_override(async_receiver):
     ids=["exact-then-overflow", "partial-then-overflow"],
 )
 def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, b2_off):
-    """Cumulative chunks > max_inflight → RuntimeError; prior batch kept."""
-    async_receiver._max_inflight_chunks = max_t
+    """Cumulative chunks > total_capacity → RuntimeError; prior batch kept."""
+    # Override the reservation manager's total capacity to test overflow detection.
+    async_receiver._recv_reservation_mgr._total_chunks = max_t
     async_receiver.allocate = _auto_alloc()
     req_id = "req-failfast"
 
@@ -585,7 +589,7 @@ def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, 
         )
         assert -1 not in r1.remote_indexes and len(r1.remote_indexes) == b1_n
 
-        with pytest.raises(RuntimeError, match="max_inflight_chunks"):
+        with pytest.raises(RuntimeError, match="total_chunks"):
             await async_receiver._async_allocate_and_put(
                 _make_alloc_req(
                     [_make_key(b2_off + i) for i in range(b2_n)], req_id=req_id
@@ -598,7 +602,6 @@ def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, 
         assert async_receiver.contains(k, pin=False)
 
     # unrelated req_id should work fine
-    async_receiver._inflight_chunks = 0
 
     async def check_other():
         r = await async_receiver._async_allocate_and_put(
@@ -611,7 +614,6 @@ def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, 
 
 def test_receiver_alloc_timeout(async_receiver):
     """allocate() returning None past deadline → RuntimeError; prior batch kept."""
-    async_receiver._max_inflight_chunks = 10
     req_id = "req-timeout"
     async_receiver.allocate = _auto_alloc()
 
@@ -645,7 +647,6 @@ def test_receiver_alloc_timeout(async_receiver):
 
 def test_receiver_is_last_batch_cleanup(async_receiver):
     """is_last_batch=True removes req_id from _req_allocated_keys."""
-    async_receiver._max_inflight_chunks = 10
     req_id = "req-lifecycle"
     async_receiver.allocate = _auto_alloc()
 
@@ -675,7 +676,6 @@ def test_receiver_is_last_batch_cleanup(async_receiver):
 
 def test_receiver_admission_control(async_receiver):
     """Reservation-based admission: concurrent requests can proceed."""
-    async_receiver._max_inflight_chunks = 20
     async_receiver.allocate = _auto_alloc()
 
     log = []

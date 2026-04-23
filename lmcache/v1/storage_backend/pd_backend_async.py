@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
-import math
 import os
 import threading
 import time
@@ -106,14 +105,14 @@ class _TransferItem:
 
 class ReservationManager:
     """
-    Manages reservation-based admission control for PD staging buffers.
+    Manages reservation-based admission control for the receiver PD buffer.
 
     Prevents deadlock where N concurrent requests each allocate partial chunks,
     fill the buffer, and none can complete. When a request is admitted, its
     total_chunks are reserved upfront. Subsequent physical allocations draw
     from that reservation.
 
-    Provides both threading (sender) and asyncio (receiver) variants.
+    Used exclusively on the receiver side via asyncio primitives.
     """
 
     def __init__(
@@ -135,15 +134,6 @@ class ReservationManager:
         # Shared data
         self._reservations: dict[str, int] = {}  # req_id -> reserved chunks
         self._total_reserved: int = 0
-        self._aborted_reqs: set[str] = set()
-
-        # Threading variant (sender, called from worker threads)
-        self._threading_lock = threading.Lock()
-        self._threading_condition = threading.Condition(self._threading_lock)
-        # Separate lock for _aborted_reqs to avoid deadlock: try_admit holds
-        # _threading_condition (whose lock IS _threading_lock) and calls
-        # is_aborted() which must not re-acquire _threading_lock.
-        self._abort_lock = threading.Lock()
 
         # Asyncio variant (receiver, created lazily on receiver event loop)
         self._async_admit_condition: asyncio.Condition | None = None
@@ -160,22 +150,17 @@ class ReservationManager:
 
         :param req_id: The request identifier to admit.
         :param total_chunks: Number of chunks to reserve.
-        :return: True if admitted, False if aborted/timed out.
+        :return: True if admitted, False if timed out.
         """
         assert self._async_admit_condition is not None
         async with self._async_admit_condition:
             deadline = asyncio.get_running_loop().time() + self._allocation_timeout
             while True:
-                if self.is_aborted(req_id):
-                    logger.warning(
-                        "[ADMIT] req=%s aborted before admission (async)", req_id
-                    )
-                    return False
                 available = self._total_chunks - self._total_reserved
                 if available >= total_chunks:
                     self._reservations[req_id] = total_chunks
                     self._total_reserved += total_chunks
-                    logger.warning(
+                    logger.debug(
                         "[ADMIT] req=%s admitted (async), reserved=%d, "
                         "total_reserved=%d/%d",
                         req_id,
@@ -186,7 +171,7 @@ class ReservationManager:
                     return True
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    logger.warning(
+                    logger.debug(
                         "[ADMIT] req=%s async admission timed out: need=%d, "
                         "available=%d, total_reserved=%d/%d",
                         req_id,
@@ -204,7 +189,6 @@ class ReservationManager:
                 except asyncio.TimeoutError:
                     pass
 
-
     async def async_release_reservation(self, req_id: str) -> None:
         """Release reservation (asyncio variant). Notifies all waiters.
 
@@ -215,7 +199,7 @@ class ReservationManager:
             count = self._reservations.pop(req_id, 0)
             if count > 0:
                 self._total_reserved -= count
-                logger.warning(
+                logger.debug(
                     "[ADMIT] req=%s reservation released (async), freed=%d, "
                     "total_reserved=%d/%d",
                     req_id,
@@ -225,42 +209,6 @@ class ReservationManager:
                 )
                 self._async_admit_condition.notify_all()
 
-    def mark_abort(self, req_id: str) -> None:
-        """Mark a request as aborted. Thread-safe.
-
-        :param req_id: The request identifier to abort.
-        """
-        with self._abort_lock:
-            self._aborted_reqs.add(req_id)
-        with self._threading_condition:
-            self._threading_condition.notify_all()
-
-    def clear_abort(self, req_id: str) -> None:
-        """Clear the abort flag for a request.
-
-        :param req_id: The request identifier to clear.
-        """
-        with self._abort_lock:
-            self._aborted_reqs.discard(req_id)
-
-    def is_aborted(self, req_id: str) -> bool:
-        """Check if a request has been aborted. Thread-safe.
-
-        :param req_id: The request identifier to check.
-        :return: True if aborted, False otherwise.
-        """
-        with self._abort_lock:
-            return req_id in self._aborted_reqs
-
-    def get_reserved(self, req_id: str) -> int:
-        """Return the number of reserved chunks for a request.
-
-        :param req_id: The request identifier.
-        :return: Number of reserved chunks, or 0 if not reserved.
-        """
-        with self._threading_lock:
-            return self._reservations.get(req_id, 0)
-
     def get_total_chunks(self) -> int:
         """Return the total buffer capacity in chunks.
 
@@ -268,28 +216,6 @@ class ReservationManager:
         :rtype: int
         """
         return self._total_chunks
-
-    def get_status(self) -> dict:
-        """Return diagnostic status dict.
-
-        :return: Dict with total_chunks, total_reserved, reservations, aborted_reqs.
-        """
-        with self._threading_lock:
-            reservations = dict(self._reservations)
-            total_reserved = self._total_reserved
-        with self._abort_lock:
-            aborted_reqs = set(self._aborted_reqs)
-        return {
-            "total_chunks": self._total_chunks,
-            "total_reserved": total_reserved,
-            "reservations": reservations,
-            "aborted_reqs": aborted_reqs,
-        }
-
-    def wake_all(self) -> None:
-        """Wake all threading waiters (for shutdown)."""
-        with self._threading_condition:
-            self._threading_condition.notify_all()
 
 
 @dataclass
@@ -477,22 +403,10 @@ class PDBackendAsync(AllocatorBackendInterface):
             self._async_zmq_context = zmq.asyncio.Context()
             self._async_alloc_sockets: dict[str, zmq.asyncio.Socket] = {}
             self._async_alloc_locks: dict[str, asyncio.Lock] = {}
-            # Reservation-based admission control.
-            total_chunks = self._aligned_buffer_size // self._chunk_size_bytes
-            self._reservation_mgr = ReservationManager(
-                total_chunks,
-                self._allocation_timeout,
-                self._condition_poll_interval,
-            )
             # Physical memory wait condition (woken when RDMA completes and
             # ref_count_down() frees buffer slots).
             self._staging_lock = threading.Lock()
             self._staging_condition = threading.Condition(self._staging_lock)
-            logger.info(
-                "PDBackendAsync sender: reservation-based admission control "
-                "initialized with total_chunks=%d",
-                total_chunks,
-            )
             # Per-request tracking for ProxyNotif ordering and abort.
             # All accessed only from coroutines on _sender_loop (no extra lock).
             self._completed_chunks: dict[str, int] = {}
@@ -926,9 +840,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             self._req_receiver[req_id] = receiver_id
 
         # Lazily initialize per-request tracking on first batch seen by the
-        # sender loop. This avoids the race condition where try_admit() (called
-        # from worker threads) would write to dicts exclusively owned by the
-        # sender loop coroutines.
+        # sender loop.
         if req_id and req_id not in self._req_total_chunks:
             tc = (
                 getattr(transfer_spec, "total_chunks", 0)
@@ -1029,6 +941,7 @@ class PDBackendAsync(AllocatorBackendInterface):
                 )
                 if is_last_batch:
                     self._req_has_last[req_id] = True
+                await self._check_and_send_proxy_notif(req_id, transfer_spec)
             if isinstance(e, asyncio.CancelledError):
                 raise
         finally:
@@ -1150,14 +1063,6 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
             raise
 
-
-        self._reservation_mgr.clear_abort(req_id)
-        self._completed_chunks.pop(req_id, None)
-        self._req_has_last.pop(req_id, None)
-        self._req_total_chunks.pop(req_id, None)
-        self._sent_keys.pop(req_id, None)
-        self._req_receiver.pop(req_id, None)
-
     ############################################################
     # Prefiller functions end
     ############################################################
@@ -1174,6 +1079,9 @@ class PDBackendAsync(AllocatorBackendInterface):
         self._pending_alloc_tasks: set[asyncio.Task] = set()
         # Initialize the async condition for reservation-based admission.
         self._recv_reservation_mgr.init_async_admit_condition()
+        # Condition notified when remove() frees a chunk, allowing blocked
+        # allocation retries to wake up immediately instead of polling.
+        self._alloc_freed_condition: asyncio.Condition = asyncio.Condition()
 
     def _init_receiver(self):
         """
@@ -1328,7 +1236,7 @@ class PDBackendAsync(AllocatorBackendInterface):
                     f"Buffer may be over-subscribed."
                 )
         elif is_first_batch and alloc_request.total_chunks == 0:
-            logger.warning(
+            logger.debug(
                 "[PD-ADMIT] req=%s: legacy sender detected (total_chunks=0). "
                 "No buffer reservation — buffer over-commitment is possible. "
                 "Upgrade sender to pass total_chunks.",
@@ -1381,15 +1289,20 @@ class PDBackendAsync(AllocatorBackendInterface):
                             f"timeout (~{self._allocation_timeout:.0f}s). "
                             f"req_id={req_id}, key_index={idx}/{total_allocs}."
                         )
-                    await asyncio.sleep(
-                        min(remaining, self._condition_poll_interval)
-                    )
+                    async with self._alloc_freed_condition:
+                        try:
+                            await asyncio.wait_for(
+                                self._alloc_freed_condition.wait(),
+                                timeout=min(remaining, self._condition_poll_interval),
+                            )
+                        except asyncio.TimeoutError:
+                            pass
                     mem_obj = self.allocate(torch.Size(shape), dtype, fmt)
 
                 alloc_indexes.append(mem_obj.meta.address)
                 self.put(key, mem_obj)
                 current_batch_keys.append(key_str)
-                logger.warning(
+                logger.debug(
                     "[PD-ALLOC] req=%s alloc chunk %d/%d, "
                     "free_chunks=%d, data_size=%d",
                     req_id,
@@ -1483,15 +1396,27 @@ class PDBackendAsync(AllocatorBackendInterface):
         with self.data_lock:
             mem_obj = self.data.pop(key, None)
             if mem_obj is not None:
-                logger.warning(
+                logger.debug(
                     "[PD-FREE] remove key=%s, data_size=%d, "
                     "free_chunks_before=%d",
                     key, len(self.data),
                     self._get_free_chunks(),
                 )
                 mem_obj.ref_count_down()
+                # Notify any coroutines blocked waiting for free memory.
+                if hasattr(self, "_alloc_freed_condition") and hasattr(
+                    self, "_recv_loop"
+                ):
+                    loop = self._recv_loop
+                    if loop.is_running():
+
+                        async def _notify_freed() -> None:
+                            async with self._alloc_freed_condition:
+                                self._alloc_freed_condition.notify_all()
+
+                        asyncio.run_coroutine_threadsafe(_notify_freed(), loop)
                 return True
-            logger.warning("[PD-FREE] remove: key=%s NOT FOUND", key)
+            logger.debug("[PD-FREE] remove: key=%s NOT FOUND", key)
             return False
 
     def _get_free_chunks(self) -> int:
@@ -1581,9 +1506,6 @@ class PDBackendAsync(AllocatorBackendInterface):
         if hasattr(self, "_staging_condition"):
             with self._staging_condition:
                 self._staging_condition.notify_all()
-        # Wake ReservationManager waiters so admission callers can unblock.
-        if hasattr(self, "_reservation_mgr"):
-            self._reservation_mgr.wake_all()
         for thread in self.running_threads:
             thread.join()
         # Shut down sender async loop if present
