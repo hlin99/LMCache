@@ -146,14 +146,14 @@ class ReservationManager:
         self._abort_lock = threading.Lock()
 
         # Asyncio variant (receiver, created lazily on receiver event loop)
-        self._async_condition: asyncio.Condition | None = None
+        self._async_admit_condition: asyncio.Condition | None = None
 
-    def init_async_condition(self) -> None:
+    def init_async_admit_condition(self) -> None:
         """Create asyncio.Condition bound to the current event loop.
 
         Must be called from within the target event loop.
         """
-        self._async_condition = asyncio.Condition()
+        self._async_admit_condition = asyncio.Condition()
 
     async def async_try_admit(self, req_id: str, total_chunks: int) -> bool:
         """Async (asyncio) admission for receiver.
@@ -162,8 +162,8 @@ class ReservationManager:
         :param total_chunks: Number of chunks to reserve.
         :return: True if admitted, False if aborted/timed out.
         """
-        assert self._async_condition is not None
-        async with self._async_condition:
+        assert self._async_admit_condition is not None
+        async with self._async_admit_condition:
             deadline = asyncio.get_running_loop().time() + self._allocation_timeout
             while True:
                 if self.is_aborted(req_id):
@@ -198,38 +198,20 @@ class ReservationManager:
                     return False
                 try:
                     await asyncio.wait_for(
-                        self._async_condition.wait(),
+                        self._async_admit_condition.wait(),
                         timeout=min(remaining, self._condition_poll_interval),
                     )
                 except asyncio.TimeoutError:
                     pass
 
-    def release_reservation(self, req_id: str) -> None:
-        """Release reservation (threading variant). Notifies all waiters.
-
-        :param req_id: The request identifier whose reservation to release.
-        """
-        with self._threading_condition:
-            count = self._reservations.pop(req_id, 0)
-            if count > 0:
-                self._total_reserved -= count
-                logger.warning(
-                    "[ADMIT] req=%s reservation released, freed=%d, "
-                    "total_reserved=%d/%d",
-                    req_id,
-                    count,
-                    self._total_reserved,
-                    self._total_chunks,
-                )
-                self._threading_condition.notify_all()
 
     async def async_release_reservation(self, req_id: str) -> None:
         """Release reservation (asyncio variant). Notifies all waiters.
 
         :param req_id: The request identifier whose reservation to release.
         """
-        assert self._async_condition is not None
-        async with self._async_condition:
+        assert self._async_admit_condition is not None
+        async with self._async_admit_condition:
             count = self._reservations.pop(req_id, 0)
             if count > 0:
                 self._total_reserved -= count
@@ -241,7 +223,7 @@ class ReservationManager:
                     self._total_reserved,
                     self._total_chunks,
                 )
-                self._async_condition.notify_all()
+                self._async_admit_condition.notify_all()
 
     def mark_abort(self, req_id: str) -> None:
         """Mark a request as aborted. Thread-safe.
@@ -1088,7 +1070,6 @@ class PDBackendAsync(AllocatorBackendInterface):
         if has_last and (total == 0 or completed >= total):
             await self._send_proxy_notif(transfer_spec)
             # Release sender reservation now that RDMA is complete.
-            self._reservation_mgr.release_reservation(req_id)
             # Clean up per-request state.
             self._completed_chunks.pop(req_id, None)
             self._req_has_last.pop(req_id, None)
@@ -1170,60 +1151,6 @@ class PDBackendAsync(AllocatorBackendInterface):
             raise
 
 
-    def release_reservation(self, req_id: str) -> None:
-        """Release the sender-side reservation for a request.
-
-        Under normal operation, reservations are released automatically inside
-        _check_and_send_proxy_notif() after all RDMA transfers complete.
-        This method is provided for external/emergency use (e.g., error recovery
-        paths that bypass normal completion tracking).
-
-        :param req_id: The request identifier whose reservation to release.
-        """
-        self._reservation_mgr.release_reservation(req_id)
-
-    def cancel_request(self, req_id: str) -> None:
-        """Cancel an in-flight or pending request.
-
-        Marks the request as aborted (unblocking any try_admit waiter),
-        wakes staging allocate() waiters, and schedules cleanup on the
-        sender event loop.
-
-        :param req_id: The request identifier to cancel.
-        """
-        logger.info("[CANCEL] req=%s cancel_request called", req_id)
-        self._reservation_mgr.mark_abort(req_id)
-        if hasattr(self, "_staging_condition"):
-            with self._staging_condition:
-                self._staging_condition.notify_all()
-        if hasattr(self, "_sender_loop"):
-            asyncio.run_coroutine_threadsafe(
-                self._abort_request(req_id), self._sender_loop
-            )
-
-    async def _abort_request(self, req_id: str) -> None:
-        """Clean up request state and notify receiver of cancellation.
-
-        Runs on the sender event loop. Sends CancelNotif to the receiver so
-        it can release allocated keys. Then releases the sender reservation
-        and clears all per-request tracking.
-
-        :param req_id: The request identifier to abort.
-        """
-        logger.info("[ABORT] req=%s _abort_request starting", req_id)
-        sent_keys = self._sent_keys.get(req_id, [])
-        if sent_keys:
-            receiver_id = self._req_receiver.get(req_id)
-            if receiver_id:
-                try:
-                    cancel_notif = CancelNotif(req_id=req_id, keys=sent_keys)
-                    await self._async_remote_allocate(receiver_id, cancel_notif)
-                except Exception as e:
-                    logger.warning(
-                        "[ABORT] req=%s failed to send CancelNotif: %s", req_id, e
-                    )
-
-        self._reservation_mgr.release_reservation(req_id)
         self._reservation_mgr.clear_abort(req_id)
         self._completed_chunks.pop(req_id, None)
         self._req_has_last.pop(req_id, None)
@@ -1246,7 +1173,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         self._router_send_lock = asyncio.Lock()
         self._pending_alloc_tasks: set[asyncio.Task] = set()
         # Initialize the async condition for reservation-based admission.
-        self._recv_reservation_mgr.init_async_condition()
+        self._recv_reservation_mgr.init_async_admit_condition()
 
     def _init_receiver(self):
         """
