@@ -1189,24 +1189,21 @@ class LMCacheConnectorV1Impl:
             # Disagg admission control: reserve sender buffer before store().
             if request.disagg_spec is not None and request.disagg_spec.total_chunks > 0:
                 if not request.disagg_spec.admitted:
-                    # Try admission control on PDBackend if it exists
                     assert self.lmcache_engine is not None
                     sm = self.lmcache_engine.storage_manager
                     if sm is not None:
-                        backend = sm.storage_backends.get("PDBackend")
-                        if backend is not None:
-                            admitted = backend.try_admit(
-                                request.req_id, request.disagg_spec.total_chunks
+                        admitted = sm.try_admit(
+                            request.req_id, request.disagg_spec.total_chunks
+                        )
+                        if not admitted:
+                            logger.warning(
+                                "[DISAGG] req=%s try_admit failed "
+                                "(total_chunks=%d), skipping store",
+                                request.req_id,
+                                request.disagg_spec.total_chunks,
                             )
-                            if not admitted:
-                                logger.warning(
-                                    "[DISAGG] req=%s try_admit failed "
-                                    "(total_chunks=%d), skipping store",
-                                    request.req_id,
-                                    request.disagg_spec.total_chunks,
-                                )
-                                continue
-                            request.disagg_spec.admitted = True
+                            continue
+                        request.disagg_spec.admitted = True
 
             self.lmcache_engine.store(
                 token_ids,
@@ -1716,14 +1713,12 @@ class LMCacheConnectorV1Impl:
             assert self.lookup_client is not None
             self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
 
-        # Notify PDBackend of aborted disagg requests.
+        # Notify storage backends of aborted disagg requests.
         if request.status == RequestStatus.FINISHED_ABORTED:
             assert self.lmcache_engine is not None
             sm = self.lmcache_engine.storage_manager
             if sm is not None:
-                backend = sm.storage_backends.get("PDBackend")
-                if backend is not None:
-                    backend.cancel_request(request.request_id)
+                sm.cancel_request(request.request_id)
 
         params = (
             request.kv_transfer_params

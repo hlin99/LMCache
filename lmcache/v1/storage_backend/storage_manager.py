@@ -430,8 +430,7 @@ class StorageManager:
 
         for cname, (ks, objs) in obj_dict.items():
             for i, memory_obj in enumerate(objs):
-                logger.warning("[REF-TRACE] batched_put cleanup %d/%d, ", 
-                               i, len(objs))
+                logger.warning("[REF-TRACE] batched_put cleanup %d/%d, ", i, len(objs))
                 memory_obj.ref_count_down()
 
     def get(
@@ -1314,6 +1313,40 @@ class StorageManager:
                 self.local_cpu_backend = None
 
             return created
+
+    def try_admit(self, req_id: str, total_chunks: int) -> bool:
+        """
+        Admit a request for transfer by reserving buffer space.
+
+        Delegates to all storage backends. Returns True if all backends
+        that implement admission control successfully admit the request.
+        Backends that don't implement admission control return True by default.
+
+        :param str req_id: The request identifier to admit.
+        :param int total_chunks: Total number of chunks this request will transfer.
+        :return: True if admitted, False if any backend rejects admission.
+        :rtype: bool
+        """
+        for backend_name, backend in self.storage_backends.items():
+            if not backend.try_admit(req_id, total_chunks):
+                logger.warning(
+                    "Backend %s rejected admission for req %s", backend_name, req_id
+                )
+                return False
+        return True
+
+    def cancel_request(self, req_id: str) -> None:
+        """
+        Cancel an in-flight or pending request.
+
+        Delegates to all storage backends. Backends that track per-request
+        state will cancel the request; others will no-op.
+
+        :param str req_id: The request identifier to cancel.
+        :return: None
+        """
+        for backend in self.storage_backends.values():
+            backend.cancel_request(req_id)
 
     def close(self):
         logger.info("Closing StorageManager...")
