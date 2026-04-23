@@ -155,51 +155,6 @@ class ReservationManager:
         """
         self._async_condition = asyncio.Condition()
 
-    def try_admit(self, req_id: str, total_chunks: int) -> bool:
-        """Blocking (threading) admission.
-
-        Waits until there is room in the buffer to reserve total_chunks slots.
-
-        :param req_id: The request identifier to admit.
-        :param total_chunks: Number of chunks to reserve.
-        :return: True if admitted (reservation created), False if aborted/timed out.
-        """
-        with self._threading_condition:
-            deadline = time.monotonic() + self._allocation_timeout
-            while True:
-                if self.is_aborted(req_id):
-                    logger.warning("[ADMIT] req=%s aborted before admission", req_id)
-                    return False
-                available = self._total_chunks - self._total_reserved
-                if available >= total_chunks:
-                    self._reservations[req_id] = total_chunks
-                    self._total_reserved += total_chunks
-                    logger.warning(
-                        "[ADMIT] req=%s admitted, reserved=%d, "
-                        "total_reserved=%d/%d, available=%d",
-                        req_id,
-                        total_chunks,
-                        self._total_reserved,
-                        self._total_chunks,
-                        available - total_chunks,
-                    )
-                    return True
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.warning(
-                        "[ADMIT] req=%s admission timed out: need=%d, "
-                        "available=%d, total_reserved=%d/%d",
-                        req_id,
-                        total_chunks,
-                        available,
-                        self._total_reserved,
-                        self._total_chunks,
-                    )
-                    return False
-                self._threading_condition.wait(
-                    timeout=min(remaining, self._condition_poll_interval)
-                )
-
     async def async_try_admit(self, req_id: str, total_chunks: int) -> bool:
         """Async (asyncio) admission for receiver.
 
@@ -1214,23 +1169,6 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
             raise
 
-    def try_admit(self, req_id: str, total_chunks: int) -> bool:
-        """Admit a request for transfer by reserving buffer space.
-
-        Called by the adapter before store() to prevent over-subscription of
-        the sender staging buffer. Blocks until space is available or timeout.
-
-        Per-request tracking dicts (_req_total_chunks, _completed_chunks,
-        _req_has_last, _sent_keys) are intentionally NOT initialized here
-        because this method is called from vLLM worker threads while those
-        dicts are exclusively owned by _sender_loop coroutines. Initialization
-        happens lazily in _async_transfer_task on first access.
-
-        :param req_id: The request identifier to admit.
-        :param total_chunks: Total number of chunks this request will transfer.
-        :return: True if admitted (reservation created), False on timeout/abort.
-        """
-        return self._reservation_mgr.try_admit(req_id, total_chunks)
 
     def release_reservation(self, req_id: str) -> None:
         """Release the sender-side reservation for a request.
