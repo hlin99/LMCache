@@ -1186,25 +1186,6 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
-            # Disagg admission control: reserve sender buffer before store().
-            if request.disagg_spec is not None and request.disagg_spec.total_chunks > 0:
-                if not request.disagg_spec.admitted:
-                    assert self.lmcache_engine is not None
-                    sm = self.lmcache_engine.storage_manager
-                    if sm is not None:
-                        admitted = sm.try_admit(
-                            request.req_id, request.disagg_spec.total_chunks
-                        )
-                        if not admitted:
-                            logger.warning(
-                                "[DISAGG] req=%s try_admit failed "
-                                "(total_chunks=%d), skipping store",
-                                request.req_id,
-                                request.disagg_spec.total_chunks,
-                            )
-                            continue
-                        request.disagg_spec.admitted = True
-
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
