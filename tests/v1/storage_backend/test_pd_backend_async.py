@@ -520,6 +520,10 @@ def test_receiver_flow_control_inflight(async_receiver):
 
     alloc_req = _make_alloc_req([_make_key(600)])
 
+    # Wait longer than several poll intervals so condition-timeout retries
+    # still return None (freed[0] is still False).
+    block_duration = async_receiver._condition_poll_interval * 5
+
     async def run():
         completed = asyncio.Event()
         holder = []
@@ -529,9 +533,7 @@ def test_receiver_flow_control_inflight(async_receiver):
             completed.set()
 
         async def free_later():
-            # Wait longer than two poll intervals so retries from timeout
-            # still return None (freed[0] is still False).
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(block_duration)
             assert not completed.is_set(), "should still be blocked"
             freed[0] = True
             # Notify the alloc freed condition to wake the blocked coroutine.

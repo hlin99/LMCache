@@ -1404,6 +1404,11 @@ class PDBackendAsync(AllocatorBackendInterface):
                 )
                 mem_obj.ref_count_down()
                 # Notify any coroutines blocked waiting for free memory.
+                # _alloc_freed_condition and _recv_loop only exist on the
+                # receiver; remove() is also called on the sender, so the
+                # hasattr guards are intentional.  run_coroutine_threadsafe is
+                # used because remove() may be called from any OS thread while
+                # the receiver event loop runs on a dedicated thread.
                 if hasattr(self, "_alloc_freed_condition") and hasattr(
                     self, "_recv_loop"
                 ):
