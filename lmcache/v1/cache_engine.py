@@ -459,8 +459,7 @@ class LMCacheEngine:
                         )
                         return
                     # Mark as admitted to avoid redundant admission checks
-                    if hasattr(transfer_spec, "admitted"):
-                        transfer_spec.admitted = True
+                    transfer_spec.admitted = True
 
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
 
