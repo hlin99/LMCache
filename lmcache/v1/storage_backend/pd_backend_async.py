@@ -1063,6 +1063,55 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
             raise
 
+    def cancel_request(self, req_id: str) -> None:
+        """Cancel an in-flight or pending request.
+
+        Wakes staging allocate() waiters and schedules cleanup on
+        the sender event loop.
+
+        :param req_id: The request identifier to cancel.
+        """
+        logger.info("[CANCEL] req=%s cancel_request called", req_id)
+        if hasattr(self, "_staging_condition"):
+            with self._staging_condition:
+                self._staging_condition.notify_all()
+        if hasattr(self, "_sender_loop"):
+            asyncio.run_coroutine_threadsafe(
+                self._abort_request(req_id), self._sender_loop
+            )
+
+    async def _abort_request(self, req_id: str) -> None:
+        """Clean up request state and notify receiver of cancellation.
+
+        Sends CancelNotif to the receiver so it can release allocated
+        keys and reservation. Then clears all per-request tracking.
+
+        :param req_id: The request identifier to abort.
+        """
+        logger.info("[ABORT] req=%s _abort_request starting", req_id)
+        sent_keys = self._sent_keys.get(req_id, [])
+        if sent_keys:
+            receiver_id = self._req_receiver.get(req_id)
+            if receiver_id:
+                try:
+                    cancel_notif = CancelNotif(req_id=req_id, keys=sent_keys)
+                    await self._async_remote_allocate(
+                        receiver_id, cancel_notif
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[ABORT] req=%s failed to send CancelNotif: %s",
+                        req_id,
+                        e,
+                    )
+
+        # Clean up per-request state.
+        self._completed_chunks.pop(req_id, None)
+        self._req_has_last.pop(req_id, None)
+        self._req_total_chunks.pop(req_id, None)
+        self._sent_keys.pop(req_id, None)
+        self._req_receiver.pop(req_id, None)
+
     ############################################################
     # Prefiller functions end
     ############################################################
