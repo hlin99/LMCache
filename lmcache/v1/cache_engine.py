@@ -441,26 +441,6 @@ class LMCacheEngine:
             )
             return
 
-        # Disagg admission control: reserve sender buffer before processing.
-        transfer_spec = kwargs.get("transfer_spec", None)
-        if transfer_spec is not None:
-            total_chunks = getattr(transfer_spec, "total_chunks", 0)
-            if total_chunks > 0:
-                # Check if already admitted (to avoid redundant calls)
-                already_admitted = getattr(transfer_spec, "admitted", False)
-                if not already_admitted:
-                    admitted = self.storage_manager.try_admit(req_id, total_chunks)
-                    if not admitted:
-                        logger.warning(
-                            "[DISAGG] req=%s try_admit failed "
-                            "(total_chunks=%d), skipping store",
-                            req_id,
-                            total_chunks,
-                        )
-                        return
-                    # Mark as admitted to avoid redundant admission checks
-                    transfer_spec.admitted = True
-
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
 
         starts: List[int] = []
