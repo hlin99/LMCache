@@ -421,7 +421,7 @@ class ReqMeta:
             tracker.disagg_spec.total_chunks = total_chunks_for_req
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
-        req_meta = ReqMeta(
+        return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
@@ -431,8 +431,6 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
         )
-
-        return req_meta
 
 
 @dataclass
