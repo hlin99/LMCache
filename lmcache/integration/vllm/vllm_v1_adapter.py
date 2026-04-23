@@ -43,7 +43,6 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
-from lmcache.v1.storage_backend.pd_backend_async import PDBackendAsync
 
 if TYPE_CHECKING:
     # Third Party
@@ -1187,24 +1186,6 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
-            # Disagg admission control: reserve sender buffer before store().
-            if request.disagg_spec is not None and request.disagg_spec.total_chunks > 0:
-                if not request.disagg_spec.admitted:
-                    pd_backend = self._get_pd_backend()
-                    if pd_backend is not None:
-                        admitted = pd_backend.try_admit(
-                            request.req_id, request.disagg_spec.total_chunks
-                        )
-                        if not admitted:
-                            logger.warning(
-                                "[DISAGG] req=%s try_admit failed "
-                                "(total_chunks=%d), skipping store",
-                                request.req_id,
-                                request.disagg_spec.total_chunks,
-                            )
-                            continue
-                        request.disagg_spec.admitted = True
-
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1229,18 +1210,6 @@ class LMCacheConnectorV1Impl:
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         return None, None
-
-    def _get_pd_backend(self) -> PDBackendAsync | None:
-        """Return the PDBackendAsync instance if this is a disagg sender, else None."""
-        if self.lmcache_engine is None:
-            return None
-        sm = self.lmcache_engine.storage_manager
-        if sm is None:
-            return None
-        backend = sm.storage_backends.get("PDBackend")
-        if isinstance(backend, PDBackendAsync) and backend.pd_config.role == "sender":
-            return backend
-        return None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid_blocks = self._invalid_block_ids.copy()
@@ -1725,11 +1694,12 @@ class LMCacheConnectorV1Impl:
             assert self.lookup_client is not None
             self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
 
-        # Notify PDBackend of aborted disagg requests.
+        # Notify storage backends of aborted disagg requests.
         if request.status == RequestStatus.FINISHED_ABORTED:
-            pd_backend = self._get_pd_backend()
-            if pd_backend is not None:
-                pd_backend.cancel_request(request.request_id)
+            assert self.lmcache_engine is not None
+            sm = self.lmcache_engine.storage_manager
+            if sm is not None:
+                sm.cancel_request(request.request_id)
 
         params = (
             request.kv_transfer_params
