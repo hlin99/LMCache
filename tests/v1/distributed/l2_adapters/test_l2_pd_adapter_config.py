@@ -57,7 +57,7 @@ def test_parse_minimal_receiver_config():
 @pytest.mark.parametrize(
     "missing_key,match",
     [
-        ("peer_host", "peer_host is required"),
+        ("peer_host", "peer_host must be a non-empty string"),
         ("peer_init_port", "peer_init_port is required"),
         ("peer_alloc_port", "peer_alloc_port is required"),
     ],
