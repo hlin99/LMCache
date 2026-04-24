@@ -240,7 +240,7 @@ class TestReservationManager:
         asyncio.run(run())
 
     def test_get_total_chunks(self) -> None:
-        """get_total_chunks returns the initialised value."""
+        """get_total_chunks returns the initialized value."""
         mgr = ReservationManager(10, 1.0, 0.1)
         assert mgr.get_total_chunks() == 10
 

@@ -317,7 +317,7 @@ class ReservationManager:
         allocation_timeout: float,
         condition_poll_interval: float,
     ) -> None:
-        """Initialise the ReservationManager.
+        """Initialize the ReservationManager.
 
         Args:
             total_chunks: Total number of chunks in the buffer.
@@ -412,7 +412,7 @@ class ReservationManager:
         """Return the total buffer capacity in chunks.
 
         Returns:
-            Total number of chunks this manager was initialised with.
+            Total number of chunks this manager was initialized with.
         """
         return self._total_chunks
 
@@ -811,7 +811,7 @@ class PdL2Adapter(L2AdapterInterface):
             )
             future.result(timeout=10)
 
-        # Transfer channel will be initialised lazily on first
+        # Transfer channel will be initialized lazily on first
         # _ensure_peer_connection call (requires l1_memory_desc or
         # allocator info that may not be available yet).
         self._transfer_channel: Any = None
