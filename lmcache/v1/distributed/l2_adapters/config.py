@@ -30,26 +30,6 @@ logger = init_logger(__name__)
 T = TypeVar("T", bound="L2AdapterConfigBase")
 
 
-def _is_frozen_dataclass(obj: object) -> bool:
-    """Return True if *obj* is an instance of a frozen dataclass.
-
-    Used to avoid ``FrozenInstanceError`` when trying to set
-    ``eviction_config`` / ``persist_config`` on config objects
-    whose ``from_dict`` already set them at construction time.
-
-    Args:
-        obj: The object to check.
-
-    Returns:
-        ``True`` if *obj* is a frozen dataclass instance.
-    """
-    import dataclasses  # noqa: PLC0415
-
-    return dataclasses.is_dataclass(obj) and getattr(
-        obj.__class__, "__dataclass_params__", None
-    ) is not None and obj.__class__.__dataclass_params__.frozen
-
-
 @dataclass(frozen=True)
 class PersistConfig:
     """
@@ -382,18 +362,8 @@ def parse_args_to_l2_adapters_config(args: argparse.Namespace) -> L2AdaptersConf
         config_cls = _L2_ADAPTER_CONFIG_REGISTRY[type_name]
         try:
             adapter_cfg = config_cls.from_dict(d)
-
-            # Frozen dataclass configs (e.g. PdL2AdapterConfig) parse
-            # eviction_config and persist_config inside from_dict() and
-            # cannot be mutated afterwards.  Only apply the post-creation
-            # assignment for mutable config objects.
-            if not _is_frozen_dataclass(adapter_cfg):
-                adapter_cfg.eviction_config = (
-                    L2AdapterConfigBase._parse_eviction_config(d)
-                )
-                adapter_cfg.persist_config = (
-                    L2AdapterConfigBase._parse_persist_config(d)
-                )
+            adapter_cfg.eviction_config = L2AdapterConfigBase._parse_eviction_config(d)
+            adapter_cfg.persist_config = L2AdapterConfigBase._parse_persist_config(d)
             adapter_configs.append(adapter_cfg)
         except (TypeError, ValueError) as e:
             logger.error(

@@ -78,7 +78,7 @@ _REQUIRED_FIELDS: tuple[str, ...] = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class PdL2AdapterConfig(L2AdapterConfigBase):
     """
     Configuration for the PD (Prefetch/Decode) L2 adapter.
@@ -137,7 +137,7 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
         Build a PdL2AdapterConfig from a dict (e.g. from parsed JSON).
 
         Validates all required fields and the ``role`` value, then
-        constructs a fully-populated frozen instance.
+        constructs a fully-populated instance.
 
         Args:
             d: Adapter spec dict. Must include all required keys
