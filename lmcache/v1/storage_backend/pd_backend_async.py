@@ -1266,9 +1266,13 @@ class PDBackendAsync(AllocatorBackendInterface):
         req_id = alloc_request.req_id
 
         # Reservation-based admission: admit on first batch for this req_id.
-        # Legacy senders with total_chunks==0 skip reservation (deprecated path).
         is_first_batch = req_id and (req_id not in self._req_allocated_keys)
-        if is_first_batch and alloc_request.total_chunks > 0:
+        if is_first_batch:
+            if alloc_request.total_chunks == 0:
+                raise RuntimeError(
+                    f"Receiver requires total_chunks > 0 for req {req_id}. "
+                    f"Legacy senders (total_chunks=0) are no longer supported."
+                )
             admitted = await self._recv_reservation_mgr.async_try_admit(
                 req_id, alloc_request.total_chunks
             )
@@ -1278,28 +1282,29 @@ class PDBackendAsync(AllocatorBackendInterface):
                     f"for req {req_id} (total_chunks={alloc_request.total_chunks}). "
                     f"Buffer may be over-subscribed."
                 )
-        elif is_first_batch and alloc_request.total_chunks == 0:
-            logger.debug(
-                "[PD-ADMIT] req=%s: legacy sender detected (total_chunks=0). "
-                "No buffer reservation — buffer over-commitment is possible. "
-                "Upgrade sender to pass total_chunks.",
-                req_id,
-            )
 
-        # Fail-fast: detect if cumulative chunks exceed total buffer capacity.
+        # Fail-fast: detect if cumulative chunks exceed declared total_chunks.
         if req_id:
             prev_count = len(self._req_allocated_keys.get(req_id, []))
             new_total = prev_count + total_allocs
-            total_capacity = self._recv_reservation_mgr.get_total_chunks()
-            if new_total > total_capacity:
-                if alloc_request.total_chunks > 0:
-                    await self._recv_reservation_mgr.async_release_reservation(req_id)
+
+            if new_total > alloc_request.total_chunks:
+                # Rollback any prior batches
+                prior_keys = self._req_allocated_keys.get(req_id, [])
+                for prior_key_str in prior_keys:
+                    try:
+                        self.remove(CacheEngineKey.from_string(prior_key_str))
+                    except Exception as e:
+                        logger.warning(
+                            "Rollback failed for key %s: %s", prior_key_str, e
+                        )
+
+                # Clean up tracking and release reservation
+                self._req_allocated_keys.pop(req_id, None)
+                await self._recv_reservation_mgr.async_release_reservation(req_id)
                 raise RuntimeError(
-                    f"Request {req_id} requires {new_total} total chunks "
-                    f"(already allocated {prev_count}, new batch {total_allocs}) "
-                    f"but total_chunks={total_capacity}. "
-                    f"This request can never complete. "
-                    f"Increase pd_buffer_size or reduce prompt length / chunk size."
+                    f"Request {req_id} protocol violation: declared total_chunks="
+                    f"{alloc_request.total_chunks} but attempting {new_total} chunks."
                 )
         else:
             logger.debug(
@@ -1361,6 +1366,7 @@ class PDBackendAsync(AllocatorBackendInterface):
                     len(self.data),
                 )
         except BaseException:
+            # Rollback: remove chunks from the current batch.
             for rollback_key_str in current_batch_keys:
                 try:
                     rollback_key = CacheEngineKey.from_string(rollback_key_str)
@@ -1371,10 +1377,33 @@ class PDBackendAsync(AllocatorBackendInterface):
                         rollback_key_str,
                         re,
                     )
+
+            # If this request has prior successful batches, clean them up too.
+            # Any batch failure means the entire request is invalid since the
+            # decoder needs all chunks to proceed.
             if req_id:
+                prior_keys = self._req_allocated_keys.get(req_id, [])
+                if prior_keys:
+                    logger.warning(
+                        "[PD-ALLOC] req=%s batch failed, rolling back %d chunks "
+                        "from prior batches",
+                        req_id,
+                        len(prior_keys),
+                    )
+                    for prior_key_str in prior_keys:
+                        try:
+                            prior_key = CacheEngineKey.from_string(prior_key_str)
+                            self.remove(prior_key)
+                        except Exception as re:
+                            logger.warning(
+                                "Rollback remove failed for prior key %s: %s",
+                                prior_key_str,
+                                re,
+                            )
+
+                # Clean up tracking and release reservation.
                 self._req_allocated_keys.pop(req_id, None)
-                if alloc_request.total_chunks > 0:
-                    await self._recv_reservation_mgr.async_release_reservation(req_id)
+                await self._recv_reservation_mgr.async_release_reservation(req_id)
             raise
 
         # All allocations succeeded.
@@ -1384,8 +1413,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             self._req_allocated_keys[req_id].extend(current_batch_keys)
             if alloc_request.is_last_batch:
                 self._req_allocated_keys.pop(req_id, None)
-                if alloc_request.total_chunks > 0:
-                    await self._recv_reservation_mgr.async_release_reservation(req_id)
+                await self._recv_reservation_mgr.async_release_reservation(req_id)
 
         return AllocResponse(remote_indexes=alloc_indexes)
 
