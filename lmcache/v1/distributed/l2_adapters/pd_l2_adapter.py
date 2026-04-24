@@ -67,6 +67,7 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
             nixl_backends: List of NIXL transport backend names.  Defaults
                 to ``['tcp']``.
         """
+        super().__init__()
         self.role = role
         self.peer_host = peer_host
         self.peer_init_port = peer_init_port
