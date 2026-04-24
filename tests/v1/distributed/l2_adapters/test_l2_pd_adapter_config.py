@@ -12,6 +12,9 @@ Covers:
 - Default values are applied when optional fields are omitted
 """
 
+# Standard
+from typing import Any
+
 # Third Party
 import pytest
 
@@ -23,14 +26,14 @@ from lmcache.v1.distributed.l2_adapters.pd_l2_adapter import PdL2AdapterConfig
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
-_SENDER_REQUIRED: dict = {
+_SENDER_REQUIRED: dict[str, Any] = {
     "role": "sender",
     "peer_host": "192.168.1.10",
     "peer_init_port": [9000, 9001],
     "peer_alloc_port": [9100, 9101],
 }
 
-_RECEIVER_REQUIRED: dict = {
+_RECEIVER_REQUIRED: dict[str, Any] = {
     "role": "receiver",
     "peer_host": "192.168.1.20",
     "peer_init_port": [9000, 9001],
@@ -105,7 +108,7 @@ def test_registered_in_factory() -> None:
 
 def test_all_fields_round_trip() -> None:
     """All fields, including optional ones, survive from_dict."""
-    full: dict = {
+    full: dict[str, Any] = {
         "role": "sender",
         "peer_host": "10.0.0.1",
         "peer_init_port": [8000],

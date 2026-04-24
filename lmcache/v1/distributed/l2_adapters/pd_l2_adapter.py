@@ -46,10 +46,10 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
         nixl_backends: NIXL transport backends (default: ["tcp"]).
     """
 
-    role: str = field(default="")
-    peer_host: str = field(default="")
-    peer_init_port: list[int] = field(default_factory=list)
-    peer_alloc_port: list[int] = field(default_factory=list)
+    role: str
+    peer_host: str
+    peer_init_port: list[int]
+    peer_alloc_port: list[int]
     proxy_host: str = ""
     proxy_port: int = 0
     buffer_size: int = 67108864  # 64 MB
