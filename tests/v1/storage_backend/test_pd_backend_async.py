@@ -870,3 +870,210 @@ def test_sync_response_decoded_as_async():
     decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(resp), type=AsyncPDMsg)
     assert isinstance(decoded, AsyncAllocResponse)
     assert decoded.already_sent_indexes == [0] and decoded.remote_indexes == [100]
+
+
+# ── new coverage tests ────────────────────────────────────────────────────
+
+
+def test_receiver_reject_legacy_sender_zero_total_chunks(async_receiver):
+    """req_id + total_chunks=0 → RuntimeError (legacy sender rejected).
+
+    Verifies that a request with a req_id but total_chunks=0 is rejected
+    immediately, since the new reservation-based design requires senders to
+    declare total_chunks upfront.
+    """
+    async_receiver.allocate = _auto_alloc()
+    req = _make_alloc_req([_make_key(0)], req_id="req-legacy", total_chunks=0)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="total_chunks"):
+            await async_receiver._async_allocate_and_put(req)
+
+    asyncio.run(run())
+
+
+def test_receiver_reservation_admission_timeout(async_receiver):
+    """Admission times out when buffer is fully reserved by another request.
+
+    Verifies that when the entire buffer is reserved by an in-progress request,
+    a new request's admission attempt times out and raises RuntimeError.
+    """
+    async_receiver.allocate = _auto_alloc()
+    # Set the reservation manager's own admission timeout to keep the test fast.
+    async_receiver._recv_reservation_mgr._allocation_timeout = 0.05
+    total = async_receiver._recv_reservation_mgr._total_chunks
+
+    async def run():
+        # Admit a request that reserves the entire buffer (not yet released).
+        await async_receiver._async_allocate_and_put(
+            _make_alloc_req(
+                [_make_key(i) for i in range(total)],
+                req_id="req-hog",
+                total_chunks=total,
+                is_last_batch=False,
+            )
+        )
+
+        # Second request cannot be admitted → timeout.
+        with pytest.raises(RuntimeError, match="timed out"):
+            await async_receiver._async_allocate_and_put(
+                _make_alloc_req(
+                    [_make_key(9000)],
+                    req_id="req-blocked",
+                    total_chunks=1,
+                )
+            )
+
+    asyncio.run(run())
+
+
+def test_receiver_cancel_notif_releases_keys_and_reservation(async_receiver):
+    """CancelNotif removes keys, releases reservation, and cleans up tracking.
+
+    Verifies that when a CancelNotif arrives via _handle_alloc_request, all
+    previously allocated keys are removed, the per-request tracking entry is
+    deleted, and the reservation is fully released.
+    """
+    async_receiver.allocate = _auto_alloc()
+    req_id = "req-cancel"
+    keys = [_make_key(5000 + i) for i in range(3)]
+
+    async def run():
+        # Allocate first batch (not last).
+        await async_receiver._async_allocate_and_put(
+            _make_alloc_req(
+                keys, req_id=req_id, total_chunks=5, is_last_batch=False
+            )
+        )
+        assert req_id in async_receiver._req_allocated_keys
+        assert async_receiver._recv_reservation_mgr._total_reserved > 0
+
+        # Send CancelNotif via _handle_alloc_request.
+        cancel = CancelNotif(req_id=req_id, keys=[k.to_string() for k in keys])
+        payload = msgspec.msgpack.encode(cancel)
+        sock = MagicMock()
+        sock.send_multipart = AsyncMock()
+        await async_receiver._handle_alloc_request(sock, b"sender-1", payload)
+
+        # Verify cleanup.
+        for k in keys:
+            assert not async_receiver.contains(k, pin=False)
+        assert req_id not in async_receiver._req_allocated_keys
+        assert async_receiver._recv_reservation_mgr._total_reserved == 0
+
+    asyncio.run(run())
+
+
+def test_receiver_no_req_id_skips_admission(async_receiver):
+    """Empty req_id bypasses reservation admission and chunk accounting.
+
+    Verifies that anonymous requests (req_id="") are allocated without
+    touching the reservation manager, leaving total_reserved unchanged.
+    """
+    async_receiver.allocate = _auto_alloc()
+
+    async def run():
+        r = await async_receiver._async_allocate_and_put(
+            _make_alloc_req([_make_key(0), _make_key(1)], req_id="", total_chunks=0)
+        )
+        assert len(r.remote_indexes) == 2
+        assert -1 not in r.remote_indexes
+        # No reservation should be held for anonymous requests.
+        assert async_receiver._recv_reservation_mgr._total_reserved == 0
+
+    asyncio.run(run())
+
+
+def test_receiver_batch_failure_rolls_back_prior_batches(async_receiver):
+    """Second batch allocation timeout → both batches rolled back.
+
+    Verifies that when a batch fails mid-allocation, all previously allocated
+    keys from earlier batches for the same request are also removed and the
+    reservation is released, since the decoder needs all chunks to proceed.
+    """
+    async_receiver.allocate = _auto_alloc()
+    req_id = "req-rollback"
+    b1_keys = [_make_key(1000 + i) for i in range(3)]
+
+    async def run():
+        # First batch succeeds.
+        r1 = await async_receiver._async_allocate_and_put(
+            _make_alloc_req(
+                b1_keys, req_id=req_id, total_chunks=6, is_last_batch=False
+            )
+        )
+        assert -1 not in r1.remote_indexes
+        for k in b1_keys:
+            assert async_receiver.contains(k, pin=False)
+
+        # Second batch: allocator always returns None → timeout.
+        async_receiver.allocate = lambda *a, **kw: None
+        async_receiver._allocation_timeout = 0.05
+
+        with pytest.raises(RuntimeError, match="timeout"):
+            await async_receiver._async_allocate_and_put(
+                _make_alloc_req(
+                    [_make_key(2000 + i) for i in range(3)],
+                    req_id=req_id,
+                    total_chunks=6,
+                    is_last_batch=True,
+                )
+            )
+
+        # Prior batch keys must be rolled back too.
+        for k in b1_keys:
+            assert not async_receiver.contains(k, pin=False)
+        assert req_id not in async_receiver._req_allocated_keys
+        assert async_receiver._recv_reservation_mgr._total_reserved == 0
+
+    asyncio.run(run())
+
+
+def test_receiver_reservation_released_unblocks_waiting_request(async_receiver):
+    """Releasing a reservation unblocks a concurrently waiting admission.
+
+    Covers the notify_all() call in async_release_reservation.
+    """
+    async_receiver.allocate = _auto_alloc()
+    total = async_receiver._recv_reservation_mgr._total_chunks
+
+    async def run():
+        # Fill all reservation with req-fill (not last batch, so not released yet).
+        await async_receiver._async_allocate_and_put(
+            _make_alloc_req(
+                [_make_key(i) for i in range(total)],
+                req_id="req-fill",
+                total_chunks=total,
+                is_last_batch=False,
+            )
+        )
+
+        result: list = []
+
+        async def blocked_req():
+            r = await async_receiver._async_allocate_and_put(
+                _make_alloc_req(
+                    [_make_key(9000)],
+                    req_id="req-wait",
+                    total_chunks=1,
+                )
+            )
+            result.append(r)
+
+        async def release_later():
+            await asyncio.sleep(0.05)
+            # Release req-fill's reservation by sending the last batch.
+            await async_receiver._async_allocate_and_put(
+                _make_alloc_req(
+                    [],
+                    req_id="req-fill",
+                    total_chunks=total,
+                    is_last_batch=True,
+                )
+            )
+
+        await asyncio.gather(blocked_req(), release_later())
+        assert len(result) == 1
+        assert -1 not in result[0].remote_indexes
+
+    asyncio.run(run())
