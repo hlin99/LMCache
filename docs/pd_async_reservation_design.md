@@ -34,7 +34,6 @@ B admitted → reserved=8, proceeds
 │    ├─ store() × N batches              ←─── allocate + from_gpu per batch
 │    │   ├─ allocate()                   ←─── blocks on _staging_condition if buffer full
 │    │   └─ batched_submit_put_task()    ←─── submits to sender loop, returns immediately
-│    └─ (no admission control)                │
 └─────────────────────────────────────────────┘
               │ asyncio.run_coroutine_threadsafe
               ▼
@@ -56,11 +55,8 @@ B admitted → reserved=8, proceeds
 │    ├─ CancelNotif → release keys + reservation
 │    └─ AllocRequest → _async_allocate_and_put()
 │         ├─ async_try_admit() (first batch)  │
-│         │   └─ reject if total_chunks == 0  │
-│         ├─ detect protocol violations        │
 │         ├─ allocate() per chunk             │
-│         ├─ put() → register KV object       │
-│         └─ full rollback on batch failure   │
+│         └─ put() → register KV object       │
 └─────────────────────────────────────────────┘
 ```
 
