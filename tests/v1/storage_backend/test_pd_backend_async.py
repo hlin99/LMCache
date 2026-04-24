@@ -35,6 +35,7 @@ from lmcache.v1.storage_backend.pd_backend_async import (
     AllocResponse as AsyncAllocResponse,
 )
 from lmcache.v1.storage_backend.pd_backend_async import (
+    CancelNotif,
     PDBackendAsync,
 )
 from lmcache.v1.storage_backend.pd_backend_async import PDMsg as AsyncPDMsg
@@ -96,6 +97,7 @@ def _make_alloc_req(
     req_id="",
     is_last_batch=False,
     shape=None,
+    total_chunks=0,
 ):
     return AsyncAllocRequest(
         keys=[k.to_string() for k in keys],
@@ -105,6 +107,7 @@ def _make_alloc_req(
         last_chunk_toks=last_chunk_toks,
         req_id=req_id,
         is_last_batch=is_last_batch,
+        total_chunks=total_chunks,
     )
 
 
@@ -572,42 +575,42 @@ def test_receiver_last_chunk_shape_override(async_receiver):
 
 
 @pytest.mark.parametrize(
-    "max_t, b1_n, b2_n, b1_off, b2_off",
-    [(5, 5, 1, 0, 5), (4, 3, 2, 5000, 6000)],
+    "total_declared, b1_n, b2_n",
+    [(5, 5, 1), (4, 3, 2)],
     ids=["exact-then-overflow", "partial-then-overflow"],
 )
-def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, b2_off):
-    """Cumulative chunks > total_capacity → RuntimeError; prior batch kept."""
-    # Override the reservation manager's total capacity to test overflow detection.
-    async_receiver._recv_reservation_mgr._total_chunks = max_t
+def test_receiver_fail_fast_overflow(async_receiver, total_declared, b1_n, b2_n):
+    """Cumulative chunks > declared total_chunks → RuntimeError; all keys rolled back."""
     async_receiver.allocate = _auto_alloc()
     req_id = "req-failfast"
 
-    b1_keys = [_make_key(b1_off + i) for i in range(b1_n)]
+    b1_keys = [_make_key(i) for i in range(b1_n)]
 
     async def run():
         r1 = await async_receiver._async_allocate_and_put(
-            _make_alloc_req(b1_keys, req_id=req_id)
+            _make_alloc_req(b1_keys, req_id=req_id, total_chunks=total_declared)
         )
         assert -1 not in r1.remote_indexes and len(r1.remote_indexes) == b1_n
 
         with pytest.raises(RuntimeError, match="total_chunks"):
             await async_receiver._async_allocate_and_put(
                 _make_alloc_req(
-                    [_make_key(b2_off + i) for i in range(b2_n)], req_id=req_id
+                    [_make_key(5000 + i) for i in range(b2_n)],
+                    req_id=req_id,
+                    total_chunks=total_declared,
                 )
             )
 
     asyncio.run(run())
 
+    # Fail-fast path rolls back prior batch keys too.
     for k in b1_keys:
-        assert async_receiver.contains(k, pin=False)
+        assert not async_receiver.contains(k, pin=False)
 
     # unrelated req_id should work fine
-
     async def check_other():
         r = await async_receiver._async_allocate_and_put(
-            _make_alloc_req([_make_key(20000)], req_id="req-other")
+            _make_alloc_req([_make_key(20000)], req_id="req-other", total_chunks=1)
         )
         assert -1 not in r.remote_indexes
 
@@ -615,13 +618,15 @@ def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, 
 
 
 def test_receiver_alloc_timeout(async_receiver):
-    """allocate() returning None past deadline → RuntimeError; prior batch kept."""
+    """allocate() returning None past deadline → RuntimeError; prior batches rolled back."""
     req_id = "req-timeout"
     async_receiver.allocate = _auto_alloc()
 
     b1_keys = [_make_key(1000 + i) for i in range(3)]
     r1 = asyncio.run(
-        async_receiver._async_allocate_and_put(_make_alloc_req(b1_keys, req_id=req_id))
+        async_receiver._async_allocate_and_put(
+            _make_alloc_req(b1_keys, req_id=req_id, total_chunks=6)
+        )
     )
     assert -1 not in r1.remote_indexes
 
@@ -638,13 +643,18 @@ def test_receiver_alloc_timeout(async_receiver):
     async def run():
         with pytest.raises(RuntimeError, match="timeout"):
             await async_receiver._async_allocate_and_put(
-                _make_alloc_req([_make_key(2000 + i) for i in range(3)], req_id=req_id)
+                _make_alloc_req(
+                    [_make_key(2000 + i) for i in range(3)],
+                    req_id=req_id,
+                    total_chunks=6,
+                )
             )
 
     asyncio.run(run())
 
+    # New design rolls back prior batches on failure.
     for k in b1_keys:
-        assert async_receiver.contains(k, pin=False)
+        assert not async_receiver.contains(k, pin=False)
 
 
 def test_receiver_is_last_batch_cleanup(async_receiver):
@@ -658,6 +668,7 @@ def test_receiver_is_last_batch_cleanup(async_receiver):
                 [_make_key(3000 + i) for i in range(3)],
                 req_id=req_id,
                 is_last_batch=False,
+                total_chunks=5,
             )
         )
     )
@@ -670,6 +681,7 @@ def test_receiver_is_last_batch_cleanup(async_receiver):
                 [_make_key(4000 + i) for i in range(2)],
                 req_id=req_id,
                 is_last_batch=True,
+                total_chunks=5,
             )
         )
     )
@@ -689,6 +701,7 @@ def test_receiver_admission_control(async_receiver):
                 [_make_key(7000 + i) for i in range(2)],
                 req_id="req-A",
                 is_last_batch=False,
+                total_chunks=3,
             )
         )
         log.append("A1-done")
@@ -696,7 +709,12 @@ def test_receiver_admission_control(async_receiver):
         async def do_b():
             log.append("B-start")
             await async_receiver._async_allocate_and_put(
-                _make_alloc_req([_make_key(8000)], req_id="req-B", is_last_batch=True)
+                _make_alloc_req(
+                    [_make_key(8000)],
+                    req_id="req-B",
+                    is_last_batch=True,
+                    total_chunks=1,
+                )
             )
             log.append("B-done")
 
@@ -704,7 +722,12 @@ def test_receiver_admission_control(async_receiver):
             await asyncio.sleep(0.02)
             log.append("A2-start")
             await async_receiver._async_allocate_and_put(
-                _make_alloc_req([_make_key(9000)], req_id="req-A", is_last_batch=True)
+                _make_alloc_req(
+                    [_make_key(9000)],
+                    req_id="req-A",
+                    is_last_batch=True,
+                    total_chunks=3,
+                )
             )
             log.append("A2-done")
 
