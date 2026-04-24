@@ -1286,43 +1286,81 @@ class PDBackendAsync(AllocatorBackendInterface):
                 req_id,
             )
 
-        # Fail-fast: detect if cumulative chunks exceed total buffer capacity.
+        # Fail-fast: detect if cumulative chunks exceed the declared total or buffer capacity.
         if req_id:
             prev_count = len(self._req_allocated_keys.get(req_id, []))
             new_total = prev_count + total_allocs
-            total_capacity = self._recv_reservation_mgr.get_total_chunks()
-            if new_total > total_capacity:
-                # Clean up any prior successful batches before failing.
-                prior_keys = self._req_allocated_keys.get(req_id, [])
-                if prior_keys:
-                    logger.warning(
-                        "[PD-ALLOC] req=%s fail-fast overflow detected, "
-                        "rolling back %d chunks from prior batches",
-                        req_id,
-                        len(prior_keys),
-                    )
-                    for prior_key_str in prior_keys:
-                        try:
-                            prior_key = CacheEngineKey.from_string(prior_key_str)
-                            self.remove(prior_key)
-                        except Exception as re:
-                            logger.warning(
-                                "Rollback remove failed for key %s: %s",
-                                prior_key_str,
-                                re,
-                            )
 
-                # Clean up tracking and release reservation.
-                self._req_allocated_keys.pop(req_id, None)
-                if alloc_request.total_chunks > 0:
+            # For requests with reservation (total_chunks > 0), check against the
+            # reserved amount. This catches senders that send more chunks than declared.
+            if alloc_request.total_chunks > 0:
+                if new_total > alloc_request.total_chunks:
+                    # Sender is sending more chunks than it declared in total_chunks.
+                    # This is a protocol violation — clean up and fail.
+                    prior_keys = self._req_allocated_keys.get(req_id, [])
+                    if prior_keys:
+                        logger.error(
+                            "[PD-ALLOC] req=%s protocol violation: sender declared "
+                            "total_chunks=%d but is sending %d chunks. "
+                            "Rolling back %d chunks from prior batches.",
+                            req_id,
+                            alloc_request.total_chunks,
+                            new_total,
+                            len(prior_keys),
+                        )
+                        for prior_key_str in prior_keys:
+                            try:
+                                prior_key = CacheEngineKey.from_string(prior_key_str)
+                                self.remove(prior_key)
+                            except Exception as re:
+                                logger.warning(
+                                    "Rollback remove failed for key %s: %s",
+                                    prior_key_str,
+                                    re,
+                                )
+
+                    # Clean up tracking and release reservation.
+                    self._req_allocated_keys.pop(req_id, None)
                     await self._recv_reservation_mgr.async_release_reservation(req_id)
-                raise RuntimeError(
-                    f"Request {req_id} requires {new_total} total chunks "
-                    f"(already allocated {prev_count}, new batch {total_allocs}) "
-                    f"but total_chunks={total_capacity}. "
-                    f"This request can never complete. "
-                    f"Increase pd_buffer_size or reduce prompt length / chunk size."
-                )
+                    raise RuntimeError(
+                        f"Request {req_id} protocol violation: declared total_chunks="
+                        f"{alloc_request.total_chunks} but attempting to allocate "
+                        f"{new_total} chunks (prev={prev_count}, current={total_allocs}). "
+                        f"Sender must correctly compute total_chunks before sending."
+                    )
+            else:
+                # Legacy sender without reservation: check against total buffer capacity.
+                total_capacity = self._recv_reservation_mgr.get_total_chunks()
+                if new_total > total_capacity:
+                    # This request can never complete because buffer is too small.
+                    prior_keys = self._req_allocated_keys.get(req_id, [])
+                    if prior_keys:
+                        logger.warning(
+                            "[PD-ALLOC] req=%s fail-fast overflow detected (legacy sender), "
+                            "rolling back %d chunks from prior batches",
+                            req_id,
+                            len(prior_keys),
+                        )
+                        for prior_key_str in prior_keys:
+                            try:
+                                prior_key = CacheEngineKey.from_string(prior_key_str)
+                                self.remove(prior_key)
+                            except Exception as re:
+                                logger.warning(
+                                    "Rollback remove failed for key %s: %s",
+                                    prior_key_str,
+                                    re,
+                                )
+
+                    # Clean up tracking (no reservation to release for legacy senders).
+                    self._req_allocated_keys.pop(req_id, None)
+                    raise RuntimeError(
+                        f"Request {req_id} requires {new_total} total chunks "
+                        f"(already allocated {prev_count}, new batch {total_allocs}) "
+                        f"but total_chunks={total_capacity}. "
+                        f"This request can never complete. "
+                        f"Increase pd_buffer_size or reduce prompt length / chunk size."
+                    )
         else:
             logger.debug(
                 "AllocRequest has no req_id — per-request chunk accounting "
