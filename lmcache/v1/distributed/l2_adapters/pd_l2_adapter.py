@@ -99,8 +99,8 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("role must be 'sender' or 'receiver', got %r" % role)
 
         peer_host = d.get("peer_host")
-        if not peer_host:
-            raise ValueError("peer_host is required")
+        if not isinstance(peer_host, str) or not peer_host:
+            raise ValueError("peer_host must be a non-empty string")
 
         peer_init_port = d.get("peer_init_port")
         if not peer_init_port:
@@ -123,12 +123,16 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
                 % transfer_channel
             )
 
+        proxy_host = d.get("proxy_host", "127.0.0.1")
+        if not isinstance(proxy_host, str) or not proxy_host:
+            raise ValueError("proxy_host must be a non-empty string")
+
         cfg = cls(
             role=role,
             peer_host=peer_host,
             peer_init_port=list(peer_init_port),
             peer_alloc_port=list(peer_alloc_port),
-            proxy_host=d.get("proxy_host", "127.0.0.1"),
+            proxy_host=proxy_host,
             proxy_port=int(d.get("proxy_port", 6688)),
             buffer_size=int(d.get("buffer_size", 1073741824)),
             buffer_device=buffer_device,
