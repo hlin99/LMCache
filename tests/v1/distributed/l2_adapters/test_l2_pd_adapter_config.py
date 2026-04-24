@@ -95,7 +95,7 @@ def test_help_contains_all_field_names():
         "persist_enabled",
         "eviction",
     ):
-        assert field in text, "help() is missing field %r" % field
+        assert field in text, f"help() is missing field {field!r}"
 
 
 def test_registered_in_factory():

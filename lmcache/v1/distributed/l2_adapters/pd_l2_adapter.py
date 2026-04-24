@@ -66,7 +66,7 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
             buffer_device: Device for the staging buffer ('cpu' or 'cuda').
             transfer_channel: Transfer backend ('nixl' or 'mock_memory').
             nixl_backends: List of NIXL transport backend names.  Defaults
-                to ``['tcp']`` when ``None``.
+                to ``['tcp']``.
         """
         self.role = role
         self.peer_host = peer_host
@@ -77,7 +77,7 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
         self.buffer_size = buffer_size
         self.buffer_device = buffer_device
         self.transfer_channel = transfer_channel
-        self.nixl_backends = nixl_backends if nixl_backends is not None else ["tcp"]
+        self.nixl_backends = nixl_backends or ["tcp"]
 
     @classmethod
     def from_dict(cls, d: dict) -> "PdL2AdapterConfig":
