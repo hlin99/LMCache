@@ -1295,7 +1295,9 @@ class PDBackendAsync(AllocatorBackendInterface):
                     try:
                         self.remove(CacheEngineKey.from_string(prior_key_str))
                     except Exception as e:
-                        logger.warning("Rollback failed for key %s: %s", prior_key_str, e)
+                        logger.warning(
+                            "Rollback failed for key %s: %s", prior_key_str, e
+                        )
 
                 # Clean up tracking and release reservation
                 self._req_allocated_keys.pop(req_id, None)
