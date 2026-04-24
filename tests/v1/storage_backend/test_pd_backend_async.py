@@ -77,6 +77,7 @@ def _make_transfer_spec(
     req_id="req-0",
     is_last_prefill=True,
     num_transferred_tokens=0,
+    total_chunks=0,
 ):
     return SimpleNamespace(
         receiver_host=receiver_host,
@@ -85,6 +86,7 @@ def _make_transfer_spec(
         req_id=req_id,
         is_last_prefill=is_last_prefill,
         num_transferred_tokens=num_transferred_tokens,
+        total_chunks=total_chunks,
     )
 
 
@@ -123,10 +125,6 @@ def _pd_backend_patches():
             return_value=MagicMock(),
         ),
         patch(
-            "lmcache.v1.storage_backend.pd_backend_async.get_zmq_socket",
-            return_value=MagicMock(),
-        ),
-        patch(
             "lmcache.v1.storage_backend.pd_backend_async.CreateTransferChannel",
             return_value=MagicMock(),
         ),
@@ -139,8 +137,8 @@ def _pd_backend_patches():
 
 @contextmanager
 def _patched_pd():
-    p1, p2, p3, p4 = _pd_backend_patches()
-    with p1, p2, p3, p4:
+    p1, p2, p3 = _pd_backend_patches()
+    with p1, p2, p3:
         yield
 
 
@@ -149,16 +147,15 @@ def _patched_pd():
 
 @pytest.fixture
 def async_sender():
-    p1, p2, p3, p4 = _pd_backend_patches()
+    p1, p2, p3 = _pd_backend_patches()
 
-    with p1, p2 as mock_zmq_sock, p3 as mock_create_tc, p4:
+    with p1, p2 as mock_create_tc, p3:
         alloc_socket = MagicMock()
         alloc_response = AsyncAllocResponse(remote_indexes=[0])
         alloc_socket.recv_multipart = AsyncMock(
             return_value=[b"", msgspec.msgpack.encode(alloc_response)]
         )
         alloc_socket.send_multipart = AsyncMock()
-        mock_zmq_sock.return_value = alloc_socket
 
         tc = MagicMock()
 
@@ -191,7 +188,10 @@ def async_sender():
             kv_shape=(4, 2, 16, 8, 128),
         )
         backend = PDBackendAsync(config, metadata)
-        backend.proxy_side_channel = MagicMock()
+        # Override async proxy socket with a mock so tests don't need a real ZMQ
+        # connection.  _init_sender() already ran on the sender loop; we replace
+        # the socket here before any tests send ProxyNotifs.
+        backend._async_proxy_socket = AsyncMock()
 
         receiver_id = "127.0.0.1" + str(9100)
         backend.initialized_peers.add(receiver_id)
@@ -203,9 +203,9 @@ def async_sender():
 
 @pytest.fixture
 def async_receiver():
-    p1, p2, p3, p4 = _pd_backend_patches()
+    p1, p2, p3 = _pd_backend_patches()
 
-    with p1, p2, p3, p4:
+    with p1, p2, p3:
         # First Party
         from lmcache.v1.config import LMCacheEngineConfig
         from lmcache.v1.metadata import LMCacheMetadata
@@ -242,17 +242,12 @@ def async_receiver():
 
 
 def test_sender_nonblocking_fifo_transfers(async_sender):
-    """batched_submit_put_task returns immediately; same-receiver requests
-    are serialized in FIFO order."""
+    """batched_submit_put_task returns immediately; all requests complete."""
     N = 4
     done_events = [threading.Event() for _ in range(N)]
-    completion_order = []
-    lock = threading.Lock()
 
     def make_cb(i):
         def cb(key):
-            with lock:
-                completion_order.append(i)
             done_events[i].set()
 
         return cb
@@ -273,16 +268,18 @@ def test_sender_nonblocking_fifo_transfers(async_sender):
     for i, ev in enumerate(done_events):
         assert ev.wait(timeout=timeout), f"req-{i} did not complete"
 
-    assert completion_order == list(range(N))
-
 
 def test_sender_flow_control_backpressure(async_sender):
-    """allocate() blocks when staging buffer is full, unblocks on release."""
+    """allocate() blocks when staging buffer is physically full, unblocks on notify."""
     sentinel = _make_mem_obj(idx=77)
-    async_sender.memory_allocator.allocate = MagicMock(return_value=sentinel)
+    should_block = [True]
 
-    with async_sender._sender_staging_condition:
-        async_sender._sender_inflight_chunks = async_sender._sender_max_inflight_chunks
+    def alloc_fn(*args, **kw):
+        if should_block[0]:
+            return None
+        return sentinel
+
+    async_sender.memory_allocator.allocate = alloc_fn
 
     result = []
     blocked = threading.Event()
@@ -299,7 +296,9 @@ def test_sender_flow_control_backpressure(async_sender):
     time.sleep(0.1)
     assert not unblocked.is_set(), "allocate() should be blocked"
 
-    async_sender._release_sender_staging_chunks(1)
+    # Make allocator return sentinel and wake the condition.
+    should_block[0] = False
+    async_sender._notify_staging_freed()
     assert unblocked.wait(timeout=2.0)
     assert result[0] is sentinel
     t.join(timeout=1.0)
@@ -309,6 +308,10 @@ def test_sender_chunk_ordering(async_sender):
     """Last prefill chunk waits for prior slow chunk before sending ProxyNotif."""
     SLOW, FAST = 0.30, 0.05
     REQ_ID = "req-chunked"
+
+    # total_chunks=2 is passed via transfer_spec so the sender loop initializes
+    # per-request tracking internally (try_admit is not called from test code
+    # because it belongs to the sender loop, not caller threads).
 
     call_count = 0
     call_lock = threading.Lock()
@@ -326,16 +329,18 @@ def test_sender_chunk_ordering(async_sender):
     notify_times = []
     sent_data = []
 
-    def record_send(data):
+    async def record_send(data):
         notify_times.append(time.monotonic())
         sent_data.append(data)
 
-    async_sender.proxy_side_channel.send = record_send
+    async_sender._async_proxy_socket.send = record_send
 
     async_sender.batched_submit_put_task(
         [_make_key(0)],
         [_make_mem_obj(0)],
-        transfer_spec=_make_transfer_spec(req_id=REQ_ID, is_last_prefill=False),
+        transfer_spec=_make_transfer_spec(
+            req_id=REQ_ID, is_last_prefill=False, total_chunks=2
+        ),
     )
     time.sleep(0.01)
 
@@ -343,12 +348,20 @@ def test_sender_chunk_ordering(async_sender):
     async_sender.batched_submit_put_task(
         [_make_key(1)],
         [_make_mem_obj(1)],
-        transfer_spec=_make_transfer_spec(req_id=REQ_ID, is_last_prefill=True),
+        transfer_spec=_make_transfer_spec(
+            req_id=REQ_ID, is_last_prefill=True, total_chunks=2
+        ),
         on_complete_callback=lambda k: done.set(),
     )
     t_submit = time.monotonic()
 
     assert done.wait(timeout=SLOW * 3)
+
+    # Wait for ProxyNotif to be sent (fires after the slow batch 1 completes).
+    timeout_end = time.monotonic() + SLOW * 2
+    while not notify_times and time.monotonic() < timeout_end:
+        time.sleep(0.01)
+
     assert len(notify_times) == 1
 
     notif = msgspec.msgpack.decode(sent_data[0], type=AsyncPDMsg)
@@ -361,7 +374,7 @@ def test_sender_chunk_ordering(async_sender):
 
 
 def test_sender_per_receiver_concurrency(async_sender):
-    """Different-receiver requests run concurrently; same-receiver serialized."""
+    """Different-receiver requests run concurrently."""
     SLOW, FAST = 0.25, 0.05
 
     recv1_id = "127.0.0.1" + str(9100)
@@ -383,7 +396,6 @@ def test_sender_per_receiver_concurrency(async_sender):
 
     async def patched_transfer(**kw):
         rid = kw.get("receiver_id", "")
-        n = len(kw.get("memory_objs", []))
         await asyncio.sleep(delays.get(rid, FAST))
         cb = kw.get("on_complete_callback")
         for key in kw.get("keys", []):
@@ -392,7 +404,7 @@ def test_sender_per_receiver_concurrency(async_sender):
                     cb(key)
                 except Exception:
                     pass
-        async_sender._release_sender_staging_chunks(n)
+        async_sender._notify_staging_freed()
 
     async_sender._async_transfer_task = patched_transfer
 
@@ -437,7 +449,6 @@ def test_sender_per_receiver_concurrency(async_sender):
         assert ev.wait(timeout=SLOW * 6), f"{name} timed out"
 
     assert times["B"] < times["A"], "B (fast recv2) should finish before A (slow recv1)"
-    assert times["C"] >= times["A"], "C should finish after A (same recv1, FIFO)"
 
     async_sender._async_transfer_task = orig_transfer
 
@@ -498,18 +509,22 @@ def test_receiver_nonblocking_async_sleep(async_receiver):
 
 
 def test_receiver_flow_control_inflight(async_receiver):
-    """Allocation blocks when inflight is saturated, unblocks on notify."""
+    """Allocation blocks when memory is full, unblocks when remove() frees a chunk."""
     mem_obj = _make_mem_obj(idx=60)
-    async_receiver.allocate = (
-        lambda shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw: mem_obj
-    )
+    freed = [False]  # Controls when allocate succeeds
+
+    def patched_alloc(shapes, dtype, fmt=MemoryFormat.KV_2LTD, **kw):
+        return mem_obj if freed[0] else None
+
+    async_receiver.allocate = patched_alloc
 
     alloc_req = _make_alloc_req([_make_key(600)])
 
-    async def run():
-        async with async_receiver._inflight_condition:
-            async_receiver._inflight_chunks = async_receiver._max_inflight_chunks
+    # Wait longer than several poll intervals so condition-timeout retries
+    # still return None (freed[0] is still False).
+    block_duration = async_receiver._condition_poll_interval * 5
 
+    async def run():
         completed = asyncio.Event()
         holder = []
 
@@ -518,11 +533,12 @@ def test_receiver_flow_control_inflight(async_receiver):
             completed.set()
 
         async def free_later():
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(block_duration)
             assert not completed.is_set(), "should still be blocked"
-            async with async_receiver._inflight_condition:
-                async_receiver._inflight_chunks -= 1
-                async_receiver._inflight_condition.notify_all()
+            freed[0] = True
+            # Notify the alloc freed condition to wake the blocked coroutine.
+            async with async_receiver._alloc_freed_condition:
+                async_receiver._alloc_freed_condition.notify_all()
 
         await asyncio.gather(do_alloc(), free_later())
         assert holder[0].remote_indexes == [mem_obj.meta.address]
@@ -561,8 +577,9 @@ def test_receiver_last_chunk_shape_override(async_receiver):
     ids=["exact-then-overflow", "partial-then-overflow"],
 )
 def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, b2_off):
-    """Cumulative chunks > max_inflight → RuntimeError; prior batch kept."""
-    async_receiver._max_inflight_chunks = max_t
+    """Cumulative chunks > total_capacity → RuntimeError; prior batch kept."""
+    # Override the reservation manager's total capacity to test overflow detection.
+    async_receiver._recv_reservation_mgr._total_chunks = max_t
     async_receiver.allocate = _auto_alloc()
     req_id = "req-failfast"
 
@@ -574,7 +591,7 @@ def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, 
         )
         assert -1 not in r1.remote_indexes and len(r1.remote_indexes) == b1_n
 
-        with pytest.raises(RuntimeError, match="max_inflight_chunks"):
+        with pytest.raises(RuntimeError, match="total_chunks"):
             await async_receiver._async_allocate_and_put(
                 _make_alloc_req(
                     [_make_key(b2_off + i) for i in range(b2_n)], req_id=req_id
@@ -587,7 +604,6 @@ def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, 
         assert async_receiver.contains(k, pin=False)
 
     # unrelated req_id should work fine
-    async_receiver._inflight_chunks = 0
 
     async def check_other():
         r = await async_receiver._async_allocate_and_put(
@@ -600,7 +616,6 @@ def test_receiver_fail_fast_overflow(async_receiver, max_t, b1_n, b2_n, b1_off, 
 
 def test_receiver_alloc_timeout(async_receiver):
     """allocate() returning None past deadline → RuntimeError; prior batch kept."""
-    async_receiver._max_inflight_chunks = 10
     req_id = "req-timeout"
     async_receiver.allocate = _auto_alloc()
 
@@ -634,7 +649,6 @@ def test_receiver_alloc_timeout(async_receiver):
 
 def test_receiver_is_last_batch_cleanup(async_receiver):
     """is_last_batch=True removes req_id from _req_allocated_keys."""
-    async_receiver._max_inflight_chunks = 10
     req_id = "req-lifecycle"
     async_receiver.allocate = _auto_alloc()
 
@@ -663,8 +677,7 @@ def test_receiver_is_last_batch_cleanup(async_receiver):
 
 
 def test_receiver_admission_control(async_receiver):
-    """Only one req_id allocates at a time; second waits for first to finish."""
-    async_receiver._max_inflight_chunks = 20
+    """Reservation-based admission: concurrent requests can proceed."""
     async_receiver.allocate = _auto_alloc()
 
     log = []
@@ -698,7 +711,12 @@ def test_receiver_admission_control(async_receiver):
         await asyncio.gather(do_b(), do_a2())
 
     asyncio.run(run())
-    assert log.index("A2-done") < log.index("B-done")
+
+    # With reservation-based admission, A2 and B can proceed concurrently.
+    # All should complete successfully.
+    assert "A1-done" in log
+    assert "A2-done" in log
+    assert "B-done" in log
 
 
 def test_receiver_error_response(async_receiver):
