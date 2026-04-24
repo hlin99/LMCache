@@ -92,8 +92,6 @@ def test_help_contains_all_field_names():
         "buffer_device",
         "transfer_channel",
         "nixl_backends",
-        "persist_enabled",
-        "eviction",
     ):
         assert field in text, f"help() is missing field {field!r}"
 
@@ -122,7 +120,6 @@ def test_all_fields_round_trip():
         "buffer_device": "cuda",
         "transfer_channel": "mock_memory",
         "nixl_backends": ["tcp", "rdma"],
-        "persist_enabled": False,
     }
     cfg = PdL2AdapterConfig.from_dict(d)
     assert cfg.role == "sender"
@@ -135,20 +132,17 @@ def test_all_fields_round_trip():
     assert cfg.buffer_device == "cuda"
     assert cfg.transfer_channel == "mock_memory"
     assert cfg.nixl_backends == ["tcp", "rdma"]
-    assert cfg.persist_config.persist_enabled is False
 
 
 def test_defaults_applied():
     """from_dict fills in correct default values for optional fields."""
     cfg = PdL2AdapterConfig.from_dict(_MINIMAL_SENDER)
-    assert cfg.proxy_host == ""
-    assert cfg.proxy_port == 0
-    assert cfg.buffer_size == 67108864
+    assert cfg.proxy_host == "127.0.0.1"
+    assert cfg.proxy_port == 6688
+    assert cfg.buffer_size == 1073741824
     assert cfg.buffer_device == "cpu"
     assert cfg.transfer_channel == "nixl"
     assert cfg.nixl_backends == ["tcp"]
-    assert cfg.persist_config.persist_enabled is True
-    assert cfg.eviction_config is None
 
 
 def test_fail_on_invalid_buffer_device():

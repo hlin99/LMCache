@@ -27,9 +27,9 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
     - peer_host: hostname or IP of the remote peer.
     - peer_init_port: per-TP-rank list of init ports on the peer.
     - peer_alloc_port: per-TP-rank list of alloc ports on the peer.
-    - proxy_host: proxy notification host (default: '').
-    - proxy_port: proxy notification port (default: 0).
-    - buffer_size: staging buffer size in bytes (default: 64 MiB).
+    - proxy_host: proxy notification host (default: '127.0.0.1').
+    - proxy_port: proxy notification port (default: 6688).
+    - buffer_size: staging buffer size in bytes (default: 1 GiB).
     - buffer_device: device for the staging buffer, 'cpu' or 'cuda'
       (default: 'cpu').
     - transfer_channel: transfer backend, 'nixl' or 'mock_memory'
@@ -43,9 +43,9 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
         peer_host: str,
         peer_init_port: list[int],
         peer_alloc_port: list[int],
-        proxy_host: str = "",
-        proxy_port: int = 0,
-        buffer_size: int = 67108864,
+        proxy_host: str = "127.0.0.1",
+        proxy_port: int = 6688,
+        buffer_size: int = 1073741824,
         buffer_device: str = "cpu",
         transfer_channel: str = "nixl",
         nixl_backends: list[str] | None = None,
@@ -59,9 +59,8 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
                 on the peer.
             peer_alloc_port: Per-TP-rank list of alloc port numbers on the
                 peer.
-            proxy_host: Proxy notification host. Empty string disables proxy
-                notifications.
-            proxy_port: Proxy notification port (0 if unused).
+            proxy_host: Proxy notification host (default: '127.0.0.1').
+            proxy_port: Proxy notification port (default: 6688).
             buffer_size: Staging buffer size in bytes.
             buffer_device: Device for the staging buffer ('cpu' or 'cuda').
             transfer_channel: Transfer backend ('nixl' or 'mock_memory').
@@ -128,15 +127,13 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
             peer_host=peer_host,
             peer_init_port=list(peer_init_port),
             peer_alloc_port=list(peer_alloc_port),
-            proxy_host=d.get("proxy_host", ""),
-            proxy_port=int(d.get("proxy_port", 0)),
-            buffer_size=int(d.get("buffer_size", 67108864)),
+            proxy_host=d.get("proxy_host", "127.0.0.1"),
+            proxy_port=int(d.get("proxy_port", 6688)),
+            buffer_size=int(d.get("buffer_size", 1073741824)),
             buffer_device=buffer_device,
             transfer_channel=transfer_channel,
             nixl_backends=list(d.get("nixl_backends", ["tcp"])),
         )
-        cfg.eviction_config = cls._parse_eviction_config(d)
-        cfg.persist_config = cls._parse_persist_config(d)
         return cfg
 
     @classmethod
@@ -153,14 +150,12 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
             "- peer_host (str): remote peer hostname or IP (required)\n"
             "- peer_init_port (list[int]): per-TP-rank init ports (required)\n"
             "- peer_alloc_port (list[int]): per-TP-rank alloc ports (required)\n"
-            "- proxy_host (str): proxy notification host (default: '')\n"
-            "- proxy_port (int): proxy notification port (default: 0)\n"
-            "- buffer_size (int): staging buffer size in bytes (default: 67108864)\n"
+            "- proxy_host (str): proxy notification host (default: '127.0.0.1')\n"
+            "- proxy_port (int): proxy notification port (default: 6688)\n"
+            "- buffer_size (int): staging buffer size in bytes (default: 1073741824)\n"
             "- buffer_device (str): 'cpu' or 'cuda' (default: 'cpu')\n"
             "- transfer_channel (str): 'nixl' or 'mock_memory' (default: 'nixl')\n"
-            "- nixl_backends (list[str]): NIXL transport backends (default: ['tcp'])\n"
-            "- persist_enabled (bool): keep data at shutdown (default: true)\n"
-            "- eviction (dict): L2 eviction policy config (optional)"
+            "- nixl_backends (list[str]): NIXL transport backends (default: ['tcp'])"
         )
 
 
