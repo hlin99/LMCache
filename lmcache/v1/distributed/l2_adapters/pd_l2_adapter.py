@@ -409,9 +409,6 @@ class PdL2Adapter(L2AdapterInterface):
         os.close(self._lookup_efd)
         os.close(self._load_efd)
 
-        # Call parent cleanup
-        super().close()
-
 
 # Factory registration
 def _create_pd_adapter(
