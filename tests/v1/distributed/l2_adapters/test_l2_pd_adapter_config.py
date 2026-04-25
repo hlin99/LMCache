@@ -100,11 +100,11 @@ def test_registered_in_factory():
     """'pd' is registered in the L2 adapter type registry."""
     # First Party
     from lmcache.v1.distributed.l2_adapters.config import (
-        _L2_ADAPTER_CONFIG_REGISTRY,
+        get_type_name_for_config,
     )
 
-    assert "pd" in _L2_ADAPTER_CONFIG_REGISTRY
-    assert _L2_ADAPTER_CONFIG_REGISTRY["pd"] is PdL2AdapterConfig
+    cfg = PdL2AdapterConfig.from_dict(_MINIMAL_SENDER)
+    assert get_type_name_for_config(cfg) == "pd"
 
 
 def test_all_fields_round_trip():

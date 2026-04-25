@@ -148,11 +148,11 @@ class PdL2AdapterConfig(L2AdapterConfigBase):
             peer_init_port=list(peer_init_port),
             peer_alloc_port=list(peer_alloc_port),
             proxy_host=proxy_host,
-            proxy_port=int(d.get("proxy_port", 6688)),
-            buffer_size=int(d.get("buffer_size", 1073741824)),
+            proxy_port=int(d.get("proxy_port") or 6688),
+            buffer_size=int(d.get("buffer_size") or 1073741824),
             buffer_device=buffer_device,
             transfer_channel=transfer_channel,
-            nixl_backends=list(d.get("nixl_backends", ["tcp"])),
+            nixl_backends=list(d.get("nixl_backends") or ["tcp"]),
         )
         return cfg
 
@@ -221,9 +221,9 @@ class PdL2Adapter(L2AdapterInterface):
         self._role = config.role
 
         # Create three distinct eventfds for store, lookup, load events
-        self._store_efd = os.eventfd(0, os.EFD_NONBLOCK)
-        self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK)
-        self._load_efd = os.eventfd(0, os.EFD_NONBLOCK)
+        self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self._load_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
 
         # Stubs for resources initialized in PR 5/7
         self._staging_allocator: Optional[Any] = None
@@ -232,6 +232,7 @@ class PdL2Adapter(L2AdapterInterface):
 
         # Shutdown coordination
         self._stop_flag = threading.Event()
+        self._lock = threading.Lock()
 
     #####################
     # Event Fd Interface
@@ -397,17 +398,16 @@ class PdL2Adapter(L2AdapterInterface):
         Closes the three eventfds (store, lookup, load) and sets the stop
         flag for graceful shutdown coordination. Safe to call multiple times.
         """
-        # Early return if already closed
-        if self._stop_flag.is_set():
-            return
-
-        # Set stop flag first to signal any background threads
-        self._stop_flag.set()
-
-        # Close eventfds
-        os.close(self._store_efd)
-        os.close(self._lookup_efd)
-        os.close(self._load_efd)
+        with self._lock:
+            if self._stop_flag.is_set():
+                return
+            self._stop_flag.set()
+            fds_to_close = [self._store_efd, self._lookup_efd, self._load_efd]
+        for fd in fds_to_close:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 # Factory registration
@@ -423,8 +423,13 @@ def _create_pd_adapter(
 
     Returns:
         A new PdL2Adapter instance.
+
+    Raises:
+        TypeError: If config is not an instance of PdL2AdapterConfig.
     """
-    return PdL2Adapter(config, l1_memory_desc)  # type: ignore[arg-type]
+    if not isinstance(config, PdL2AdapterConfig):
+        raise TypeError("config must be an instance of PdL2AdapterConfig")
+    return PdL2Adapter(config, l1_memory_desc)
 
 
 register_l2_adapter_factory("pd", _create_pd_adapter)
