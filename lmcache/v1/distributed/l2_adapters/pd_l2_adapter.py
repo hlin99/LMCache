@@ -217,9 +217,9 @@ class PdL2Adapter(L2AdapterInterface):
         self._load_efd = os.eventfd(0, os.EFD_NONBLOCK)
 
         # Stubs for resources initialized in PR 5/7
-        self._staging_allocator = None  # type: Optional[Any]
-        self._transfer_channel = None  # type: Optional[Any]
-        self._zmq_context = None  # type: Optional[Any]
+        self._staging_allocator: Optional[Any] = None
+        self._transfer_channel: Optional[Any] = None
+        self._zmq_context: Optional[Any] = None
 
         # Shutdown coordination
         self._stop_flag = threading.Event()
@@ -386,8 +386,12 @@ class PdL2Adapter(L2AdapterInterface):
         """Close the adapter and release all resources.
 
         Closes the three eventfds (store, lookup, load) and sets the stop
-        flag for graceful shutdown coordination.
+        flag for graceful shutdown coordination. Safe to call multiple times.
         """
+        # Early return if already closed
+        if self._stop_flag.is_set():
+            return
+
         # Set stop flag first to signal any background threads
         self._stop_flag.set()
 
@@ -395,6 +399,9 @@ class PdL2Adapter(L2AdapterInterface):
         os.close(self._store_efd)
         os.close(self._lookup_efd)
         os.close(self._load_efd)
+
+        # Call parent cleanup
+        super().close()
 
 
 # Factory registration

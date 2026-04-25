@@ -117,6 +117,13 @@ def test_close_releases_fds(sender_config):
         os.eventfd_write(load_fd, 1)
 
 
+def test_close_is_idempotent(sender_config):
+    """Calling close() multiple times is safe and does not raise."""
+    adapter = PdL2Adapter(sender_config)
+    adapter.close()
+    adapter.close()  # Should not raise or cause issues
+
+
 def test_stub_methods_raise(sender_config):
     """Each submit/query method raises NotImplementedError."""
     adapter = PdL2Adapter(sender_config)
