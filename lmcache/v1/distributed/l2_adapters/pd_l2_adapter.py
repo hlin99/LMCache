@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from lmcache.v1.distributed.internal_api import L1MemoryDesc
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -28,6 +29,8 @@ from lmcache.v1.distributed.l2_adapters.config import (
 )
 from lmcache.v1.distributed.l2_adapters.factory import register_l2_adapter_factory
 from lmcache.v1.memory_management import MemoryObj
+
+logger = init_logger(__name__)
 
 
 class PdL2AdapterConfig(L2AdapterConfigBase):
@@ -207,6 +210,12 @@ class PdL2Adapter(L2AdapterInterface):
         """
         # PD adapter does not support aggregate eviction (pass 0 for capacity)
         super().__init__(max_capacity_bytes=0)
+
+        logger.info(
+            "Initializing PdL2Adapter: role=%s, peer_host=%s",
+            config.role,
+            config.peer_host,
+        )
 
         self._config = config
         self._role = config.role
