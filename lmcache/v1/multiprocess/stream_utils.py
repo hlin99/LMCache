@@ -14,10 +14,13 @@ event to complete before invoking the callback.
 
 # Standard
 from typing import Any, Callable
+import logging
 import threading
 
 # Third Party
 import torch
+
+_logger = logging.getLogger(__name__)
 
 
 class StreamWrapper:
@@ -65,6 +68,9 @@ class StreamWrapper:
 
             def _wait_and_call() -> None:
                 event.synchronize()
-                func(*args)
+                try:
+                    func(*args)
+                except Exception:
+                    _logger.exception("Exception in stream host callback %s", func)
 
             threading.Thread(target=_wait_and_call, daemon=True).start()
