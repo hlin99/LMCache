@@ -12,7 +12,6 @@ from typing import Any
 import array
 
 # Third Party
-import cupy
 import torch
 
 # First Party
@@ -38,6 +37,7 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.multiprocess.custom_types import (
     KVCache,
 )
+from lmcache.v1.multiprocess.stream_utils import StreamWrapper
 
 # Backend selection (c_ops when CUDA is available, otherwise a pure-Python
 # fallback) is handled once in ``lmcache/__init__.py`` via ``_get_backend``,
@@ -148,16 +148,14 @@ class GPUCacheContext:
 
         # GPU streams
         self.cuda_stream_ = torch_dev.Stream(device=self.device_)
-        self.cupy_stream_ = cupy.cuda.ExternalStream(
-            self.cuda_stream_.cuda_stream, self.device_.index
-        )
+        self.cupy_stream_ = StreamWrapper(self.cuda_stream_, self.device_)
 
         _, high_priority = torch_dev.Stream.priority_range()
         self.high_priority_cuda_stream_ = torch_dev.Stream(
             device=self.device_, priority=high_priority
         )
-        self.high_priority_cupy_stream_ = cupy.cuda.ExternalStream(
-            self.high_priority_cuda_stream_.cuda_stream, self.device_.index
+        self.high_priority_cupy_stream_ = StreamWrapper(
+            self.high_priority_cuda_stream_, self.device_
         )
 
         # Extra initialization
@@ -188,7 +186,7 @@ class GPUCacheContext:
         return self.cuda_stream_
 
     @property
-    def cupy_stream(self) -> cupy.cuda.Stream:
+    def cupy_stream(self) -> StreamWrapper:
         return self.cupy_stream_
 
     @property
@@ -196,7 +194,7 @@ class GPUCacheContext:
         return self.high_priority_cuda_stream_
 
     @property
-    def high_priority_cupy_stream(self) -> cupy.cuda.Stream:
+    def high_priority_cupy_stream(self) -> StreamWrapper:
         return self.high_priority_cupy_stream_
 
     @property
@@ -403,16 +401,14 @@ class PlainGPUCacheContext:
 
         # GPU streams
         self._cuda_stream = torch_dev.Stream(device=self._device)
-        self._cupy_stream = cupy.cuda.ExternalStream(
-            self._cuda_stream.cuda_stream, self._device.index
-        )
+        self._cupy_stream = StreamWrapper(self._cuda_stream, self._device)
 
         _, high_priority = torch_dev.Stream.priority_range()
         self._high_priority_cuda_stream = torch_dev.Stream(
             device=self._device, priority=high_priority
         )
-        self._high_priority_cupy_stream = cupy.cuda.ExternalStream(
-            self._high_priority_cuda_stream.cuda_stream, self._device.index
+        self._high_priority_cupy_stream = StreamWrapper(
+            self._high_priority_cuda_stream, self._device
         )
 
         # Extra initialization
@@ -455,7 +451,7 @@ class PlainGPUCacheContext:
         return self._cuda_stream
 
     @property
-    def cupy_stream(self) -> cupy.cuda.Stream:
+    def cupy_stream(self) -> StreamWrapper:
         return self._cupy_stream
 
     @property
@@ -463,7 +459,7 @@ class PlainGPUCacheContext:
         return self._high_priority_cuda_stream
 
     @property
-    def high_priority_cupy_stream(self) -> cupy.cuda.Stream:
+    def high_priority_cupy_stream(self) -> StreamWrapper:
         return self._high_priority_cupy_stream
 
     @property
