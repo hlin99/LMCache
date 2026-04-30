@@ -73,6 +73,7 @@ class _FakeParent:
         return self._meta
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_ec_roundtrip_save_then_load():
     with tempfile.TemporaryDirectory() as td:
         vllm_config = _FakeVllmConfig(td)
