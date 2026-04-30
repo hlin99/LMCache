@@ -9,6 +9,8 @@ import pytest
 import torch
 
 pytest.importorskip("vllm", reason="EC connector adapter imports vLLM at module top")
+if not torch.cuda.is_available():
+    pytest.skip("Requires CUDA", allow_module_level=True)
 
 # First Party
 from lmcache.integration.vllm.vllm_ec_adapter import (  # noqa: E402
