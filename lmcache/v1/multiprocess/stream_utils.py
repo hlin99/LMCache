@@ -15,6 +15,7 @@ event to complete before invoking the callback.
 # Standard
 from typing import Any, Callable
 import logging
+import queue
 import threading
 
 # Third Party
@@ -29,8 +30,10 @@ class StreamWrapper:
     On CUDA the implementation delegates to
     ``cupy.cuda.ExternalStream.launch_host_func`` (imported lazily so that
     ``cupy`` is never touched on non-CUDA systems).  On other backends a
-    background thread polls the stream via a recorded event and then calls the
-    callback.
+    single persistent daemon thread drains a queue of ``(event, func, args)``
+    entries in order, waiting on each event before invoking the callback.
+    This guarantees sequential execution of callbacks while avoiding the
+    overhead of creating a new thread per call.
 
     Args:
         stream: The ``torch.Stream`` (or backend-specific subclass) to wrap.
@@ -48,14 +51,35 @@ class StreamWrapper:
             self._cupy_stream = cupy.cuda.ExternalStream(
                 stream.cuda_stream, device.index
             )
+        else:
+            self._queue: queue.Queue[
+                tuple[Any, Callable[..., Any], tuple[Any, ...]] | None
+            ] = queue.Queue()
+            self._worker = threading.Thread(
+                target=self._run, daemon=True, name="StreamWrapper-worker"
+            )
+            self._worker.start()
+
+    def _run(self) -> None:
+        """Worker loop: drain the callback queue sequentially."""
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            event, func, args = item
+            event.synchronize()
+            try:
+                func(*args)
+            except Exception:
+                _logger.exception("Exception in stream host callback %s", func)
 
     def launch_host_func(self, func: Callable[..., Any], *args: Any) -> None:
         """Schedule *func* to be called after all work on the stream finishes.
 
         On CUDA this uses ``cudaLaunchHostFunc`` via CuPy, which is
-        efficient and does not block.  On other backends a daemon thread is
-        started that waits for a recorded stream event and then calls
-        ``func(*args)``.
+        efficient and does not block.  On other backends the event and
+        callback are enqueued and processed in order by a single worker
+        thread.
 
         Args:
             func: Callable to invoke after stream completion.
@@ -65,12 +89,4 @@ class StreamWrapper:
             self._cupy_stream.launch_host_func(func, *args)
         else:
             event = self._stream.record_event()
-
-            def _wait_and_call() -> None:
-                event.synchronize()
-                try:
-                    func(*args)
-                except Exception:
-                    _logger.exception("Exception in stream host callback %s", func)
-
-            threading.Thread(target=_wait_and_call, daemon=True).start()
+            self._queue.put((event, func, args))
