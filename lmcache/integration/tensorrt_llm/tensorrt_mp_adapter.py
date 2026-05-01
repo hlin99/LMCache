@@ -16,6 +16,7 @@ because TRT-LLM's pool is allocated outside PyTorch's caching allocator
 # Standard
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+import inspect
 import os
 import time
 
@@ -401,14 +402,15 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 "interprocess Events (torch_dev.Event not available). "
                 "Multiprocess IPC requires CUDA."
             )
-        try:
-            event = torch_dev.Event(interprocess=True)
-        except (TypeError, RuntimeError) as e:
+        # Check if interprocess parameter is supported
+        event_sig = inspect.signature(torch_dev.Event.__init__)
+        if "interprocess" not in event_sig.parameters:
             raise RuntimeError(
                 f"Backend '{torch_device_type}' does not support "
                 "interprocess=True parameter for Events. "
-                f"Multiprocess IPC requires CUDA. Original error: {e}"
-            ) from e
+                "Multiprocess IPC requires CUDA."
+            )
+        event = torch_dev.Event(interprocess=True)
         event.record(stream)
 
         for req_id, spec in meta.loads.items():
@@ -463,14 +465,15 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 "interprocess Events (torch_dev.Event not available). "
                 "Multiprocess IPC requires CUDA."
             )
-        try:
-            event = torch_dev.Event(interprocess=True)
-        except (TypeError, RuntimeError) as e:
+        # Check if interprocess parameter is supported
+        event_sig = inspect.signature(torch_dev.Event.__init__)
+        if "interprocess" not in event_sig.parameters:
             raise RuntimeError(
                 f"Backend '{torch_device_type}' does not support "
                 "interprocess=True parameter for Events. "
-                f"Multiprocess IPC requires CUDA. Original error: {e}"
-            ) from e
+                "Multiprocess IPC requires CUDA."
+            )
+        event = torch_dev.Event(interprocess=True)
         event.record(stream)
 
         for req_id, spec in meta.saves.items():
