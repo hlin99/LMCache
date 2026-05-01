@@ -110,7 +110,7 @@ def test_ec_roundtrip_save_then_load():
             encoder_cache2 = {}
             with patch(
                 "lmcache.integration.vllm.vllm_ec_adapter.torch_device_type",
-                "cpu",
+                new="cpu",
             ):
                 conn.start_load_caches(encoder_cache2)
 
