@@ -382,7 +382,10 @@ def test_cluster_metadata_without_kv_bytes(url, autorelease_v1):
 
     # inject only metadata, no kv_bytes
     meta_key = random_key.to_string() + "metadata"
-    connector._connector.cluster.set(meta_key, metadata_bytes)
+    future = asyncio.run_coroutine_threadsafe(
+        connector._connector.cluster.set(meta_key, metadata_bytes), async_loop
+    )
+    future.result()
 
     # get() should return None and remove the metadata without kv_bytes pair
     future = asyncio.run_coroutine_threadsafe(connector.get(random_key), async_loop)
