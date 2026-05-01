@@ -8,6 +8,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 import asyncio
 import hashlib
+import inspect
 import re
 import threading
 import traceback
@@ -40,6 +41,38 @@ logger = init_logger(__name__)
 
 # Type definition
 KVCache = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
+
+
+# Device utility functions
+def check_interprocess_event_support() -> None:
+    """Check if the current backend supports interprocess Events.
+
+    This function checks if torch_dev.Event exists and supports the
+    interprocess=True parameter, which is required for multiprocess IPC.
+
+    Raises:
+        RuntimeError: If the backend does not support interprocess Events
+            or if the Event class doesn't accept the interprocess parameter.
+    """
+    # First Party
+    from lmcache import torch_dev, torch_device_type
+
+    # Check if Event class exists
+    if not hasattr(torch_dev, "Event"):
+        raise RuntimeError(
+            f"Backend '{torch_device_type}' does not support "
+            "interprocess Events (torch_dev.Event not available). "
+            "Multiprocess IPC requires CUDA."
+        )
+
+    # Check if interprocess parameter is supported
+    event_sig = inspect.signature(torch_dev.Event.__init__)
+    if "interprocess" not in event_sig.parameters:
+        raise RuntimeError(
+            f"Backend '{torch_device_type}' does not support "
+            "interprocess=True parameter for Events. "
+            "Multiprocess IPC requires CUDA."
+        )
 
 
 # Math utility functions

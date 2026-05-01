@@ -16,7 +16,6 @@ because TRT-LLM's pool is allocated outside PyTorch's caching allocator
 # Standard
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-import inspect
 import os
 import time
 
@@ -32,9 +31,9 @@ import torch
 import zmq
 
 # First Party
-from lmcache import torch_dev, torch_device_type
+from lmcache import torch_dev
 from lmcache.logging import init_logger
-from lmcache.utils import EngineType
+from lmcache.utils import EngineType, check_interprocess_event_support
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
     RawCudaIPCWrapper,
@@ -396,20 +395,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
 
         t0 = time.perf_counter()
         # Not all backends support interprocess Events (CUDA IPC specific)
-        if not hasattr(torch_dev, "Event"):
-            raise RuntimeError(
-                f"Backend '{torch_device_type}' does not support "
-                "interprocess Events (torch_dev.Event not available). "
-                "Multiprocess IPC requires CUDA."
-            )
-        # Check if interprocess parameter is supported
-        event_sig = inspect.signature(torch_dev.Event.__init__)
-        if "interprocess" not in event_sig.parameters:
-            raise RuntimeError(
-                f"Backend '{torch_device_type}' does not support "
-                "interprocess=True parameter for Events. "
-                "Multiprocess IPC requires CUDA."
-            )
+        check_interprocess_event_support()
         event = torch_dev.Event(interprocess=True)
         event.record(stream)
 
@@ -459,20 +445,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
 
         t0 = time.perf_counter()
         # Not all backends support interprocess Events (CUDA IPC specific)
-        if not hasattr(torch_dev, "Event"):
-            raise RuntimeError(
-                f"Backend '{torch_device_type}' does not support "
-                "interprocess Events (torch_dev.Event not available). "
-                "Multiprocess IPC requires CUDA."
-            )
-        # Check if interprocess parameter is supported
-        event_sig = inspect.signature(torch_dev.Event.__init__)
-        if "interprocess" not in event_sig.parameters:
-            raise RuntimeError(
-                f"Backend '{torch_device_type}' does not support "
-                "interprocess=True parameter for Events. "
-                "Multiprocess IPC requires CUDA."
-            )
+        check_interprocess_event_support()
         event = torch_dev.Event(interprocess=True)
         event.record(stream)
 
