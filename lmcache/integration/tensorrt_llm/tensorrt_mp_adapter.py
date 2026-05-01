@@ -401,7 +401,14 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 "interprocess Events (torch_dev.Event not available). "
                 "Multiprocess IPC requires CUDA."
             )
-        event = torch_dev.Event(interprocess=True)
+        try:
+            event = torch_dev.Event(interprocess=True)
+        except (TypeError, RuntimeError) as e:
+            raise RuntimeError(
+                f"Backend '{torch_device_type}' does not support "
+                "interprocess=True parameter for Events. "
+                f"Multiprocess IPC requires CUDA. Original error: {e}"
+            ) from e
         event.record(stream)
 
         for req_id, spec in meta.loads.items():
@@ -456,7 +463,14 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 "interprocess Events (torch_dev.Event not available). "
                 "Multiprocess IPC requires CUDA."
             )
-        event = torch_dev.Event(interprocess=True)
+        try:
+            event = torch_dev.Event(interprocess=True)
+        except (TypeError, RuntimeError) as e:
+            raise RuntimeError(
+                f"Backend '{torch_device_type}' does not support "
+                "interprocess=True parameter for Events. "
+                f"Multiprocess IPC requires CUDA. Original error: {e}"
+            ) from e
         event.record(stream)
 
         for req_id, spec in meta.saves.items():
