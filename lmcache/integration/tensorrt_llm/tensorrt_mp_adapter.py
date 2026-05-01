@@ -31,7 +31,7 @@ import torch
 import zmq
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.multiprocess.custom_types import (
@@ -394,6 +394,13 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
             return
 
         t0 = time.perf_counter()
+        # Not all backends support interprocess Events (CUDA IPC specific)
+        if not hasattr(torch_dev, "Event"):
+            raise RuntimeError(
+                f"Backend '{torch_device_type}' does not support "
+                "interprocess Events (torch_dev.Event not available). "
+                "Multiprocess IPC requires CUDA."
+            )
         event = torch_dev.Event(interprocess=True)
         event.record(stream)
 
@@ -442,6 +449,13 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
             return
 
         t0 = time.perf_counter()
+        # Not all backends support interprocess Events (CUDA IPC specific)
+        if not hasattr(torch_dev, "Event"):
+            raise RuntimeError(
+                f"Backend '{torch_device_type}' does not support "
+                "interprocess Events (torch_dev.Event not available). "
+                "Multiprocess IPC requires CUDA."
+            )
         event = torch_dev.Event(interprocess=True)
         event.record(stream)
 
