@@ -382,13 +382,15 @@ class MPCacheEngine:
             TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
         ]
 
-        assert key.worker_id is not None, "Must store with worker_id != None"
+        if key.worker_id is None:
+            raise ValueError("Must store with worker_id != None")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
-        assert instance_id in self.xpu_layout_contexts, (
-            f"XPU layout not registered for instance ID {instance_id}. "
-            "Call REGISTER_KV_CACHE_LAYOUT first."
-        )
+        if instance_id not in self.xpu_layout_contexts:
+            raise ValueError(
+                f"XPU layout not registered for instance ID {instance_id}. "
+                "Call REGISTER_KV_CACHE_LAYOUT first."
+            )
         ctx = self.xpu_layout_contexts[instance_id]
         model_name = self.xpu_context_meta[instance_id][0]
 
@@ -465,13 +467,15 @@ class MPCacheEngine:
             TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
         ]
 
-        assert key.worker_id is not None, "Must retrieve with worker_id != None"
+        if key.worker_id is None:
+            raise ValueError("Must retrieve with worker_id != None")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
-        assert instance_id in self.xpu_layout_contexts, (
-            f"XPU layout not registered for instance ID {instance_id}. "
-            "Call REGISTER_KV_CACHE_LAYOUT first."
-        )
+        if instance_id not in self.xpu_layout_contexts:
+            raise ValueError(
+                f"XPU layout not registered for instance ID {instance_id}. "
+                "Call REGISTER_KV_CACHE_LAYOUT first."
+            )
         model_name = self.xpu_context_meta[instance_id][0]
 
         prefetched_keys: list[ObjectKey] = []
