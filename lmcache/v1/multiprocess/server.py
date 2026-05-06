@@ -375,7 +375,8 @@ class MPCacheEngine:
                 Each tensor has shape ``[2, num_layers, chunk_size, hidden_dim]``.
 
         Returns:
-            True if at least one chunk was stored successfully, False on error.
+            True if all requested chunks were stored successfully, False
+            if any chunk was missing, had a shape mismatch, or caused an error.
         """
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
