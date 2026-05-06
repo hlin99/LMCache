@@ -5,10 +5,12 @@ from functools import partial
 from itertools import islice
 from typing import Generator
 import argparse
+import pickle
 import threading
 import time
 
 # Third Party
+import torch
 import zmq
 
 # First Party
@@ -173,6 +175,23 @@ class _PrefetchJob:
     cache_salt: str = ""
 
 
+@dataclass
+class XPULayoutContext:
+    """Layout metadata for XPU KV cache instances.
+
+    Stores layout information registered via ``REGISTER_KV_CACHE_LAYOUT``
+    for the CPU bounce-buffer path.  Unlike ``GPUCacheContext``, this does
+    not hold or open any device memory — it is used only to allocate
+    ``MemoryObj``s of the right shape/dtype for the storage manager.
+    """
+
+    layout_desc: MemoryLayoutDesc
+    """Memory layout descriptor (shapes + dtypes per group)."""
+
+    block_size: int
+    """Number of tokens per vLLM block."""
+
+
 # Main class for the mp cache engine
 class MPCacheEngine:
     def __init__(
@@ -181,7 +200,6 @@ class MPCacheEngine:
         chunk_size: int = 256,
         hash_algorithm: str = "blake3",
     ):
-        logger.error(" MPCacheEngine 1")
         # GPU ID -> KV cache tensors
         self.gpu_contexts: dict[int, GPUCacheContext] = {}
 
@@ -191,29 +209,30 @@ class MPCacheEngine:
         # the layout desc returned by the gpu context is the same.
         self.gpu_context_meta: dict[int, tuple[str, int]] = {}
 
+        # XPU instance ID -> XPULayoutContext (CPU bounce-buffer path)
+        self.xpu_layout_contexts: dict[int, XPULayoutContext] = {}
+
+        # XPU instance ID -> (model name, world size) as metadata
+        self.xpu_context_meta: dict[int, tuple[str, int]] = {}
+
         # chunk size
         self.chunk_size = chunk_size
 
         # Lock for clear() to avoid concurrent storage manager mutations
         self.lock = threading.Lock()
-        logger.error(" MPCacheEngine 2")
 
         # storage manager
         self.storage_manager = StorageManager(storage_manager_config)
-        logger.error(" MPCacheEngine 3")
 
         # Token hasher and session manager for token-based operations
         self.token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
         )
-        logger.error(" MPCacheEngine 4")
 
         self.session_manager = SessionManager(self.token_hasher)
-        logger.error(" MPCacheEngine 5")
 
         # EventBus for observability
         self._event_bus = get_event_bus()
-        logger.error(" MPCacheEngine 6")
 
         # Prefetch job tracking for two-phase lookup, keyed by request_id.
         # TODO: implement periodic cleanup of stale _prefetch_jobs entries
@@ -272,8 +291,221 @@ class MPCacheEngine:
             del self.gpu_context_meta[instance_id]
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
             torch_dev.empty_cache()
+        elif instance_id in self.xpu_layout_contexts:
+            del self.xpu_layout_contexts[instance_id]
+            del self.xpu_context_meta[instance_id]
+            logger.info(
+                "Unregistered XPU layout context for instance ID %d", instance_id
+            )
         else:
             logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
+
+    def register_kv_cache_layout(
+        self,
+        instance_id: int,
+        model_name: str,
+        world_size: int,
+        engine_type: EngineType,
+        layout_hints: LayoutHints,
+        block_size: int,
+        num_layers: int,
+        hidden_dim_size: int,
+        dtype_str: str,
+    ) -> None:
+        """Register XPU KV cache layout metadata without device memory access.
+
+        Used by the CPU bounce-buffer path (XPU/non-CUDA devices) to inform
+        the server of the KV cache shape and dtype so it can allocate
+        ``MemoryObj``s of the right size during store/retrieve.
+
+        Args:
+            instance_id: The worker instance ID (typically the worker PID).
+            model_name: The model name associated with this instance.
+            world_size: The KV world size for this instance.
+            engine_type: The serving engine type (e.g. VLLM).
+            layout_hints: Layout hints forwarded from the worker.
+            block_size: Number of tokens per vLLM block.
+            num_layers: Number of transformer layers.
+            hidden_dim_size: Product of num_heads * head_size.
+            dtype_str: String name of the KV dtype (e.g. ``"bfloat16"``).
+        """
+        dtype = getattr(torch, dtype_str, None)
+        if dtype is None or not isinstance(dtype, torch.dtype):
+            raise ValueError(
+                f"Invalid dtype_str '{dtype_str}': not a valid torch.dtype name."
+            )
+
+        layout_desc = MemoryLayoutDesc(
+            shapes=[torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])],
+            dtypes=[dtype],
+        )
+        ctx = XPULayoutContext(layout_desc=layout_desc, block_size=block_size)
+        self.xpu_layout_contexts[instance_id] = ctx
+        self.xpu_context_meta[instance_id] = (model_name, world_size)
+        logger.info(
+            "Registered XPU layout for instance %d: model=%s world_size=%d "
+            "num_layers=%d hidden_dim_size=%d dtype=%s block_size=%d",
+            instance_id,
+            model_name,
+            world_size,
+            num_layers,
+            hidden_dim_size,
+            dtype_str,
+            block_size,
+        )
+
+    @_lmcache_nvtx_annotate
+    def store_cpu_chunks(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+        cpu_data: bytes,
+    ) -> bool:
+        """Store XPU KV cache chunks received as CPU bytes.
+
+        The worker gathers KV blocks from XPU memory into CPU tensors and
+        sends them here.  The server writes them directly to the storage
+        manager without device-to-device copy.
+
+        Args:
+            key: Cache key identifying the token range.
+            instance_id: The worker instance ID.
+            cpu_data: Pickled list of CPU tensors, one per chunk.
+                Each tensor has shape ``[2, num_layers, chunk_size, hidden_dim]``.
+
+        Returns:
+            True if at least one chunk was stored successfully, False on error.
+        """
+        session = self.session_manager.get_or_create(key.request_id)
+        session.set_tokens(list(key.token_ids))
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
+        ]
+
+        assert key.worker_id is not None, "Must store with worker_id != None"
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+
+        assert instance_id in self.xpu_layout_contexts, (
+            f"XPU layout not registered for instance ID {instance_id}. "
+            "Call REGISTER_KV_CACHE_LAYOUT first."
+        )
+        ctx = self.xpu_layout_contexts[instance_id]
+        model_name = self.xpu_context_meta[instance_id][0]
+
+        reserved_dict: dict = {}
+        try:
+            chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+            reserved_dict = self.storage_manager.reserve_write(
+                obj_keys, ctx.layout_desc, "new"
+            )
+            for idx, obj_key in enumerate(obj_keys):
+                if obj_key not in reserved_dict:
+                    continue
+                memory_obj = reserved_dict[obj_key]
+                if idx >= len(chunks):
+                    logger.warning(
+                        "Chunk index %d out of range (received %d chunks)",
+                        idx,
+                        len(chunks),
+                    )
+                    continue
+                if memory_obj.tensor is None:
+                    logger.warning("MemoryObj has no tensor for obj_key %s", obj_key)
+                    continue
+                # Direct CPU-to-CPU copy: chunk tensor → MemoryObj tensor
+                chunk_cpu = chunks[idx]
+                if chunk_cpu.shape != memory_obj.tensor.shape:
+                    logger.warning(
+                        "Shape mismatch: chunk %s vs memory_obj %s for obj_key %s",
+                        chunk_cpu.shape,
+                        memory_obj.tensor.shape,
+                        obj_key,
+                    )
+                    continue
+                memory_obj.tensor.copy_(chunk_cpu)
+        except Exception:
+            logger.exception("Cannot store CPU chunks due to exception")
+            return False
+        finally:
+            if reserved_dict:
+                self.storage_manager.finish_write(list(reserved_dict.keys()))
+
+        if reserved_dict:
+            logger.debug(
+                "Stored %d CPU chunks for instance %d model %s",
+                len(reserved_dict),
+                instance_id,
+                model_name,
+            )
+        return True
+
+    @_lmcache_nvtx_annotate
+    def retrieve_cpu_chunks(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> tuple[bool, bytes]:
+        """Retrieve XPU KV cache chunks and return them as CPU bytes.
+
+        Reads prefetched results from the storage manager and serializes
+        the chunk tensors so the worker can scatter them back to XPU memory.
+
+        Args:
+            key: Cache key identifying the token range.
+            instance_id: The worker instance ID.
+
+        Returns:
+            A tuple ``(success, cpu_data)`` where ``success`` is True if all
+            requested chunks were found, and ``cpu_data`` is a pickled list of
+            CPU tensors (one per chunk).  On failure, ``cpu_data`` is ``b""``.
+        """
+        session = self.session_manager.get_or_create(key.request_id)
+        session.set_tokens(list(key.token_ids))
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
+        ]
+
+        assert key.worker_id is not None, "Must retrieve with worker_id != None"
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+
+        assert instance_id in self.xpu_layout_contexts, (
+            f"XPU layout not registered for instance ID {instance_id}. "
+            "Call REGISTER_KV_CACHE_LAYOUT first."
+        )
+        model_name = self.xpu_context_meta[instance_id][0]
+
+        prefetched_keys: list[ObjectKey] = []
+        try:
+            with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
+                if not memory_objs or len(memory_objs) != len(obj_keys):
+                    logger.debug(
+                        "Some keys not found during CPU chunk retrieve for instance %d",
+                        instance_id,
+                    )
+                    return False, b""
+
+                prefetched_keys = obj_keys[: len(memory_objs)]
+                chunks = []
+                for mo in memory_objs:
+                    if mo.tensor is None:
+                        logger.warning("MemoryObj has no tensor during retrieve")
+                        return False, b""
+                    chunks.append(mo.tensor.cpu().clone())
+
+            cpu_data = pickle.dumps(chunks)
+            logger.debug(
+                "Retrieved %d CPU chunks for instance %d model %s",
+                len(chunks),
+                instance_id,
+                model_name,
+            )
+            return True, cpu_data
+        except Exception:
+            logger.exception("Cannot retrieve CPU chunks due to exception")
+            return False, b""
+        finally:
+            if prefetched_keys:
+                self.storage_manager.finish_read_prefetched(prefetched_keys)
 
     @_lmcache_nvtx_annotate
     def store(
@@ -648,7 +880,10 @@ class MPCacheEngine:
         model_name: str,
         world_size: int,
     ) -> MemoryLayoutDesc | None:
-        """Find layout desc from a matching GPU context.
+        """Find layout desc from a matching GPU or XPU context.
+
+        Checks CUDA GPU contexts first, then XPU layout contexts registered
+        via ``REGISTER_KV_CACHE_LAYOUT`` (CPU bounce-buffer path).
 
         Returns:
             The layout descriptor, or None if no context
@@ -660,6 +895,9 @@ class MPCacheEngine:
                     self.gpu_contexts[gpu_id],
                     self.chunk_size,
                 )
+        for inst_id, (m, w) in self.xpu_context_meta.items():
+            if m == model_name and w == world_size:
+                return self.xpu_layout_contexts[inst_id].layout_desc
         return None
 
     def lookup(
@@ -1110,17 +1348,14 @@ def run_cache_server(
         If return_engine is True: tuple of (MessageQueueServer, MPCacheEngine)
         If return_engine is False: None (blocks until interrupted)
     """
-    logger.error(" run_cache_server +++")
     event_bus = init_observability(
         obs_config, start_prometheus_http_server=start_prometheus_http_server
     )
-    logger.error(" run_cache_server 1")
 
     # Wire up the trace recorder (no-op when --trace-level is unset).
     # Registered before the engine handlers are added so any
     # storage-manager calls during engine init are captured too.
     maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
-    logger.error(" run_cache_server 1.1")
 
     # Initialize the engine (loggers self-register with the global controller)
     engine = MPCacheEngine(
@@ -1128,7 +1363,6 @@ def run_cache_server(
         chunk_size=mp_config.chunk_size,
         hash_algorithm=mp_config.hash_algorithm,
     )
-    logger.error(" run_cache_server 2")
 
     # Initialize the message queue server
     context = zmq.Context.instance()
@@ -1136,7 +1370,6 @@ def run_cache_server(
         bind_url=f"tcp://{mp_config.host}:{mp_config.port}",
         context=context,
     )
-    logger.error(" run_cache_server 3")
 
     # Add handlers
     add_handler_helper(server, RequestType.REGISTER_KV_CACHE, engine.register_kv_cache)
@@ -1165,10 +1398,31 @@ def run_cache_server(
         RequestType.REPORT_BLOCK_ALLOCATION,
         engine.report_block_allocations,
     )
+    # XPU / CPU bounce-buffer handlers
+    add_handler_helper(
+        server,
+        RequestType.REGISTER_KV_CACHE_LAYOUT,
+        engine.register_kv_cache_layout,
+    )
+    add_handler_helper(
+        server,
+        RequestType.STORE_CPU_CHUNKS,
+        engine.store_cpu_chunks,
+    )
+    add_handler_helper(
+        server,
+        RequestType.RETRIEVE_CPU_CHUNKS,
+        engine.retrieve_cpu_chunks,
+    )
 
     # Assign thread pools
     server.add_affinity_thread_pool(
-        [RequestType.STORE, RequestType.RETRIEVE],
+        [
+            RequestType.STORE,
+            RequestType.RETRIEVE,
+            RequestType.STORE_CPU_CHUNKS,
+            RequestType.RETRIEVE_CPU_CHUNKS,
+        ],
         max_workers=mp_config.max_gpu_workers,
     )
     server.add_normal_thread_pool(
@@ -1233,11 +1487,8 @@ if __name__ == "__main__":
     mp_config = parse_args_to_mp_server_config(args)
     storage_manager_config = parse_args_to_config(args)
     obs_config = parse_args_to_observability_config(args)
-    logger.error(" __main__ ")
     run_cache_server(
         mp_config=mp_config,
         storage_manager_config=storage_manager_config,
         obs_config=obs_config,
     )
-    logger.error(" __main__ ----")
-

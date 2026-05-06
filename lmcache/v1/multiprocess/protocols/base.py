@@ -72,6 +72,11 @@ class RequestType(enum.Enum):
     CB_LOOKUP_PRE_COMPUTED_V2 = enum.auto()
     CB_RETRIEVE_PRE_COMPUTED_V2 = enum.auto()
 
+    # XPU operations (CPU bounce buffer path for non-CUDA devices)
+    REGISTER_KV_CACHE_LAYOUT = enum.auto()
+    STORE_CPU_CHUNKS = enum.auto()
+    RETRIEVE_CPU_CHUNKS = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

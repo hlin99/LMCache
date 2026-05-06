@@ -32,6 +32,10 @@ REQUEST_NAMES = [
     "QUERY_PREFETCH_LOOKUP_HITS",
     "FREE_LOOKUP_LOCKS",
     "END_SESSION",
+    # XPU / CPU bounce-buffer path
+    "REGISTER_KV_CACHE_LAYOUT",
+    "STORE_CPU_CHUNKS",
+    "RETRIEVE_CPU_CHUNKS",
 ]
 
 # Type alias for cache keys
@@ -144,6 +148,57 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "END_SESSION": ProtocolDefinition(
             payload_classes=[str],
             response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # XPU/CPU bounce-buffer path: layout-only KV cache registration
+        # Payload:
+        #   - instance_id: int - Unique identifier for the engine instance
+        #   - model_name: str - Name of the model
+        #   - world_size: int - World size of the engine
+        #   - engine_type: EngineType - Serving engine type
+        #   - layout_hints: LayoutHints - Layout hints (e.g., kv_layout)
+        #   - block_size: int - vLLM block size (tokens per block)
+        #   - num_layers: int - Number of transformer layers
+        #   - hidden_dim_size: int - Hidden dim per head (num_heads * head_size)
+        #   - dtype_str: str - PyTorch dtype name (e.g. "bfloat16")
+        # Returns: None
+        "REGISTER_KV_CACHE_LAYOUT": ProtocolDefinition(
+            payload_classes=[
+                int,
+                str,
+                int,
+                EngineType,
+                LayoutHints,
+                int,
+                int,
+                int,
+                str,
+            ],
+            response_class=None,
+            handler_type=HandlerType.SYNC,
+        ),
+        # XPU/CPU bounce-buffer path: worker sends gathered CPU KV chunks to server
+        # Payload:
+        #   - key: KeyType - Cache key identifying the token range
+        #   - instance_id: int - Unique identifier for the engine instance
+        #   - cpu_data: bytes - Pickled list of CPU tensors, one per chunk,
+        #       each with shape [2, num_layers, chunk_size, hidden_dim_size]
+        # Returns: bool - True if store succeeded
+        "STORE_CPU_CHUNKS": ProtocolDefinition(
+            payload_classes=[KeyType, int, bytes],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # XPU/CPU bounce-buffer path: worker requests CPU KV chunks from server
+        # Payload:
+        #   - key: KeyType - Cache key identifying the token range
+        #   - instance_id: int - Unique identifier for the engine instance
+        # Returns: tuple[bool, bytes]
+        #   - bool: True if retrieve succeeded
+        #   - bytes: Pickled list of CPU tensors, one per chunk
+        "RETRIEVE_CPU_CHUNKS": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=tuple[bool, bytes],
             handler_type=HandlerType.BLOCKING,
         ),
     }

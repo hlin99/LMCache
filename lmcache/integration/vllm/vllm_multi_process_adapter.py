@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 from typing import Any
 import os
+import pickle
 import threading
 
 # Third Party
@@ -11,6 +12,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache import torch_device_type
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.multiprocess.custom_types import (
@@ -33,8 +35,267 @@ DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
+    """Wrap vLLM KV cache tensors for cross-process sharing.
+
+    For CUDA, wraps each tensor in a ``CudaIPCWrapper`` so the server can
+    reconstruct it via CUDA IPC.  For XPU (and other non-CUDA devices) the
+    function returns an empty list; the XPU path uses the CPU bounce-buffer
+    protocol instead and does not share device pointers with the server.
+
+    Args:
+        kv_caches: Mapping of layer name → KV cache tensor from vLLM.
+
+    Returns:
+        A list of ``CudaIPCWrapper`` objects (CUDA), or an empty list (XPU).
+    """
+    if torch_device_type == "xpu":
+        # XPU: no CUDA IPC; registration is done via REGISTER_KV_CACHE_LAYOUT
+        return []
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
+
+
+def _compute_xpu_layout(
+    kv_caches: dict[str, torch.Tensor],
+) -> tuple[int, int, int, str]:
+    """Compute layout metadata from XPU KV cache tensors.
+
+    Used to construct the payload for ``REGISTER_KV_CACHE_LAYOUT`` so the
+    server knows how to allocate ``MemoryObj``s of the right size.
+
+    Args:
+        kv_caches: Mapping of layer name → XPU KV cache tensor.
+
+    Returns:
+        A tuple ``(block_size, num_layers, hidden_dim_size, dtype_str)`` where:
+        - ``block_size``: Number of tokens per vLLM block.
+        - ``num_layers``: Number of transformer layers.
+        - ``hidden_dim_size``: ``num_heads * head_size`` per KV head.
+        - ``dtype_str``: PyTorch dtype name (e.g. ``"bfloat16"``).
+
+    Raises:
+        ValueError: If ``kv_caches`` is empty or the format is unsupported.
+    """
+    # Local
+    from lmcache.utils import EngineType
+    from lmcache.v1.gpu_connector.utils import (
+        get_block_size,
+        get_hidden_dim_size,
+        get_num_layers,
+        normalize_kv_and_discover_format,
+    )
+
+    tensors = list(kv_caches.values())
+    if not tensors:
+        raise ValueError("kv_caches is empty; cannot compute XPU layout.")
+
+    gpu_kv_format, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM
+    )
+    block_size = get_block_size(normalized, gpu_kv_format)
+    num_layers = get_num_layers(normalized, gpu_kv_format)
+    hidden_dim_size = get_hidden_dim_size(normalized, gpu_kv_format)
+
+    first = tensors[0]
+    dtype: torch.dtype = (
+        first.dtype if isinstance(first, torch.Tensor) else first[0].dtype
+    )
+    dtype_str = str(dtype).replace("torch.", "")  # e.g. "bfloat16"
+
+    return block_size, num_layers, hidden_dim_size, dtype_str
+
+
+def _xpu_gather_chunks_to_cpu(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    blocks_per_chunk: int,
+) -> bytes:
+    """Gather XPU paged KV blocks into CPU tensors and serialize them.
+
+    For each chunk defined by ``block_ids[i*blocks_per_chunk:(i+1)*blocks_per_chunk]``,
+    gathers K and V tokens via ``index_select`` and packs them into a CPU
+    tensor of shape ``[2, num_layers, chunk_size, hidden_dim_size]``.
+
+    Args:
+        kv_caches: Mapping of layer name → XPU KV cache tensor.
+        block_ids: All block IDs across all chunks
+            (length = num_chunks * blocks_per_chunk).
+        blocks_per_chunk: Number of vLLM blocks per LMCache chunk.
+
+    Returns:
+        Pickled list of CPU tensors, one per chunk.
+
+    Raises:
+        ValueError: If the KV format is unsupported for XPU gather.
+    """
+    # Local
+    from lmcache.utils import EngineType
+    from lmcache.v1.gpu_connector.utils import (
+        _get_head_size_view,
+        get_block_size,
+        is_mla,
+        normalize_kv_and_discover_format,
+    )
+
+    tensors = list(kv_caches.values())
+    gpu_kv_format, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM
+    )
+    block_size = get_block_size(normalized, gpu_kv_format)
+    use_mla = is_mla(gpu_kv_format)
+
+    if use_mla:
+        raise NotImplementedError(
+            "XPU CPU bounce-buffer path does not yet support MLA attention. "
+            "Use the standard LMCacheConnectorV1 for MLA on XPU."
+        )
+
+    device = (
+        tensors[0].device
+        if isinstance(tensors[0], torch.Tensor)
+        else tensors[0][0].device
+    )
+    num_chunks = len(block_ids) // blocks_per_chunk
+
+    chunks: list[torch.Tensor] = []
+    for chunk_idx in range(num_chunks):
+        chunk_block_ids = block_ids[
+            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+        ]
+        slot_mapping = torch.tensor(
+            [b * block_size + t for b in chunk_block_ids for t in range(block_size)],
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Gather K and V for each layer
+        # Result shape per layer: [chunk_size, hidden_dim]
+        k_layers: list[torch.Tensor] = []
+        v_layers: list[torch.Tensor] = []
+        for layer in normalized:
+            k_flat, v_flat = _get_head_size_view(layer, use_mla=False)
+            k_gathered = k_flat.index_select(0, slot_mapping)
+            v_gathered = v_flat.index_select(0, slot_mapping)
+            k_layers.append(k_gathered)
+            v_layers.append(v_gathered)
+
+        # Stack into [2, num_layers, chunk_size, hidden_dim_size]
+        k_stacked = torch.stack(k_layers, dim=0)  # [num_layers, chunk_size, hidden_dim]
+        v_stacked = torch.stack(v_layers, dim=0)  # [num_layers, chunk_size, hidden_dim]
+        chunk_tensor = torch.stack([k_stacked, v_stacked], dim=0)  # [2, NL, T, D]
+
+        chunks.append(chunk_tensor.cpu())
+
+    # Synchronize XPU before returning so CPU tensors are fully populated
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.synchronize()
+
+    return pickle.dumps(chunks)
+
+
+def _xpu_scatter_cpu_chunks_to_kv(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    cpu_data: bytes,
+    blocks_per_chunk: int,
+    skip_first_n_tokens: int = 0,
+) -> None:
+    """Scatter CPU chunk tensors back into XPU paged KV memory.
+
+    Args:
+        kv_caches: Mapping of layer name → XPU KV cache tensor.
+        block_ids: All block IDs across all chunks.
+        cpu_data: Pickled list of CPU tensors returned by ``retrieve_cpu_chunks``.
+        blocks_per_chunk: Number of vLLM blocks per LMCache chunk.
+        skip_first_n_tokens: Number of tokens at the start to skip writing
+            (APC-shared blocks that must not be overwritten).
+    """
+    # Local
+    from lmcache.utils import EngineType
+    from lmcache.v1.gpu_connector.utils import (
+        _get_head_size_view,
+        get_block_size,
+        is_mla,
+        normalize_kv_and_discover_format,
+    )
+
+    chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+    if not chunks:
+        return
+
+    tensors = list(kv_caches.values())
+    gpu_kv_format, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM
+    )
+    block_size = get_block_size(normalized, gpu_kv_format)
+    use_mla = is_mla(gpu_kv_format)
+
+    if use_mla:
+        raise NotImplementedError(
+            "XPU CPU bounce-buffer path does not yet support MLA attention."
+        )
+
+    device = (
+        tensors[0].device
+        if isinstance(tensors[0], torch.Tensor)
+        else tensors[0][0].device
+    )
+
+    for chunk_idx, chunk_cpu in enumerate(chunks):
+        # chunk_cpu: [2, num_layers, chunk_size, hidden_dim_size]
+        chunk_block_ids = block_ids[
+            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+        ]
+        if not chunk_block_ids:
+            continue
+
+        # Compute token-level skip within this chunk
+        chunk_start_token = chunk_idx * blocks_per_chunk * block_size
+        chunk_end_token = chunk_start_token + len(chunk_block_ids) * block_size
+        effective_start = max(chunk_start_token, skip_first_n_tokens)
+        if effective_start >= chunk_end_token:
+            # Entire chunk is within APC-skipped range
+            continue
+
+        skip_tokens_in_chunk = effective_start - chunk_start_token
+        skip_blocks_in_chunk = skip_tokens_in_chunk // block_size
+        effective_block_ids = chunk_block_ids[skip_blocks_in_chunk:]
+        if not effective_block_ids:
+            continue
+
+        slot_mapping = torch.tensor(
+            [
+                b * block_size + t
+                for b in effective_block_ids
+                for t in range(block_size)
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Move chunk to XPU
+        chunk_xpu = chunk_cpu.to(device)
+        skip_tok = skip_blocks_in_chunk * block_size
+
+        # Scatter each layer: k_flat/v_flat are views of the original XPU
+        # tensor, so index_copy_ writes in place to paged KV memory.
+        for layer_idx, layer in enumerate(normalized):
+            k_flat, v_flat = _get_head_size_view(layer, use_mla=False)
+            k_src = chunk_xpu[0, layer_idx, skip_tok:]
+            v_src = chunk_xpu[1, layer_idx, skip_tok:]
+
+            # Reshape src if k_flat has 3D shape [num_tokens, num_heads, head_size]
+            if k_flat.dim() == 3 and k_src.dim() == 2:
+                nh, hs = k_flat.shape[1], k_flat.shape[2]
+                k_src = k_src.reshape(-1, nh, hs)
+                v_src = v_src.reshape(-1, nh, hs)
+
+            k_flat.index_copy_(0, slot_mapping, k_src)
+            v_flat.index_copy_(0, slot_mapping, v_src)
+
+    # Synchronize after scattering
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.synchronize()
 
 
 def send_lmcache_request(
@@ -661,6 +922,10 @@ class LMCacheMPWorkerAdapter:
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
 
+        # XPU-specific: stores skip_first_n_tokens for pending retrieve requests.
+        # Used in get_finished() to scatter only the non-APC blocks.
+        self._xpu_skip_tokens: dict[str, int] = {}
+
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
 
@@ -744,34 +1009,63 @@ class LMCacheMPWorkerAdapter:
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """
-        Register the kv caches with LMCache server
+        """Register the kv caches with LMCache server.
+
+        For CUDA, wraps tensors as ``CudaIPCWrapper`` and sends
+        ``REGISTER_KV_CACHE`` so the server can access device memory via
+        CUDA IPC.
+
+        For XPU, computes layout metadata from tensor shapes and sends
+        ``REGISTER_KV_CACHE_LAYOUT`` so the server can allocate
+        ``MemoryObj``s of the right size.  Tensors remain in the worker
+        process; the server never touches XPU memory directly.
 
         Args:
             kv_caches: A dict of kv caches to register. The keys are the
                 layer names and the values are the corresponding tensors.
         """
-        # First Party
+        # Local
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
-        # Register kv cache and send the request
-        logger.info("Registering kv caches")
+        logger.info("Registering kv caches (device=%s)", torch_device_type)
 
         layout_hints = vllm_layout_hints()
         self.kv_caches = kv_caches
 
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.REGISTER_KV_CACHE,
-            [
-                self.instance_id,
-                wrap_kv_caches(kv_caches),
-                self.model_name,
-                self.world_size,
-                EngineType.VLLM,
-                layout_hints,
-            ],
-        )
+        if torch_device_type == "xpu":
+            # XPU path: send layout-only registration (no IPC wrapping)
+            block_size, num_layers, hidden_dim_size, dtype_str = _compute_xpu_layout(
+                kv_caches
+            )
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.REGISTER_KV_CACHE_LAYOUT,
+                [
+                    self.instance_id,
+                    self.model_name,
+                    self.world_size,
+                    EngineType.VLLM,
+                    layout_hints,
+                    block_size,
+                    num_layers,
+                    hidden_dim_size,
+                    dtype_str,
+                ],
+            )
+        else:
+            # CUDA path: existing IPC-based registration
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.REGISTER_KV_CACHE,
+                [
+                    self.instance_id,
+                    wrap_kv_caches(kv_caches),
+                    self.model_name,
+                    self.world_size,
+                    EngineType.VLLM,
+                    layout_hints,
+                ],
+            )
         try:
             future.result(timeout=self._mq_timeout)
         except TimeoutError:
@@ -803,14 +1097,21 @@ class LMCacheMPWorkerAdapter:
         event: Any,
         cache_salt: str = "",
     ):
-        """
-        Submit a KV cache store request to LMCache
+        """Submit a KV cache store request to LMCache.
+
+        For CUDA, sends a ``STORE`` request with the CUDA IPC event handle so
+        the server can synchronize on the event and then gather KV blocks from
+        device memory.
+
+        For XPU, gathers KV blocks from XPU memory on the worker side into CPU
+        tensors, then sends a ``STORE_CPU_CHUNKS`` request.  No CUDA IPC event
+        is used; the future is a plain ``MessagingFuture[bool]``.
 
         Args:
-            request_id: The ID of the request
+            request_id: The ID of the request.
             op: The LoadStoreOp describing the store operation.
-            event: The CUDA event that is recorded after the current
-                model inference step
+            event: The device event recorded after the current model step.
+                Used only on CUDA; ignored on XPU.
             cache_salt: Per-user isolation salt.
         """
         self._ensure_heartbeat_started()
@@ -826,12 +1127,28 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.STORE,
-            [key, self.instance_id, op.block_ids, event.ipc_handle()],
-        ).to_cuda_future()
-        self.store_futures[request_id] = future
+
+        if torch_device_type == "xpu":
+            # XPU path: gather KV blocks to CPU, then send to server
+            cpu_data = _xpu_gather_chunks_to_cpu(
+                self.kv_caches,
+                op.block_ids,
+                self.blocks_in_chunk,
+            )
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.STORE_CPU_CHUNKS,
+                [key, self.instance_id, cpu_data],
+            )
+            self.store_futures[request_id] = future
+        else:
+            # CUDA path: existing IPC event-based store
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.STORE,
+                [key, self.instance_id, op.block_ids, event.ipc_handle()],
+            ).to_cuda_future()
+            self.store_futures[request_id] = future
 
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
@@ -841,14 +1158,19 @@ class LMCacheMPWorkerAdapter:
         event: Any,
         cache_salt: str = "",
     ):
-        """
-        Submit a KV cache retrieve request to LMCache
+        """Submit a KV cache retrieve request to LMCache.
+
+        For CUDA, sends a ``RETRIEVE`` request with the CUDA IPC event handle
+        so the server can scatter retrieved KV blocks directly to device memory.
+
+        For XPU, sends a ``RETRIEVE_CPU_CHUNKS`` request.  The server returns
+        CPU tensors; the worker scatters them to XPU in ``get_finished()``.
 
         Args:
-            request_id: The ID of the request
+            request_id: The ID of the request.
             op: The LoadStoreOp describing the retrieve operation.
-            event: The CUDA event that is recorded after the current
-                model inference step
+            event: The device event recorded after the current model step.
+                Used only on CUDA; ignored on XPU.
             cache_salt: Per-user isolation salt.
         """
         self._ensure_heartbeat_started()
@@ -865,18 +1187,30 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.RETRIEVE,
-            [
-                key,
-                self.instance_id,
-                op.block_ids,
-                event.ipc_handle(),
-                op.skip_first_n_tokens,
-            ],
-        ).to_cuda_future()
-        self.retrieve_futures[request_id] = (future, list(op.block_ids))
+
+        if torch_device_type == "xpu":
+            # XPU path: server returns CPU chunks; worker scatters in get_finished()
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.RETRIEVE_CPU_CHUNKS,
+                [key, self.instance_id],
+            )
+            self.retrieve_futures[request_id] = (future, list(op.block_ids))
+            self._xpu_skip_tokens[request_id] = op.skip_first_n_tokens
+        else:
+            # CUDA path: existing IPC event-based retrieve
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.RETRIEVE,
+                [
+                    key,
+                    self.instance_id,
+                    op.block_ids,
+                    event.ipc_handle(),
+                    op.skip_first_n_tokens,
+                ],
+            ).to_cuda_future()
+            self.retrieve_futures[request_id] = (future, list(op.block_ids))
 
     @_lmcache_nvtx_annotate
     def batched_submit_store_requests(
@@ -1013,11 +1347,35 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, _) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
 
-            r_result = r_future.result()
+            if torch_device_type == "xpu":
+                # XPU path: result is (bool, bytes); scatter CPU chunks to XPU
+                r_result_raw = r_future.result()
+                success, cpu_data = r_result_raw
+                r_result = success
+                if success and cpu_data:
+                    skip = self._xpu_skip_tokens.pop(request_id, 0)
+                    try:
+                        _xpu_scatter_cpu_chunks_to_kv(
+                            self.kv_caches,
+                            r_block_ids,
+                            cpu_data,
+                            self.blocks_in_chunk,
+                            skip_first_n_tokens=skip,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "XPU scatter failed for request_id=%s", request_id
+                        )
+                        r_result = False
+                else:
+                    self._xpu_skip_tokens.pop(request_id, None)
+            else:
+                r_result = r_future.result()
+
             finished_retrieves.add(request_id)
 
             if not r_result:
@@ -1033,6 +1391,8 @@ class LMCacheMPWorkerAdapter:
             self.store_futures.pop(request_id, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
+            # Clean up XPU skip tokens if not already consumed
+            self._xpu_skip_tokens.pop(request_id, None)
 
         # Update the internal states
         ret_stores = self._process_finished_stores(
