@@ -396,6 +396,7 @@ class MPCacheEngine:
         model_name = self.xpu_context_meta[instance_id][0]
 
         reserved_dict: dict = {}
+        written_keys: list = []
         try:
             chunks: list[torch.Tensor] = pickle.loads(cpu_data)
             reserved_dict = self.storage_manager.reserve_write(
@@ -426,21 +427,23 @@ class MPCacheEngine:
                     )
                     continue
                 memory_obj.tensor.copy_(chunk_cpu)
+                written_keys.append(obj_key)
         except Exception:
             logger.exception("Cannot store CPU chunks due to exception")
             return False
         finally:
-            if reserved_dict:
-                self.storage_manager.finish_write(list(reserved_dict.keys()))
+            if written_keys:
+                self.storage_manager.finish_write(written_keys)
 
-        if reserved_dict:
+        if written_keys:
             logger.debug(
                 "Stored %d CPU chunks for instance %d model %s",
-                len(reserved_dict),
+                len(written_keys),
                 instance_id,
                 model_name,
             )
-        return True
+        # Return True only if all needed obj_keys in reserved_dict were written
+        return len(written_keys) == len(reserved_dict)
 
     @_lmcache_nvtx_annotate
     def retrieve_cpu_chunks(
@@ -1247,6 +1250,17 @@ class MPCacheEngine:
             "hash_algorithm": self.token_hasher.hash_algorithm_name,
             "registered_gpu_ids": list(self.gpu_contexts.keys()),
             "gpu_context_meta": gpu_context_meta,
+            "registered_xpu_instance_ids": list(self.xpu_layout_contexts.keys()),
+            "xpu_context_meta": {
+                str(inst_id): {
+                    "model_name": self.xpu_context_meta[inst_id][0],
+                    "world_size": self.xpu_context_meta[inst_id][1],
+                    "block_size": ctx.block_size,
+                    "shapes": [str(s) for s in ctx.layout_desc.shapes],
+                    "dtypes": [str(d) for d in ctx.layout_desc.dtypes],
+                }
+                for inst_id, ctx in self.xpu_layout_contexts.items()
+            },
             "active_sessions": self.session_manager.active_count(),
             "active_prefetch_jobs": self._active_prefetch_count(),
             "storage_manager": sm,

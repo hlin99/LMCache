@@ -57,7 +57,8 @@ def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
 
 def _compute_xpu_layout(
     kv_caches: dict[str, torch.Tensor],
-) -> tuple[int, int, int, str]:
+    layout_hints: "Any | None" = None,
+) -> tuple[int, int, int, str, Any]:
     """Compute layout metadata from XPU KV cache tensors.
 
     Used to construct the payload for ``REGISTER_KV_CACHE_LAYOUT`` so the
@@ -65,13 +66,16 @@ def _compute_xpu_layout(
 
     Args:
         kv_caches: Mapping of layer name → XPU KV cache tensor.
+        layout_hints: Optional vLLM layout hints for HND/NHD detection.
 
     Returns:
-        A tuple ``(block_size, num_layers, hidden_dim_size, dtype_str)`` where:
+        A tuple ``(block_size, num_layers, hidden_dim_size, dtype_str,
+        gpu_kv_format)`` where:
         - ``block_size``: Number of tokens per vLLM block.
         - ``num_layers``: Number of transformer layers.
         - ``hidden_dim_size``: ``num_heads * head_size`` per KV head.
         - ``dtype_str``: PyTorch dtype name (e.g. ``"bfloat16"``).
+        - ``gpu_kv_format``: The discovered GPU KV format enum value.
 
     Raises:
         ValueError: If ``kv_caches`` is empty or the format is unsupported.
@@ -90,7 +94,7 @@ def _compute_xpu_layout(
         raise ValueError("kv_caches is empty; cannot compute XPU layout.")
 
     gpu_kv_format, normalized = normalize_kv_and_discover_format(
-        tensors, EngineType.VLLM
+        tensors, EngineType.VLLM, layout_hints=layout_hints
     )
     block_size = get_block_size(normalized, gpu_kv_format)
     num_layers = get_num_layers(normalized, gpu_kv_format)
@@ -104,13 +108,15 @@ def _compute_xpu_layout(
     # This relies on torch's __str__ format staying stable, which it has been.
     dtype_str = str(dtype).replace("torch.", "")  # e.g. "bfloat16"
 
-    return block_size, num_layers, hidden_dim_size, dtype_str
+    return block_size, num_layers, hidden_dim_size, dtype_str, gpu_kv_format
 
 
 def _xpu_gather_chunks_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
     blocks_per_chunk: int,
+    layout_hints: "Any | None" = None,
+    gpu_kv_format: "Any | None" = None,
 ) -> bytes:
     """Gather XPU paged KV blocks into CPU tensors and serialize them.
 
@@ -123,6 +129,8 @@ def _xpu_gather_chunks_to_cpu(
         block_ids: All block IDs across all chunks
             (length = num_chunks * blocks_per_chunk).
         blocks_per_chunk: Number of vLLM blocks per LMCache chunk.
+        layout_hints: Optional vLLM layout hints for HND/NHD detection.
+        gpu_kv_format: Pre-computed GPU KV format enum (avoids re-discovery).
 
     Returns:
         Pickled list of CPU tensors, one per chunk.
@@ -140,9 +148,11 @@ def _xpu_gather_chunks_to_cpu(
     )
 
     tensors = list(kv_caches.values())
-    gpu_kv_format, normalized = normalize_kv_and_discover_format(
-        tensors, EngineType.VLLM
+    fmt, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM, layout_hints=layout_hints
     )
+    if gpu_kv_format is None:
+        gpu_kv_format = fmt
     block_size = get_block_size(normalized, gpu_kv_format)
     use_mla = is_mla(gpu_kv_format)
 
@@ -175,16 +185,18 @@ def _xpu_gather_chunks_to_cpu(
         k_layers: list[torch.Tensor] = []
         v_layers: list[torch.Tensor] = []
         for layer in normalized:
-            k_flat, v_flat = _get_head_size_view(layer, use_mla=False)
+            k_flat, v_flat = _get_head_size_view(
+                layer, use_mla=False, gpu_kv_format=gpu_kv_format
+            )
             k_gathered = k_flat.index_select(0, slot_mapping)
             v_gathered = v_flat.index_select(0, slot_mapping)
             k_layers.append(k_gathered)
             v_layers.append(v_gathered)
 
         # Stack into [2, num_layers, chunk_size, hidden_dim_size]
-        k_stacked = torch.stack(k_layers, dim=0)  # [num_layers, chunk_size, hidden_dim]
-        v_stacked = torch.stack(v_layers, dim=0)  # [num_layers, chunk_size, hidden_dim]
-        chunk_tensor = torch.stack([k_stacked, v_stacked], dim=0)  # [2, NL, T, D]
+        k_stacked = torch.stack(k_layers, dim=0)
+        v_stacked = torch.stack(v_layers, dim=0)
+        chunk_tensor = torch.stack([k_stacked, v_stacked], dim=0)
 
         chunks.append(chunk_tensor.cpu())
 
@@ -201,6 +213,8 @@ def _xpu_scatter_cpu_chunks_to_kv(
     cpu_data: bytes,
     blocks_per_chunk: int,
     skip_first_n_tokens: int = 0,
+    layout_hints: "Any | None" = None,
+    gpu_kv_format: "Any | None" = None,
 ) -> None:
     """Scatter CPU chunk tensors back into XPU paged KV memory.
 
@@ -211,6 +225,8 @@ def _xpu_scatter_cpu_chunks_to_kv(
         blocks_per_chunk: Number of vLLM blocks per LMCache chunk.
         skip_first_n_tokens: Number of tokens at the start to skip writing
             (APC-shared blocks that must not be overwritten).
+        layout_hints: Optional vLLM layout hints for HND/NHD detection.
+        gpu_kv_format: Pre-computed GPU KV format enum (avoids re-discovery).
     """
     # Local
     from lmcache.utils import EngineType
@@ -226,9 +242,11 @@ def _xpu_scatter_cpu_chunks_to_kv(
         return
 
     tensors = list(kv_caches.values())
-    gpu_kv_format, normalized = normalize_kv_and_discover_format(
-        tensors, EngineType.VLLM
+    fmt, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM, layout_hints=layout_hints
     )
+    if gpu_kv_format is None:
+        gpu_kv_format = fmt
     block_size = get_block_size(normalized, gpu_kv_format)
     use_mla = is_mla(gpu_kv_format)
 
@@ -280,21 +298,58 @@ def _xpu_scatter_cpu_chunks_to_kv(
         chunk_xpu = chunk_cpu.to(device)
         skip_tok = skip_blocks_in_chunk * block_size
 
-        # Scatter each layer: k_flat/v_flat are views of the original XPU
-        # tensor, so index_copy_ writes in place to paged KV memory.
+        # Scatter each layer.
+        # For NHD formats, _get_head_size_view returns views of the original
+        # tensor so index_copy_ writes in place. For HND formats, we need
+        # to handle the scatter explicitly to avoid writing to copies.
+        import lmcache.c_ops as lmc_ops
+
+        is_hnd = gpu_kv_format in (
+            lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
+            lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
+        )
+
         for layer_idx, layer in enumerate(normalized):
-            k_flat, v_flat = _get_head_size_view(layer, use_mla=False)
-            k_src = chunk_xpu[0, layer_idx, skip_tok:]
+            k_src = chunk_xpu[0, layer_idx, skip_tok:]  # [tokens, hidden_dim]
             v_src = chunk_xpu[1, layer_idx, skip_tok:]
 
-            # Reshape src if k_flat has 3D shape [num_tokens, num_heads, head_size]
-            if k_flat.dim() == 3 and k_src.dim() == 2:
-                nh, hs = k_flat.shape[1], k_flat.shape[2]
-                k_src = k_src.reshape(-1, nh, hs)
-                v_src = v_src.reshape(-1, nh, hs)
-
-            k_flat.index_copy_(0, slot_mapping, k_src)
-            v_flat.index_copy_(0, slot_mapping, v_src)
+            if is_hnd:
+                # HND: write directly to the tensor in HND layout
+                # layer is [2, NB, NH, BS, HS] or [NB, 2, NH, BS, HS]
+                if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+                    # layer: [2, NB, NH, BS, HS]
+                    k_t = layer[0]  # [NB, NH, BS, HS]
+                    v_t = layer[1]
+                else:
+                    # layer: [NB, 2, NH, BS, HS]
+                    k_t = layer[:, 0]  # [NB, NH, BS, HS]
+                    v_t = layer[:, 1]
+                nb, nh, bs_l, hs = k_t.shape
+                # Reshape src from [tokens, NH*HS] to [tokens, NH, HS]
+                k_src_3d = k_src.reshape(-1, nh, hs)
+                v_src_3d = v_src.reshape(-1, nh, hs)
+                # Write block by block
+                token_offset = 0
+                for blk_id in effective_block_ids:
+                    k_t[blk_id, :, :, :] = k_src_3d[
+                        token_offset : token_offset + block_size
+                    ].permute(1, 0, 2)
+                    v_t[blk_id, :, :, :] = v_src_3d[
+                        token_offset : token_offset + block_size
+                    ].permute(1, 0, 2)
+                    token_offset += block_size
+            else:
+                # NHD: use _get_head_size_view which returns writable views
+                k_flat, v_flat = _get_head_size_view(
+                    layer, use_mla=False, gpu_kv_format=gpu_kv_format
+                )
+                # Reshape src if k_flat has 3D shape
+                if k_flat.dim() == 3 and k_src.dim() == 2:
+                    nh, hs = k_flat.shape[1], k_flat.shape[2]
+                    k_src = k_src.reshape(-1, nh, hs)
+                    v_src = v_src.reshape(-1, nh, hs)
+                k_flat.index_copy_(0, slot_mapping, k_src)
+                v_flat.index_copy_(0, slot_mapping, v_src)
 
     # Synchronize after scattering
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -929,6 +984,12 @@ class LMCacheMPWorkerAdapter:
         # Used in get_finished() to scatter only the non-APC blocks.
         self._xpu_skip_tokens: dict[str, int] = {}
 
+        # XPU-specific: cached layout metadata from register_kv_caches()
+        self._xpu_layout_hints: Any = None
+        self._xpu_gpu_kv_format: Any = None
+        self._xpu_block_size: int | None = None
+        self._xpu_hidden_dim_size: int | None = None
+
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
 
@@ -1037,9 +1098,14 @@ class LMCacheMPWorkerAdapter:
 
         if torch_device_type == "xpu":
             # XPU path: send layout-only registration (no IPC wrapping)
-            block_size, num_layers, hidden_dim_size, dtype_str = _compute_xpu_layout(
-                kv_caches
+            block_size, num_layers, hidden_dim_size, dtype_str, gpu_kv_format = (
+                _compute_xpu_layout(kv_caches, layout_hints=layout_hints)
             )
+            # Cache XPU layout metadata for gather/scatter
+            self._xpu_layout_hints = layout_hints
+            self._xpu_gpu_kv_format = gpu_kv_format
+            self._xpu_block_size = block_size
+            self._xpu_hidden_dim_size = hidden_dim_size
             future = send_lmcache_request(
                 self.mq_client,
                 RequestType.REGISTER_KV_CACHE_LAYOUT,
@@ -1132,11 +1198,19 @@ class LMCacheMPWorkerAdapter:
         )
 
         if torch_device_type == "xpu":
-            # XPU path: gather KV blocks to CPU, then send to server
+            # XPU path: synchronize before gather to ensure vLLM has
+            # finished writing to the KV cache
+            if event is not None and hasattr(event, "synchronize"):
+                event.synchronize()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.synchronize()
+            # Gather KV blocks to CPU, then send to server
             cpu_data = _xpu_gather_chunks_to_cpu(
                 self.kv_caches,
                 op.block_ids,
                 self.blocks_in_chunk,
+                layout_hints=self._xpu_layout_hints,
+                gpu_kv_format=self._xpu_gpu_kv_format,
             )
             future = send_lmcache_request(
                 self.mq_client,
@@ -1368,6 +1442,8 @@ class LMCacheMPWorkerAdapter:
                             cpu_data,
                             self.blocks_in_chunk,
                             skip_first_n_tokens=skip,
+                            layout_hints=self._xpu_layout_hints,
+                            gpu_kv_format=self._xpu_gpu_kv_format,
                         )
                     except Exception:
                         logger.exception(
@@ -1382,6 +1458,7 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
+                self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
