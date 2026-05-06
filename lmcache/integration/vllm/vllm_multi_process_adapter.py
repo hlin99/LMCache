@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 import os
 import pickle
 import threading
@@ -1430,8 +1430,11 @@ class LMCacheMPWorkerAdapter:
 
             if torch_device_type == "xpu":
                 # XPU path: result is (bool, bytes); scatter CPU chunks to XPU
-                r_result_raw = r_future.result()
-                success, cpu_data = r_result_raw
+                r_result_raw = cast(
+                    tuple[bool, bytes], r_future.result()
+                )
+                success: bool = r_result_raw[0]
+                cpu_data: bytes = r_result_raw[1]
                 r_result = success
                 if success and cpu_data:
                     skip = self._xpu_skip_tokens.pop(request_id, 0)
