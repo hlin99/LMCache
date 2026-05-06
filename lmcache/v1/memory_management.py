@@ -407,6 +407,7 @@ def _resolve_pinned_alloc_free(
             (lmc_ops.free_pinned_numa_ptr, size),
         )
     else:
+        logger.error(" _resolve_pinned_alloc_free !!! ")
         return (
             (lmc_ops.alloc_pinned_ptr, 0),
             (lmc_ops.free_pinned_ptr,),
@@ -418,6 +419,8 @@ def _allocate_cpu_memory(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
 ) -> torch.Tensor:
+    logger.error(" _allocate_cpu_memory i+++ ")
+
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
 
@@ -425,10 +428,12 @@ def _allocate_cpu_memory(
         numa_mapping,
         shm_name,
     )
+    logger.error(" _allocate_cpu_memory 0 ")
     alloc_fn, *alloc_args = alloc_info
     ptr = alloc_fn(size, *alloc_args)
 
     array_type = ctypes.c_uint8 * size
+    logger.error(" _allocate_cpu_memory ")
     buf = array_type.from_address(ptr)
     buffer = torch.frombuffer(buf, dtype=torch.uint8)
 
@@ -2066,11 +2071,13 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         """
         :param int size: The size of the pinned memory in bytes.
         """
-
+        logger.info(" MixedMemoryAllocator 1 ")
         self.numa_mapping = kwargs.get("numa_mapping", None)
         self.align_bytes = kwargs.get("align_bytes", AddressManager.ALIGN_BYTES)
         if self.align_bytes <= 0 or self.align_bytes & (self.align_bytes - 1) != 0:
             raise ValueError("align_bytes must be a positive power of two")
+
+        logger.info(" MixedMemoryAllocator 2 ")
 
         # Extract shm_name from config.extra_config if available
         config = kwargs.get("config", None)
@@ -2082,8 +2089,10 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             self.shm_name = kwargs.get("shm_name", None)
 
         self.size = size
+        logger.info(" MixedMemoryAllocator 2.1 ")
 
         self.buffer = _allocate_cpu_memory(size, self.numa_mapping, self.shm_name)
+        logger.info(" MixedMemoryAllocator 3 ")
 
         self._unregistered = False
 
@@ -2106,6 +2115,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             self.pin_allocator = TensorMemoryAllocator(
                 self.buffer, align_bytes=self.align_bytes
             )
+        logger.info(" MixedMemoryAllocator 4 ")
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
 

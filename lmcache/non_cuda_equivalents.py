@@ -30,6 +30,11 @@ _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
 
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
     """Lazily load and cache the CUDA/ROCm runtime library, or None for CPU fallback."""
     global _copy_lib
@@ -337,15 +342,20 @@ def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     to it. On XPU, uses pin_memory=True (SYCL USM host allocation) for
     fast DMA transfers. On other non-CUDA platforms, pinning is not supported."""
 
+    logger.info(" alloc_pinned_ptr 0 ")
     # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
-    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=_XPU_PIN_MEMORY)
+    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=_XPU_PIN_MEMORY) # False)
+
+    logger.info(" alloc_pinned_ptr 1 ")
 
     # First-touch initialization (forces physical allocation)
     tensor.fill_(0)
+    logger.info(" alloc_pinned_ptr 2 ")
 
     # Get a pointer to the start of the tensor object as this is what is
     # returned by the CUDA equivalent function
     ptr = tensor.data_ptr()
+    logger.info(" alloc_pinned_ptr 3 ")
 
     # Store the tensor so it can be accessed outide this function scope
     _tensor_registry[ptr] = tensor

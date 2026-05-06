@@ -181,6 +181,7 @@ class MPCacheEngine:
         chunk_size: int = 256,
         hash_algorithm: str = "blake3",
     ):
+        logger.error(" MPCacheEngine 1")
         # GPU ID -> KV cache tensors
         self.gpu_contexts: dict[int, GPUCacheContext] = {}
 
@@ -195,18 +196,24 @@ class MPCacheEngine:
 
         # Lock for clear() to avoid concurrent storage manager mutations
         self.lock = threading.Lock()
+        logger.error(" MPCacheEngine 2")
 
         # storage manager
         self.storage_manager = StorageManager(storage_manager_config)
+        logger.error(" MPCacheEngine 3")
 
         # Token hasher and session manager for token-based operations
         self.token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
         )
+        logger.error(" MPCacheEngine 4")
+
         self.session_manager = SessionManager(self.token_hasher)
+        logger.error(" MPCacheEngine 5")
 
         # EventBus for observability
         self._event_bus = get_event_bus()
+        logger.error(" MPCacheEngine 6")
 
         # Prefetch job tracking for two-phase lookup, keyed by request_id.
         # TODO: implement periodic cleanup of stale _prefetch_jobs entries
@@ -1103,14 +1110,17 @@ def run_cache_server(
         If return_engine is True: tuple of (MessageQueueServer, MPCacheEngine)
         If return_engine is False: None (blocks until interrupted)
     """
+    logger.error(" run_cache_server +++")
     event_bus = init_observability(
         obs_config, start_prometheus_http_server=start_prometheus_http_server
     )
+    logger.error(" run_cache_server 1")
 
     # Wire up the trace recorder (no-op when --trace-level is unset).
     # Registered before the engine handlers are added so any
     # storage-manager calls during engine init are captured too.
     maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
+    logger.error(" run_cache_server 1.1")
 
     # Initialize the engine (loggers self-register with the global controller)
     engine = MPCacheEngine(
@@ -1118,6 +1128,7 @@ def run_cache_server(
         chunk_size=mp_config.chunk_size,
         hash_algorithm=mp_config.hash_algorithm,
     )
+    logger.error(" run_cache_server 2")
 
     # Initialize the message queue server
     context = zmq.Context.instance()
@@ -1125,6 +1136,7 @@ def run_cache_server(
         bind_url=f"tcp://{mp_config.host}:{mp_config.port}",
         context=context,
     )
+    logger.error(" run_cache_server 3")
 
     # Add handlers
     add_handler_helper(server, RequestType.REGISTER_KV_CACHE, engine.register_kv_cache)
@@ -1221,8 +1233,11 @@ if __name__ == "__main__":
     mp_config = parse_args_to_mp_server_config(args)
     storage_manager_config = parse_args_to_config(args)
     obs_config = parse_args_to_observability_config(args)
+    logger.error(" __main__ ")
     run_cache_server(
         mp_config=mp_config,
         storage_manager_config=storage_manager_config,
         obs_config=obs_config,
     )
+    logger.error(" __main__ ----")
+

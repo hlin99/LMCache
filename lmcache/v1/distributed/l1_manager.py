@@ -166,11 +166,14 @@ class L1Manager:
     _gauge_target: "L1Manager | None" = None
 
     def __init__(self, config: L1ManagerConfig):
+        logger.error(" L1 manager 1 ")
         self._lock = threading.Lock()
 
         self._objects: dict[ObjectKey, L1ObjectState] = {}
+        logger.error(" L1 manager 1.1 ")
 
         self._memory_manager = L1MemoryManager(config.memory_config)
+        logger.error(" L1 manager 2 ")
 
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
@@ -178,6 +181,7 @@ class L1Manager:
         self._registered_listeners: list[L1ManagerListener] = []
 
         self._event_bus = get_event_bus()
+        logger.error(" L1 manager 3")
 
         L1Manager._gauge_target = self
         if not L1Manager._gauge_registered:

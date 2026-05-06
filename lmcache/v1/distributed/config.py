@@ -136,7 +136,7 @@ def add_storage_manager_args(
     memory_group.add_argument(
         "--l1-use-lazy",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Whether to use lazy loading for L1 memory. (Default is True)",
     )
     memory_group.add_argument(

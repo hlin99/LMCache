@@ -40,6 +40,7 @@ class EvictionController(StorageControllerInterface):
     """
 
     def __init__(self):
+        logger.error(" EvictionController __init__ ")
         self._stop_flag = threading.Event()
         self._thread = threading.Thread(
             target=self.eviction_loop,

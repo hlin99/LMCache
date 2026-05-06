@@ -51,8 +51,12 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        logger.warning(" StorageManager 1 ")
         self._l1_manager = L1Manager(config.l1_manager_config)
+        logger.warning(" StorageManager 2 ")
+
         self._event_bus = get_event_bus()
+        logger.warning(" StorageManager 3 ")
 
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
@@ -66,6 +70,8 @@ class StorageManager:
         # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
         # and serde is transparent.
         l1_memory_desc = self._l1_manager.get_l1_memory_desc()
+        logger.warning(" StorageManager 1 ")
+
         self._l2_adapters: list[L2AdapterInterface] = []
         for ac in config.l2_adapter_config.adapters:
             adapter: L2AdapterInterface = create_l2_adapter(ac, l1_memory_desc)
@@ -84,6 +90,7 @@ class StorageManager:
         # reference. No explicit cleanup on close — the registry is
         # just a dict protected by a lock and has no OS resources.
         self._quota_manager = QuotaManager()
+        logger.warning(" StorageManager 1 ")
 
         # Unified L2 eviction controller for all adapters with eviction
         # config. Aggregate-usage policies (``LRU``, ``noop``) need

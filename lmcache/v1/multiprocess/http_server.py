@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     else:
         # First Party
         from lmcache.v1.multiprocess.server import run_cache_server
-
+    logger.error(" +++ run_cache_server ")
     result = run_cache_server(
         mp_config=mp_config,
         storage_manager_config=_configs["storage_manager"],
@@ -75,6 +75,8 @@ async def lifespan(app: FastAPI):
         return_engine=True,
         start_prometheus_http_server=False,
     )
+    logger.error(" --- run_cache_server ")
+
     assert result is not None, "run_cache_server returned None with return_engine=True"
     zmq_server, engine = result
 
@@ -152,7 +154,7 @@ def run_http_server(
     server = uvicorn.Server(config)
 
     logger.info(
-        "Starting LMCache HTTP server on http://%s:%d",
+        "[tony] Starting LMCache HTTP server on http://%s:%d",
         http_config.http_host,
         http_config.http_port,
     )
