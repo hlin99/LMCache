@@ -332,7 +332,8 @@ class MPCacheEngine:
         dtype = getattr(torch, dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
             raise ValueError(
-                f"Invalid dtype_str '{dtype_str}': not a valid torch.dtype name."
+                f"Invalid dtype_str '{dtype_str}': not a recognized torch.dtype name. "
+                "Valid examples: 'float16', 'bfloat16', 'float32'."
             )
 
         layout_desc = MemoryLayoutDesc(
@@ -383,7 +384,7 @@ class MPCacheEngine:
         ]
 
         if key.worker_id is None:
-            raise ValueError("Must store with worker_id != None")
+            raise ValueError("worker_id is required for store operations")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
         if instance_id not in self.xpu_layout_contexts:
@@ -468,7 +469,7 @@ class MPCacheEngine:
         ]
 
         if key.worker_id is None:
-            raise ValueError("Must retrieve with worker_id != None")
+            raise ValueError("worker_id is required for retrieve operations")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
         if instance_id not in self.xpu_layout_contexts:

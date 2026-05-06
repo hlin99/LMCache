@@ -100,6 +100,8 @@ def _compute_xpu_layout(
     dtype: torch.dtype = (
         first.dtype if isinstance(first, torch.Tensor) else first[0].dtype
     )
+    # torch.dtype.__str__ returns "torch.<name>"; strip the prefix.
+    # This relies on torch's __str__ format staying stable, which it has been.
     dtype_str = str(dtype).replace("torch.", "")  # e.g. "bfloat16"
 
     return block_size, num_layers, hidden_dim_size, dtype_str
@@ -232,7 +234,8 @@ def _xpu_scatter_cpu_chunks_to_kv(
 
     if use_mla:
         raise NotImplementedError(
-            "XPU CPU bounce-buffer path does not yet support MLA attention."
+            "XPU CPU bounce-buffer path does not yet support MLA attention. "
+            "Use the standard LMCacheConnectorV1 for MLA on XPU."
         )
 
     device = (
