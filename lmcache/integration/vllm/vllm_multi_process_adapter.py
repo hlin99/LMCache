@@ -674,8 +674,8 @@ class LMCacheMPWorkerAdapter:
         self._bounce_layout_hints: Any = None
         self._bounce_gpu_kv_format: Any = None
         self._bounce_block_size: int | None = None
-        self._use_bounce_buffer = False
-        self._device_type = "cuda"
+        self._use_bounce_buffer: bool = False
+        self._device_type: str = "cuda"
 
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
@@ -774,7 +774,12 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         if not kv_caches:
             raise ValueError("kv_caches is empty")
-        self._device_type = next(iter(kv_caches.values())).device.type
+        device_types = {tensor.device.type for tensor in kv_caches.values()}
+        if len(device_types) != 1:
+            raise ValueError(
+                f"All KV cache tensors must share one device type, got {device_types}"
+            )
+        self._device_type = next(iter(device_types))
         self._use_bounce_buffer = self._device_type != "cuda"
         logger.info(
             "Registering kv caches (device_type=%s, bounce=%s)",

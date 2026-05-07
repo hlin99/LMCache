@@ -365,7 +365,8 @@ class MPCacheEngine:
         chunk_hashes = [
             TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
         ]
-        assert key.worker_id is not None, "Must store with worker_id != None"
+        if key.worker_id is None:
+            raise ValueError("Must store with worker_id != None")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
         if instance_id not in self.bounce_contexts:
@@ -422,7 +423,8 @@ class MPCacheEngine:
         chunk_hashes = [
             TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
         ]
-        assert key.worker_id is not None, "Must retrieve with worker_id != None"
+        if key.worker_id is None:
+            raise ValueError("Must retrieve with worker_id != None")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
         if instance_id not in self.bounce_contexts:
@@ -822,8 +824,9 @@ class MPCacheEngine:
         """Find layout desc from a matching GPU or bounce context.
 
         Returns:
-            The layout descriptor, or None if no context
-            matches (model_name, world_size).
+            The layout descriptor, or None if no context matches
+            ``(model_name, world_size)``. GPU contexts are checked first,
+            then bounce contexts.
         """
         for gpu_id, (m, w) in self.gpu_context_meta.items():
             if m == model_name and w == world_size:

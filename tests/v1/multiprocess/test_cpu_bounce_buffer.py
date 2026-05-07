@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager
-from typing import Any
 import pickle
 import sys
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 # Third Party

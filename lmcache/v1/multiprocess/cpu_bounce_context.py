@@ -31,7 +31,7 @@ def device_synchronize(device_type: str | None = None) -> None:
 
 def compute_kv_layout(
     kv_caches: dict[str, torch.Tensor],
-    layout_hints: "Any | None" = None,
+    layout_hints: Any | None = None,
 ) -> tuple[int, int, int, str, Any]:
     """Compute KV layout metadata from KV tensors.
 
@@ -72,8 +72,8 @@ def gather_chunks_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
     blocks_per_chunk: int,
-    layout_hints: "Any | None" = None,
-    gpu_kv_format: "Any | None" = None,
+    layout_hints: Any | None = None,
+    gpu_kv_format: Any | None = None,
 ) -> bytes:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -152,8 +152,8 @@ def scatter_cpu_chunks_to_kv(
     cpu_data: bytes,
     blocks_per_chunk: int,
     skip_first_n_tokens: int = 0,
-    layout_hints: "Any | None" = None,
-    gpu_kv_format: "Any | None" = None,
+    layout_hints: Any | None = None,
+    gpu_kv_format: Any | None = None,
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
