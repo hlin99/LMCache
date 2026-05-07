@@ -31,10 +31,19 @@ logger = init_logger(__name__)
 DEFAULT_MQ_TIMEOUT: float = 300.0
 # Interval (seconds) between periodic heartbeat pings to the server.
 DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
+_MLA_BOUNCE_UNSUPPORTED_MSG = (
+    "CPU bounce-buffer path does not support MLA "
+    "(multi-head latent attention) yet."
+)
 
 
 def _device_synchronize(device_type: str) -> None:
-    """Synchronize the active backend device when needed."""
+    """Synchronize device work for backends that require explicit barriers.
+
+    Args:
+        device_type: Active device type string (for example ``"cuda"``,
+            ``"xpu"``, or ``"cpu"``).
+    """
     if device_type == "cuda":
         torch.cuda.synchronize()
     elif device_type == "xpu" and hasattr(torch, "xpu"):
@@ -45,7 +54,19 @@ def _compute_kv_layout(
     kv_caches: dict[str, torch.Tensor],
     layout_hints: "Any | None" = None,
 ) -> tuple[int, int, int, str, Any]:
-    """Compute KV layout metadata from per-layer KV cache tensors."""
+    """Compute KV layout metadata from KV tensors.
+
+    Args:
+        kv_caches: Per-layer KV tensor mapping.
+        layout_hints: Optional engine layout hints.
+
+    Returns:
+        Tuple of ``(block_size, num_layers, hidden_dim_size, dtype_str,``
+        ``gpu_kv_format)``.
+
+    Raises:
+        ValueError: If ``kv_caches`` is empty.
+    """
     # Local
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
@@ -56,7 +77,7 @@ def _compute_kv_layout(
 
     tensors = list(kv_caches.values())
     if not tensors:
-        raise ValueError("kv_caches is empty; cannot compute KV layout.")
+        raise ValueError("kv_caches is empty. Cannot compute KV layout.")
 
     gpu_kv_format, normalized = normalize_kv_and_discover_format(
         tensors, EngineType.VLLM, layout_hints=layout_hints
@@ -75,7 +96,22 @@ def _gather_chunks_to_cpu(
     layout_hints: "Any | None" = None,
     gpu_kv_format: "Any | None" = None,
 ) -> bytes:
-    """Gather paged KV blocks into chunked CPU tensors and serialize them."""
+    """Gather paged KV blocks into CPU chunk tensors.
+
+    Args:
+        kv_caches: Per-layer KV tensor mapping.
+        block_ids: Flattened block IDs for all chunks.
+        blocks_per_chunk: Number of paged blocks in one LMCache chunk.
+        layout_hints: Optional engine layout hints.
+        gpu_kv_format: Optional pre-detected KV format.
+
+    Returns:
+        Pickled list of CPU tensors with shape
+        ``[2, num_layers, chunk_tokens, hidden_dim]``.
+
+    Raises:
+        NotImplementedError: If MLA KV format is used.
+    """
     # Local
     from lmcache.v1.gpu_connector.utils import (
         _get_head_size_view,
@@ -91,7 +127,7 @@ def _gather_chunks_to_cpu(
     if gpu_kv_format is None:
         gpu_kv_format = fmt
     if is_mla(gpu_kv_format):
-        raise NotImplementedError("CPU bounce-buffer path does not support MLA yet.")
+        raise NotImplementedError(_MLA_BOUNCE_UNSUPPORTED_MSG)
 
     block_size = get_block_size(normalized, gpu_kv_format)
     device = tensors[0].device
@@ -130,7 +166,20 @@ def _scatter_cpu_chunks_to_kv(
     layout_hints: "Any | None" = None,
     gpu_kv_format: "Any | None" = None,
 ) -> None:
-    """Scatter chunked CPU KV tensors back into paged KV tensors."""
+    """Scatter CPU chunk tensors back into paged KV tensors.
+
+    Args:
+        kv_caches: Per-layer KV tensor mapping to write into.
+        block_ids: Flattened destination block IDs for all chunks.
+        cpu_data: Serialized CPU chunk list.
+        blocks_per_chunk: Number of paged blocks in one LMCache chunk.
+        skip_first_n_tokens: Token prefix to skip when scattering.
+        layout_hints: Optional engine layout hints.
+        gpu_kv_format: Optional pre-detected KV format.
+
+    Raises:
+        NotImplementedError: If MLA KV format is used.
+    """
     # Local
     import lmcache.c_ops as lmc_ops
     from lmcache.v1.gpu_connector.utils import (
@@ -151,7 +200,7 @@ def _scatter_cpu_chunks_to_kv(
     if gpu_kv_format is None:
         gpu_kv_format = fmt
     if is_mla(gpu_kv_format):
-        raise NotImplementedError("CPU bounce-buffer path does not support MLA yet.")
+        raise NotImplementedError(_MLA_BOUNCE_UNSUPPORTED_MSG)
 
     block_size = get_block_size(normalized, gpu_kv_format)
     device = tensors[0].device

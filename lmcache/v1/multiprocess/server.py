@@ -291,12 +291,29 @@ class MPCacheEngine:
         hidden_dim_size: int,
         dtype_str: str,
     ) -> None:
-        """Register non-CUDA KV layout metadata for bounce-buffer transfers."""
-        _ = (engine_type, layout_hints)
+        """Register non-CUDA KV layout metadata for CPU bounce-buffer mode.
+
+        Args:
+            instance_id: Worker instance identifier (typically PID).
+            model_name: Model name associated with this worker.
+            world_size: Worker world size used in cache keys.
+            engine_type: Serving engine type (kept for protocol compatibility).
+            layout_hints: Optional engine layout hints (protocol compatibility).
+            block_size: Tokens per paged block.
+            num_layers: Number of model layers.
+            hidden_dim_size: Flattened hidden dimension per token.
+            dtype_str: Torch dtype name (for example ``"float16"``).
+
+        Raises:
+            ValueError: If ``dtype_str`` is not a valid torch dtype name.
+        """
+        # Keep these for protocol compatibility with register_kv_cache().
+        del engine_type, layout_hints
         dtype = getattr(torch, dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
             raise ValueError(
-                f"Invalid dtype_str '{dtype_str}': expected a torch.dtype name."
+                f"Invalid dtype_str '{dtype_str}': expected a torch.dtype name "
+                "(e.g. 'float16', 'bfloat16', 'float32')."
             )
 
         layout_desc = MemoryLayoutDesc(
@@ -316,7 +333,19 @@ class MPCacheEngine:
         instance_id: int,
         cpu_data: bytes,
     ) -> bool:
-        """Store worker-provided CPU chunks for non-CUDA bounce-buffer mode."""
+        """Store worker-provided CPU chunks for non-CUDA bounce-buffer mode.
+
+        Args:
+            key: Cache key for the token range to store.
+            instance_id: Worker instance identifier.
+            cpu_data: Pickled list of CPU tensors produced by the worker.
+
+        Returns:
+            ``True`` when all reserved objects are written, otherwise ``False``.
+
+        Raises:
+            ValueError: If the instance has no registered bounce context.
+        """
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [
@@ -361,7 +390,19 @@ class MPCacheEngine:
         key: IPCCacheEngineKey,
         instance_id: int,
     ) -> tuple[bool, bytes]:
-        """Retrieve prefetched chunks and return serialized CPU tensors."""
+        """Retrieve prefetched chunks and return serialized CPU tensors.
+
+        Args:
+            key: Cache key for the token range to retrieve.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            Tuple ``(success, payload)`` where ``payload`` is a pickled
+            list of CPU chunk tensors.
+
+        Raises:
+            ValueError: If the instance has no registered bounce context.
+        """
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [

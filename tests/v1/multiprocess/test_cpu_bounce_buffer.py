@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import pickle
+import sys
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
-import pickle
-import sys
 
 # Third Party
 import pytest
@@ -18,6 +18,7 @@ def _make_kv_caches(
     num_heads: int = 2,
     head_size: int = 8,
 ) -> dict[str, torch.Tensor]:
+    """Build per-layer NHD KV tensors for CPU bounce-buffer tests."""
     kv_caches = {}
     for i in range(num_layers):
         kv_caches[f"layer_{i}"] = torch.randn(
@@ -27,6 +28,7 @@ def _make_kv_caches(
 
 
 def test_wrap_kv_caches_bounce_returns_empty() -> None:
+    """Verify wrap_kv_caches returns no IPC wrappers in bounce-buffer mode."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
 
@@ -34,6 +36,7 @@ def test_wrap_kv_caches_bounce_returns_empty() -> None:
 
 
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
+    """Validate layout extraction and gather/scatter round-trip on CPU tensors."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         _compute_kv_layout,
@@ -59,6 +62,7 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
 
 
 def test_scatter_respects_skip_first_n_tokens() -> None:
+    """Ensure scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         _gather_chunks_to_cpu,
@@ -86,7 +90,8 @@ def test_scatter_respects_skip_first_n_tokens() -> None:
 
 
 @pytest.fixture
-def _stub_native_storage_ops() -> Any:
+def stub_native_storage_ops() -> Any:
+    """Stub native modules so server imports work in source-only test runs."""
     module = type(sys)("lmcache.native_storage_ops")
     module.TTLLock = type("TTLLock", (), {})
     module.Bitmap = type("Bitmap", (), {})
@@ -100,7 +105,8 @@ def _stub_native_storage_ops() -> Any:
         yield
 
 
-def test_server_register_and_find_bounce_layout(_stub_native_storage_ops: Any) -> None:
+def test_server_register_and_find_bounce_layout(stub_native_storage_ops: Any) -> None:
+    """Ensure bounce registration stores metadata and lookup finds its layout."""
     # First Party
     from lmcache.v1.multiprocess.server import MPCacheEngine
 
@@ -128,7 +134,8 @@ def test_server_register_and_find_bounce_layout(_stub_native_storage_ops: Any) -
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
-def test_server_store_and_retrieve_cpu_chunks(_stub_native_storage_ops: Any) -> None:
+def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> None:
+    """Validate mocked server-side CPU chunk store and retrieve behavior."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
     from lmcache.v1.multiprocess.server import MPCacheEngine
