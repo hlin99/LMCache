@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 import os
+import pickle
 import threading
 
 # Third Party
@@ -32,7 +33,198 @@ DEFAULT_MQ_TIMEOUT: float = 300.0
 DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 
 
-def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
+def _device_synchronize(device_type: str) -> None:
+    """Synchronize the active backend device when needed."""
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    elif device_type == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.synchronize()
+
+
+def _compute_kv_layout(
+    kv_caches: dict[str, torch.Tensor],
+    layout_hints: "Any | None" = None,
+) -> tuple[int, int, int, str, Any]:
+    """Compute KV layout metadata from per-layer KV cache tensors."""
+    # Local
+    from lmcache.v1.gpu_connector.utils import (
+        get_block_size,
+        get_hidden_dim_size,
+        get_num_layers,
+        normalize_kv_and_discover_format,
+    )
+
+    tensors = list(kv_caches.values())
+    if not tensors:
+        raise ValueError("kv_caches is empty; cannot compute KV layout.")
+
+    gpu_kv_format, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM, layout_hints=layout_hints
+    )
+    block_size = get_block_size(normalized, gpu_kv_format)
+    num_layers = get_num_layers(normalized, gpu_kv_format)
+    hidden_dim_size = get_hidden_dim_size(normalized, gpu_kv_format)
+    dtype_str = str(tensors[0].dtype).replace("torch.", "")
+    return block_size, num_layers, hidden_dim_size, dtype_str, gpu_kv_format
+
+
+def _gather_chunks_to_cpu(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    blocks_per_chunk: int,
+    layout_hints: "Any | None" = None,
+    gpu_kv_format: "Any | None" = None,
+) -> bytes:
+    """Gather paged KV blocks into chunked CPU tensors and serialize them."""
+    # Local
+    from lmcache.v1.gpu_connector.utils import (
+        _get_head_size_view,
+        get_block_size,
+        is_mla,
+        normalize_kv_and_discover_format,
+    )
+
+    tensors = list(kv_caches.values())
+    fmt, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM, layout_hints=layout_hints
+    )
+    if gpu_kv_format is None:
+        gpu_kv_format = fmt
+    if is_mla(gpu_kv_format):
+        raise NotImplementedError("CPU bounce-buffer path does not support MLA yet.")
+
+    block_size = get_block_size(normalized, gpu_kv_format)
+    device = tensors[0].device
+    num_chunks = len(block_ids) // blocks_per_chunk
+
+    chunks: list[torch.Tensor] = []
+    for chunk_idx in range(num_chunks):
+        chunk_block_ids = block_ids[
+            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+        ]
+        slot_mapping = torch.tensor(
+            [b * block_size + t for b in chunk_block_ids for t in range(block_size)],
+            dtype=torch.long,
+            device=device,
+        )
+        k_layers: list[torch.Tensor] = []
+        v_layers: list[torch.Tensor] = []
+        for layer in normalized:
+            k_flat, v_flat = _get_head_size_view(
+                layer, use_mla=False, gpu_kv_format=gpu_kv_format
+            )
+            k_layers.append(k_flat.index_select(0, slot_mapping))
+            v_layers.append(v_flat.index_select(0, slot_mapping))
+        k_stacked = torch.stack(k_layers, dim=0)
+        v_stacked = torch.stack(v_layers, dim=0)
+        chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
+    return pickle.dumps(chunks)
+
+
+def _scatter_cpu_chunks_to_kv(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    cpu_data: bytes,
+    blocks_per_chunk: int,
+    skip_first_n_tokens: int = 0,
+    layout_hints: "Any | None" = None,
+    gpu_kv_format: "Any | None" = None,
+) -> None:
+    """Scatter chunked CPU KV tensors back into paged KV tensors."""
+    # Local
+    import lmcache.c_ops as lmc_ops
+    from lmcache.v1.gpu_connector.utils import (
+        _get_head_size_view,
+        get_block_size,
+        is_mla,
+        normalize_kv_and_discover_format,
+    )
+
+    chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+    if not chunks:
+        return
+
+    tensors = list(kv_caches.values())
+    fmt, normalized = normalize_kv_and_discover_format(
+        tensors, EngineType.VLLM, layout_hints=layout_hints
+    )
+    if gpu_kv_format is None:
+        gpu_kv_format = fmt
+    if is_mla(gpu_kv_format):
+        raise NotImplementedError("CPU bounce-buffer path does not support MLA yet.")
+
+    block_size = get_block_size(normalized, gpu_kv_format)
+    device = tensors[0].device
+    is_hnd = gpu_kv_format in (
+        lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
+    )
+
+    for chunk_idx, chunk_cpu in enumerate(chunks):
+        chunk_block_ids = block_ids[
+            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
+        ]
+        if not chunk_block_ids:
+            continue
+
+        chunk_start_token = chunk_idx * blocks_per_chunk * block_size
+        chunk_end_token = chunk_start_token + len(chunk_block_ids) * block_size
+        effective_start = max(chunk_start_token, skip_first_n_tokens)
+        if effective_start >= chunk_end_token:
+            continue
+
+        skip_blocks_in_chunk = (effective_start - chunk_start_token) // block_size
+        effective_block_ids = chunk_block_ids[skip_blocks_in_chunk:]
+        if not effective_block_ids:
+            continue
+
+        slot_mapping = torch.tensor(
+            [
+                block_id * block_size + token_idx
+                for block_id in effective_block_ids
+                for token_idx in range(block_size)
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        skip_tokens = skip_blocks_in_chunk * block_size
+        chunk_device = chunk_cpu.to(device)
+
+        for layer_idx, layer in enumerate(normalized):
+            k_src = chunk_device[0, layer_idx, skip_tokens:]
+            v_src = chunk_device[1, layer_idx, skip_tokens:]
+            if is_hnd:
+                if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+                    k_t = layer[0]
+                    v_t = layer[1]
+                else:
+                    k_t = layer[:, 0]
+                    v_t = layer[:, 1]
+                _nb, nh, _bs, hs = k_t.shape
+                k_src_3d = k_src.reshape(-1, nh, hs)
+                v_src_3d = v_src.reshape(-1, nh, hs)
+                offset = 0
+                for block_id in effective_block_ids:
+                    k_t[block_id] = k_src_3d[
+                        offset : offset + block_size
+                    ].permute(1, 0, 2)
+                    v_t[block_id] = v_src_3d[
+                        offset : offset + block_size
+                    ].permute(1, 0, 2)
+                    offset += block_size
+            else:
+                k_flat, v_flat = _get_head_size_view(
+                    layer, use_mla=False, gpu_kv_format=gpu_kv_format
+                )
+                k_flat.index_copy_(0, slot_mapping, k_src)
+                v_flat.index_copy_(0, slot_mapping, v_src)
+
+
+def wrap_kv_caches(
+    kv_caches: dict[str, torch.Tensor], use_bounce_buffer: bool = False
+) -> KVCache:
+    if use_bounce_buffer:
+        return []
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
 
@@ -660,6 +852,12 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
+        self._bounce_skip_tokens: dict[str, int] = {}
+        self._bounce_layout_hints: Any = None
+        self._bounce_gpu_kv_format: Any = None
+        self._bounce_block_size: int | None = None
+        self._use_bounce_buffer = False
+        self._device_type = "cuda"
 
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
@@ -754,24 +952,57 @@ class LMCacheMPWorkerAdapter:
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
-        # Register kv cache and send the request
-        logger.info("Registering kv caches")
-
         layout_hints = vllm_layout_hints()
         self.kv_caches = kv_caches
-
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.REGISTER_KV_CACHE,
-            [
-                self.instance_id,
-                wrap_kv_caches(kv_caches),
-                self.model_name,
-                self.world_size,
-                EngineType.VLLM,
-                layout_hints,
-            ],
+        if not kv_caches:
+            raise ValueError("kv_caches is empty")
+        self._device_type = next(iter(kv_caches.values())).device.type
+        self._use_bounce_buffer = self._device_type != "cuda"
+        logger.info(
+            "Registering kv caches (device_type=%s, bounce=%s)",
+            self._device_type,
+            self._use_bounce_buffer,
         )
+
+        if self._use_bounce_buffer:
+            (
+                block_size,
+                num_layers,
+                hidden_dim_size,
+                dtype_str,
+                gpu_kv_format,
+            ) = _compute_kv_layout(kv_caches, layout_hints=layout_hints)
+            self._bounce_layout_hints = layout_hints
+            self._bounce_gpu_kv_format = gpu_kv_format
+            self._bounce_block_size = block_size
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.REGISTER_KV_CACHE_BOUNCE,
+                [
+                    self.instance_id,
+                    self.model_name,
+                    self.world_size,
+                    EngineType.VLLM,
+                    layout_hints,
+                    block_size,
+                    num_layers,
+                    hidden_dim_size,
+                    dtype_str,
+                ],
+            )
+        else:
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.REGISTER_KV_CACHE,
+                [
+                    self.instance_id,
+                    wrap_kv_caches(kv_caches, use_bounce_buffer=False),
+                    self.model_name,
+                    self.world_size,
+                    EngineType.VLLM,
+                    layout_hints,
+                ],
+            )
         try:
             future.result(timeout=self._mq_timeout)
         except TimeoutError:
@@ -800,7 +1031,7 @@ class LMCacheMPWorkerAdapter:
         self,
         request_id: str,
         op: LoadStoreOp,
-        event: torch.cuda.Event,
+        event: Any,
         cache_salt: str = "",
     ):
         """
@@ -826,11 +1057,26 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.STORE,
-            [key, self.instance_id, op.block_ids, event.ipc_handle()],
-        ).to_cuda_future()
+        if self._use_bounce_buffer:
+            _device_synchronize(self._device_type)
+            cpu_data = _gather_chunks_to_cpu(
+                self.kv_caches,
+                op.block_ids,
+                self.blocks_in_chunk,
+                layout_hints=self._bounce_layout_hints,
+                gpu_kv_format=self._bounce_gpu_kv_format,
+            )
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.STORE_CPU_CHUNKS,
+                [key, self.instance_id, cpu_data],
+            )
+        else:
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.STORE,
+                [key, self.instance_id, op.block_ids, event.ipc_handle()],
+            ).to_cuda_future()
         self.store_futures[request_id] = future
 
     @_lmcache_nvtx_annotate
@@ -838,7 +1084,7 @@ class LMCacheMPWorkerAdapter:
         self,
         request_id: str,
         op: LoadStoreOp,
-        event: torch.cuda.Event,
+        event: Any,
         cache_salt: str = "",
     ):
         """
@@ -865,17 +1111,25 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.RETRIEVE,
-            [
-                key,
-                self.instance_id,
-                op.block_ids,
-                event.ipc_handle(),
-                op.skip_first_n_tokens,
-            ],
-        ).to_cuda_future()
+        if self._use_bounce_buffer:
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.RETRIEVE_CPU_CHUNKS,
+                [key, self.instance_id],
+            )
+            self._bounce_skip_tokens[request_id] = op.skip_first_n_tokens
+        else:
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.RETRIEVE,
+                [
+                    key,
+                    self.instance_id,
+                    op.block_ids,
+                    event.ipc_handle(),
+                    op.skip_first_n_tokens,
+                ],
+            ).to_cuda_future()
         self.retrieve_futures[request_id] = (future, list(op.block_ids))
 
     @_lmcache_nvtx_annotate
@@ -985,6 +1239,7 @@ class LMCacheMPWorkerAdapter:
                 self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
+            self._bounce_skip_tokens.clear()
 
             ret_stores = self._process_finished_stores(
                 finished_stores, finished_req_ids_from_engine
@@ -1013,14 +1268,39 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
-        for request_id, (r_future, _) in self.retrieve_futures.items():
+        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
 
-            r_result = r_future.result()
+            if self._use_bounce_buffer:
+                success, cpu_data = cast(tuple[bool, bytes], r_future.result())
+                r_result = success
+                if success and cpu_data:
+                    try:
+                        _scatter_cpu_chunks_to_kv(
+                            self.kv_caches,
+                            r_block_ids,
+                            cpu_data,
+                            self.blocks_in_chunk,
+                            skip_first_n_tokens=self._bounce_skip_tokens.pop(
+                                request_id, 0
+                            ),
+                            layout_hints=self._bounce_layout_hints,
+                            gpu_kv_format=self._bounce_gpu_kv_format,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to scatter retrieved bounce-buffer chunks"
+                        )
+                        r_result = False
+                else:
+                    self._bounce_skip_tokens.pop(request_id, None)
+            else:
+                r_result = r_future.result()
             finished_retrieves.add(request_id)
 
             if not r_result:
+                self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
@@ -1033,6 +1313,7 @@ class LMCacheMPWorkerAdapter:
             self.store_futures.pop(request_id, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
+            self._bounce_skip_tokens.pop(request_id, None)
 
         # Update the internal states
         ret_stores = self._process_finished_stores(
