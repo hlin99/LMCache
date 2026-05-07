@@ -23,6 +23,12 @@ def get_default_shm_ring_size_bytes() -> int:
 
     The ``LMCACHE_SHM_RING_SIZE_GB`` environment variable overrides the
     default size of 128 GiB per ring buffer.
+
+    Returns:
+        The configured ring-buffer size in bytes.
+
+    Raises:
+        ValueError: If the environment variable is not a positive integer.
     """
 
     raw_value = os.getenv(
@@ -58,7 +64,17 @@ class ShmRingBuffer:
     """
 
     def __init__(self, name: str, size: int, create: bool = True) -> None:
-        """Create or attach to a named shared-memory ring buffer."""
+        """Create or attach to a named shared-memory ring buffer.
+
+        Args:
+            name: Shared-memory segment name.
+            size: Total segment size in bytes, including the ring header.
+            create: Whether to create a new segment or attach to an existing one.
+
+        Raises:
+            ValueError: If ``size`` does not exceed the ring header size.
+            FileExistsError: If ``create`` is True and the segment already exists.
+        """
 
         shm_name = name.lstrip("/")
         if size <= _HEADER_BYTES:
@@ -85,7 +101,21 @@ class ShmRingBuffer:
             self._set_u64(_READ_PTR_OFFSET, 0)
 
     def write(self, data: bytes | memoryview) -> tuple[int, int]:
-        """Write a contiguous byte payload into the ring buffer."""
+        """Write a contiguous byte payload into the ring buffer.
+
+        Args:
+            data: Byte payload to write into the ring.
+
+        Returns:
+            Tuple ``(offset, length)`` describing the contiguous region that was
+            written.
+
+        Raises:
+            ValueError: If the payload is larger than the ring-buffer capacity.
+
+        Notes:
+            This method blocks until enough free space is available.
+        """
 
         payload = data if isinstance(data, memoryview) else memoryview(data)
         length = len(payload)
@@ -130,7 +160,15 @@ class ShmRingBuffer:
         return self._data[offset : offset + length]
 
     def write_tensor(self, tensor: torch.Tensor) -> tuple[int, int]:
-        """Write a CPU tensor into the shared-memory ring buffer."""
+        """Write a CPU tensor into the shared-memory ring buffer.
+
+        Args:
+            tensor: Tensor to serialize into shared memory. The tensor is first
+                converted to a contiguous CPU tensor view.
+
+        Returns:
+            Tuple ``(offset, length)`` describing the written payload.
+        """
 
         tensor_cpu = tensor.detach().cpu().contiguous()
         payload = memoryview(tensor_cpu.numpy()).cast("B")
@@ -143,7 +181,20 @@ class ShmRingBuffer:
         shape: list[int],
         dtype: str | torch.dtype,
     ) -> torch.Tensor:
-        """Read a CPU tensor view from the shared-memory ring buffer."""
+        """Read a CPU tensor view from the shared-memory ring buffer.
+
+        Args:
+            offset: Byte offset within the ring-buffer data region.
+            length: Byte length of the serialized tensor payload.
+            shape: Tensor shape used to reconstruct the view.
+            dtype: Serialized torch dtype name or ``torch.dtype``.
+
+        Returns:
+            A CPU tensor view backed directly by shared memory.
+
+        Raises:
+            ValueError: If the metadata does not match the payload size.
+        """
 
         torch_dtype = _normalize_torch_dtype(dtype)
         itemsize = torch.empty((), dtype=torch_dtype).element_size()
@@ -161,12 +212,28 @@ class ShmRingBuffer:
         ).view(*shape)
 
     def get_read_ptr(self) -> int:
-        """Return the absolute reader pointer."""
+        """Return the absolute reader pointer.
+
+        Returns:
+            The total number of bytes the reader has consumed from the ring.
+        """
 
         return self._get_u64(_READ_PTR_OFFSET)
 
     def advance_read_ptr(self, length: int, offset: int | None = None) -> int:
-        """Advance the absolute reader pointer after consuming one payload."""
+        """Advance the absolute reader pointer after consuming one payload.
+
+        Args:
+            length: Number of payload bytes consumed.
+            offset: Expected payload offset within the current ring cycle.
+
+        Returns:
+            The new absolute read pointer.
+
+        Raises:
+            ValueError: If ``length`` is negative or the reader is
+                desynchronized from the provided offset.
+        """
 
         if length < 0:
             raise ValueError("length must be non-negative")
@@ -185,7 +252,7 @@ class ShmRingBuffer:
         return read_ptr
 
     def close(self) -> None:
-        """Close the shared-memory handle."""
+        """Close the shared-memory handle without unlinking the segment."""
 
         self._data.release()
         self._header.release()
@@ -213,7 +280,17 @@ class ShmRingBuffer:
 
 
 def _normalize_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
-    """Convert a serialized dtype string into a torch dtype."""
+    """Convert a serialized dtype string into a torch dtype.
+
+    Args:
+        dtype: Serialized torch dtype name or an existing ``torch.dtype``.
+
+    Returns:
+        The normalized torch dtype.
+
+    Raises:
+        ValueError: If ``dtype`` does not resolve to a valid torch dtype.
+    """
 
     if isinstance(dtype, torch.dtype):
         return dtype

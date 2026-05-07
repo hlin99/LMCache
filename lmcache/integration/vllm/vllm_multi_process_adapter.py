@@ -771,17 +771,29 @@ class LMCacheMPWorkerAdapter:
         )
 
     def _store_ring_name(self) -> str:
-        """Return the shared-memory ring-buffer name for store transfers."""
+        """Return the shared-memory ring-buffer name for store transfers.
+
+        Returns:
+            The shared-memory segment name used for worker-to-server transfers.
+        """
 
         return f"lmcache_store_ring_{self.instance_id}"
 
     def _retrieve_ring_name(self) -> str:
-        """Return the shared-memory ring-buffer name for retrieve transfers."""
+        """Return the shared-memory ring-buffer name for retrieve transfers.
+
+        Returns:
+            The shared-memory segment name used for server-to-worker transfers.
+        """
 
         return f"lmcache_retrieve_ring_{self.instance_id}"
 
     def _close_bounce_ring_buffers(self) -> None:
-        """Close and unlink any registered bounce-buffer ring buffers."""
+        """Close and unlink any registered bounce-buffer ring buffers.
+
+        This helper is idempotent and resets the stored ring-buffer handles to
+        ``None`` after cleanup.
+        """
 
         if self._store_ring_buffer is not None:
             self._store_ring_buffer.close()

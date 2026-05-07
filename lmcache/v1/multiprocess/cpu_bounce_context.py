@@ -274,7 +274,18 @@ def write_chunks_to_ring_buffer(
     chunks: list[torch.Tensor],
     ring_buffer: ShmRingBuffer,
 ) -> ShmTransferMetadata:
-    """Write chunk tensors into a shared-memory ring buffer."""
+    """Write chunk tensors into a shared-memory ring buffer.
+
+    Args:
+        chunks: CPU chunk tensors to write.
+        ring_buffer: Shared-memory ring buffer receiving the tensors.
+
+    Returns:
+        Metadata describing the written shared-memory payloads.
+
+    Raises:
+        ValueError: If the chunks do not share one shape and dtype.
+    """
 
     if not chunks:
         return ShmTransferMetadata(offsets=[], lengths=[], shape=[], dtype="")
@@ -306,7 +317,15 @@ def read_chunks_from_ring_buffer(
     metadata: ShmTransferMetadata,
     ring_buffer: ShmRingBuffer,
 ) -> list[torch.Tensor]:
-    """Reconstruct chunk tensors from shared-memory ring-buffer metadata."""
+    """Reconstruct chunk tensors from shared-memory ring-buffer metadata.
+
+    Args:
+        metadata: Shared-memory offsets, lengths, shape, and dtype.
+        ring_buffer: Shared-memory ring buffer holding the tensors.
+
+    Returns:
+        The reconstructed CPU chunk tensor views.
+    """
 
     return [
         ring_buffer.read_tensor(offset, length, metadata.shape, metadata.dtype)
@@ -318,7 +337,12 @@ def advance_ring_buffer_read_ptr(
     metadata: ShmTransferMetadata,
     ring_buffer: ShmRingBuffer,
 ) -> None:
-    """Advance the ring-buffer read pointer after consuming shared-memory data."""
+    """Advance the ring-buffer read pointer after consuming shared-memory data.
+
+    Args:
+        metadata: Shared-memory offsets and lengths that were consumed.
+        ring_buffer: Shared-memory ring buffer whose read pointer is advanced.
+    """
 
     for offset, length in zip(metadata.offsets, metadata.lengths, strict=True):
         ring_buffer.advance_read_ptr(length, offset=offset)

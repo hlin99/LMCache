@@ -478,7 +478,19 @@ class MPCacheEngine:
                 self.storage_manager.finish_read_prefetched(prefetched_keys)
 
     def get_read_ptr(self, instance_id: int, direction: str) -> int:
-        """Return the absolute read pointer for a registered ring buffer."""
+        """Return the absolute read pointer for a registered ring buffer.
+
+        Args:
+            instance_id: Worker instance identifier.
+            direction: Either ``"store"`` or ``"retrieve"``.
+
+        Returns:
+            The absolute read pointer for the selected ring buffer.
+
+        Raises:
+            ValueError: If the instance has no registered bounce context or the
+                direction is invalid.
+        """
 
         if instance_id not in self.bounce_contexts:
             raise ValueError(
