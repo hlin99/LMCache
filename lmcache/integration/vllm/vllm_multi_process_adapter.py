@@ -20,10 +20,10 @@ from lmcache.v1.multiprocess.custom_types import (
     KVCache,
 )
 from lmcache.v1.multiprocess.cpu_bounce_context import (
-    compute_kv_layout as _compute_kv_layout,
-    device_synchronize as _device_synchronize,
-    gather_chunks_to_cpu as _gather_chunks_to_cpu,
-    scatter_cpu_chunks_to_kv as _scatter_cpu_chunks_to_kv,
+    _compute_kv_layout,
+    _device_synchronize,
+    _gather_chunks_to_cpu,
+    _scatter_cpu_chunks_to_kv,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -40,9 +40,9 @@ DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 def wrap_kv_caches(
     kv_caches: dict[str, torch.Tensor], use_bounce_buffer: bool = False
 ) -> KVCache:
+    logger.info("KV caches keys are %s", list(kv_caches.keys()))
     if use_bounce_buffer:
         return []
-    logger.info("KV caches keys are %s", list(kv_caches.keys()))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
 
 
