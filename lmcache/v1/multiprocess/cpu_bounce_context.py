@@ -10,6 +10,7 @@ import pickle
 import torch
 
 # First Party
+import lmcache.c_ops as lmc_ops
 from lmcache import torch_device_type
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -27,6 +28,77 @@ def device_synchronize(device_type: str | None = None) -> None:
         torch.cuda.synchronize()
     elif dt == "xpu" and hasattr(torch, "xpu"):
         torch.xpu.synchronize()
+
+
+def _get_non_mla_flat_views(
+    layer: torch.Tensor,
+    gpu_kv_format: lmc_ops.GPUKVFormat,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Get flattened non-MLA K/V views for bounce gather/scatter.
+
+    Args:
+        layer: Per-layer non-MLA KV tensor.
+        gpu_kv_format: Concrete GPU KV format describing ``layer`` layout.
+
+    Returns:
+        Flattened ``(k_flat, v_flat)`` tensors, both shaped
+        ``[num_blocks * block_size, num_heads * head_size]``.
+
+    Raises:
+        NotImplementedError: If ``gpu_kv_format`` is unsupported.
+        ValueError: If ``layer`` shape is incompatible with ``gpu_kv_format``.
+
+    This keeps HND handling local to the bounce path, so we don't need to
+    extend generic gpu_connector utils for this port.
+    """
+    if layer.dim() != 5:
+        raise ValueError(f"Expected non-MLA layer as 5D tensor, got {layer.shape}")
+
+    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+        if layer.shape[0] != 2:
+            raise ValueError(
+                f"{gpu_kv_format} expects [2,NB,BS,NH,HS], got {layer.shape}"
+            )
+        k = layer[0]
+        v = layer[1]
+        nb, bs, nh, hs = k.shape
+        return k.view(nb * bs, nh * hs), v.view(nb * bs, nh * hs)
+
+    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
+        if layer.shape[1] != 2:
+            raise ValueError(
+                f"{gpu_kv_format} expects [NB,2,BS,NH,HS], got {layer.shape}"
+            )
+        k = layer[:, 0]
+        v = layer[:, 1]
+        nb, bs, nh, hs = k.shape
+        return k.view(nb * bs, nh * hs), v.view(nb * bs, nh * hs)
+
+    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+        if layer.shape[0] != 2:
+            raise ValueError(
+                f"{gpu_kv_format} expects [2,NB,NH,BS,HS], got {layer.shape}"
+            )
+        # HND [NB,NH,BS,HS] -> NHD [NB,BS,NH,HS] for flattened token-major views.
+        k = layer[0].permute(0, 2, 1, 3).contiguous()
+        v = layer[1].permute(0, 2, 1, 3).contiguous()
+        nb, bs, nh, hs = k.shape
+        return k.view(nb * bs, nh * hs), v.view(nb * bs, nh * hs)
+
+    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS:
+        if layer.shape[1] != 2:
+            raise ValueError(
+                f"{gpu_kv_format} expects [NB,2,NH,BS,HS], got {layer.shape}"
+            )
+        # HND [NB,NH,BS,HS] -> NHD [NB,BS,NH,HS] for flattened token-major views.
+        k = layer[:, 0].permute(0, 2, 1, 3).contiguous()
+        v = layer[:, 1].permute(0, 2, 1, 3).contiguous()
+        nb, bs, nh, hs = k.shape
+        return k.view(nb * bs, nh * hs), v.view(nb * bs, nh * hs)
+
+    raise NotImplementedError(
+        f"gpu_kv_format={gpu_kv_format} not supported in bounce non-MLA path."
+    )
 
 
 def compute_kv_layout(
@@ -135,9 +207,7 @@ def gather_chunks_to_cpu(
             k_layers: list[torch.Tensor] = []
             v_layers: list[torch.Tensor] = []
             for layer in normalized:
-                k_flat, v_flat = _get_head_size_view(
-                    layer, use_mla=False, gpu_kv_format=gpu_kv_format
-                )
+                k_flat, v_flat = _get_non_mla_flat_views(layer, gpu_kv_format)
                 k_layers.append(k_flat.index_select(0, slot_mapping))
                 v_layers.append(v_flat.index_select(0, slot_mapping))
             k_stacked = torch.stack(k_layers, dim=0)
