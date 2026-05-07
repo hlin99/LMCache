@@ -338,7 +338,7 @@ def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     fast DMA transfers. On other non-CUDA platforms, pinning is not supported."""
 
     # Create a 1D uint8 CPU tensor, as uint8 == 1 byte
-    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=_XPU_PIN_MEMORY)
+    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
 
     # First-touch initialization (forces physical allocation)
     tensor.fill_(0)
