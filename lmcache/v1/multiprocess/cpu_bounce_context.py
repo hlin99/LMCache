@@ -14,7 +14,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 
 
-def _device_synchronize(device_type: str) -> None:
+def device_synchronize(device_type: str) -> None:
     """Synchronize device work for backends that require explicit barriers.
 
     Args:
@@ -27,7 +27,7 @@ def _device_synchronize(device_type: str) -> None:
         torch.xpu.synchronize()
 
 
-def _compute_kv_layout(
+def compute_kv_layout(
     kv_caches: dict[str, torch.Tensor],
     layout_hints: "Any | None" = None,
 ) -> tuple[int, int, int, str, Any]:
@@ -66,7 +66,7 @@ def _compute_kv_layout(
     return block_size, num_layers, hidden_dim_size, dtype_str, gpu_kv_format
 
 
-def _gather_chunks_to_cpu(
+def gather_chunks_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
     blocks_per_chunk: int,
@@ -144,7 +144,7 @@ def _gather_chunks_to_cpu(
     return pickle.dumps(chunks)
 
 
-def _scatter_cpu_chunks_to_kv(
+def scatter_cpu_chunks_to_kv(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
     cpu_data: bytes,
@@ -274,10 +274,3 @@ class CPUBounceContext:
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
-
-
-# Backward-compatible aliases for external imports.
-device_synchronize = _device_synchronize
-compute_kv_layout = _compute_kv_layout
-gather_chunks_to_cpu = _gather_chunks_to_cpu
-scatter_cpu_chunks_to_kv = _scatter_cpu_chunks_to_kv

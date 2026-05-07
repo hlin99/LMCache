@@ -20,10 +20,10 @@ from lmcache.v1.multiprocess.custom_types import (
     KVCache,
 )
 from lmcache.v1.multiprocess.cpu_bounce_context import (
-    _compute_kv_layout,
-    _device_synchronize,
-    _gather_chunks_to_cpu,
-    _scatter_cpu_chunks_to_kv,
+    compute_kv_layout,
+    device_synchronize,
+    gather_chunks_to_cpu,
+    scatter_cpu_chunks_to_kv,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -40,9 +40,9 @@ DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 def wrap_kv_caches(
     kv_caches: dict[str, torch.Tensor], use_bounce_buffer: bool = False
 ) -> KVCache:
-    logger.info("KV caches keys are %s", list(kv_caches.keys()))
     if use_bounce_buffer:
         return []
+    logger.info("KV caches keys are %s", list(kv_caches.keys()))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
 
 
@@ -791,7 +791,7 @@ class LMCacheMPWorkerAdapter:
                 hidden_dim_size,
                 dtype_str,
                 gpu_kv_format,
-            ) = _compute_kv_layout(kv_caches, layout_hints=layout_hints)
+            ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
             self._bounce_layout_hints = layout_hints
             self._bounce_gpu_kv_format = gpu_kv_format
             self._bounce_block_size = block_size
@@ -879,8 +879,8 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
         )
         if self._use_bounce_buffer:
-            _device_synchronize(self._device_type)
-            cpu_data = _gather_chunks_to_cpu(
+            device_synchronize(self._device_type)
+            cpu_data = gather_chunks_to_cpu(
                 self.kv_caches,
                 op.block_ids,
                 self.blocks_in_chunk,
@@ -1098,7 +1098,7 @@ class LMCacheMPWorkerAdapter:
                 r_result = success
                 if success and cpu_data:
                     try:
-                        _scatter_cpu_chunks_to_kv(
+                        scatter_cpu_chunks_to_kv(
                             self.kv_caches,
                             r_block_ids,
                             cpu_data,
