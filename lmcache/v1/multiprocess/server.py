@@ -176,6 +176,7 @@ class CPUBounceContext:
 
     layout_desc: MemoryLayoutDesc
     block_size: int
+    use_mla: bool
 
 
 # Main class for the mp cache engine
@@ -290,6 +291,7 @@ class MPCacheEngine:
         num_layers: int,
         hidden_dim_size: int,
         dtype_str: str,
+        use_mla: bool,
     ) -> None:
         """Register non-CUDA KV layout metadata for CPU bounce-buffer mode.
 
@@ -303,6 +305,7 @@ class MPCacheEngine:
             num_layers: Number of model layers.
             hidden_dim_size: Flattened hidden dimension per token.
             dtype_str: Torch dtype name (for example ``"float16"``).
+            use_mla: Whether the worker KV format is MLA.
 
         Raises:
             ValueError: If ``dtype_str`` is not a valid torch dtype name.
@@ -316,13 +319,16 @@ class MPCacheEngine:
                 "(e.g. 'float16', 'bfloat16', 'float32')."
             )
 
-        layout_desc = MemoryLayoutDesc(
-            shapes=[torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])],
-            dtypes=[dtype],
+        shape = (
+            torch.Size([num_layers, self.chunk_size, hidden_dim_size])
+            if use_mla
+            else torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])
         )
+        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
         self.bounce_contexts[instance_id] = CPUBounceContext(
             layout_desc=layout_desc,
             block_size=block_size,
+            use_mla=use_mla,
         )
         self.bounce_context_meta[instance_id] = (model_name, world_size)
 
@@ -1159,6 +1165,7 @@ class MPCacheEngine:
                     "model_name": model_name,
                     "world_size": world_size,
                     "block_size": self.bounce_contexts[instance_id].block_size,
+                    "use_mla": self.bounce_contexts[instance_id].use_mla,
                 }
                 for instance_id, (model_name, world_size) in (
                     self.bounce_context_meta.items()

@@ -31,12 +31,6 @@ logger = init_logger(__name__)
 DEFAULT_MQ_TIMEOUT: float = 300.0
 # Interval (seconds) between periodic heartbeat pings to the server.
 DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
-_MLA_BOUNCE_UNSUPPORTED_MSG = (
-    "CPU bounce-buffer path does not support MLA "
-    "(multi-head latent attention) yet."
-)
-
-
 def _device_synchronize(device_type: str) -> None:
     """Synchronize device work for backends that require explicit barriers.
 
@@ -106,11 +100,9 @@ def _gather_chunks_to_cpu(
         gpu_kv_format: Optional pre-detected KV format.
 
     Returns:
-        Pickled list of CPU tensors with shape
-        ``[2, num_layers, chunk_tokens, hidden_dim]``.
-
-    Raises:
-        NotImplementedError: If MLA KV format is used.
+        Pickled list of CPU tensors. For non-MLA, each chunk shape is
+        ``[2, num_layers, chunk_tokens, hidden_dim]``. For MLA, each chunk
+        shape is ``[num_layers, chunk_tokens, hidden_dim]``.
     """
     # Local
     from lmcache.v1.gpu_connector.utils import (
@@ -126,8 +118,7 @@ def _gather_chunks_to_cpu(
     )
     if gpu_kv_format is None:
         gpu_kv_format = fmt
-    if is_mla(gpu_kv_format):
-        raise NotImplementedError(_MLA_BOUNCE_UNSUPPORTED_MSG)
+    use_mla = is_mla(gpu_kv_format)
 
     block_size = get_block_size(normalized, gpu_kv_format)
     device = tensors[0].device
@@ -145,15 +136,28 @@ def _gather_chunks_to_cpu(
         )
         k_layers: list[torch.Tensor] = []
         v_layers: list[torch.Tensor] = []
+        mla_layers: list[torch.Tensor] = []
         for layer in normalized:
-            k_flat, v_flat = _get_head_size_view(
-                layer, use_mla=False, gpu_kv_format=gpu_kv_format
-            )
-            k_layers.append(k_flat.index_select(0, slot_mapping))
-            v_layers.append(v_flat.index_select(0, slot_mapping))
-        k_stacked = torch.stack(k_layers, dim=0)
-        v_stacked = torch.stack(v_layers, dim=0)
-        chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
+            if use_mla:
+                layer_flat = cast(
+                    torch.Tensor,
+                    _get_head_size_view(
+                        layer, use_mla=True, gpu_kv_format=gpu_kv_format
+                    ),
+                )
+                mla_layers.append(layer_flat.index_select(0, slot_mapping))
+            else:
+                k_flat, v_flat = _get_head_size_view(
+                    layer, use_mla=False, gpu_kv_format=gpu_kv_format
+                )
+                k_layers.append(k_flat.index_select(0, slot_mapping))
+                v_layers.append(v_flat.index_select(0, slot_mapping))
+        if use_mla:
+            chunks.append(torch.stack(mla_layers, dim=0).cpu())
+        else:
+            k_stacked = torch.stack(k_layers, dim=0)
+            v_stacked = torch.stack(v_layers, dim=0)
+            chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
     return pickle.dumps(chunks)
 
 
@@ -177,8 +181,6 @@ def _scatter_cpu_chunks_to_kv(
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
 
-    Raises:
-        NotImplementedError: If MLA KV format is used.
     """
     # Local
     import lmcache.c_ops as lmc_ops
@@ -199,8 +201,7 @@ def _scatter_cpu_chunks_to_kv(
     )
     if gpu_kv_format is None:
         gpu_kv_format = fmt
-    if is_mla(gpu_kv_format):
-        raise NotImplementedError(_MLA_BOUNCE_UNSUPPORTED_MSG)
+    use_mla = is_mla(gpu_kv_format)
 
     block_size = get_block_size(normalized, gpu_kv_format)
     device = tensors[0].device
@@ -240,9 +241,18 @@ def _scatter_cpu_chunks_to_kv(
         chunk_device = chunk_cpu.to(device)
 
         for layer_idx, layer in enumerate(normalized):
-            k_src = chunk_device[0, layer_idx, skip_tokens:]
-            v_src = chunk_device[1, layer_idx, skip_tokens:]
-            if is_hnd:
+            if use_mla:
+                mla_src = chunk_device[layer_idx, skip_tokens:]
+                dst_flat = cast(
+                    torch.Tensor,
+                    _get_head_size_view(
+                        layer, use_mla=True, gpu_kv_format=gpu_kv_format
+                    ),
+                )
+                dst_flat.index_copy_(0, slot_mapping, mla_src)
+            elif is_hnd:
+                k_src = chunk_device[0, layer_idx, skip_tokens:]
+                v_src = chunk_device[1, layer_idx, skip_tokens:]
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
                     k_t = layer[0]
                     v_t = layer[1]
@@ -262,6 +272,8 @@ def _scatter_cpu_chunks_to_kv(
                     ].permute(1, 0, 2)
                     offset += block_size
             else:
+                k_src = chunk_device[0, layer_idx, skip_tokens:]
+                v_src = chunk_device[1, layer_idx, skip_tokens:]
                 k_flat, v_flat = _get_head_size_view(
                     layer, use_mla=False, gpu_kv_format=gpu_kv_format
                 )
@@ -1014,6 +1026,9 @@ class LMCacheMPWorkerAdapter:
         )
 
         if self._use_bounce_buffer:
+            # Local
+            from lmcache.v1.gpu_connector.utils import is_mla
+
             (
                 block_size,
                 num_layers,
@@ -1037,6 +1052,7 @@ class LMCacheMPWorkerAdapter:
                     num_layers,
                     hidden_dim_size,
                     dtype_str,
+                    is_mla(gpu_kv_format),
                 ],
             )
         else:
