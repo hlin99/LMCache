@@ -57,6 +57,7 @@ from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueServer
+from lmcache.v1.multiprocess.cpu_bounce_context import CPUBounceContext
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
     get_handler_type,
@@ -168,15 +169,6 @@ class _PrefetchJob:
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
-
-
-@dataclass
-class CPUBounceContext:
-    """CPU bounce-buffer layout metadata for non-CUDA workers."""
-
-    layout_desc: MemoryLayoutDesc
-    block_size: int
-    use_mla: bool
 
 
 # Main class for the mp cache engine
