@@ -158,7 +158,9 @@ def scatter_cpu_chunks_to_kv(
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
         block_ids: Flattened destination block IDs for all chunks.
-        cpu_data: Serialized CPU chunk list.
+        cpu_data: Serialized CPU chunk list (bytes returned by
+            :func:`gather_chunks_to_cpu`, unpickled internally to
+            ``list[torch.Tensor]``).
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
         skip_first_n_tokens: Token prefix to skip when scattering.
         layout_hints: Optional engine layout hints.
