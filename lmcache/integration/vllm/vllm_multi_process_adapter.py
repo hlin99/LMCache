@@ -813,16 +813,16 @@ class LMCacheMPWorkerAdapter:
             )
         else:
             future = send_lmcache_request(
-                self.mq_client,
-                RequestType.REGISTER_KV_CACHE,
-                [
-                    self.instance_id,
-                    wrap_kv_caches(kv_caches, use_bounce_buffer=False),
-                    self.model_name,
-                    self.world_size,
-                    EngineType.VLLM,
-                    layout_hints,
-                ],
+                    self.mq_client,
+                    RequestType.REGISTER_KV_CACHE,
+                    [
+                        self.instance_id,
+                        wrap_kv_caches(kv_caches),
+                        self.model_name,
+                        self.world_size,
+                        EngineType.VLLM,
+                        layout_hints,
+                    ],
             )
         try:
             future.result(timeout=self._mq_timeout)
@@ -1121,7 +1121,6 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
-                self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
                     "retrieve request for request_id=%s, result=%s",
