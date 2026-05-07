@@ -51,6 +51,7 @@ class RequestType(enum.Enum):
     REGISTER_KV_CACHE_BOUNCE = enum.auto()
     STORE_CPU_CHUNKS = enum.auto()
     RETRIEVE_CPU_CHUNKS = enum.auto()
+    GET_READ_PTR = enum.auto()
 
     # Controller operations
     CLEAR = enum.auto()

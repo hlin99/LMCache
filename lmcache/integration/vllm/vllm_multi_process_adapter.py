@@ -20,13 +20,21 @@ from lmcache.v1.multiprocess.custom_types import (
     KVCache,
 )
 from lmcache.v1.multiprocess.cpu_bounce_context import (
+    advance_ring_buffer_read_ptr,
     compute_kv_layout,
     device_synchronize,
     gather_chunks_to_cpu,
+    read_chunks_from_ring_buffer,
     scatter_cpu_chunks_to_kv,
+    write_chunks_to_ring_buffer,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.shm_ring_buffer import (
+    ShmRingBuffer,
+    ShmTransferMetadata,
+    get_default_shm_ring_size_bytes,
+)
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 
 logger = init_logger(__name__)
@@ -261,7 +269,7 @@ class LoadStoreOp:
 
 
 StoreResult = bool
-RetrieveResult = bool
+RetrieveResult = bool | tuple[bool, ShmTransferMetadata]
 LookupResult = int
 
 
@@ -674,6 +682,9 @@ class LMCacheMPWorkerAdapter:
         self._bounce_layout_hints: Any = None
         self._bounce_gpu_kv_format: Any = None
         self._bounce_block_size: int | None = None
+        self._bounce_ring_size_bytes: int | None = None
+        self._store_ring_buffer: ShmRingBuffer | None = None
+        self._retrieve_ring_buffer: ShmRingBuffer | None = None
         self._use_bounce_buffer: bool = False
         self._device_type: str = "cuda"
 
@@ -759,6 +770,28 @@ class LMCacheMPWorkerAdapter:
             == 0
         )
 
+    def _store_ring_name(self) -> str:
+        """Return the shared-memory ring-buffer name for store transfers."""
+
+        return f"lmcache_store_ring_{self.instance_id}"
+
+    def _retrieve_ring_name(self) -> str:
+        """Return the shared-memory ring-buffer name for retrieve transfers."""
+
+        return f"lmcache_retrieve_ring_{self.instance_id}"
+
+    def _close_bounce_ring_buffers(self) -> None:
+        """Close and unlink any registered bounce-buffer ring buffers."""
+
+        if self._store_ring_buffer is not None:
+            self._store_ring_buffer.close()
+            self._store_ring_buffer.unlink()
+            self._store_ring_buffer = None
+        if self._retrieve_ring_buffer is not None:
+            self._retrieve_ring_buffer.close()
+            self._retrieve_ring_buffer.unlink()
+            self._retrieve_ring_buffer = None
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
         Register the kv caches with LMCache server
@@ -801,6 +834,18 @@ class LMCacheMPWorkerAdapter:
             self._bounce_layout_hints = layout_hints
             self._bounce_gpu_kv_format = gpu_kv_format
             self._bounce_block_size = block_size
+            self._bounce_ring_size_bytes = get_default_shm_ring_size_bytes()
+            self._close_bounce_ring_buffers()
+            self._store_ring_buffer = ShmRingBuffer(
+                self._store_ring_name(),
+                self._bounce_ring_size_bytes,
+                create=True,
+            )
+            self._retrieve_ring_buffer = ShmRingBuffer(
+                self._retrieve_ring_name(),
+                self._bounce_ring_size_bytes,
+                create=True,
+            )
             future = send_lmcache_request(
                 self.mq_client,
                 RequestType.REGISTER_KV_CACHE_BOUNCE,
@@ -815,6 +860,9 @@ class LMCacheMPWorkerAdapter:
                     hidden_dim_size,
                     dtype_str,
                     is_mla(gpu_kv_format),
+                    self._store_ring_name(),
+                    self._retrieve_ring_name(),
+                    self._bounce_ring_size_bytes,
                 ],
             )
         else:
@@ -833,6 +881,8 @@ class LMCacheMPWorkerAdapter:
         try:
             future.result(timeout=self._mq_timeout)
         except TimeoutError:
+            if self._use_bounce_buffer:
+                self._close_bounce_ring_buffers()
             raise ConnectionError(
                 "LMCache server did not respond to "
                 "register_kv_caches within "
@@ -885,18 +935,24 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
         )
         if self._use_bounce_buffer:
+            if self._store_ring_buffer is None:
+                raise RuntimeError("Bounce-buffer store ring buffer is not registered")
             device_synchronize(self._device_type)
-            cpu_data = gather_chunks_to_cpu(
+            cpu_chunks = gather_chunks_to_cpu(
                 self.kv_caches,
                 op.block_ids,
                 self.blocks_in_chunk,
                 layout_hints=self._bounce_layout_hints,
                 gpu_kv_format=self._bounce_gpu_kv_format,
             )
+            cpu_metadata = write_chunks_to_ring_buffer(
+                cpu_chunks,
+                self._store_ring_buffer,
+            )
             future = send_lmcache_request(
                 self.mq_client,
                 RequestType.STORE_CPU_CHUNKS,
-                [key, self.instance_id, cpu_data],
+                [key, self.instance_id, cpu_metadata],
             )
         else:
             future = send_lmcache_request(
@@ -1100,14 +1156,25 @@ class LMCacheMPWorkerAdapter:
                 continue
 
             if self._use_bounce_buffer:
-                success, cpu_data = cast(tuple[bool, bytes], r_future.result())
+                if self._retrieve_ring_buffer is None:
+                    raise RuntimeError(
+                        "Bounce-buffer retrieve ring buffer is not registered"
+                    )
+                success, cpu_metadata = cast(
+                    tuple[bool, ShmTransferMetadata],
+                    r_future.result(),
+                )
                 r_result = success
-                if success and cpu_data:
+                if success and cpu_metadata.offsets:
                     try:
+                        cpu_chunks = read_chunks_from_ring_buffer(
+                            cpu_metadata,
+                            self._retrieve_ring_buffer,
+                        )
                         scatter_cpu_chunks_to_kv(
                             self.kv_caches,
                             r_block_ids,
-                            cpu_data,
+                            cpu_chunks,
                             self.blocks_in_chunk,
                             skip_first_n_tokens=self._bounce_skip_tokens.pop(
                                 request_id, 0
@@ -1120,6 +1187,11 @@ class LMCacheMPWorkerAdapter:
                             "Failed to scatter retrieved bounce-buffer chunks"
                         )
                         r_result = False
+                    finally:
+                        advance_ring_buffer_read_ptr(
+                            cpu_metadata,
+                            self._retrieve_ring_buffer,
+                        )
                 else:
                     self._bounce_skip_tokens.pop(request_id, None)
             else:
@@ -1192,6 +1264,7 @@ class LMCacheMPWorkerAdapter:
                 self._mq_timeout,
             )
 
+        self._close_bounce_ring_buffers()
         self.mq_client.close()
         self.request_telemetry.close()
 

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager
-import pickle
+import os
 import sys
+import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +50,25 @@ def _make_mla_kv_caches(
     for i in range(num_layers):
         kv_caches[f"layer_{i}"] = torch.randn(num_blocks, block_size, hidden_size)
     return kv_caches
+
+
+@contextmanager
+def _make_ring_buffers(size: int = 64 * 1024) -> Any:
+    """Create and clean up a pair of shared-memory ring buffers for tests."""
+
+    # First Party
+    from lmcache.v1.multiprocess.shm_ring_buffer import ShmRingBuffer
+
+    suffix = f"{os.getpid()}_{time.time_ns()}"
+    store_ring = ShmRingBuffer(f"test_store_ring_{suffix}", size, create=True)
+    retrieve_ring = ShmRingBuffer(f"test_retrieve_ring_{suffix}", size, create=True)
+    try:
+        yield store_ring, retrieve_ring
+    finally:
+        store_ring.close()
+        retrieve_ring.close()
+        store_ring.unlink()
+        retrieve_ring.unlink()
 
 
 def test_wrap_kv_caches_bounce_returns_empty() -> None:
@@ -249,22 +269,26 @@ def test_server_register_and_find_bounce_layout(stub_native_storage_ops: Any) ->
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
     ):
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=16)
-    engine.register_kv_cache_bounce(
-        instance_id=1,
-        model_name="m",
-        world_size=1,
-        engine_type=MagicMock(),
-        layout_hints={},
-        block_size=4,
-        num_layers=2,
-        hidden_dim_size=16,
-        dtype_str="float32",
-        use_mla=False,
-    )
+    with _make_ring_buffers() as (store_ring, retrieve_ring):
+        engine.register_kv_cache_bounce(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            engine_type=MagicMock(),
+            layout_hints={},
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            store_ring_name=store_ring.name,
+            retrieve_ring_name=retrieve_ring.name,
+            ring_buffer_size=store_ring.size,
+        )
 
-    layout = engine._find_layout_desc("m", 1)
-    assert layout is not None
-    assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
+        layout = engine._find_layout_desc("m", 1)
+        assert layout is not None
+        assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
 def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> None:
@@ -302,38 +326,55 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
 
-    engine.register_kv_cache_bounce(
-        instance_id=2,
-        model_name="m",
-        world_size=1,
-        engine_type=MagicMock(),
-        layout_hints={},
-        block_size=4,
-        num_layers=2,
-        hidden_dim_size=16,
-        dtype_str="float32",
-        use_mla=False,
-    )
-    payload = torch.ones(2, 2, 8, 16)
-    key = IPCCacheEngineKey.from_token_ids(
-        "m",
-        1,
-        0,
-        [1] * 8,
-        start=0,
-        end=8,
-        request_id="req",
-    )
-    with patch(
-        "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
-        return_value=["obj"],
-    ):
-        store_ok = engine.store_cpu_chunks(key, 2, pickle.dumps([payload]))
-        success, cpu_data = engine.retrieve_cpu_chunks(key, 2)
-    assert isinstance(store_ok, bool)
-    assert torch.allclose(mock_memory_obj.tensor, payload)
+    with _make_ring_buffers() as (store_ring, retrieve_ring):
+        engine.register_kv_cache_bounce(
+            instance_id=2,
+            model_name="m",
+            world_size=1,
+            engine_type=MagicMock(),
+            layout_hints={},
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            store_ring_name=store_ring.name,
+            retrieve_ring_name=retrieve_ring.name,
+            ring_buffer_size=store_ring.size,
+        )
+        payload = torch.ones(2, 2, 8, 16)
+        key = IPCCacheEngineKey.from_token_ids(
+            "m",
+            1,
+            0,
+            [1] * 8,
+            start=0,
+            end=8,
+            request_id="req",
+        )
+        # First Party
+        from lmcache.v1.multiprocess.cpu_bounce_context import (
+            advance_ring_buffer_read_ptr,
+            read_chunks_from_ring_buffer,
+            write_chunks_to_ring_buffer,
+        )
 
-    assert success is True
-    recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-    assert len(recovered_chunks) == 1
-    assert torch.allclose(recovered_chunks[0], payload)
+        store_metadata = write_chunks_to_ring_buffer([payload], store_ring)
+        with patch(
+            "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
+            return_value=["obj"],
+        ):
+            store_ok = engine.store_cpu_chunks(key, 2, store_metadata)
+            success, retrieve_metadata = engine.retrieve_cpu_chunks(key, 2)
+        assert isinstance(store_ok, bool)
+        assert torch.allclose(mock_memory_obj.tensor, payload)
+
+        assert success is True
+        recovered_chunks = read_chunks_from_ring_buffer(
+            retrieve_metadata,
+            retrieve_ring,
+        )
+        assert len(recovered_chunks) == 1
+        assert torch.allclose(recovered_chunks[0], payload)
+        advance_ring_buffer_read_ptr(retrieve_metadata, retrieve_ring)
+        del recovered_chunks

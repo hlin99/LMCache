@@ -4,7 +4,6 @@
 # Standard
 from dataclasses import dataclass
 from typing import Any, cast
-import pickle
 
 # Third Party
 import torch
@@ -13,6 +12,10 @@ import torch
 from lmcache import torch_device_type
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.multiprocess.shm_ring_buffer import (
+    ShmRingBuffer,
+    ShmTransferMetadata,
+)
 
 
 def device_synchronize(device_type: str | None = None) -> None:
@@ -74,7 +77,7 @@ def gather_chunks_to_cpu(
     blocks_per_chunk: int,
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
-) -> bytes:
+) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
     Args:
@@ -85,7 +88,7 @@ def gather_chunks_to_cpu(
         gpu_kv_format: Optional pre-detected KV format.
 
     Returns:
-        Pickled list of CPU tensors. For non-MLA, each chunk shape is
+        List of CPU tensors. For non-MLA, each chunk shape is
         ``[2, num_layers, chunk_tokens, hidden_dim]`` where dimension ``0``
         stores ``(K, V)``. For MLA (multi-head latent attention), each chunk
         shape is ``[num_layers, chunk_tokens, hidden_dim]``.
@@ -143,13 +146,13 @@ def gather_chunks_to_cpu(
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
             chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
-    return pickle.dumps(chunks)
+    return chunks
 
 
 def scatter_cpu_chunks_to_kv(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
-    cpu_data: bytes,
+    chunks: list[torch.Tensor],
     blocks_per_chunk: int,
     skip_first_n_tokens: int = 0,
     layout_hints: Any | None = None,
@@ -160,9 +163,8 @@ def scatter_cpu_chunks_to_kv(
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
         block_ids: Flattened destination block IDs for all chunks.
-        cpu_data: Serialized CPU chunk list (bytes returned by
-            :func:`gather_chunks_to_cpu`, unpickled internally to
-            ``list[torch.Tensor]``).
+        chunks: CPU chunk tensors returned by :func:`gather_chunks_to_cpu` or
+            reconstructed from shared-memory metadata.
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
         skip_first_n_tokens: Token prefix to skip when scattering.
         layout_hints: Optional engine layout hints.
@@ -177,7 +179,6 @@ def scatter_cpu_chunks_to_kv(
         normalize_kv_and_discover_format,
     )
 
-    chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     if not chunks:
         return
 
@@ -269,6 +270,60 @@ def scatter_cpu_chunks_to_kv(
                 v_flat.index_copy_(0, slot_mapping, v_src)
 
 
+def write_chunks_to_ring_buffer(
+    chunks: list[torch.Tensor],
+    ring_buffer: ShmRingBuffer,
+) -> ShmTransferMetadata:
+    """Write chunk tensors into a shared-memory ring buffer."""
+
+    if not chunks:
+        return ShmTransferMetadata(offsets=[], lengths=[], shape=[], dtype="float32")
+
+    first_chunk = chunks[0]
+    shape = list(first_chunk.shape)
+    dtype = str(first_chunk.dtype).removeprefix("torch.")
+
+    offsets: list[int] = []
+    lengths: list[int] = []
+    for chunk in chunks:
+        if list(chunk.shape) != shape:
+            raise ValueError("All bounce-buffer chunks must share the same shape")
+        if chunk.dtype != first_chunk.dtype:
+            raise ValueError("All bounce-buffer chunks must share the same dtype")
+        offset, length = ring_buffer.write_tensor(chunk)
+        offsets.append(offset)
+        lengths.append(length)
+
+    return ShmTransferMetadata(
+        offsets=offsets,
+        lengths=lengths,
+        shape=shape,
+        dtype=dtype,
+    )
+
+
+def read_chunks_from_ring_buffer(
+    metadata: ShmTransferMetadata,
+    ring_buffer: ShmRingBuffer,
+) -> list[torch.Tensor]:
+    """Reconstruct chunk tensors from shared-memory ring-buffer metadata."""
+
+    return [
+        ring_buffer.read_tensor(offset, length, metadata.shape, metadata.dtype)
+        for offset, length in zip(metadata.offsets, metadata.lengths, strict=False)
+    ]
+
+
+def advance_ring_buffer_read_ptr(
+    metadata: ShmTransferMetadata,
+    ring_buffer: ShmRingBuffer,
+) -> None:
+    """Advance the ring-buffer read pointer after consuming shared-memory data."""
+
+    for offset, length in zip(metadata.offsets, metadata.lengths, strict=False):
+        ring_buffer.advance_read_ptr(length, offset=offset)
+
+
 @dataclass
 class CPUBounceContext:
     """CPU bounce-buffer layout metadata for non-CUDA workers."""
@@ -276,3 +331,5 @@ class CPUBounceContext:
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
+    store_ring_buffer: ShmRingBuffer
+    retrieve_ring_buffer: ShmRingBuffer

@@ -19,6 +19,7 @@ from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
     KVCache,
 )
+from lmcache.v1.multiprocess.shm_ring_buffer import ShmTransferMetadata
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
 # Define request names for this protocol group
@@ -35,6 +36,7 @@ REQUEST_NAMES = [
     "REGISTER_KV_CACHE_BOUNCE",
     "STORE_CPU_CHUNKS",
     "RETRIEVE_CPU_CHUNKS",
+    "GET_READ_PTR",
 ]
 
 # Type alias for cache keys
@@ -161,18 +163,26 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 int,
                 str,
                 bool,
+                str,
+                str,
+                int,
             ],
             response_class=None,
             handler_type=HandlerType.SYNC,
         ),
         "STORE_CPU_CHUNKS": ProtocolDefinition(
-            payload_classes=[KeyType, int, bytes],
+            payload_classes=[KeyType, int, ShmTransferMetadata],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
         "RETRIEVE_CPU_CHUNKS": ProtocolDefinition(
             payload_classes=[KeyType, int],
-            response_class=tuple[bool, bytes],
+            response_class=tuple[bool, ShmTransferMetadata],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "GET_READ_PTR": ProtocolDefinition(
+            payload_classes=[int, str],
+            response_class=int,
             handler_type=HandlerType.BLOCKING,
         ),
     }

@@ -5,7 +5,6 @@ from functools import partial
 from itertools import islice
 from typing import Generator
 import argparse
-import pickle
 import threading
 import time
 
@@ -60,7 +59,12 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
 )
-from lmcache.v1.multiprocess.cpu_bounce_context import CPUBounceContext
+from lmcache.v1.multiprocess.cpu_bounce_context import (
+    CPUBounceContext,
+    advance_ring_buffer_read_ptr,
+    read_chunks_from_ring_buffer,
+    write_chunks_to_ring_buffer,
+)
 from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -68,6 +72,10 @@ from lmcache.v1.multiprocess.protocol import (
     get_payload_classes,
 )
 from lmcache.v1.multiprocess.session import SessionManager
+from lmcache.v1.multiprocess.shm_ring_buffer import (
+    ShmRingBuffer,
+    ShmTransferMetadata,
+)
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 import lmcache.c_ops as lmc_ops
 
@@ -270,6 +278,8 @@ class MPCacheEngine:
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
             torch_dev.empty_cache()
         elif instance_id in self.bounce_contexts:
+            self.bounce_contexts[instance_id].store_ring_buffer.close()
+            self.bounce_contexts[instance_id].retrieve_ring_buffer.close()
             del self.bounce_contexts[instance_id]
             del self.bounce_context_meta[instance_id]
             logger.info("Unregistered bounce context for instance ID %d", instance_id)
@@ -288,6 +298,9 @@ class MPCacheEngine:
         hidden_dim_size: int,
         dtype_str: str,
         use_mla: bool,
+        store_ring_name: str,
+        retrieve_ring_name: str,
+        ring_buffer_size: int,
     ) -> None:
         """Register non-CUDA KV layout metadata for CPU bounce-buffer mode.
 
@@ -306,6 +319,11 @@ class MPCacheEngine:
                 ``[num_layers, chunk_size, hidden_dim_size]``; non-MLA stores
                 separate K/V planes with shape
                 ``[2, num_layers, chunk_size, hidden_dim_size]``.
+            store_ring_name: Shared-memory ring-buffer name for worker->server
+                transfers.
+            retrieve_ring_name: Shared-memory ring-buffer name for
+                server->worker transfers.
+            ring_buffer_size: Shared-memory ring-buffer size in bytes.
 
         Raises:
             ValueError: If ``dtype_str`` is not a valid torch dtype name.
@@ -334,6 +352,16 @@ class MPCacheEngine:
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla,
+            store_ring_buffer=ShmRingBuffer(
+                store_ring_name,
+                ring_buffer_size,
+                create=False,
+            ),
+            retrieve_ring_buffer=ShmRingBuffer(
+                retrieve_ring_name,
+                ring_buffer_size,
+                create=False,
+            ),
         )
         self.bounce_context_meta[instance_id] = (model_name, world_size)
 
@@ -342,14 +370,14 @@ class MPCacheEngine:
         self,
         key: IPCCacheEngineKey,
         instance_id: int,
-        cpu_data: bytes,
+        metadata: ShmTransferMetadata,
     ) -> bool:
         """Store worker-provided CPU chunks for non-CUDA bounce-buffer mode.
 
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
-            cpu_data: Pickled list of CPU tensors produced by the worker.
+            metadata: Shared-memory metadata produced by the worker.
 
         Returns:
             ``True`` when all reserved objects are written, otherwise ``False``.
@@ -357,9 +385,6 @@ class MPCacheEngine:
         Raises:
             ValueError: If the instance has no registered bounce context.
         """
-        # Third Party
-        import torch
-
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [
@@ -374,7 +399,7 @@ class MPCacheEngine:
                 f"Bounce context not registered for instance ID {instance_id}"
             )
         ctx = self.bounce_contexts[instance_id]
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        chunks = read_chunks_from_ring_buffer(metadata, ctx.store_ring_buffer)
         reserved_dict = self.storage_manager.reserve_write(
             obj_keys, ctx.layout_desc, "new"
         )
@@ -394,6 +419,7 @@ class MPCacheEngine:
                 memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
+            advance_ring_buffer_read_ptr(metadata, ctx.store_ring_buffer)
             if written_keys:
                 self.storage_manager.finish_write(written_keys)
 
@@ -404,16 +430,16 @@ class MPCacheEngine:
         self,
         key: IPCCacheEngineKey,
         instance_id: int,
-    ) -> tuple[bool, bytes]:
-        """Retrieve prefetched chunks and return serialized CPU tensors.
+    ) -> tuple[bool, ShmTransferMetadata]:
+        """Retrieve prefetched chunks and return shared-memory metadata.
 
         Args:
             key: Cache key for the token range to retrieve.
             instance_id: Worker instance identifier.
 
         Returns:
-            Tuple ``(success, payload)`` where ``payload`` is a pickled
-            list of CPU chunk tensors.
+            Tuple ``(success, payload)`` where ``payload`` describes
+            CPU chunk tensors stored in the retrieve ring buffer.
 
         Raises:
             ValueError: If the instance has no registered bounce context.
@@ -436,17 +462,34 @@ class MPCacheEngine:
         try:
             with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
                 if not memory_objs or len(memory_objs) != len(obj_keys):
-                    return False, b""
+                    return False, ShmTransferMetadata([], [], [], "float32")
                 prefetched_keys = obj_keys[: len(memory_objs)]
                 chunks = []
                 for memory_obj in memory_objs:
                     if memory_obj.tensor is None:
-                        return False, b""
+                        return False, ShmTransferMetadata([], [], [], "float32")
                     chunks.append(memory_obj.tensor.cpu().clone())
-                return True, pickle.dumps(chunks)
+                return True, write_chunks_to_ring_buffer(
+                    chunks,
+                    self.bounce_contexts[instance_id].retrieve_ring_buffer,
+                )
         finally:
             if prefetched_keys:
                 self.storage_manager.finish_read_prefetched(prefetched_keys)
+
+    def get_read_ptr(self, instance_id: int, direction: str) -> int:
+        """Return the absolute read pointer for a registered ring buffer."""
+
+        if instance_id not in self.bounce_contexts:
+            raise ValueError(
+                f"Bounce context not registered for instance ID {instance_id}"
+            )
+        ctx = self.bounce_contexts[instance_id]
+        if direction == "store":
+            return ctx.store_ring_buffer.get_read_ptr()
+        if direction == "retrieve":
+            return ctx.retrieve_ring_buffer.get_read_ptr()
+        raise ValueError("direction must be either 'store' or 'retrieve'")
 
     @_lmcache_nvtx_annotate
     def store(
@@ -1346,6 +1389,7 @@ def run_cache_server(
     add_handler_helper(
         server, RequestType.RETRIEVE_CPU_CHUNKS, engine.retrieve_cpu_chunks
     )
+    add_handler_helper(server, RequestType.GET_READ_PTR, engine.get_read_ptr)
     add_handler_helper(server, RequestType.CLEAR, engine.clear)
     add_handler_helper(server, RequestType.GET_CHUNK_SIZE, engine.get_chunk_size)
     add_handler_helper(server, RequestType.PING, engine.ping)
@@ -1364,6 +1408,7 @@ def run_cache_server(
             RequestType.RETRIEVE,
             RequestType.STORE_CPU_CHUNKS,
             RequestType.RETRIEVE_CPU_CHUNKS,
+            RequestType.GET_READ_PTR,
         ],
         max_workers=mp_config.max_gpu_workers,
     )
