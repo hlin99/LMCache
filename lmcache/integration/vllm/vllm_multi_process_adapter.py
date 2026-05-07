@@ -836,16 +836,20 @@ class LMCacheMPWorkerAdapter:
             self._bounce_block_size = block_size
             self._bounce_ring_size_bytes = get_default_shm_ring_size_bytes()
             self._close_bounce_ring_buffers()
-            self._store_ring_buffer = ShmRingBuffer(
-                self._store_ring_name(),
-                self._bounce_ring_size_bytes,
-                create=True,
-            )
-            self._retrieve_ring_buffer = ShmRingBuffer(
-                self._retrieve_ring_name(),
-                self._bounce_ring_size_bytes,
-                create=True,
-            )
+            try:
+                self._store_ring_buffer = ShmRingBuffer(
+                    self._store_ring_name(),
+                    self._bounce_ring_size_bytes,
+                    create=True,
+                )
+                self._retrieve_ring_buffer = ShmRingBuffer(
+                    self._retrieve_ring_name(),
+                    self._bounce_ring_size_bytes,
+                    create=True,
+                )
+            except Exception:
+                self._close_bounce_ring_buffers()
+                raise
             future = send_lmcache_request(
                 self.mq_client,
                 RequestType.REGISTER_KV_CACHE_BOUNCE,

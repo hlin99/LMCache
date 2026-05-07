@@ -277,7 +277,7 @@ def write_chunks_to_ring_buffer(
     """Write chunk tensors into a shared-memory ring buffer."""
 
     if not chunks:
-        return ShmTransferMetadata(offsets=[], lengths=[], shape=[], dtype="float32")
+        return ShmTransferMetadata(offsets=[], lengths=[], shape=[], dtype="")
 
     first_chunk = chunks[0]
     shape = list(first_chunk.shape)
@@ -310,7 +310,7 @@ def read_chunks_from_ring_buffer(
 
     return [
         ring_buffer.read_tensor(offset, length, metadata.shape, metadata.dtype)
-        for offset, length in zip(metadata.offsets, metadata.lengths, strict=False)
+        for offset, length in zip(metadata.offsets, metadata.lengths, strict=True)
     ]
 
 
@@ -320,7 +320,7 @@ def advance_ring_buffer_read_ptr(
 ) -> None:
     """Advance the ring-buffer read pointer after consuming shared-memory data."""
 
-    for offset, length in zip(metadata.offsets, metadata.lengths, strict=False):
+    for offset, length in zip(metadata.offsets, metadata.lengths, strict=True):
         ring_buffer.advance_read_ptr(length, offset=offset)
 
 

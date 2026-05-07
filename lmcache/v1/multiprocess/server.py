@@ -462,12 +462,12 @@ class MPCacheEngine:
         try:
             with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
                 if not memory_objs or len(memory_objs) != len(obj_keys):
-                    return False, ShmTransferMetadata([], [], [], "float32")
+                    return False, ShmTransferMetadata([], [], [], "")
                 prefetched_keys = obj_keys[: len(memory_objs)]
                 chunks = []
                 for memory_obj in memory_objs:
                     if memory_obj.tensor is None:
-                        return False, ShmTransferMetadata([], [], [], "float32")
+                        return False, ShmTransferMetadata([], [], [], "")
                     chunks.append(memory_obj.tensor.cpu().clone())
                 return True, write_chunks_to_ring_buffer(
                     chunks,

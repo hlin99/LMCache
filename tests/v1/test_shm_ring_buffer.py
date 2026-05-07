@@ -65,7 +65,7 @@ def test_shm_ring_buffer_sequential_writes() -> None:
         payloads = [b"one", b"two" * 10, b"three" * 20]
         positions = [ring_buffer.write(payload) for payload in payloads]
 
-        for payload, (offset, length) in zip(payloads, positions, strict=False):
+        for payload, (offset, length) in zip(payloads, positions, strict=True):
             assert bytes(ring_buffer.read(offset, length)) == payload
             ring_buffer.advance_read_ptr(length, offset=offset)
 

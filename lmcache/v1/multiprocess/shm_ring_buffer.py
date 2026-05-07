@@ -19,7 +19,11 @@ _DEFAULT_RING_SIZE_GB = 128
 
 
 def get_default_shm_ring_size_bytes() -> int:
-    """Return the configured shared-memory ring-buffer size in bytes."""
+    """Return the configured shared-memory ring-buffer size in bytes.
+
+    The ``LMCACHE_SHM_RING_SIZE_GB`` environment variable overrides the
+    default size of 128 GiB per ring buffer.
+    """
 
     raw_value = os.getenv(
         "LMCACHE_SHM_RING_SIZE_GB",
@@ -42,7 +46,16 @@ class ShmTransferMetadata:
 
 
 class ShmRingBuffer:
-    """Single-writer single-reader shared-memory ring buffer."""
+    """Single-writer single-reader shared-memory ring buffer.
+
+    Notes:
+        This implementation targets the current LMCache multiprocess bounce
+        path: one writer, one reader, and aligned 64-bit pointer updates on
+        64-bit platforms. The writer publishes completed payloads by updating
+        the absolute write pointer after copying data into shared memory, while
+        the reader advances the absolute read pointer after consuming the
+        corresponding metadata.
+    """
 
     def __init__(self, name: str, size: int, create: bool = True) -> None:
         """Create or attach to a named shared-memory ring buffer."""
@@ -104,7 +117,11 @@ class ShmRingBuffer:
         return offset, length
 
     def read(self, offset: int, length: int) -> memoryview:
-        """Return a zero-copy view for a previously written contiguous payload."""
+        """Return a zero-copy view for a previously written contiguous payload.
+
+        Callers must only read ranges whose metadata has already been published
+        by the writer and not yet released by advancing the read pointer.
+        """
 
         if length < 0:
             raise ValueError("length must be non-negative")
@@ -175,7 +192,11 @@ class ShmRingBuffer:
         self._shm.close()
 
     def unlink(self) -> None:
-        """Unlink the shared-memory segment if this process created it."""
+        """Unlink the shared-memory segment if this process created it.
+
+        The worker process is the single owner of bounce-buffer ring names and
+        is responsible for unlinking them during shutdown.
+        """
 
         if not self._owns_shm:
             return
