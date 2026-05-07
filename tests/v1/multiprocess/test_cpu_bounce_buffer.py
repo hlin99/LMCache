@@ -33,7 +33,18 @@ def _make_mla_kv_caches(
     block_size: int = 4,
     hidden_size: int = 16,
 ) -> dict[str, torch.Tensor]:
-    """Build per-layer MLA KV tensors for CPU bounce-buffer tests."""
+    """Build per-layer MLA KV tensors for CPU bounce-buffer tests.
+
+    Args:
+        num_layers: Number of KV layers to generate.
+        num_blocks: Number of paged blocks per layer.
+        block_size: Number of tokens per block.
+        hidden_size: Hidden size per token.
+
+    Returns:
+        Mapping from layer name to MLA KV tensor with shape
+        ``[num_blocks, block_size, hidden_size]``.
+    """
     kv_caches = {}
     for i in range(num_layers):
         kv_caches[f"layer_{i}"] = torch.randn(num_blocks, block_size, hidden_size)
@@ -58,11 +69,18 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     )
 
     source = _make_kv_caches(num_layers=2, num_blocks=8, block_size=4)
-    block_size, num_layers, hidden_dim, dtype_str, _ = _compute_kv_layout(source)
+    (
+        block_size,
+        num_layers,
+        hidden_dim,
+        dtype_str,
+        detected_kv_format,
+    ) = _compute_kv_layout(source)
     assert block_size == 4
     assert num_layers == 2
     assert hidden_dim == 16
     assert dtype_str == "float32"
+    assert detected_kv_format is not None
 
     blocks_per_chunk = 2
     gathered = _gather_chunks_to_cpu(source, [0, 1], blocks_per_chunk)
@@ -114,11 +132,18 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
     source = _make_mla_kv_caches(
         num_layers=2, num_blocks=8, block_size=4, hidden_size=16
     )
-    block_size, num_layers, hidden_dim, dtype_str, _ = _compute_kv_layout(source)
+    (
+        block_size,
+        num_layers,
+        hidden_dim,
+        dtype_str,
+        detected_kv_format,
+    ) = _compute_kv_layout(source)
     assert block_size == 4
     assert num_layers == 2
     assert hidden_dim == 16
     assert dtype_str == "float32"
+    assert detected_kv_format is not None
 
     blocks_per_chunk = 2
     gathered = _gather_chunks_to_cpu(source, [0, 1], blocks_per_chunk)
@@ -128,6 +153,15 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
     for name in source:
         assert torch.allclose(source[name][0], destination[name][4])
         assert torch.allclose(source[name][1], destination[name][5])
+
+
+def test_compute_kv_layout_empty_raises_value_error() -> None:
+    """Ensure _compute_kv_layout rejects empty KV cache input."""
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import _compute_kv_layout
+
+    with pytest.raises(ValueError, match="kv_caches is empty"):
+        _compute_kv_layout({})
 
 
 def test_scatter_mla_respects_skip_first_n_tokens() -> None:
@@ -158,6 +192,33 @@ def test_scatter_mla_respects_skip_first_n_tokens() -> None:
         assert torch.all(destination[name][1] == 999.0)
         assert torch.allclose(destination[name][2], source[name][2])
         assert torch.allclose(destination[name][3], source[name][3])
+
+
+def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
+    """Ensure MLA scatter is a no-op when skip_first_n_tokens exceeds chunk tokens."""
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        _gather_chunks_to_cpu,
+        _scatter_cpu_chunks_to_kv,
+    )
+
+    source = _make_mla_kv_caches(
+        num_layers=2, num_blocks=8, block_size=4, hidden_size=16
+    )
+    destination = {
+        name: torch.full_like(tensor, 123.0) for name, tensor in source.items()
+    }
+    gathered = _gather_chunks_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=4)
+    _scatter_cpu_chunks_to_kv(
+        destination,
+        [0, 1, 2, 3],
+        gathered,
+        blocks_per_chunk=4,
+        skip_first_n_tokens=40,
+    )
+
+    for name in destination:
+        assert torch.all(destination[name] == 123.0)
 
 
 @pytest.fixture

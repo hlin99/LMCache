@@ -101,8 +101,9 @@ def _gather_chunks_to_cpu(
 
     Returns:
         Pickled list of CPU tensors. For non-MLA, each chunk shape is
-        ``[2, num_layers, chunk_tokens, hidden_dim]``. For MLA, each chunk
-        shape is ``[num_layers, chunk_tokens, hidden_dim]``.
+        ``[2, num_layers, chunk_tokens, hidden_dim]`` where dimension ``0``
+        stores ``(K, V)``. For MLA (multi-head latent attention), each chunk shape is
+        ``[num_layers, chunk_tokens, hidden_dim]``.
     """
     # Local
     from lmcache.v1.gpu_connector.utils import (
@@ -134,11 +135,9 @@ def _gather_chunks_to_cpu(
             dtype=torch.long,
             device=device,
         )
-        k_layers: list[torch.Tensor] = []
-        v_layers: list[torch.Tensor] = []
-        mla_layers: list[torch.Tensor] = []
-        for layer in normalized:
-            if use_mla:
+        if use_mla:
+            mla_layers: list[torch.Tensor] = []
+            for layer in normalized:
                 layer_flat = cast(
                     torch.Tensor,
                     _get_head_size_view(
@@ -146,15 +145,16 @@ def _gather_chunks_to_cpu(
                     ),
                 )
                 mla_layers.append(layer_flat.index_select(0, slot_mapping))
-            else:
+            chunks.append(torch.stack(mla_layers, dim=0).cpu())
+        else:
+            k_layers: list[torch.Tensor] = []
+            v_layers: list[torch.Tensor] = []
+            for layer in normalized:
                 k_flat, v_flat = _get_head_size_view(
                     layer, use_mla=False, gpu_kv_format=gpu_kv_format
                 )
                 k_layers.append(k_flat.index_select(0, slot_mapping))
                 v_layers.append(v_flat.index_select(0, slot_mapping))
-        if use_mla:
-            chunks.append(torch.stack(mla_layers, dim=0).cpu())
-        else:
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
             chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
@@ -240,8 +240,8 @@ def _scatter_cpu_chunks_to_kv(
         skip_tokens = skip_blocks_in_chunk * block_size
         chunk_device = chunk_cpu.to(device)
 
-        for layer_idx, layer in enumerate(normalized):
-            if use_mla:
+        if use_mla:
+            for layer_idx, layer in enumerate(normalized):
                 mla_src = chunk_device[layer_idx, skip_tokens:]
                 dst_flat = cast(
                     torch.Tensor,
@@ -250,7 +250,8 @@ def _scatter_cpu_chunks_to_kv(
                     ),
                 )
                 dst_flat.index_copy_(0, slot_mapping, mla_src)
-            elif is_hnd:
+        elif is_hnd:
+            for layer_idx, layer in enumerate(normalized):
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
                 v_src = chunk_device[1, layer_idx, skip_tokens:]
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
@@ -271,7 +272,8 @@ def _scatter_cpu_chunks_to_kv(
                         offset : offset + block_size
                     ].permute(1, 0, 2)
                     offset += block_size
-            else:
+        else:
+            for layer_idx, layer in enumerate(normalized):
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
                 v_src = chunk_device[1, layer_idx, skip_tokens:]
                 k_flat, v_flat = _get_head_size_view(

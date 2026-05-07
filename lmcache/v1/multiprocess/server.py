@@ -306,6 +306,10 @@ class MPCacheEngine:
             hidden_dim_size: Flattened hidden dimension per token.
             dtype_str: Torch dtype name (for example ``"float16"``).
             use_mla: Whether the worker KV format is MLA.
+                MLA stores one latent vector per token with shape
+                ``[num_layers, chunk_size, hidden_dim_size]``; non-MLA stores
+                separate K/V planes with shape
+                ``[2, num_layers, chunk_size, hidden_dim_size]``.
 
         Raises:
             ValueError: If ``dtype_str`` is not a valid torch dtype name.
@@ -320,6 +324,8 @@ class MPCacheEngine:
             )
 
         shape = (
+            # MLA has one latent state per token (no separate K/V axis),
+            # while non-MLA stores separate K and V tensors at dim 0.
             torch.Size([num_layers, self.chunk_size, hidden_dim_size])
             if use_mla
             else torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])
