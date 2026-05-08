@@ -10,23 +10,8 @@ import pickle
 import torch
 
 # First Party
-from lmcache import torch_device_type
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-
-
-def device_synchronize(device_type: str | None = None) -> None:
-    """Synchronize device work for backends that require explicit barriers.
-
-    Args:
-        device_type: Active device type string (for example ``"cuda"``,
-            ``"xpu"``, or ``"cpu"``). If None, uses ``lmcache.torch_device_type``.
-    """
-    dt = device_type or torch_device_type
-    if dt == "cuda":
-        torch.cuda.synchronize()
-    elif dt == "xpu" and hasattr(torch, "xpu"):
-        torch.xpu.synchronize()
 
 
 def compute_kv_layout(
@@ -91,6 +76,7 @@ def gather_chunks_to_cpu(
         shape is ``[num_layers, chunk_tokens, hidden_dim]``.
     """
     # First Party
+    import lmcache.c_ops as lmc_ops
     from lmcache.v1.gpu_connector.utils import (
         _get_head_size_view,
         get_block_size,
@@ -105,6 +91,10 @@ def gather_chunks_to_cpu(
     if gpu_kv_format is None:
         gpu_kv_format = fmt
     use_mla = is_mla(gpu_kv_format)
+    is_hnd = gpu_kv_format in (
+        lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
+    )
 
     block_size = get_block_size(normalized, gpu_kv_format)
     device = tensors[0].device
@@ -134,12 +124,35 @@ def gather_chunks_to_cpu(
         else:
             k_layers: list[torch.Tensor] = []
             v_layers: list[torch.Tensor] = []
+            if is_hnd:
+                # Reused for all layers in this chunk to avoid recomputing per layer.
+                hnd_block_ids = slot_mapping // block_size
+                hnd_token_offs = slot_mapping % block_size
             for layer in normalized:
-                k_flat, v_flat = _get_head_size_view(
-                    layer, use_mla=False, gpu_kv_format=gpu_kv_format
-                )
-                k_layers.append(k_flat.index_select(0, slot_mapping))
-                v_layers.append(v_flat.index_select(0, slot_mapping))
+                if is_hnd:
+                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+                        k_t = layer[0]
+                        v_t = layer[1]
+                    else:
+                        k_t = layer[:, 0]
+                        v_t = layer[:, 1]
+                    _num_blocks, num_heads, _block_size, head_size = k_t.shape
+                    k_layers.append(
+                        k_t[hnd_block_ids, :, hnd_token_offs, :].reshape(
+                            -1, num_heads * head_size
+                        )
+                    )
+                    v_layers.append(
+                        v_t[hnd_block_ids, :, hnd_token_offs, :].reshape(
+                            -1, num_heads * head_size
+                        )
+                    )
+                else:
+                    k_flat, v_flat = _get_head_size_view(
+                        layer, use_mla=False, gpu_kv_format=gpu_kv_format
+                    )
+                    k_layers.append(k_flat.index_select(0, slot_mapping))
+                    v_layers.append(v_flat.index_select(0, slot_mapping))
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
             chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())

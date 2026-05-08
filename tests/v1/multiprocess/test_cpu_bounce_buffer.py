@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 import pickle
 import sys
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import MagicMock, patch
 
 # Third Party
@@ -51,6 +51,38 @@ def _make_mla_kv_caches(
     return kv_caches
 
 
+def _make_hnd_kv_caches(
+    num_layers: int = 2,
+    num_blocks: int = 6,
+    block_size: int = 4,
+    num_heads: int = 2,
+    head_size: int = 8,
+) -> dict[str, torch.Tensor]:
+    """Build per-layer HND KV tensors for CPU bounce-buffer tests."""
+    kv_caches = {}
+    for i in range(num_layers):
+        kv_caches[f"layer_{i}"] = torch.randn(
+            2, num_blocks, num_heads, block_size, head_size
+        )
+    return kv_caches
+
+
+def _make_hnd_flashinfer_kv_caches(
+    num_layers: int = 2,
+    num_blocks: int = 6,
+    block_size: int = 4,
+    num_heads: int = 2,
+    head_size: int = 8,
+) -> dict[str, torch.Tensor]:
+    """Build per-layer HND flash-infer KV tensors for CPU bounce-buffer tests."""
+    kv_caches = {}
+    for i in range(num_layers):
+        kv_caches[f"layer_{i}"] = torch.randn(
+            num_blocks, 2, num_heads, block_size, head_size
+        )
+    return kv_caches
+
+
 def test_wrap_kv_caches_bounce_returns_empty() -> None:
     """Verify wrap_kv_caches returns no IPC wrappers in bounce-buffer mode."""
     # First Party
@@ -90,6 +122,68 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     for name in source:
         assert torch.allclose(source[name][:, 0], destination[name][:, 4])
         assert torch.allclose(source[name][:, 1], destination[name][:, 5])
+
+
+@pytest.mark.parametrize(
+    ("hnd_builder", "expected_format"),
+    [
+        (_make_hnd_kv_caches, "NL_X_TWO_NB_NH_BS_HS"),
+        (_make_hnd_flashinfer_kv_caches, "NL_X_NB_TWO_NH_BS_HS"),
+    ],
+)
+def test_gather_scatter_roundtrip_hnd_layout(
+    hnd_builder: Callable[[int, int, int, int, int], dict[str, torch.Tensor]],
+    expected_format: str,
+) -> None:
+    """Validate gather/scatter round-trip for HND vLLM KV layout."""
+    # First Party
+    import lmcache.c_ops as lmc_ops
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        compute_kv_layout,
+        gather_chunks_to_cpu,
+        scatter_cpu_chunks_to_kv,
+    )
+
+    source = hnd_builder(num_layers=2, num_blocks=8, block_size=4)
+    layout_hints = {"kv_layout": "HND"}
+    (
+        block_size,
+        num_layers,
+        hidden_dim,
+        dtype_str,
+        detected_kv_format,
+    ) = compute_kv_layout(source, layout_hints=layout_hints)
+    assert block_size == 4
+    assert num_layers == 2
+    assert hidden_dim == 16
+    assert dtype_str == "float32"
+    assert detected_kv_format == getattr(lmc_ops.GPUKVFormat, expected_format)
+
+    blocks_per_chunk = 2
+    gathered = gather_chunks_to_cpu(
+        source,
+        [0, 1],
+        blocks_per_chunk,
+        layout_hints=layout_hints,
+        gpu_kv_format=detected_kv_format,
+    )
+    destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
+    scatter_cpu_chunks_to_kv(
+        destination,
+        [4, 5],
+        gathered,
+        blocks_per_chunk,
+        layout_hints=layout_hints,
+        gpu_kv_format=detected_kv_format,
+    )
+
+    for name in source:
+        if detected_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+            assert torch.allclose(source[name][:, 0], destination[name][:, 4])
+            assert torch.allclose(source[name][:, 1], destination[name][:, 5])
+        else:
+            assert torch.allclose(source[name][0], destination[name][4])
+            assert torch.allclose(source[name][1], destination[name][5])
 
 
 def test_scatter_respects_skip_first_n_tokens() -> None:

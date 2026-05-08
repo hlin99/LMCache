@@ -11,6 +11,7 @@ import torch
 import zmq
 
 # First Party
+from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.multiprocess.custom_types import (
@@ -21,7 +22,6 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.cpu_bounce_context import (
     compute_kv_layout,
-    device_synchronize,
     gather_chunks_to_cpu,
     scatter_cpu_chunks_to_kv,
 )
@@ -885,7 +885,7 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
         )
         if self._use_bounce_buffer:
-            device_synchronize(self._device_type)
+            torch_dev.synchronize()
             cpu_data = gather_chunks_to_cpu(
                 self.kv_caches,
                 op.block_ids,
