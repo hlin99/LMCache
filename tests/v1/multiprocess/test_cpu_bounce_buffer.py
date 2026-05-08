@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager
-import pickle
-import sys
 from typing import Any, Callable
 from unittest.mock import MagicMock, patch
+import pickle
+import sys
 
 # Third Party
 import pytest
@@ -137,14 +137,14 @@ def test_gather_scatter_roundtrip_hnd_layout(
 ) -> None:
     """Validate gather/scatter round-trip for HND vLLM KV layout."""
     # First Party
-    import lmcache.c_ops as lmc_ops
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         compute_kv_layout,
         gather_chunks_to_cpu,
         scatter_cpu_chunks_to_kv,
     )
+    import lmcache.c_ops as lmc_ops
 
-    source = hnd_builder(num_layers=2, num_blocks=8, block_size=4)
+    source = hnd_builder(2, 8, 4, 2, 8)
     layout_hints = {"kv_layout": "HND"}
     (
         block_size,
@@ -319,8 +319,8 @@ def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
 def stub_native_storage_ops() -> Any:
     """Stub native modules so server imports work in source-only test runs."""
     module = type(sys)("lmcache.native_storage_ops")
-    module.TTLLock = type("TTLLock", (), {})
-    module.Bitmap = type("Bitmap", (), {})
+    module.TTLLock = type("TTLLock", (), {})  # type: ignore[attr-defined]
+    module.Bitmap = type("Bitmap", (), {})  # type: ignore[attr-defined]
     with patch.dict(
         sys.modules,
         {
