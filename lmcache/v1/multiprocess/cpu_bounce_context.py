@@ -288,7 +288,13 @@ def write_chunks_to_ring_buffer(
     """
 
     if not chunks:
-        return ShmTransferMetadata(offsets=[], lengths=[], shape=[], dtype="")
+        return ShmTransferMetadata(
+            offsets=[],
+            lengths=[],
+            paddings=[],
+            shape=[],
+            dtype="",
+        )
 
     first_chunk = chunks[0]
     shape = list(first_chunk.shape)
@@ -296,18 +302,21 @@ def write_chunks_to_ring_buffer(
 
     offsets: list[int] = []
     lengths: list[int] = []
+    paddings: list[int] = []
     for chunk in chunks:
         if list(chunk.shape) != shape:
             raise ValueError("All bounce-buffer chunks must share the same shape")
         if chunk.dtype != first_chunk.dtype:
             raise ValueError("All bounce-buffer chunks must share the same dtype")
-        offset, length = ring_buffer.write_tensor(chunk)
+        offset, length, padding = ring_buffer.write_tensor(chunk)
         offsets.append(offset)
         lengths.append(length)
+        paddings.append(padding)
 
     return ShmTransferMetadata(
         offsets=offsets,
         lengths=lengths,
+        paddings=paddings,
         shape=shape,
         dtype=dtype,
     )
@@ -342,10 +351,14 @@ def advance_ring_buffer_read_ptr(
     Args:
         metadata: Shared-memory offsets and lengths that were consumed.
         ring_buffer: Shared-memory ring buffer whose read pointer is advanced.
+
+    Notes:
+        This must be called after the reader finishes consuming the shared-memory
+        tensor views so the writer can safely reuse the released space.
     """
 
-    for offset, length in zip(metadata.offsets, metadata.lengths, strict=True):
-        ring_buffer.advance_read_ptr(length, offset=offset)
+    for length, padding in zip(metadata.lengths, metadata.paddings, strict=True):
+        ring_buffer.advance_read_ptr(length, padding=padding)
 
 
 @dataclass

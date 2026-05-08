@@ -419,6 +419,9 @@ class MPCacheEngine:
                 memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
+            # Always release the consumed ring-buffer region, even when the
+            # storage write fails, so the worker does not stall behind data that
+            # this server instance has already deemed unusable.
             advance_ring_buffer_read_ptr(metadata, ctx.store_ring_buffer)
             if written_keys:
                 self.storage_manager.finish_write(written_keys)
@@ -462,12 +465,12 @@ class MPCacheEngine:
         try:
             with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
                 if not memory_objs or len(memory_objs) != len(obj_keys):
-                    return False, ShmTransferMetadata([], [], [], "")
+                    return False, ShmTransferMetadata([], [], [], [], "")
                 prefetched_keys = obj_keys[: len(memory_objs)]
                 chunks = []
                 for memory_obj in memory_objs:
                     if memory_obj.tensor is None:
-                        return False, ShmTransferMetadata([], [], [], "")
+                        return False, ShmTransferMetadata([], [], [], [], "")
                     chunks.append(memory_obj.tensor.cpu().clone())
                 return True, write_chunks_to_ring_buffer(
                     chunks,

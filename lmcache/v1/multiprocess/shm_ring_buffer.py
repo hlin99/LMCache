@@ -2,13 +2,13 @@
 """Shared-memory ring-buffer helpers for multiprocess CPU bounce buffers."""
 
 # Standard
-from dataclasses import dataclass
 from multiprocessing import shared_memory
 import os
 import struct
 import time
 
 # Third Party
+import msgspec
 import torch
 
 _HEADER_BYTES = 128
@@ -41,12 +41,12 @@ def get_default_shm_ring_size_bytes() -> int:
     return ring_size_gb * 1024 * 1024 * 1024
 
 
-@dataclass
-class ShmTransferMetadata:
+class ShmTransferMetadata(msgspec.Struct):
     """Metadata describing tensors written into a shared-memory ring buffer."""
 
     offsets: list[int]
     lengths: list[int]
+    paddings: list[int]
     shape: list[int]
     dtype: str
 
@@ -100,15 +100,16 @@ class ShmRingBuffer:
             self._set_u64(_WRITE_PTR_OFFSET, 0)
             self._set_u64(_READ_PTR_OFFSET, 0)
 
-    def write(self, data: bytes | memoryview) -> tuple[int, int]:
+    def write(self, data: bytes | memoryview) -> tuple[int, int, int]:
         """Write a contiguous byte payload into the ring buffer.
 
         Args:
             data: Byte payload to write into the ring.
 
         Returns:
-            Tuple ``(offset, length)`` describing the contiguous region that was
-            written.
+            Tuple ``(offset, length, padding)`` describing the contiguous
+            region that was written and any skipped tail bytes inserted to wrap
+            back to the beginning of the ring.
 
         Raises:
             ValueError: If the payload is larger than the ring-buffer capacity.
@@ -120,7 +121,7 @@ class ShmRingBuffer:
         payload = data if isinstance(data, memoryview) else memoryview(data)
         length = len(payload)
         if length == 0:
-            return 0, 0
+            return 0, 0, 0
         if length > self.capacity:
             raise ValueError(
                 f"Payload size {length} exceeds ring-buffer capacity {self.capacity}"
@@ -144,7 +145,7 @@ class ShmRingBuffer:
             offset = 0
         self._data[offset : offset + length] = payload
         self._set_u64(_WRITE_PTR_OFFSET, write_ptr + padding + length)
-        return offset, length
+        return offset, length, padding
 
     def read(self, offset: int, length: int) -> memoryview:
         """Return a zero-copy view for a previously written contiguous payload.
@@ -159,7 +160,7 @@ class ShmRingBuffer:
             raise ValueError("Requested range exceeds ring-buffer bounds")
         return self._data[offset : offset + length]
 
-    def write_tensor(self, tensor: torch.Tensor) -> tuple[int, int]:
+    def write_tensor(self, tensor: torch.Tensor) -> tuple[int, int, int]:
         """Write a CPU tensor into the shared-memory ring buffer.
 
         Args:
@@ -167,10 +168,14 @@ class ShmRingBuffer:
                 converted to a contiguous CPU tensor view.
 
         Returns:
-            Tuple ``(offset, length)`` describing the written payload.
+            Tuple ``(offset, length, padding)`` describing the written payload.
         """
 
-        tensor_cpu = tensor.detach().cpu().contiguous()
+        tensor_cpu = tensor.detach()
+        if tensor_cpu.device.type != "cpu":
+            tensor_cpu = tensor_cpu.cpu()
+        if not tensor_cpu.is_contiguous():
+            tensor_cpu = tensor_cpu.contiguous()
         payload = memoryview(tensor_cpu.numpy()).cast("B")
         return self.write(payload)
 
@@ -220,34 +225,25 @@ class ShmRingBuffer:
 
         return self._get_u64(_READ_PTR_OFFSET)
 
-    def advance_read_ptr(self, length: int, offset: int | None = None) -> int:
+    def advance_read_ptr(self, length: int, padding: int = 0) -> int:
         """Advance the absolute reader pointer after consuming one payload.
 
         Args:
             length: Number of payload bytes consumed.
-            offset: Expected payload offset within the current ring cycle.
+            padding: Number of skipped tail bytes that the writer inserted
+                before this payload when wrapping back to offset zero.
 
         Returns:
             The new absolute read pointer.
 
         Raises:
-            ValueError: If ``length`` is negative or the reader is
-                desynchronized from the provided offset.
+            ValueError: If ``length`` or ``padding`` is negative.
         """
 
-        if length < 0:
-            raise ValueError("length must be non-negative")
+        if length < 0 or padding < 0:
+            raise ValueError("length and padding must be non-negative")
         read_ptr = self._get_u64(_READ_PTR_OFFSET)
-        if offset is not None:
-            current_offset = read_ptr % self.capacity
-            if current_offset != offset:
-                if offset != 0:
-                    raise ValueError(
-                        "Shared-memory ring-buffer reader desynchronized: "
-                        f"expected offset {current_offset}, got {offset}"
-                    )
-                read_ptr += self.capacity - current_offset
-        read_ptr += length
+        read_ptr += padding + length
         self._set_u64(_READ_PTR_OFFSET, read_ptr)
         return read_ptr
 

@@ -35,27 +35,28 @@ def test_shm_ring_buffer_write_read_roundtrip() -> None:
 
     with _make_ring_buffer() as ring_buffer:
         payload = b"hello shared memory"
-        offset, length = ring_buffer.write(payload)
+        offset, length, padding = ring_buffer.write(payload)
 
         assert bytes(ring_buffer.read(offset, length)) == payload
-        ring_buffer.advance_read_ptr(length, offset=offset)
+        ring_buffer.advance_read_ptr(length, padding=padding)
 
 
 def test_shm_ring_buffer_wraparound_write() -> None:
     """Ensure writes wrap to the start when the tail region is too small."""
 
     with _make_ring_buffer(size=1024) as ring_buffer:
-        first_offset, first_length = ring_buffer.write(b"a" * 400)
-        ring_buffer.advance_read_ptr(first_length, offset=first_offset)
+        first_offset, first_length, first_padding = ring_buffer.write(b"a" * 400)
+        ring_buffer.advance_read_ptr(first_length, padding=first_padding)
 
-        second_offset, second_length = ring_buffer.write(b"b" * 300)
-        ring_buffer.advance_read_ptr(second_length, offset=second_offset)
+        second_offset, second_length, second_padding = ring_buffer.write(b"b" * 300)
+        ring_buffer.advance_read_ptr(second_length, padding=second_padding)
 
-        wrapped_offset, wrapped_length = ring_buffer.write(b"c" * 250)
+        wrapped_offset, wrapped_length, wrapped_padding = ring_buffer.write(b"c" * 250)
 
         assert wrapped_offset == 0
+        assert wrapped_padding > 0
         assert bytes(ring_buffer.read(wrapped_offset, wrapped_length)) == b"c" * 250
-        ring_buffer.advance_read_ptr(wrapped_length, offset=wrapped_offset)
+        ring_buffer.advance_read_ptr(wrapped_length, padding=wrapped_padding)
 
 
 def test_shm_ring_buffer_sequential_writes() -> None:
@@ -65,9 +66,11 @@ def test_shm_ring_buffer_sequential_writes() -> None:
         payloads = [b"one", b"two" * 10, b"three" * 20]
         positions = [ring_buffer.write(payload) for payload in payloads]
 
-        for payload, (offset, length) in zip(payloads, positions, strict=True):
+        for payload, (offset, length, padding) in zip(
+            payloads, positions, strict=True
+        ):
             assert bytes(ring_buffer.read(offset, length)) == payload
-            ring_buffer.advance_read_ptr(length, offset=offset)
+            ring_buffer.advance_read_ptr(length, padding=padding)
 
 
 def test_shm_ring_buffer_tensor_roundtrip() -> None:
@@ -75,7 +78,7 @@ def test_shm_ring_buffer_tensor_roundtrip() -> None:
 
     with _make_ring_buffer() as ring_buffer:
         tensor = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
-        offset, length = ring_buffer.write_tensor(tensor)
+        offset, length, padding = ring_buffer.write_tensor(tensor)
         recovered = ring_buffer.read_tensor(
             offset,
             length,
@@ -85,7 +88,7 @@ def test_shm_ring_buffer_tensor_roundtrip() -> None:
 
         assert torch.equal(recovered, tensor)
         del recovered
-        ring_buffer.advance_read_ptr(length, offset=offset)
+        ring_buffer.advance_read_ptr(length, padding=padding)
 
 
 def test_shm_ring_buffer_blocks_until_space_available() -> None:
@@ -94,7 +97,7 @@ def test_shm_ring_buffer_blocks_until_space_available() -> None:
     with _make_ring_buffer(size=512) as ring_buffer:
         first = ring_buffer.write(b"a" * 160)
         second = ring_buffer.write(b"b" * 160)
-        third_result: dict[str, tuple[int, int]] = {}
+        third_result: dict[str, tuple[int, int, int]] = {}
         finished = threading.Event()
 
         def _writer() -> None:
@@ -106,14 +109,38 @@ def test_shm_ring_buffer_blocks_until_space_available() -> None:
         time.sleep(0.05)
         assert not finished.is_set()
 
-        ring_buffer.advance_read_ptr(first[1], offset=first[0])
+        ring_buffer.advance_read_ptr(first[1], padding=first[2])
         thread.join(timeout=1.0)
 
         assert finished.is_set()
-        third_offset, third_length = third_result["value"]
+        third_offset, third_length, third_padding = third_result["value"]
         assert bytes(ring_buffer.read(third_offset, third_length)) == b"c" * 160
-        ring_buffer.advance_read_ptr(second[1], offset=second[0])
-        ring_buffer.advance_read_ptr(third_length, offset=third_offset)
+        ring_buffer.advance_read_ptr(second[1], padding=second[2])
+        ring_buffer.advance_read_ptr(third_length, padding=third_padding)
+
+
+def test_shm_ring_buffer_preserves_padding_for_repeated_offset_zero() -> None:
+    """Ensure explicit padding keeps repeated offset-zero writes unambiguous."""
+
+    with _make_ring_buffer(size=1024) as ring_buffer:
+        first = ring_buffer.write(b"a" * 700)
+        ring_buffer.advance_read_ptr(first[1], padding=first[2])
+
+        wrapped = ring_buffer.write(b"b" * 400)
+        assert wrapped[0] == 0
+        assert wrapped[2] > 0
+        ring_buffer.advance_read_ptr(wrapped[1], padding=wrapped[2])
+
+        fill_to_boundary = ring_buffer.write(b"d" * 496)
+        assert fill_to_boundary[0] == 400
+        assert fill_to_boundary[2] == 0
+        ring_buffer.advance_read_ptr(fill_to_boundary[1], padding=fill_to_boundary[2])
+
+        at_zero_again = ring_buffer.write(b"c" * 100)
+        assert at_zero_again[0] == 0
+        assert at_zero_again[2] == 0
+        assert bytes(ring_buffer.read(at_zero_again[0], at_zero_again[1])) == b"c" * 100
+        ring_buffer.advance_read_ptr(at_zero_again[1], padding=at_zero_again[2])
 
 
 def test_shm_transfer_metadata_msgpack_roundtrip() -> None:
@@ -125,6 +152,7 @@ def test_shm_transfer_metadata_msgpack_roundtrip() -> None:
     metadata = ShmTransferMetadata(
         offsets=[1, 2],
         lengths=[16, 16],
+        paddings=[0, 4],
         shape=[2, 2, 4],
         dtype="float16",
     )
