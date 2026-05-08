@@ -254,17 +254,14 @@ def scatter_cpu_chunks_to_kv(
                     k_t = layer[:, 0]
                     v_t = layer[:, 1]
                 _nb, nh, _bs, hs = k_t.shape
-                k_src_3d = k_src.reshape(-1, nh, hs)
-                v_src_3d = v_src.reshape(-1, nh, hs)
-                offset = 0
-                for block_id in effective_block_ids:
-                    k_t[block_id] = k_src_3d[
-                        offset : offset + block_size
-                    ].permute(1, 0, 2)
-                    v_t[block_id] = v_src_3d[
-                        offset : offset + block_size
-                    ].permute(1, 0, 2)
-                    offset += block_size
+                k_blocks = k_src.reshape(
+                    len(effective_block_ids), block_size, nh, hs
+                ).permute(0, 2, 1, 3)
+                v_blocks = v_src.reshape(
+                    len(effective_block_ids), block_size, nh, hs
+                ).permute(0, 2, 1, 3)
+                k_t[effective_block_ids] = k_blocks
+                v_t[effective_block_ids] = v_blocks
         else:
             for layer_idx, layer in enumerate(normalized):
                 k_src = chunk_device[0, layer_idx, skip_tokens:]

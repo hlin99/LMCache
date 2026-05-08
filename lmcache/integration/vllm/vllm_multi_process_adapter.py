@@ -673,7 +673,6 @@ class LMCacheMPWorkerAdapter:
         self._bounce_skip_tokens: dict[str, int] = {}
         self._bounce_layout_hints: Any = None
         self._bounce_gpu_kv_format: Any = None
-        self._bounce_block_size: int | None = None
         self._use_bounce_buffer: bool = False
         self._device_type: str = "cuda"
 
@@ -800,7 +799,6 @@ class LMCacheMPWorkerAdapter:
             ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
             self._bounce_layout_hints = layout_hints
             self._bounce_gpu_kv_format = gpu_kv_format
-            self._bounce_block_size = block_size
             future = send_lmcache_request(
                 self.mq_client,
                 RequestType.REGISTER_KV_CACHE_BOUNCE,
