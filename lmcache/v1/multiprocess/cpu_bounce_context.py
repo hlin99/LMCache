@@ -3,7 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 import pickle
 
 # Third Party
@@ -78,7 +78,6 @@ def gather_chunks_to_cpu(
     # First Party
     import lmcache.c_ops as lmc_ops
     from lmcache.v1.gpu_connector.utils import (
-        _get_head_size_view,
         get_block_size,
         is_mla,
         normalize_kv_and_discover_format,
@@ -97,7 +96,6 @@ def gather_chunks_to_cpu(
     )
 
     block_size = get_block_size(normalized, gpu_kv_format)
-    device = tensors[0].device
     num_chunks = len(block_ids) // blocks_per_chunk
 
     chunks: list[torch.Tensor] = []
@@ -105,29 +103,19 @@ def gather_chunks_to_cpu(
         chunk_block_ids = block_ids[
             chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
         ]
-        slot_mapping = torch.tensor(
-            [b * block_size + t for b in chunk_block_ids for t in range(block_size)],
-            dtype=torch.long,
-            device=device,
-        )
         if use_mla:
             mla_layers: list[torch.Tensor] = []
             for layer in normalized:
-                layer_flat = cast(
-                    torch.Tensor,
-                    _get_head_size_view(
-                        layer, use_mla=True, gpu_kv_format=gpu_kv_format
-                    ),
+                layer_blocks = layer[chunk_block_ids]
+                mla_layers.append(
+                    layer_blocks.reshape(
+                        len(chunk_block_ids) * block_size, layer_blocks.shape[-1]
+                    )
                 )
-                mla_layers.append(layer_flat.index_select(0, slot_mapping))
             chunks.append(torch.stack(mla_layers, dim=0).cpu())
         else:
             k_layers: list[torch.Tensor] = []
             v_layers: list[torch.Tensor] = []
-            if is_hnd:
-                # Reused for all layers in this chunk to avoid recomputing per layer.
-                hnd_block_ids = slot_mapping // block_size
-                hnd_token_offs = slot_mapping % block_size
             for layer in normalized:
                 if is_hnd:
                     if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
@@ -137,22 +125,40 @@ def gather_chunks_to_cpu(
                         k_t = layer[:, 0]
                         v_t = layer[:, 1]
                     _num_blocks, num_heads, _block_size, head_size = k_t.shape
+                    k_blocks = k_t[chunk_block_ids]
+                    v_blocks = v_t[chunk_block_ids]
+                    # HND blocks are [NB, NH, BS, HS]; convert to token-major
+                    # [NB, BS, NH, HS] before flattening to [tokens, NH*HS].
                     k_layers.append(
-                        k_t[hnd_block_ids, :, hnd_token_offs, :].reshape(
-                            -1, num_heads * head_size
+                        k_blocks.permute(0, 2, 1, 3).reshape(
+                            len(chunk_block_ids) * block_size, num_heads * head_size
                         )
                     )
                     v_layers.append(
-                        v_t[hnd_block_ids, :, hnd_token_offs, :].reshape(
-                            -1, num_heads * head_size
+                        v_blocks.permute(0, 2, 1, 3).reshape(
+                            len(chunk_block_ids) * block_size, num_heads * head_size
                         )
                     )
                 else:
-                    k_flat, v_flat = _get_head_size_view(
-                        layer, use_mla=False, gpu_kv_format=gpu_kv_format
+                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+                        k_t = layer[0]
+                        v_t = layer[1]
+                    else:
+                        k_t = layer[:, 0]
+                        v_t = layer[:, 1]
+                    _num_blocks, _block_size, num_heads, head_size = k_t.shape
+                    k_blocks = k_t[chunk_block_ids]
+                    v_blocks = v_t[chunk_block_ids]
+                    k_layers.append(
+                        k_blocks.reshape(
+                            len(chunk_block_ids) * block_size, num_heads * head_size
+                        )
                     )
-                    k_layers.append(k_flat.index_select(0, slot_mapping))
-                    v_layers.append(v_flat.index_select(0, slot_mapping))
+                    v_layers.append(
+                        v_blocks.reshape(
+                            len(chunk_block_ids) * block_size, num_heads * head_size
+                        )
+                    )
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
             chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
@@ -184,7 +190,6 @@ def scatter_cpu_chunks_to_kv(
     # First Party
     import lmcache.c_ops as lmc_ops
     from lmcache.v1.gpu_connector.utils import (
-        _get_head_size_view,
         get_block_size,
         is_mla,
         normalize_kv_and_discover_format,
@@ -227,28 +232,17 @@ def scatter_cpu_chunks_to_kv(
         if not effective_block_ids:
             continue
 
-        slot_mapping = torch.tensor(
-            [
-                block_id * block_size + token_idx
-                for block_id in effective_block_ids
-                for token_idx in range(block_size)
-            ],
-            dtype=torch.long,
-            device=device,
-        )
         skip_tokens = skip_blocks_in_chunk * block_size
         chunk_device = chunk_cpu.to(device)
 
         if use_mla:
             for layer_idx, layer in enumerate(normalized):
                 mla_src = chunk_device[layer_idx, skip_tokens:]
-                dst_flat = cast(
-                    torch.Tensor,
-                    _get_head_size_view(
-                        layer, use_mla=True, gpu_kv_format=gpu_kv_format
-                    ),
+                hidden_size = layer.shape[-1]
+                mla_src_3d = mla_src.reshape(
+                    len(effective_block_ids), block_size, hidden_size
                 )
-                dst_flat.index_copy_(0, slot_mapping, mla_src)
+                layer[effective_block_ids] = mla_src_3d
         elif is_hnd:
             for layer_idx, layer in enumerate(normalized):
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
@@ -275,11 +269,21 @@ def scatter_cpu_chunks_to_kv(
             for layer_idx, layer in enumerate(normalized):
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
                 v_src = chunk_device[1, layer_idx, skip_tokens:]
-                k_flat, v_flat = _get_head_size_view(
-                    layer, use_mla=False, gpu_kv_format=gpu_kv_format
+                if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+                    k_t = layer[0]
+                    v_t = layer[1]
+                else:
+                    k_t = layer[:, 0]
+                    v_t = layer[:, 1]
+                _num_blocks, _block_size, num_heads, head_size = k_t.shape
+                k_src_4d = k_src.reshape(
+                    len(effective_block_ids), block_size, num_heads, head_size
                 )
-                k_flat.index_copy_(0, slot_mapping, k_src)
-                v_flat.index_copy_(0, slot_mapping, v_src)
+                v_src_4d = v_src.reshape(
+                    len(effective_block_ids), block_size, num_heads, head_size
+                )
+                k_t[effective_block_ids] = k_src_4d
+                v_t[effective_block_ids] = v_src_4d
 
 
 @dataclass
