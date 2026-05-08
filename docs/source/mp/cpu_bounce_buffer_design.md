@@ -115,6 +115,60 @@ Additional integration points:
 
 ## Runtime behavior summary
 
+## CUDA vs non-CUDA state machine
+
+```text
+                           register_kv_caches()
+                                      |
+                                      v
+                             [Inspect device.type]
+                                      |
+                     +----------------+----------------+
+                     |                                 |
+                     v                                 v
+              [device == cuda]                 [device != cuda]
+                     |                                 |
+                     v                                 v
+       REGISTER_KV_CACHE (CUDA IPC)      REGISTER_KV_CACHE_BOUNCE (CPU metadata)
+                     |                                 |
+                     +----------------+----------------+
+                                      |
+                                      v
+                              [READY / SERVING]
+                                      |
+                     +----------------+----------------+
+                     |                                 |
+                     v                                 v
+                submit_store()                    submit_store()
+                     |                                 |
+                     v                                 v
+            STORE (GPU -> L1)          gather_chunks_to_cpu + torch_dev.synchronize()
+                     |                                 |
+                     v                                 v
+                 [READY]                    STORE_CPU_CHUNKS (CPU -> L1)
+                     |                                 |
+                     +----------------+----------------+
+                                      |
+                                      v
+                submit_retrieve() / get_finished()
+                                      |
+                     +----------------+----------------+
+                     |                                 |
+                     v                                 v
+          RETRIEVE (L1 -> GPU)          RETRIEVE_CPU_CHUNKS + scatter_cpu_chunks_to_kv
+                     |                                 |
+                     +----------------+----------------+
+                                      |
+                                      v
+                                [READY / SERVING]
+                                      |
+                                      v
+                           unregister_kv_cache()
+                                      |
+                                      v
+                                  [TERMINATED]
+```
+
 ### Store path (non-CUDA)
 
 1. Adapter gathers chunk tensors from KV tensors.
