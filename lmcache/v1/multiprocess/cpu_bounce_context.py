@@ -76,12 +76,12 @@ def gather_chunks_to_cpu(
         shape is ``[num_layers, chunk_tokens, hidden_dim]``.
     """
     # First Party
-    import lmcache.c_ops as lmc_ops
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         is_mla,
         normalize_kv_and_discover_format,
     )
+    import lmcache.c_ops as lmc_ops
 
     tensors = list(kv_caches.values())
     fmt, normalized = normalize_kv_and_discover_format(
@@ -106,7 +106,7 @@ def gather_chunks_to_cpu(
         if use_mla:
             mla_layers: list[torch.Tensor] = []
             for layer in normalized:
-                layer_blocks = layer[chunk_block_ids]
+                layer_blocks = layer[torch.tensor(chunk_block_ids, dtype=torch.long)]
                 mla_layers.append(
                     layer_blocks.reshape(
                         len(chunk_block_ids) * block_size, layer_blocks.shape[-1]
@@ -119,14 +119,14 @@ def gather_chunks_to_cpu(
             for layer in normalized:
                 if is_hnd:
                     if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                        k_t = layer[0]
-                        v_t = layer[1]
+                        k_t = layer[0]  # type: ignore[index]
+                        v_t = layer[1]  # type: ignore[index]
                     else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _num_blocks, num_heads, _block_size, head_size = k_t.shape
-                    k_blocks = k_t[chunk_block_ids]
-                    v_blocks = v_t[chunk_block_ids]
+                        k_t = layer[:, 0]  # type: ignore[call-overload]  # type: ignore[index]
+                        v_t = layer[:, 1]  # type: ignore[call-overload]  # type: ignore[index]
+                    _num_blocks, num_heads, _block_size, head_size = k_t.shape  # type: ignore[union-attr]
+                    k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
+                    v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     # HND blocks are [NB, NH, BS, HS]; convert to token-major
                     # [NB, BS, NH, HS] before flattening to [tokens, NH*HS].
                     k_layers.append(
@@ -141,14 +141,14 @@ def gather_chunks_to_cpu(
                     )
                 else:
                     if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                        k_t = layer[0]
-                        v_t = layer[1]
+                        k_t = layer[0]  # type: ignore[index]
+                        v_t = layer[1]  # type: ignore[index]
                     else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _num_blocks, _block_size, num_heads, head_size = k_t.shape
-                    k_blocks = k_t[chunk_block_ids]
-                    v_blocks = v_t[chunk_block_ids]
+                        k_t = layer[:, 0]  # type: ignore[call-overload]  # type: ignore[index]
+                        v_t = layer[:, 1]  # type: ignore[call-overload]  # type: ignore[index]
+                    _num_blocks, _block_size, num_heads, head_size = k_t.shape  # type: ignore[union-attr]
+                    k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
+                    v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     k_layers.append(
                         k_blocks.reshape(
                             len(chunk_block_ids) * block_size, num_heads * head_size
@@ -188,12 +188,12 @@ def scatter_cpu_chunks_to_kv(
         gpu_kv_format: Optional pre-detected KV format.
     """
     # First Party
-    import lmcache.c_ops as lmc_ops
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         is_mla,
         normalize_kv_and_discover_format,
     )
+    import lmcache.c_ops as lmc_ops
 
     chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     if not chunks:
@@ -248,11 +248,11 @@ def scatter_cpu_chunks_to_kv(
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
                 v_src = chunk_device[1, layer_idx, skip_tokens:]
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                    k_t = layer[0]
-                    v_t = layer[1]
+                    k_t = layer[0]  # type: ignore[index]
+                    v_t = layer[1]  # type: ignore[index]
                 else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
+                    k_t = layer[:, 0]  # type: ignore[index]
+                    v_t = layer[:, 1]  # type: ignore[index]
                 _nb, nh, _bs, hs = k_t.shape
                 k_blocks = k_src.reshape(
                     len(effective_block_ids), block_size, nh, hs
@@ -267,11 +267,11 @@ def scatter_cpu_chunks_to_kv(
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
                 v_src = chunk_device[1, layer_idx, skip_tokens:]
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                    k_t = layer[0]
-                    v_t = layer[1]
+                    k_t = layer[0]  # type: ignore[index]  # type: ignore[index]
+                    v_t = layer[1]  # type: ignore[index]  # type: ignore[index]
                 else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
+                    k_t = layer[:, 0]  # type: ignore[index]  # type: ignore[index]
+                    v_t = layer[:, 1]  # type: ignore[index]  # type: ignore[index]
                 _num_blocks, _block_size, num_heads, head_size = k_t.shape
                 k_src_4d = k_src.reshape(
                     len(effective_block_ids), block_size, num_heads, head_size
