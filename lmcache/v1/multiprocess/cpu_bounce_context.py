@@ -3,7 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 import pickle
 
 # Third Party
@@ -98,6 +98,10 @@ def gather_chunks_to_cpu(
     block_size = get_block_size(normalized, gpu_kv_format)
     num_chunks = len(block_ids) // blocks_per_chunk
 
+    # After normalization the structure is always a list of per-layer
+    # tensors.  Cast once so all downstream indexing is typed correctly.
+    layer_tensors = cast(list[torch.Tensor], normalized)
+
     chunks: list[torch.Tensor] = []
     for chunk_idx in range(num_chunks):
         chunk_block_ids = block_ids[
@@ -105,7 +109,7 @@ def gather_chunks_to_cpu(
         ]
         if use_mla:
             mla_layers: list[torch.Tensor] = []
-            for layer in normalized:
+            for layer in layer_tensors:
                 layer_blocks = layer[torch.tensor(chunk_block_ids, dtype=torch.long)]
                 mla_layers.append(
                     layer_blocks.reshape(
@@ -116,15 +120,15 @@ def gather_chunks_to_cpu(
         else:
             k_layers: list[torch.Tensor] = []
             v_layers: list[torch.Tensor] = []
-            for layer in normalized:
+            for layer in layer_tensors:
                 if is_hnd:
                     if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                        k_t = layer[0]  # type: ignore[index]
-                        v_t = layer[1]  # type: ignore[index]
+                        k_t = layer[0]
+                        v_t = layer[1]
                     else:
-                        k_t = layer[:, 0]  # type: ignore[call-overload]  # type: ignore[index]
-                        v_t = layer[:, 1]  # type: ignore[call-overload]  # type: ignore[index]
-                    _num_blocks, num_heads, _block_size, head_size = k_t.shape  # type: ignore[union-attr]
+                        k_t = layer[:, 0]
+                        v_t = layer[:, 1]
+                    _num_blocks, num_heads, _block_size, head_size = k_t.shape
                     k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     # HND blocks are [NB, NH, BS, HS]; convert to token-major
@@ -141,12 +145,12 @@ def gather_chunks_to_cpu(
                     )
                 else:
                     if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                        k_t = layer[0]  # type: ignore[index]
-                        v_t = layer[1]  # type: ignore[index]
+                        k_t = layer[0]
+                        v_t = layer[1]
                     else:
-                        k_t = layer[:, 0]  # type: ignore[call-overload]  # type: ignore[index]
-                        v_t = layer[:, 1]  # type: ignore[call-overload]  # type: ignore[index]
-                    _num_blocks, _block_size, num_heads, head_size = k_t.shape  # type: ignore[union-attr]
+                        k_t = layer[:, 0]
+                        v_t = layer[:, 1]
+                    _num_blocks, _block_size, num_heads, head_size = k_t.shape
                     k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     k_layers.append(
@@ -214,6 +218,10 @@ def scatter_cpu_chunks_to_kv(
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     )
 
+    # After normalization the structure is always a list of per-layer
+    # tensors.  Cast once so all downstream indexing is typed correctly.
+    layer_tensors = cast(list[torch.Tensor], normalized)
+
     for chunk_idx, chunk_cpu in enumerate(chunks):
         chunk_block_ids = block_ids[
             chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
@@ -236,7 +244,7 @@ def scatter_cpu_chunks_to_kv(
         chunk_device = chunk_cpu.to(device)
 
         if use_mla:
-            for layer_idx, layer in enumerate(normalized):
+            for layer_idx, layer in enumerate(layer_tensors):
                 mla_src = chunk_device[layer_idx, skip_tokens:]
                 hidden_size = layer.shape[-1]
                 mla_src_3d = mla_src.reshape(
@@ -244,15 +252,15 @@ def scatter_cpu_chunks_to_kv(
                 )
                 layer[effective_block_ids] = mla_src_3d
         elif is_hnd:
-            for layer_idx, layer in enumerate(normalized):
+            for layer_idx, layer in enumerate(layer_tensors):
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
                 v_src = chunk_device[1, layer_idx, skip_tokens:]
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                    k_t = layer[0]  # type: ignore[index]
-                    v_t = layer[1]  # type: ignore[index]
+                    k_t = layer[0]
+                    v_t = layer[1]
                 else:
-                    k_t = layer[:, 0]  # type: ignore[index]
-                    v_t = layer[:, 1]  # type: ignore[index]
+                    k_t = layer[:, 0]
+                    v_t = layer[:, 1]
                 _nb, nh, _bs, hs = k_t.shape
                 k_blocks = k_src.reshape(
                     len(effective_block_ids), block_size, nh, hs
@@ -263,15 +271,15 @@ def scatter_cpu_chunks_to_kv(
                 k_t[effective_block_ids] = k_blocks
                 v_t[effective_block_ids] = v_blocks
         else:
-            for layer_idx, layer in enumerate(normalized):
+            for layer_idx, layer in enumerate(layer_tensors):
                 k_src = chunk_device[0, layer_idx, skip_tokens:]
                 v_src = chunk_device[1, layer_idx, skip_tokens:]
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                    k_t = layer[0]  # type: ignore[index]  # type: ignore[index]
-                    v_t = layer[1]  # type: ignore[index]  # type: ignore[index]
+                    k_t = layer[0]
+                    v_t = layer[1]
                 else:
-                    k_t = layer[:, 0]  # type: ignore[index]  # type: ignore[index]
-                    v_t = layer[:, 1]  # type: ignore[index]  # type: ignore[index]
+                    k_t = layer[:, 0]
+                    v_t = layer[:, 1]
                 _num_blocks, _block_size, num_heads, head_size = k_t.shape
                 k_src_4d = k_src.reshape(
                     len(effective_block_ids), block_size, num_heads, head_size
