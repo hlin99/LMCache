@@ -42,7 +42,13 @@ def get_default_shm_ring_size_bytes() -> int:
 
 
 class ShmTransferMetadata(msgspec.Struct):
-    """Metadata describing tensors written into a shared-memory ring buffer."""
+    """Metadata describing tensors written into a shared-memory ring buffer.
+
+    ``paddings`` records the number of skipped tail bytes before each payload
+    when a write wraps back to offset zero, so the reader can advance its
+    absolute read pointer deterministically without inferring wrap-around from
+    offsets alone.
+    """
 
     offsets: list[int]
     lengths: list[int]
@@ -165,7 +171,8 @@ class ShmRingBuffer:
 
         Args:
             tensor: Tensor to serialize into shared memory. The tensor is first
-                converted to a contiguous CPU tensor view.
+                converted to a CPU contiguous view only when required, so an
+                already CPU-contiguous tensor avoids an extra copy.
 
         Returns:
             Tuple ``(offset, length, padding)`` describing the written payload.
