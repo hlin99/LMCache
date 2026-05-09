@@ -93,8 +93,6 @@ REQUEST_NAMES = [
     "FREE_LOOKUP_LOCKS",
     "END_SESSION",
     "REGISTER_KV_CACHE_BOUNCE",
-    "STORE_CPU_CHUNKS",
-    "RETRIEVE_CPU_CHUNKS",
     "PREPARE_STORE",
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
@@ -228,16 +226,6 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             ],
             response_class=tuple[str, int],
             handler_type=HandlerType.SYNC,
-        ),
-        "STORE_CPU_CHUNKS": ProtocolDefinition(
-            payload_classes=[KeyType, int, bytes],
-            response_class=bool,
-            handler_type=HandlerType.BLOCKING,
-        ),
-        "RETRIEVE_CPU_CHUNKS": ProtocolDefinition(
-            payload_classes=[KeyType, int],
-            response_class=tuple[bool, bytes],
-            handler_type=HandlerType.BLOCKING,
         ),
         # Prepare SHM store (two-phase RPC step 1)
         # Payload:

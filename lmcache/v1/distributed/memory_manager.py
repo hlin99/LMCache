@@ -79,6 +79,14 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         _unlink_stale_shm(config.shm_name)
 
     if config.use_lazy:
+        if config.shm_name:
+            logger.warning(
+                "LazyMemoryAllocator does not support named shared memory; "
+                "shm_name=%r will be ignored. The lazy allocator is used "
+                "only in CUDA environments where workers use GPU IPC "
+                "instead of SHM.",
+                config.shm_name,
+            )
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
             "final size is %d bytes, align bytes is %d bytes",
@@ -99,7 +107,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         return MixedMemoryAllocator(
             config.size_in_bytes,
             align_bytes=config.align_bytes,
-            shm_name=config.shm_name if config.shm_name else None,
+            shm_name=config.shm_name,
         )
 
 
@@ -117,7 +125,12 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
-        self._shm_name = config.shm_name
+        # shm_name is only meaningful when MixedMemoryAllocator is used
+        # (non-lazy path). For LazyMemoryAllocator (CUDA), it's cleared.
+        if config.use_lazy:
+            self._shm_name = ""
+        else:
+            self._shm_name = config.shm_name
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
