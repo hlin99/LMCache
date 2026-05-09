@@ -639,6 +639,32 @@ class StorageManager:
         """
         return self._l1_manager.get_shm_pool_info()
 
+    def unsafe_read(
+        self, keys: list[ObjectKey]
+    ) -> tuple[list[ObjectKey], list[MemoryObj]]:
+        """Read previously read-locked objects without adding new locks.
+
+        This is used by the SHM retrieve path where read-locks are
+        held across process boundaries.  The caller must ensure that
+        ``reserve_read`` has already been called for these keys.
+
+        Args:
+            keys: Object keys to read.
+
+        Returns:
+            Tuple of (good_keys, good_objs) for keys that were
+            successfully read.  Keys that are missing or not
+            read-locked are silently excluded.
+        """
+        read_results = self._l1_manager.unsafe_read(keys)
+        good_keys: list[ObjectKey] = []
+        good_objs: list[MemoryObj] = []
+        for k, (e, o) in read_results.items():
+            if o is not None:
+                good_keys.append(k)
+                good_objs.append(o)
+        return good_keys, good_objs
+
     # Functions for debugging and testing
     def memcheck(self) -> bool:
         """

@@ -333,7 +333,7 @@ class TestGatherChunksToTensors(unittest.TestCase):
         )
 
         # Create minimal KV caches in NHD format
-        # vLLM non-MLA with shape [2, num_blocks, block_size, hidden_dim]
+        # vLLM non-MLA: [2, num_blocks, block_size, num_heads, head_size]
         num_layers = 2
         block_size = 4
         hidden_dim = 8

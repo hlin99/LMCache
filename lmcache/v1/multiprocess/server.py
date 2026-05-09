@@ -517,7 +517,7 @@ class MPCacheEngine:
         shm_name = str(shm_info["shm_name"])
 
         slots: list[ShmSlotMetadata] = []
-        for obj_key in obj_keys:
+        for idx, obj_key in enumerate(obj_keys):
             if obj_key not in reserved_dict:
                 continue
             memory_obj = reserved_dict[obj_key]
@@ -531,6 +531,7 @@ class MPCacheEngine:
                     length=memory_obj.shm_byte_length,
                     shape=list(memory_obj.tensor.shape),
                     dtype=str(memory_obj.tensor.dtype).removeprefix("torch."),
+                    chunk_index=idx,
                 )
             )
 
@@ -605,19 +606,10 @@ class MPCacheEngine:
                 f"Bounce context not registered for instance ID {instance_id}"
             )
 
-        # Manually acquire read-locks via the context manager, BUT
-        # hold the results beyond the with-block lifetime by using
-        # read_prefetched_results with careful handling.
-        # We use the storage manager's unsafe_read through the
-        # read_prefetched_results context manager approach but instead
-        # manually read and hold the locks.
-        read_results = self.storage_manager._l1_manager.unsafe_read(obj_keys)
-        good_keys: list[ObjectKey] = []
-        good_objs: list[MemoryObj] = []
-        for k, (e, o) in read_results.items():
-            if o is not None:
-                good_keys.append(k)
-                good_objs.append(o)
+        # Manually acquire read-locks via unsafe_read.
+        # The read_prefetched_results context manager would auto-release
+        # locks on exit, but we need them held until finish_read().
+        good_keys, good_objs = self.storage_manager.unsafe_read(obj_keys)
 
         if len(good_objs) != len(obj_keys):
             # Some keys missing — release any locks we did acquire

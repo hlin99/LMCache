@@ -41,6 +41,10 @@ class ShmSlotMetadata(msgspec.Struct):
         length: Byte length of the slot.
         shape: Tensor shape as a list of ints.
         dtype: Torch dtype name (e.g. ``"float16"``).
+        chunk_index: Zero-based index of the chunk this slot corresponds
+            to within the original request.  Used by the worker to match
+            slots to gathered CPU chunks when OOM causes some keys to be
+            skipped.
     """
 
     key: str
@@ -49,6 +53,7 @@ class ShmSlotMetadata(msgspec.Struct):
     length: int
     shape: list[int]
     dtype: str
+    chunk_index: int = 0
 
 
 class PrepareStoreResponse(msgspec.Struct):

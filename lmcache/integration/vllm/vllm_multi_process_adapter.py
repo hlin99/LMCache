@@ -1306,7 +1306,8 @@ class LMCacheMPWorkerAdapter:
         Returns:
             A :class:`torch.Tensor` backed by the SHM buffer.
         """
-        assert self._l1_buffer is not None
+        if self._l1_buffer is None:
+            raise ValueError("SHM pool not attached; call _attach_shm first")
         torch_dtype = getattr(torch, dtype)
         buf_view = self._l1_buffer[offset : offset + length]
         return torch.frombuffer(buf_view, dtype=torch_dtype).view(*shape)
@@ -1338,12 +1339,13 @@ class LMCacheMPWorkerAdapter:
             gpu_kv_format=self._bounce_gpu_kv_format,
         )
 
-        # Phase 2: Copy data into SHM slots
-        for chunk, slot in zip(cpu_chunks, response.slots, strict=False):
-            tensor_view = self._make_tensor_view(
-                slot.offset, slot.length, slot.shape, slot.dtype
-            )
-            tensor_view.copy_(chunk)
+        # Phase 2: Copy data into SHM slots (match by chunk_index)
+        for slot in response.slots:
+            if slot.chunk_index < len(cpu_chunks):
+                tensor_view = self._make_tensor_view(
+                    slot.offset, slot.length, slot.shape, slot.dtype
+                )
+                tensor_view.copy_(cpu_chunks[slot.chunk_index])
 
         # Phase 3: Commit
         send_lmcache_request(

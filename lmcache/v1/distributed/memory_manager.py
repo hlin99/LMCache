@@ -32,10 +32,11 @@ def _check_shm_capacity(required_bytes: int) -> None:
     """
     shm_stat = shutil.disk_usage("/dev/shm")
     if shm_stat.free < required_bytes:
+        size_gib = max(1, (required_bytes + 2**30 - 1) // 2**30)
         raise RuntimeError(
             f"Insufficient /dev/shm space: need {required_bytes / 2**30:.1f} GiB, "
             f"available {shm_stat.free / 2**30:.1f} GiB. "
-            f"Use 'docker run --shm-size={required_bytes * 2 // 2**30}g' or "
+            f"Use 'docker run --shm-size={size_gib}g' or "
             f"set Kubernetes emptyDir.medium=Memory to increase /dev/shm size."
         )
 

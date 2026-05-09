@@ -195,6 +195,8 @@ def gather_chunks_to_cpu_tensors(
         ``[2, num_layers, chunk_tokens, hidden_dim]``; for MLA,
         ``[num_layers, chunk_tokens, hidden_dim]``.
     """
+    # TODO: refactor gather_chunks_to_cpu to extract the tensor-building
+    # logic into a shared helper to avoid the pickle/unpickle round-trip.
     raw = gather_chunks_to_cpu(
         kv_caches,
         block_ids,
@@ -353,6 +355,8 @@ def scatter_tensors_to_kv(
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
     """
+    # TODO: refactor scatter_cpu_chunks_to_kv to accept tensors directly
+    # to avoid the pickle/unpickle round-trip in the SHM path.
     cpu_data = pickle.dumps(cpu_tensors)
     scatter_cpu_chunks_to_kv(
         kv_caches,
