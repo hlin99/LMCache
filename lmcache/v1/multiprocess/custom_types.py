@@ -391,3 +391,74 @@ class CBMatchResult:
     cur_st: int
     cur_ed: int
     hash: bytes
+
+
+@dataclass
+class ShmSlotMetadata:
+    """Metadata describing a single slot in the shared-memory L1 pool.
+
+    This struct is transmitted from the server to the worker process so the
+    worker can construct a zero-copy tensor view directly into the shm pool.
+
+    Attributes:
+        shm_name: Name of the POSIX shared memory segment (without leading
+            slash).  The worker must have already attached to this segment.
+        offset: Byte offset from the start of the shm pool to the first byte
+            of this slot's data.
+        length: Number of bytes in this slot (logical, not padded size).
+        shape: Tensor shape as a list of ints.
+        dtype: Torch dtype name, e.g. ``"float16"`` or ``"bfloat16"``.
+    """
+
+    shm_name: str
+    offset: int
+    length: int
+    shape: list[int]
+    dtype: str
+
+
+@dataclass
+class PrepareStoreResponse:
+    """Response to a PREPARE_STORE request.
+
+    The server replies with this struct to tell the worker which path to take:
+
+    * ``use_shm=True``: The server reserved slots in the shm L1 pool.  The
+      worker should memcpy each chunk directly into the corresponding
+      ``ShmSlotMetadata`` offset and then send a ``COMMIT_STORE`` request.
+    * ``use_shm=False``: The shm path is unavailable (pool disabled, OOM, or
+      the instance has no bounce context registered).  The worker should fall
+      back to the existing ``STORE_CPU_CHUNKS`` ring-buffer path.
+
+    Attributes:
+        use_shm: Whether to use the shm zero-copy path.
+        slots: Per-chunk slot descriptors.  Empty when ``use_shm=False``.
+    """
+
+    use_shm: bool
+    slots: list[ShmSlotMetadata]
+
+
+@dataclass
+class PrepareRetrieveResponse:
+    """Response to a PREPARE_RETRIEVE request.
+
+    * ``use_shm=True, success=True``: Keys were found in L1; slots contain
+      the shm offsets the worker should read from.  The read_lock is held
+      until the worker sends ``FINISH_READ``.
+    * ``use_shm=False``: The shm path is unavailable.  The server will handle
+      the request via the existing ``RETRIEVE_CPU_CHUNKS`` ring-buffer path.
+    * ``success=False``: The keys were not found (cache miss); ``slots`` is
+      empty regardless of ``use_shm``.
+
+    Attributes:
+        use_shm: Whether to use the shm zero-copy path.
+        success: Whether all requested keys were found in L1.
+        slots: Per-chunk slot descriptors.  Empty when ``use_shm=False`` or
+            ``success=False``.
+    """
+
+    use_shm: bool
+    success: bool
+    slots: list[ShmSlotMetadata]
+

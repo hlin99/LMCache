@@ -57,6 +57,9 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheEngineKey,
     KVCache,
+    PrepareRetrieveResponse,
+    PrepareStoreResponse,
+    ShmSlotMetadata,
 )
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
@@ -217,6 +220,19 @@ class MPCacheEngine:
         # for crash resilience (e.g., client calls lookup but never queries)
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+
+        # SHM two-phase store tracking: request_id -> reserved_dict
+        # Holds the mapping from ObjectKey to MemoryObj between
+        # prepare_store and commit_store.  Write locks are held during this
+        # interval.  Keyed by key.request_id.
+        self._shm_store_state: dict[str, dict[ObjectKey, MemoryObj]] = {}
+        self._shm_store_lock = threading.Lock()
+
+        # SHM two-phase retrieve tracking: request_id -> obj_keys
+        # Holds the obj_keys between prepare_retrieve (read_lock acquired)
+        # and finish_read (read_lock released).  Keyed by key.request_id.
+        self._shm_retrieve_state: dict[str, list[ObjectKey]] = {}
+        self._shm_retrieve_lock = threading.Lock()
 
         self._setup_metrics()
 
@@ -447,6 +463,286 @@ class MPCacheEngine:
         finally:
             if prefetched_keys:
                 self.storage_manager.finish_read_prefetched(prefetched_keys)
+
+    @_lmcache_nvtx_annotate
+    def prepare_store(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> PrepareStoreResponse:
+        """Reserve SHM L1 slots for a worker store and return slot metadata.
+
+        This is phase 1 of the two-phase SHM store protocol.  The server
+        reserves write slots in the L1 shared-memory pool and returns their
+        byte offsets so the worker can memcpy directly into the pool without
+        going through the ring buffer.
+
+        If the SHM pool is disabled, has insufficient space, or the instance
+        has no registered bounce context, this returns
+        ``PrepareStoreResponse(use_shm=False, slots=[])`` and the worker
+        should fall back to the existing ``STORE_CPU_CHUNKS`` path.
+
+        The write lock is held until the worker sends ``COMMIT_STORE``.  If
+        the worker crashes before sending ``COMMIT_STORE`` the TTLLock
+        auto-releases the write lock after ``write_ttl_seconds``.
+
+        Args:
+            key: Cache key for the token range to store.  Must have
+                ``worker_id != None``.
+            instance_id: Worker instance identifier (bounce context must be
+                registered via ``REGISTER_KV_CACHE_BOUNCE``).
+
+        Returns:
+            PrepareStoreResponse with ``use_shm=True`` and slot descriptors
+            on success, or ``use_shm=False`` on any failure.
+        """
+        _fallback = PrepareStoreResponse(use_shm=False, slots=[])
+
+        shm_info = self.storage_manager.get_shm_pool_info()
+        if not shm_info.shm_enabled:
+            return _fallback
+
+        if instance_id not in self.bounce_contexts:
+            logger.debug(
+                "prepare_store: no bounce context for instance %d", instance_id
+            )
+            return _fallback
+
+        if key.worker_id is None:
+            logger.warning("prepare_store called with worker_id=None")
+            return _fallback
+
+        session = self.session_manager.get_or_create(key.request_id)
+        session.set_tokens(list(key.token_ids))
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h)
+            for h in session.get_hashes(key.start, key.end)
+        ]
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+        ctx = self.bounce_contexts[instance_id]
+
+        reserved_dict = self.storage_manager.reserve_write(obj_keys, ctx.layout_desc, "new")
+        if not reserved_dict:
+            logger.debug(
+                "prepare_store: reserve_write returned empty (OOM or already exists); "
+                "falling back to ring buffer path"
+            )
+            return _fallback
+
+        slots: list[ShmSlotMetadata] = []
+        try:
+            for obj_key in obj_keys:
+                if obj_key not in reserved_dict:
+                    # Partial reservation is not supported for SHM path.
+                    # Release all held locks and fall back.
+                    self.storage_manager.finish_write(list(reserved_dict.keys()))
+                    with self._shm_store_lock:
+                        self._shm_store_state.pop(key.request_id, None)
+                    return _fallback
+                memory_obj = reserved_dict[obj_key]
+                offset, length = self.storage_manager.compute_shm_slot(memory_obj)
+                tensor = memory_obj.tensor
+                if tensor is None:
+                    self.storage_manager.finish_write(list(reserved_dict.keys()))
+                    return _fallback
+                shape = list(tensor.shape)
+                dtype = str(tensor.dtype).removeprefix("torch.")
+                slots.append(
+                    ShmSlotMetadata(
+                        shm_name=shm_info.shm_name,
+                        offset=offset,
+                        length=length,
+                        shape=shape,
+                        dtype=dtype,
+                    )
+                )
+        except Exception:
+            logger.exception("prepare_store: error computing shm slots; falling back")
+            self.storage_manager.finish_write(list(reserved_dict.keys()))
+            return _fallback
+
+        # Store the reserved dict under the request_id for commit_store.
+        with self._shm_store_lock:
+            self._shm_store_state[key.request_id] = reserved_dict
+
+        return PrepareStoreResponse(use_shm=True, slots=slots)
+
+    @_lmcache_nvtx_annotate
+    def commit_store(
+        self,
+        key: IPCCacheEngineKey,
+    ) -> bool:
+        """Release write locks after the worker has finished copying into SHM.
+
+        This is phase 2 of the two-phase SHM store protocol.  The server
+        calls ``finish_write`` on the keys reserved during ``prepare_store``
+        so the data becomes visible to future readers.
+
+        Args:
+            key: Cache key (must match the key used in the preceding
+                ``prepare_store`` call, same ``request_id``).
+
+        Returns:
+            True when the commit succeeded, False if no matching
+            ``prepare_store`` record was found.
+        """
+        with self._shm_store_lock:
+            reserved_dict = self._shm_store_state.pop(key.request_id, None)
+
+        if reserved_dict is None:
+            logger.warning(
+                "commit_store: no pending prepare_store for request_id=%s",
+                key.request_id,
+            )
+            return False
+
+        self.storage_manager.finish_write(list(reserved_dict.keys()))
+        return True
+
+    @_lmcache_nvtx_annotate
+    def prepare_retrieve(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> PrepareRetrieveResponse:
+        """Look up prefetched L1 objects and return SHM slot metadata.
+
+        This is phase 1 of the two-phase SHM retrieve protocol.  The server
+        calls ``unsafe_read`` on the requested keys (whose read_lock was
+        already acquired during the ``LOOKUP`` prefetch phase) and returns
+        their SHM offsets to the worker.  The read_lock remains held until
+        the worker sends ``FINISH_READ``.
+
+        If the SHM pool is disabled or the requested keys are not found in
+        L1, the method returns ``PrepareRetrieveResponse(use_shm=False, …)``
+        and the worker should use the ``RETRIEVE_CPU_CHUNKS`` path instead.
+
+        Args:
+            key: Cache key for the token range to retrieve.  Must have
+                ``worker_id != None``.
+            instance_id: Worker instance identifier (used for validation
+                that the instance has a registered bounce context).
+
+        Returns:
+            PrepareRetrieveResponse.  ``use_shm=True, success=True`` means
+            the slots are ready; ``use_shm=False`` means fall back to ring
+            buffer; ``success=False`` means cache miss.
+        """
+        _miss = PrepareRetrieveResponse(use_shm=True, success=False, slots=[])
+        _fallback = PrepareRetrieveResponse(use_shm=False, success=False, slots=[])
+
+        shm_info = self.storage_manager.get_shm_pool_info()
+        if not shm_info.shm_enabled:
+            return _fallback
+
+        if instance_id not in self.bounce_contexts:
+            logger.debug(
+                "prepare_retrieve: no bounce context for instance %d", instance_id
+            )
+            return _fallback
+
+        if key.worker_id is None:
+            logger.warning("prepare_retrieve called with worker_id=None")
+            return _fallback
+
+        session = self.session_manager.get_or_create(key.request_id)
+        session.set_tokens(list(key.token_ids))
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h)
+            for h in session.get_hashes(key.start, key.end)
+        ]
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+
+        # The read_lock was already acquired by submit_prefetch_task during
+        # the LOOKUP phase.  Call unsafe_read without acquiring new locks so
+        # the caller (worker) can release them via FINISH_READ.
+        read_results = self.storage_manager.unsafe_read_for_shm(obj_keys)
+
+        good_keys: list[ObjectKey] = []
+        good_objs: list[MemoryObj] = []
+        for k, (err, obj) in read_results.items():
+            if obj is None:
+                logger.debug(
+                    "prepare_retrieve: key %s not available (err=%s); "
+                    "falling back to ring buffer",
+                    k,
+                    err,
+                )
+                # Release any read locks we already have for good_keys.
+                if good_keys:
+                    self.storage_manager.finish_read_prefetched(good_keys)
+                return _fallback
+            good_keys.append(k)
+            good_objs.append(obj)
+
+        if not good_objs or len(good_objs) != len(obj_keys):
+            if good_keys:
+                self.storage_manager.finish_read_prefetched(good_keys)
+            return _miss
+
+        slots: list[ShmSlotMetadata] = []
+        try:
+            for memory_obj in good_objs:
+                offset, length = self.storage_manager.compute_shm_slot(memory_obj)
+                tensor = memory_obj.tensor
+                if tensor is None:
+                    self.storage_manager.finish_read_prefetched(good_keys)
+                    return _fallback
+                shape = list(tensor.shape)
+                dtype = str(tensor.dtype).removeprefix("torch.")
+                slots.append(
+                    ShmSlotMetadata(
+                        shm_name=shm_info.shm_name,
+                        offset=offset,
+                        length=length,
+                        shape=shape,
+                        dtype=dtype,
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "prepare_retrieve: error computing shm slots; falling back"
+            )
+            self.storage_manager.finish_read_prefetched(good_keys)
+            return _fallback
+
+        # Park the keys: read_lock remains held until finish_read.
+        with self._shm_retrieve_lock:
+            self._shm_retrieve_state[key.request_id] = good_keys
+
+        return PrepareRetrieveResponse(use_shm=True, success=True, slots=slots)
+
+    @_lmcache_nvtx_annotate
+    def finish_read(
+        self,
+        key: IPCCacheEngineKey,
+    ) -> bool:
+        """Release read locks after the worker has finished reading from SHM.
+
+        This is phase 2 of the two-phase SHM retrieve protocol.  The server
+        calls ``finish_read_prefetched`` on the keys whose read_lock was held
+        since ``prepare_retrieve``.
+
+        Args:
+            key: Cache key (must match the key used in the preceding
+                ``prepare_retrieve`` call, same ``request_id``).
+
+        Returns:
+            True when the finish succeeded, False if no matching
+            ``prepare_retrieve`` record was found.
+        """
+        with self._shm_retrieve_lock:
+            obj_keys = self._shm_retrieve_state.pop(key.request_id, None)
+
+        if obj_keys is None:
+            logger.warning(
+                "finish_read: no pending prepare_retrieve for request_id=%s",
+                key.request_id,
+            )
+            return False
+
+        self.storage_manager.finish_read_prefetched(obj_keys)
+        return True
 
     @_lmcache_nvtx_annotate
     def store(
@@ -1356,6 +1652,11 @@ def run_cache_server(
         RequestType.REPORT_BLOCK_ALLOCATION,
         engine.report_block_allocations,
     )
+    # SHM two-phase store/retrieve handlers
+    add_handler_helper(server, RequestType.PREPARE_STORE, engine.prepare_store)
+    add_handler_helper(server, RequestType.COMMIT_STORE, engine.commit_store)
+    add_handler_helper(server, RequestType.PREPARE_RETRIEVE, engine.prepare_retrieve)
+    add_handler_helper(server, RequestType.FINISH_READ, engine.finish_read)
 
     # Assign thread pools
     server.add_affinity_thread_pool(
@@ -1364,6 +1665,10 @@ def run_cache_server(
             RequestType.RETRIEVE,
             RequestType.STORE_CPU_CHUNKS,
             RequestType.RETRIEVE_CPU_CHUNKS,
+            RequestType.PREPARE_STORE,
+            RequestType.COMMIT_STORE,
+            RequestType.PREPARE_RETRIEVE,
+            RequestType.FINISH_READ,
         ],
         max_workers=mp_config.max_gpu_workers,
     )

@@ -371,6 +371,53 @@ class StorageManager:
             )
         )
 
+    def get_shm_pool_info(self):
+        """Return ShmPoolInfo for the L1 memory pool.
+
+        Returns:
+            ShmPoolInfo with shm_name, pool_size, shm_enabled, base_ptr.
+            When shm is disabled shm_enabled=False and base_ptr=0.
+        """
+        return self._l1_manager.get_shm_pool_info()
+
+    def unsafe_read_for_shm(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
+        """Read objects whose read locks were already acquired by a prior
+        ``reserve_read`` / prefetch call, without acquiring new locks.
+
+        This is the SHM two-phase retrieve path.  The read_lock must remain
+        held (not released) until the caller invokes ``finish_read_prefetched``
+        after the worker has finished consuming the data.
+
+        The caller is responsible for ensuring that ``reserve_read`` was
+        called before this method (typically via ``submit_prefetch_task``).
+
+        Args:
+            keys: Object keys to read.  Each key must be read-locked.
+
+        Returns:
+            A dict mapping each key to ``(L1Error, Optional[MemoryObj])``.
+            ``L1Error.SUCCESS`` with a non-None object on success.
+        """
+        return self._l1_manager.unsafe_read(keys)
+
+    def compute_shm_slot(
+        self, memory_obj: MemoryObj
+    ) -> tuple[int, int]:
+        """Compute (shm_offset, byte_length) for a memory object.
+
+        Delegates to L1Manager/L1MemoryManager.  Only valid when shm is
+        enabled.
+
+        Args:
+            memory_obj: A MemoryObj previously allocated from the L1 pool.
+
+        Returns:
+            tuple[int, int]: (shm_offset, byte_length).
+        """
+        return self._l1_manager.compute_shm_slot(memory_obj)
+
     @enable_tracing()
     def submit_prefetch_task(
         self,

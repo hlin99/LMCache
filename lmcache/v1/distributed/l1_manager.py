@@ -783,6 +783,29 @@ class L1Manager:
         """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
         return self._memory_manager.get_l1_memory_desc()
 
+    def get_shm_pool_info(self):
+        """Return ShmPoolInfo for the underlying L1 memory manager.
+
+        Returns:
+            ShmPoolInfo describing shm_name, pool_size, shm_enabled and
+            base_ptr.  Delegates directly to L1MemoryManager.
+        """
+        return self._memory_manager.get_shm_pool_info()
+
+    def compute_shm_slot(self, memory_obj: MemoryObj) -> tuple[int, int]:
+        """Compute (shm_offset, byte_length) for a MemoryObj.
+
+        Delegates directly to L1MemoryManager.  See that method for full
+        documentation.
+
+        Args:
+            memory_obj: A MemoryObj previously allocated from this L1 pool.
+
+        Returns:
+            tuple[int, int]: (shm_offset, byte_length).
+        """
+        return self._memory_manager.compute_shm_slot(memory_obj)
+
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:

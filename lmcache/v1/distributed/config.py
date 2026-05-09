@@ -35,6 +35,25 @@ class L1MemoryManagerConfig:
     align_bytes: int = field(default=0x1000)
     """ The alignment size in bytes. Default is 4KB. """
 
+    use_shm_l1_pool: bool = field(default=False)
+    """Whether to attempt using a POSIX shared memory segment for L1.
+
+    When True the server creates (or re-creates) a named shm segment so
+    worker processes can map it directly, enabling zero-copy KV transfers.
+    If the /dev/shm filesystem has insufficient free space the option is
+    silently downgraded to False with a warning — the server will NOT
+    crash. When False (default) the existing CPU bounce-buffer + ring
+    buffer path is used.
+    """
+
+    shm_name: str = field(default="lmcache_l1_pool")
+    """Name of the POSIX shared memory segment (without leading slash).
+
+    Only used when ``use_shm_l1_pool`` is True.  The server prepends a
+    slash when calling ``shm_open``; workers use the same bare name to
+    attach.  Must be a valid POSIX shm name component (no slashes).
+    """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 
@@ -150,6 +169,26 @@ def add_storage_manager_args(
         type=int,
         default=4096,
         help="The alignment size in bytes. Default is 4KB (4096 bytes).",
+    )
+    memory_group.add_argument(
+        "--l1-use-shm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Attempt to back the L1 pool with a POSIX shared memory segment "
+            "so worker processes can map it directly for zero-copy KV "
+            "transfers.  If /dev/shm is too small the server degrades "
+            "gracefully to the CPU bounce-buffer path.  (Default: False)"
+        ),
+    )
+    memory_group.add_argument(
+        "--l1-shm-name",
+        type=str,
+        default="lmcache_l1_pool",
+        help=(
+            "Name of the POSIX shared memory segment (without leading slash). "
+            "Only used when --l1-use-shm is set.  (Default: lmcache_l1_pool)"
+        ),
     )
 
     # L1 Manager Config (TTL settings)
@@ -279,6 +318,8 @@ def parse_args_to_config(
         use_lazy=args.l1_use_lazy,
         init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
         align_bytes=args.l1_align_bytes,
+        use_shm_l1_pool=args.l1_use_shm,
+        shm_name=args.l1_shm_name,
     )
 
     l1_manager_config = L1ManagerConfig(

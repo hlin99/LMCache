@@ -18,6 +18,8 @@ from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
     KVCache,
+    PrepareRetrieveResponse,
+    PrepareStoreResponse,
 )
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
@@ -35,6 +37,10 @@ REQUEST_NAMES = [
     "REGISTER_KV_CACHE_BOUNCE",
     "STORE_CPU_CHUNKS",
     "RETRIEVE_CPU_CHUNKS",
+    "PREPARE_STORE",
+    "COMMIT_STORE",
+    "PREPARE_RETRIEVE",
+    "FINISH_READ",
 ]
 
 # Type alias for cache keys
@@ -173,6 +179,47 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "RETRIEVE_CPU_CHUNKS": ProtocolDefinition(
             payload_classes=[KeyType, int],
             response_class=tuple[bool, bytes],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Prepare a SHM-based store: reserve L1 write slots and return their
+        # offsets so the worker can memcpy directly.
+        # Payload:
+        #   - key: KeyType - Cache key for the token range to store
+        #   - instance_id: int - Worker instance identifier
+        # Returns: PrepareStoreResponse (use_shm=False ⇒ fallback to ring buf)
+        "PREPARE_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareStoreResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Commit a SHM store: the worker has finished writing; release the
+        # write lock so the data becomes visible to readers.
+        # Payload:
+        #   - key: KeyType - Cache key (same as the matching PREPARE_STORE)
+        # Returns: bool (True on success)
+        "COMMIT_STORE": ProtocolDefinition(
+            payload_classes=[KeyType],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Prepare a SHM-based retrieve: look up prefetched L1 objects and
+        # return their SHM offsets.  The read_lock is kept until FINISH_READ.
+        # Payload:
+        #   - key: KeyType - Cache key for the token range to retrieve
+        #   - instance_id: int - Worker instance identifier
+        # Returns: PrepareRetrieveResponse
+        "PREPARE_RETRIEVE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareRetrieveResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Release read locks held since PREPARE_RETRIEVE.
+        # Payload:
+        #   - key: KeyType - Cache key (same as the matching PREPARE_RETRIEVE)
+        # Returns: bool (True on success)
+        "FINISH_READ": ProtocolDefinition(
+            payload_classes=[KeyType],
+            response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
     }
