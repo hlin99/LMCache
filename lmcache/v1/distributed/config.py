@@ -35,6 +35,15 @@ class L1MemoryManagerConfig:
     align_bytes: int = field(default=0x1000)
     """ The alignment size in bytes. Default is 4KB. """
 
+    shm_name: str = field(default="")
+    """Named shared-memory segment for the L1 pool.
+
+    When non-empty, the allocator creates a POSIX shared-memory segment
+    with this name (via ``shm_open``).  Worker processes can then attach
+    to the same segment for zero-copy store/retrieve.  An empty string
+    (the default) means anonymous ``mmap`` is used instead.
+    """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 

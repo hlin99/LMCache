@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import os
+import shutil
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -17,6 +21,44 @@ logger = init_logger(__name__)
 
 
 # HELPER FUNCTIONS
+def _check_shm_capacity(required_bytes: int) -> None:
+    """Verify ``/dev/shm`` has sufficient free space.
+
+    Args:
+        required_bytes: Number of bytes the L1 pool requires.
+
+    Raises:
+        RuntimeError: If ``/dev/shm`` does not have enough free space.
+    """
+    shm_stat = shutil.disk_usage("/dev/shm")
+    if shm_stat.free < required_bytes:
+        raise RuntimeError(
+            f"Insufficient /dev/shm space: need {required_bytes / 2**30:.1f} GiB, "
+            f"available {shm_stat.free / 2**30:.1f} GiB. "
+            f"Use 'docker run --shm-size={required_bytes * 2 // 2**30}g' or "
+            f"set Kubernetes emptyDir.medium=Memory to increase /dev/shm size."
+        )
+
+
+def _unlink_stale_shm(shm_name: str) -> None:
+    """Proactively remove a stale shared-memory segment if it exists.
+
+    Args:
+        shm_name: POSIX shared-memory name (e.g. ``"lmcache_l1_pool"``).
+    """
+    shm_path = f"/dev/shm/{shm_name}"
+    if os.path.exists(shm_path):
+        try:
+            os.unlink(shm_path)
+            logger.info("Removed stale shared-memory segment: %s", shm_path)
+        except OSError:
+            logger.warning(
+                "Failed to remove stale shared-memory segment: %s",
+                shm_path,
+                exc_info=True,
+            )
+
+
 def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInterface:
     """
     Create a memory allocator based on the provided configuration.
@@ -26,7 +68,15 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
 
     Returns:
         MemoryAllocatorInterface: An instance of a memory allocator.
+
+    Raises:
+        RuntimeError: If ``config.shm_name`` is set but ``/dev/shm`` has
+            insufficient free space.
     """
+    if config.shm_name:
+        _check_shm_capacity(config.size_in_bytes)
+        _unlink_stale_shm(config.shm_name)
+
     if config.use_lazy:
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
@@ -48,6 +98,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         return MixedMemoryAllocator(
             config.size_in_bytes,
             align_bytes=config.align_bytes,
+            shm_name=config.shm_name if config.shm_name else None,
         )
 
 
@@ -65,6 +116,7 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
+        self._shm_name = config.shm_name
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -168,11 +220,30 @@ class L1MemoryManager:
             align_bytes=self._align_bytes,
         )
 
+    def get_shm_pool_info(self) -> dict[str, object]:
+        """Return shared-memory pool metadata for worker attachment.
+
+        Returns:
+            A dictionary with ``"shm_name"`` (str) and ``"pool_size"``
+            (int, bytes).  ``shm_name`` is empty when the pool is not
+            backed by named shared memory.
+        """
+        return {
+            "shm_name": self._shm_name,
+            "pool_size": self._size_in_bytes,
+        }
+
     def close(self) -> None:
         """
         Close the memory manager and release all resources.
+
+        If the pool is backed by named shared memory, the segment is
+        unlinked so that the kernel can reclaim the pages once all
+        processes detach.
         """
         self._allocator.close()
+        if self._shm_name:
+            _unlink_stale_shm(self._shm_name)
 
     # Debugging APIs
     def memcheck(self):

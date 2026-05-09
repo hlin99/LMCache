@@ -10,7 +10,14 @@ This module defines the protocol for:
 - LOOKUP: Submit a prefix lookup and return a prefetch job ID
 - QUERY_PREFETCH_STATUS: Poll a prefetch job for its result
 - END_SESSION: End a session and clean up associated resources
+- PREPARE_STORE: Reserve SHM slots for a two-phase store
+- COMMIT_STORE: Commit a SHM store after worker writes
+- PREPARE_RETRIEVE: Acquire read-locks and return SHM slot metadata
+- FINISH_READ: Release read-locks after worker reads from SHM
 """
+
+# Third Party
+import msgspec
 
 # First Party
 from lmcache.utils import EngineType
@@ -20,6 +27,53 @@ from lmcache.v1.multiprocess.custom_types import (
     KVCache,
 )
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
+
+
+# ---------- SHM-path msgspec structs ----------
+
+class ShmSlotMetadata(msgspec.Struct):
+    """Metadata for a single SHM slot returned by prepare_store/prepare_retrieve.
+
+    Attributes:
+        key: Stringified object key for commit/finish correlation.
+        shm_name: POSIX shared-memory segment name.
+        offset: Byte offset of the slot relative to the pool base.
+        length: Byte length of the slot.
+        shape: Tensor shape as a list of ints.
+        dtype: Torch dtype name (e.g. ``"float16"``).
+    """
+
+    key: str
+    shm_name: str
+    offset: int
+    length: int
+    shape: list[int]
+    dtype: str
+
+
+class PrepareStoreResponse(msgspec.Struct):
+    """Response for ``PREPARE_STORE``.
+
+    Contains only the slots that were successfully allocated.
+    Keys that hit OOM are silently excluded (consistent with the CUDA path).
+
+    Attributes:
+        slots: List of successfully allocated slot metadata.
+    """
+
+    slots: list[ShmSlotMetadata]
+
+
+class PrepareRetrieveResponse(msgspec.Struct):
+    """Response for ``PREPARE_RETRIEVE``.
+
+    Attributes:
+        success: ``True`` if all requested keys were found and read-locked.
+        slots: Slot metadata for the read-locked keys (empty on failure).
+    """
+
+    success: bool
+    slots: list[ShmSlotMetadata]
 
 # Define request names for this protocol group
 REQUEST_NAMES = [
@@ -35,6 +89,10 @@ REQUEST_NAMES = [
     "REGISTER_KV_CACHE_BOUNCE",
     "STORE_CPU_CHUNKS",
     "RETRIEVE_CPU_CHUNKS",
+    "PREPARE_STORE",
+    "COMMIT_STORE",
+    "PREPARE_RETRIEVE",
+    "FINISH_READ",
 ]
 
 # Type alias for cache keys
@@ -162,7 +220,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 str,
                 bool,
             ],
-            response_class=None,
+            response_class=tuple[str, int],
             handler_type=HandlerType.SYNC,
         ),
         "STORE_CPU_CHUNKS": ProtocolDefinition(
@@ -173,6 +231,46 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "RETRIEVE_CPU_CHUNKS": ProtocolDefinition(
             payload_classes=[KeyType, int],
             response_class=tuple[bool, bytes],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Prepare SHM store (two-phase RPC step 1)
+        # Payload:
+        #   - key: KeyType - Cache key for the token range
+        #   - instance_id: int - Worker instance identifier
+        # Returns: PrepareStoreResponse - only successfully allocated slots
+        "PREPARE_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareStoreResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Commit SHM store (two-phase RPC step 2)
+        # Payload:
+        #   - key: KeyType - Original cache key from prepare_store
+        #   - instance_id: int - Worker instance identifier
+        # Returns: bool - True if commit succeeded
+        "COMMIT_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Prepare SHM retrieve (two-phase RPC step 1)
+        # Payload:
+        #   - key: KeyType - Cache key for the token range
+        #   - instance_id: int - Worker instance identifier
+        # Returns: PrepareRetrieveResponse - slot metadata with held read-locks
+        "PREPARE_RETRIEVE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareRetrieveResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Finish SHM read (two-phase RPC step 2)
+        # Payload:
+        #   - key: KeyType - Original cache key from prepare_retrieve
+        #   - instance_id: int - Worker instance identifier
+        # Returns: bool - True if locks released
+        "FINISH_READ": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
     }

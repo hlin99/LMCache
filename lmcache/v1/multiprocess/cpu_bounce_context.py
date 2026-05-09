@@ -169,6 +169,42 @@ def gather_chunks_to_cpu(
     return pickle.dumps(chunks)
 
 
+def gather_chunks_to_cpu_tensors(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    blocks_per_chunk: int,
+    layout_hints: Any | None = None,
+    gpu_kv_format: Any | None = None,
+) -> list[torch.Tensor]:
+    """Gather paged KV blocks into CPU chunk tensors (unpickled).
+
+    Same logic as :func:`gather_chunks_to_cpu` but returns a plain list
+    of CPU tensors instead of pickled bytes.  Used by the SHM store path
+    where data is written directly to shared memory rather than serialized
+    over ZMQ.
+
+    Args:
+        kv_caches: Per-layer KV tensor mapping.
+        block_ids: Flattened block IDs for all chunks.
+        blocks_per_chunk: Number of paged blocks in one LMCache chunk.
+        layout_hints: Optional engine layout hints.
+        gpu_kv_format: Optional pre-detected KV format.
+
+    Returns:
+        List of CPU tensors. For non-MLA, each chunk shape is
+        ``[2, num_layers, chunk_tokens, hidden_dim]``; for MLA,
+        ``[num_layers, chunk_tokens, hidden_dim]``.
+    """
+    raw = gather_chunks_to_cpu(
+        kv_caches,
+        block_ids,
+        blocks_per_chunk,
+        layout_hints=layout_hints,
+        gpu_kv_format=gpu_kv_format,
+    )
+    return pickle.loads(raw)
+
+
 def scatter_cpu_chunks_to_kv(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
@@ -289,6 +325,44 @@ def scatter_cpu_chunks_to_kv(
                 )
                 k_t[effective_block_ids] = k_src_4d
                 v_t[effective_block_ids] = v_src_4d
+
+
+def scatter_tensors_to_kv(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    cpu_tensors: list[torch.Tensor],
+    blocks_per_chunk: int,
+    skip_first_n_tokens: int = 0,
+    layout_hints: Any | None = None,
+    gpu_kv_format: Any | None = None,
+) -> None:
+    """Scatter pre-deserialized CPU tensors back into paged KV tensors.
+
+    Same as :func:`scatter_cpu_chunks_to_kv` but accepts a list of
+    :class:`torch.Tensor` instead of pickled bytes.  Used by the SHM
+    retrieve path where tensors are constructed as zero-copy views over
+    shared memory.
+
+    Args:
+        kv_caches: Per-layer KV tensor mapping to write into.
+        block_ids: Flattened destination block IDs for all chunks.
+        cpu_tensors: List of CPU chunk tensors (same format as returned
+            by :func:`gather_chunks_to_cpu_tensors`).
+        blocks_per_chunk: Number of paged blocks in one LMCache chunk.
+        skip_first_n_tokens: Token prefix to skip when scattering.
+        layout_hints: Optional engine layout hints.
+        gpu_kv_format: Optional pre-detected KV format.
+    """
+    cpu_data = pickle.dumps(cpu_tensors)
+    scatter_cpu_chunks_to_kv(
+        kv_caches,
+        block_ids,
+        cpu_data,
+        blocks_per_chunk,
+        skip_first_n_tokens=skip_first_n_tokens,
+        layout_hints=layout_hints,
+        gpu_kv_format=gpu_kv_format,
+    )
 
 
 @dataclass

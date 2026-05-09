@@ -67,6 +67,11 @@ from lmcache.v1.multiprocess.protocol import (
     get_handler_type,
     get_payload_classes,
 )
+from lmcache.v1.multiprocess.protocols.engine import (
+    PrepareRetrieveResponse,
+    PrepareStoreResponse,
+    ShmSlotMetadata,
+)
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 import lmcache.c_ops as lmc_ops
@@ -218,6 +223,16 @@ class MPCacheEngine:
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
 
+        # SHM two-phase store/retrieve tracking.
+        # Maps (request_id, instance_id) -> list[ObjectKey] for pending ops.
+        self._pending_shm_stores: dict[
+            tuple[str, int], list[ObjectKey]
+        ] = {}
+        self._pending_shm_reads: dict[
+            tuple[str, int], list[ObjectKey]
+        ] = {}
+        self._shm_lock = threading.Lock()
+
         self._setup_metrics()
 
     def register_kv_cache(
@@ -288,7 +303,7 @@ class MPCacheEngine:
         hidden_dim_size: int,
         dtype_str: str,
         use_mla: bool,
-    ) -> None:
+    ) -> tuple[str, int]:
         """Register non-CUDA KV layout metadata for CPU bounce-buffer mode.
 
         Args:
@@ -306,6 +321,11 @@ class MPCacheEngine:
                 ``[num_layers, chunk_size, hidden_dim_size]``; non-MLA stores
                 separate K/V planes with shape
                 ``[2, num_layers, chunk_size, hidden_dim_size]``.
+
+        Returns:
+            Tuple of ``(shm_name, pool_size)`` for worker SHM attachment.
+            ``shm_name`` is empty when the pool is not backed by named
+            shared memory.
 
         Raises:
             ValueError: If ``dtype_str`` is not a valid torch dtype name.
@@ -336,6 +356,10 @@ class MPCacheEngine:
             use_mla=use_mla,
         )
         self.bounce_context_meta[instance_id] = (model_name, world_size)
+
+        # Return SHM pool info so workers can attach
+        shm_info = self.storage_manager.get_shm_pool_info()
+        return (str(shm_info["shm_name"]), int(shm_info["pool_size"]))
 
     @_lmcache_nvtx_annotate
     def store_cpu_chunks(
@@ -447,6 +471,226 @@ class MPCacheEngine:
         finally:
             if prefetched_keys:
                 self.storage_manager.finish_read_prefetched(prefetched_keys)
+
+    # ---- SHM two-phase store/retrieve handlers ----
+
+    @_lmcache_nvtx_annotate
+    def prepare_store(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> PrepareStoreResponse:
+        """Reserve L1 slots and return SHM metadata for a two-phase store.
+
+        The server allocates memory for each chunk key via
+        ``reserve_write``.  Keys that fail due to OOM are silently
+        skipped (consistent with the CUDA GPU path).  The write-lock
+        is held for every successfully allocated key until the worker
+        calls ``commit_store``.
+
+        Args:
+            key: Cache key for the token range to store.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            A :class:`PrepareStoreResponse` containing only the
+            successfully allocated slots.
+
+        Raises:
+            ValueError: If the instance has no registered bounce context.
+        """
+        session = self.session_manager.get_or_create(key.request_id)
+        session.set_tokens(list(key.token_ids))
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h)
+            for h in session.get_hashes(key.start, key.end)
+        ]
+        if key.worker_id is None:
+            raise ValueError("Must store with worker_id != None")
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+
+        if instance_id not in self.bounce_contexts:
+            raise ValueError(
+                f"Bounce context not registered for instance ID {instance_id}"
+            )
+        ctx = self.bounce_contexts[instance_id]
+        reserved_dict = self.storage_manager.reserve_write(
+            obj_keys, ctx.layout_desc, "new"
+        )
+
+        shm_info = self.storage_manager.get_shm_pool_info()
+        shm_name = str(shm_info["shm_name"])
+
+        slots: list[ShmSlotMetadata] = []
+        for obj_key in obj_keys:
+            if obj_key not in reserved_dict:
+                continue
+            memory_obj = reserved_dict[obj_key]
+            if memory_obj.tensor is None:
+                continue
+            slots.append(
+                ShmSlotMetadata(
+                    key=str(obj_key),
+                    shm_name=shm_name,
+                    offset=memory_obj.shm_offset,
+                    length=memory_obj.shm_byte_length,
+                    shape=list(memory_obj.tensor.shape),
+                    dtype=str(memory_obj.tensor.dtype).removeprefix("torch."),
+                )
+            )
+
+        # Track the reserved keys for commit_store
+        committed_keys = [
+            obj_key for obj_key in obj_keys if obj_key in reserved_dict
+        ]
+        if committed_keys:
+            with self._shm_lock:
+                self._pending_shm_stores[
+                    (key.request_id, instance_id)
+                ] = committed_keys
+
+        return PrepareStoreResponse(slots=slots)
+
+    @_lmcache_nvtx_annotate
+    def commit_store(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> bool:
+        """Commit a SHM store after the worker has written data.
+
+        Releases the write-lock for each key, making the data visible
+        to readers and triggering the async L2 store pipeline.
+
+        Args:
+            key: Original cache key from ``prepare_store``.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            ``True`` if all keys were committed successfully.
+        """
+        with self._shm_lock:
+            obj_keys = self._pending_shm_stores.pop(
+                (key.request_id, instance_id), []
+            )
+        if obj_keys:
+            self.storage_manager.finish_write(obj_keys)
+        return True
+
+    @_lmcache_nvtx_annotate
+    def prepare_retrieve(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> PrepareRetrieveResponse:
+        """Acquire read-locks and return SHM slot metadata.
+
+        Unlike the CUDA path which uses the ``read_prefetched_results``
+        context manager, the SHM path manually acquires read-locks via
+        ``unsafe_read`` because the lock must be held until the worker
+        explicitly calls ``finish_read`` after consuming the data.
+
+        Args:
+            key: Cache key for the token range to retrieve.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            A :class:`PrepareRetrieveResponse` with slot metadata.  If
+            any key is missing, ``success`` is ``False`` and any
+            partially-acquired locks are released.
+
+        Raises:
+            ValueError: If the instance has no registered bounce context.
+        """
+        session = self.session_manager.get_or_create(key.request_id)
+        session.set_tokens(list(key.token_ids))
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h)
+            for h in session.get_hashes(key.start, key.end)
+        ]
+        if key.worker_id is None:
+            raise ValueError("Must retrieve with worker_id != None")
+        obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+
+        if instance_id not in self.bounce_contexts:
+            raise ValueError(
+                f"Bounce context not registered for instance ID {instance_id}"
+            )
+
+        # Manually acquire read-locks via the context manager, BUT
+        # hold the results beyond the with-block lifetime by using
+        # read_prefetched_results with careful handling.
+        # We use the storage manager's unsafe_read through the
+        # read_prefetched_results context manager approach but instead
+        # manually read and hold the locks.
+        read_results = self.storage_manager._l1_manager.unsafe_read(obj_keys)
+        good_keys: list[ObjectKey] = []
+        good_objs: list[MemoryObj] = []
+        for k, (e, o) in read_results.items():
+            if o is not None:
+                good_keys.append(k)
+                good_objs.append(o)
+
+        if len(good_objs) != len(obj_keys):
+            # Some keys missing — release any locks we did acquire
+            if good_keys:
+                self.storage_manager.finish_read_prefetched(good_keys)
+            return PrepareRetrieveResponse(success=False, slots=[])
+
+        shm_info = self.storage_manager.get_shm_pool_info()
+        shm_name = str(shm_info["shm_name"])
+
+        slots: list[ShmSlotMetadata] = []
+        for obj_key, memory_obj in zip(obj_keys, good_objs, strict=True):
+            if memory_obj.tensor is None:
+                # Should not happen after unsafe_read success
+                self.storage_manager.finish_read_prefetched(good_keys)
+                return PrepareRetrieveResponse(success=False, slots=[])
+            slots.append(
+                ShmSlotMetadata(
+                    key=str(obj_key),
+                    shm_name=shm_name,
+                    offset=memory_obj.shm_offset,
+                    length=memory_obj.shm_byte_length,
+                    shape=list(memory_obj.tensor.shape),
+                    dtype=str(memory_obj.tensor.dtype).removeprefix("torch."),
+                )
+            )
+
+        # Track the read-locked keys for finish_read
+        with self._shm_lock:
+            self._pending_shm_reads[
+                (key.request_id, instance_id)
+            ] = good_keys
+
+        # read_locks are held and will NOT be released until
+        # the worker explicitly calls finish_read().
+        return PrepareRetrieveResponse(success=True, slots=slots)
+
+    @_lmcache_nvtx_annotate
+    def finish_read(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> bool:
+        """Release read-locks after the worker has read from SHM.
+
+        After this call the eviction controller may reclaim the slots.
+
+        Args:
+            key: Original cache key from ``prepare_retrieve``.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            ``True`` if all locks were released.
+        """
+        with self._shm_lock:
+            obj_keys = self._pending_shm_reads.pop(
+                (key.request_id, instance_id), []
+            )
+        if obj_keys:
+            self.storage_manager.finish_read_prefetched(obj_keys)
+        return True
 
     @_lmcache_nvtx_annotate
     def store(
@@ -1346,6 +1590,10 @@ def run_cache_server(
     add_handler_helper(
         server, RequestType.RETRIEVE_CPU_CHUNKS, engine.retrieve_cpu_chunks
     )
+    add_handler_helper(server, RequestType.PREPARE_STORE, engine.prepare_store)
+    add_handler_helper(server, RequestType.COMMIT_STORE, engine.commit_store)
+    add_handler_helper(server, RequestType.PREPARE_RETRIEVE, engine.prepare_retrieve)
+    add_handler_helper(server, RequestType.FINISH_READ, engine.finish_read)
     add_handler_helper(server, RequestType.CLEAR, engine.clear)
     add_handler_helper(server, RequestType.GET_CHUNK_SIZE, engine.get_chunk_size)
     add_handler_helper(server, RequestType.PING, engine.ping)
@@ -1364,6 +1612,10 @@ def run_cache_server(
             RequestType.RETRIEVE,
             RequestType.STORE_CPU_CHUNKS,
             RequestType.RETRIEVE_CPU_CHUNKS,
+            RequestType.PREPARE_STORE,
+            RequestType.COMMIT_STORE,
+            RequestType.PREPARE_RETRIEVE,
+            RequestType.FINISH_READ,
         ],
         max_workers=mp_config.max_gpu_workers,
     )

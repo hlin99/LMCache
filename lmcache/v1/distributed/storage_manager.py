@@ -630,6 +630,15 @@ class StorageManager:
             "num_l2_adapters": len(self._l2_adapters),
         }
 
+    def get_shm_pool_info(self) -> dict[str, object]:
+        """Return shared-memory pool metadata for worker attachment.
+
+        Returns:
+            A dictionary with ``"shm_name"`` (str) and ``"pool_size"``
+            (int, bytes).
+        """
+        return self._l1_manager.get_shm_pool_info()
+
     # Functions for debugging and testing
     def memcheck(self) -> bool:
         """
