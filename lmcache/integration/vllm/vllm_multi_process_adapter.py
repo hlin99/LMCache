@@ -866,7 +866,8 @@ class LMCacheMPWorkerAdapter:
         # Attach to SHM pool for bounce-buffer workers
         if self._use_bounce_buffer and result is not None:
             shm_name, pool_size = result
-            self._attach_shm(shm_name, pool_size)
+            if shm_name:
+                self._attach_shm(shm_name, pool_size)
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""

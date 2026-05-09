@@ -208,7 +208,7 @@ def gather_chunks_to_cpu_tensors(
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
 ) -> list[torch.Tensor]:
-    """Gather paged KV blocks into CPU chunk tensors (zero-copy).
+    """Gather paged KV blocks into CPU chunk tensors (no serialization).
 
     Same logic as :func:`gather_chunks_to_cpu` but returns a plain list
     of CPU tensors without pickle serialization.  Used by the SHM store
