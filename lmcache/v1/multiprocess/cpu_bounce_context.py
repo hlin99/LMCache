@@ -178,6 +178,10 @@ def gather_chunks_to_cpu(
 ) -> bytes:
     """Gather paged KV blocks into CPU chunk tensors (serialized).
 
+    .. note::
+        Kept for backward compatibility with external consumers.
+        Internal SHM paths use :func:`gather_chunks_to_cpu_tensors` instead.
+
     Args:
         kv_caches: Per-layer KV tensor mapping.
         block_ids: Flattened block IDs for all chunks.
@@ -364,6 +368,10 @@ def scatter_cpu_chunks_to_kv(
     gpu_kv_format: Any | None = None,
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
+
+    .. note::
+        Kept for backward compatibility with external consumers.
+        Internal SHM paths use :func:`scatter_tensors_to_kv` instead.
 
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.

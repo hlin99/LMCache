@@ -224,6 +224,11 @@ class MPCacheEngine:
 
         # SHM two-phase store/retrieve tracking.
         # Maps (request_id, instance_id) -> list[ObjectKey] for pending ops.
+        # TODO: implement periodic cleanup of stale _pending_shm_stores/reads
+        # entries for crash resilience (e.g., client calls prepare_store but
+        # never commits, or calls prepare_retrieve but never finish_read).
+        # Write-locks are released by TTLLock timeout (600s), but the dict
+        # entries themselves will leak until the server restarts.
         self._pending_shm_stores: dict[tuple[str, int], list[ObjectKey]] = {}
         self._pending_shm_reads: dict[tuple[str, int], list[ObjectKey]] = {}
         self._shm_lock = threading.Lock()
@@ -495,6 +500,11 @@ class MPCacheEngine:
             )
 
         # Manually acquire read-locks via unsafe_read.
+        # Precondition: the worker must have already gone through the
+        # lookup → query_prefetch_status flow, which calls
+        # finish_write_and_reserve_read to acquire read-locks on these
+        # keys.  unsafe_read returns the already-locked MemoryObj
+        # references without adding new locks.
         # The read_prefetched_results context manager would auto-release
         # locks on exit, but we need them held until finish_read().
         good_keys, good_objs = self.storage_manager.unsafe_read(obj_keys)
