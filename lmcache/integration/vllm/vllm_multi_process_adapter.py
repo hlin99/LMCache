@@ -1285,15 +1285,12 @@ class LMCacheMPWorkerAdapter:
         if shm.size < pool_size:
             shm.close()
             raise ValueError(
-                f"SHM pool size mismatch: expected at least {pool_size}, "
-                f"got {shm.size}"
+                f"SHM pool size mismatch: expected at least {pool_size}, got {shm.size}"
             )
         self._l1_shm = shm
         self._l1_buffer = shm.buf
         self._use_shm = True
-        logger.info(
-            "Attached to SHM pool %s (size=%d bytes)", shm_name, pool_size
-        )
+        logger.info("Attached to SHM pool %s (size=%d bytes)", shm_name, pool_size)
 
     def _make_tensor_view(
         self, offset: int, length: int, shape: list[int], dtype: str
@@ -1327,9 +1324,7 @@ class LMCacheMPWorkerAdapter:
             RequestType.PREPARE_STORE,
             [key, self.instance_id],
         )
-        response: PrepareStoreResponse = prep_future.result(
-            timeout=self._mq_timeout
-        )
+        response: PrepareStoreResponse = prep_future.result(timeout=self._mq_timeout)
 
         if not response.slots:
             return
@@ -1357,9 +1352,7 @@ class LMCacheMPWorkerAdapter:
             [key, self.instance_id],
         ).result(timeout=self._mq_timeout)
 
-    def _shm_retrieve(
-        self, key: IPCCacheEngineKey, op: LoadStoreOp
-    ) -> bool:
+    def _shm_retrieve(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> bool:
         """Execute a two-phase SHM retrieve: prepare → read → finish.
 
         Args:
@@ -1375,9 +1368,7 @@ class LMCacheMPWorkerAdapter:
             RequestType.PREPARE_RETRIEVE,
             [key, self.instance_id],
         )
-        response: PrepareRetrieveResponse = prep_future.result(
-            timeout=self._mq_timeout
-        )
+        response: PrepareRetrieveResponse = prep_future.result(timeout=self._mq_timeout)
 
         if not response.success or not response.slots:
             return False
@@ -1385,9 +1376,7 @@ class LMCacheMPWorkerAdapter:
         try:
             # Phase 2: Read from SHM and scatter to KV caches
             cpu_tensors = [
-                self._make_tensor_view(
-                    slot.offset, slot.length, slot.shape, slot.dtype
-                )
+                self._make_tensor_view(slot.offset, slot.length, slot.shape, slot.dtype)
                 for slot in response.slots
             ]
             scatter_tensors_to_kv(

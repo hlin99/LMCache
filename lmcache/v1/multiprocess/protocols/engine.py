@@ -28,8 +28,8 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
-
 # ---------- SHM-path msgspec structs ----------
+
 
 class ShmSlotMetadata(msgspec.Struct):
     """Metadata for a single SHM slot returned by prepare_store/prepare_retrieve.
@@ -74,6 +74,7 @@ class PrepareRetrieveResponse(msgspec.Struct):
 
     success: bool
     slots: list[ShmSlotMetadata]
+
 
 # Define request names for this protocol group
 REQUEST_NAMES = [

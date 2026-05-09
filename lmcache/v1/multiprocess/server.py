@@ -225,12 +225,8 @@ class MPCacheEngine:
 
         # SHM two-phase store/retrieve tracking.
         # Maps (request_id, instance_id) -> list[ObjectKey] for pending ops.
-        self._pending_shm_stores: dict[
-            tuple[str, int], list[ObjectKey]
-        ] = {}
-        self._pending_shm_reads: dict[
-            tuple[str, int], list[ObjectKey]
-        ] = {}
+        self._pending_shm_stores: dict[tuple[str, int], list[ObjectKey]] = {}
+        self._pending_shm_reads: dict[tuple[str, int], list[ObjectKey]] = {}
         self._shm_lock = threading.Lock()
 
         self._setup_metrics()
@@ -502,8 +498,7 @@ class MPCacheEngine:
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [
-            TokenHasher.hash_to_bytes(h)
-            for h in session.get_hashes(key.start, key.end)
+            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
         ]
         if key.worker_id is None:
             raise ValueError("Must store with worker_id != None")
@@ -540,14 +535,10 @@ class MPCacheEngine:
             )
 
         # Track the reserved keys for commit_store
-        committed_keys = [
-            obj_key for obj_key in obj_keys if obj_key in reserved_dict
-        ]
+        committed_keys = [obj_key for obj_key in obj_keys if obj_key in reserved_dict]
         if committed_keys:
             with self._shm_lock:
-                self._pending_shm_stores[
-                    (key.request_id, instance_id)
-                ] = committed_keys
+                self._pending_shm_stores[(key.request_id, instance_id)] = committed_keys
 
         return PrepareStoreResponse(slots=slots)
 
@@ -570,9 +561,7 @@ class MPCacheEngine:
             ``True`` if all keys were committed successfully.
         """
         with self._shm_lock:
-            obj_keys = self._pending_shm_stores.pop(
-                (key.request_id, instance_id), []
-            )
+            obj_keys = self._pending_shm_stores.pop((key.request_id, instance_id), [])
         if obj_keys:
             self.storage_manager.finish_write(obj_keys)
         return True
@@ -605,8 +594,7 @@ class MPCacheEngine:
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [
-            TokenHasher.hash_to_bytes(h)
-            for h in session.get_hashes(key.start, key.end)
+            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
         ]
         if key.worker_id is None:
             raise ValueError("Must retrieve with worker_id != None")
@@ -659,9 +647,7 @@ class MPCacheEngine:
 
         # Track the read-locked keys for finish_read
         with self._shm_lock:
-            self._pending_shm_reads[
-                (key.request_id, instance_id)
-            ] = good_keys
+            self._pending_shm_reads[(key.request_id, instance_id)] = good_keys
 
         # read_locks are held and will NOT be released until
         # the worker explicitly calls finish_read().
@@ -685,9 +671,7 @@ class MPCacheEngine:
             ``True`` if all locks were released.
         """
         with self._shm_lock:
-            obj_keys = self._pending_shm_reads.pop(
-                (key.request_id, instance_id), []
-            )
+            obj_keys = self._pending_shm_reads.pop((key.request_id, instance_id), [])
         if obj_keys:
             self.storage_manager.finish_read_prefetched(obj_keys)
         return True
