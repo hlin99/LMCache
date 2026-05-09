@@ -107,7 +107,7 @@ class TestL1MemoryManagerConfigFields:
 
 
 # ---------------------------------------------------------------------------
-# 2. ShmPoolInfo tests (no CUDA needed — shm disabled path)
+# 2. ShmPoolInfo tests (no CUDA needed - shm disabled path)
 # ---------------------------------------------------------------------------
 
 
@@ -367,7 +367,7 @@ class TestShmPoolInfoStructure:
 
 
 # ---------------------------------------------------------------------------
-# 6. MPCacheEngine state management (no CUDA required — uses mocks)
+# 6. MPCacheEngine state management (no CUDA required - uses mocks)
 # ---------------------------------------------------------------------------
 
 
@@ -392,9 +392,6 @@ def _make_engine_shm_disabled():
     Build an MPCacheEngine with a fully mocked StorageManager that reports
     shm disabled.  Returns (engine, mock_storage_manager).
     """
-    # Third Party
-    import torch
-
     # First Party
     from lmcache.v1.distributed.memory_manager import ShmPoolInfo
     from lmcache.v1.multiprocess.server import MPCacheEngine
@@ -407,31 +404,25 @@ def _make_engine_shm_disabled():
         base_ptr=0,
     )
 
-    with patch(
-        "lmcache.v1.multiprocess.server.StorageManager",
-        return_value=mock_sm,
-    ):
-        engine = MPCacheEngine.__new__(MPCacheEngine)
-        engine.storage_manager = mock_sm
-        engine.bounce_contexts = {}
-        engine.bounce_context_meta = {}
-        engine.gpu_contexts = {}
-        engine.gpu_context_meta = {}
-        engine.chunk_size = 256
-        engine.session_manager = MagicMock()
-        engine.token_hasher = MagicMock()
-        engine.token_hasher.compute_chunk_hashes.return_value = [b"\x00" * 16]
-        engine.session_manager.get_or_create.return_value.get_hashes.return_value = [
-            0
-        ]
-        engine.lock = __import__("threading").Lock()
-        engine._prefetch_jobs = {}
-        engine._prefetch_job_lock = __import__("threading").Lock()
-        engine._shm_store_state = {}
-        engine._shm_store_lock = __import__("threading").Lock()
-        engine._shm_retrieve_state = {}
-        engine._shm_retrieve_lock = __import__("threading").Lock()
-        engine._event_bus = MagicMock()
+    engine = MPCacheEngine.__new__(MPCacheEngine)
+    engine.storage_manager = mock_sm
+    engine.bounce_contexts = {}
+    engine.bounce_context_meta = {}
+    engine.gpu_contexts = {}
+    engine.gpu_context_meta = {}
+    engine.chunk_size = 256
+    engine.session_manager = MagicMock()
+    engine.token_hasher = MagicMock()
+    engine.token_hasher.compute_chunk_hashes.return_value = [b"\x00" * 16]
+    engine.session_manager.get_or_create.return_value.get_hashes.return_value = [0]
+    engine.lock = threading.Lock()
+    engine._prefetch_jobs = {}
+    engine._prefetch_job_lock = threading.Lock()
+    engine._shm_store_state = {}
+    engine._shm_store_lock = threading.Lock()
+    engine._shm_retrieve_state = {}
+    engine._shm_retrieve_lock = threading.Lock()
+    engine._event_bus = MagicMock()
 
     return engine, mock_sm
 
@@ -597,6 +588,6 @@ class TestCheckShmCapacity:
         # First Party
         from lmcache.v1.distributed.memory_manager import _check_shm_capacity
 
-        # 1 PiB — definitely not available
+        # 1 PiB - definitely not available
         result = _check_shm_capacity(2**50)
         assert result is False

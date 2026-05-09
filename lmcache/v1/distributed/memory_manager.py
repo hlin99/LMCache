@@ -64,10 +64,11 @@ def _check_shm_capacity(required_bytes: int) -> bool:
         logger.warning(
             "Insufficient /dev/shm space: need %.1f GiB, available %.1f GiB. "
             "SHM L1 pool disabled; falling back to CPU bounce-buffer path. "
-            "Use 'docker run --shm-size=%dg' to enlarge /dev/shm.",
+            "Increase /dev/shm size via your container runtime or system "
+            "configuration (e.g. '--shm-size' for Docker, "
+            "'emptyDir.medium: Memory' for Kubernetes).",
             required_bytes / 2**30,
             shm_stat.free / 2**30,
-            (required_bytes * 2) // 2**30 + 1,
         )
         return False
 

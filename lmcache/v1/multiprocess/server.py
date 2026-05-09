@@ -529,22 +529,22 @@ class MPCacheEngine:
             )
             return _fallback
 
+        def _abort_store(reserved: dict[ObjectKey, MemoryObj]) -> PrepareStoreResponse:
+            """Release write locks and return a fallback response."""
+            self.storage_manager.finish_write(list(reserved.keys()))
+            return _fallback
+
         slots: list[ShmSlotMetadata] = []
         try:
             for obj_key in obj_keys:
                 if obj_key not in reserved_dict:
                     # Partial reservation is not supported for SHM path.
-                    # Release all held locks and fall back.
-                    self.storage_manager.finish_write(list(reserved_dict.keys()))
-                    with self._shm_store_lock:
-                        self._shm_store_state.pop(key.request_id, None)
-                    return _fallback
+                    return _abort_store(reserved_dict)
                 memory_obj = reserved_dict[obj_key]
                 offset, length = self.storage_manager.compute_shm_slot(memory_obj)
                 tensor = memory_obj.tensor
                 if tensor is None:
-                    self.storage_manager.finish_write(list(reserved_dict.keys()))
-                    return _fallback
+                    return _abort_store(reserved_dict)
                 shape = list(tensor.shape)
                 dtype = str(tensor.dtype).removeprefix("torch.")
                 slots.append(
@@ -558,8 +558,7 @@ class MPCacheEngine:
                 )
         except Exception:
             logger.exception("prepare_store: error computing shm slots; falling back")
-            self.storage_manager.finish_write(list(reserved_dict.keys()))
-            return _fallback
+            return _abort_store(reserved_dict)
 
         # Store the reserved dict under the request_id for commit_store.
         with self._shm_store_lock:
