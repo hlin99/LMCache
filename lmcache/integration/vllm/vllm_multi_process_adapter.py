@@ -1300,12 +1300,23 @@ class LMCacheMPWorkerAdapter:
             logger.exception("SHM store failed; will release write-locks")
         finally:
             # Phase 3: Always commit (even on failure) to release
-            # write-locks and prevent 600s TTL deadlock
-            send_lmcache_request(
-                self.mq_client,
-                RequestType.COMMIT_STORE,
-                [key, self.instance_id],
-            ).result(timeout=self._mq_timeout)
+            # write-locks and prevent 600s TTL deadlock.
+            # TODO: On partial write failure, commit_store still calls
+            # finish_write for all reserved keys, making partially-written
+            # data visible to readers.  Consider adding ABORT_STORE that
+            # releases write-locks without triggering StoreListener, so
+            # corrupted slots are not promoted to L2.
+            try:
+                send_lmcache_request(
+                    self.mq_client,
+                    RequestType.COMMIT_STORE,
+                    [key, self.instance_id],
+                ).result(timeout=self._mq_timeout)
+            except Exception:
+                logger.warning(
+                    "Failed to send COMMIT_STORE; "
+                    "write-locks will auto-release via TTL"
+                )
 
     def _shm_retrieve(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> bool:
         """Execute a two-phase SHM retrieve: prepare → read → finish.
