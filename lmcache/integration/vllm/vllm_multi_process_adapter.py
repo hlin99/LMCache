@@ -1279,29 +1279,32 @@ class LMCacheMPWorkerAdapter:
         if not response.slots:
             return
 
-        # Gather chunks to CPU tensors (not pickled)
-        cpu_chunks = gather_chunks_to_cpu_tensors(
-            self.kv_caches,
-            op.block_ids,
-            self.blocks_in_chunk,
-            layout_hints=self._bounce_layout_hints,
-            gpu_kv_format=self._bounce_gpu_kv_format,
-        )
+        try:
+            # Gather chunks to CPU tensors (not pickled)
+            cpu_chunks = gather_chunks_to_cpu_tensors(
+                self.kv_caches,
+                op.block_ids,
+                self.blocks_in_chunk,
+                layout_hints=self._bounce_layout_hints,
+                gpu_kv_format=self._bounce_gpu_kv_format,
+            )
 
-        # Phase 2: Copy data into SHM slots (match by chunk_index)
-        for slot in response.slots:
-            if slot.chunk_index < len(cpu_chunks):
-                tensor_view = self._make_tensor_view(
-                    slot.offset, slot.length, slot.shape, slot.dtype
-                )
-                tensor_view.copy_(cpu_chunks[slot.chunk_index])
-
-        # Phase 3: Commit
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.COMMIT_STORE,
-            [key, self.instance_id],
-        ).result(timeout=self._mq_timeout)
+            # Phase 2: Copy data into SHM slots (match by chunk_index)
+            for slot in response.slots:
+                if slot.chunk_index < len(cpu_chunks):
+                    tensor_view = self._make_tensor_view(
+                        slot.offset, slot.length, slot.shape, slot.dtype
+                    )
+                    tensor_view.copy_(cpu_chunks[slot.chunk_index])
+        except Exception:
+            logger.exception("SHM store failed, releasing write-locks")
+        finally:
+            # Phase 3: Always commit to release write-locks
+            send_lmcache_request(
+                self.mq_client,
+                RequestType.COMMIT_STORE,
+                [key, self.instance_id],
+            ).result(timeout=self._mq_timeout)
 
     def _shm_retrieve(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> bool:
         """Execute a two-phase SHM retrieve: prepare → read → finish.
@@ -1344,11 +1347,17 @@ class LMCacheMPWorkerAdapter:
             return False
         finally:
             # Phase 3: Release read-locks
-            send_lmcache_request(
-                self.mq_client,
-                RequestType.FINISH_READ,
-                [key, self.instance_id],
-            ).result(timeout=self._mq_timeout)
+            try:
+                send_lmcache_request(
+                    self.mq_client,
+                    RequestType.FINISH_READ,
+                    [key, self.instance_id],
+                ).result(timeout=self._mq_timeout)
+            except Exception:
+                logger.warning(
+                    "Failed to send FINISH_READ; "
+                    "read-locks will auto-release via TTL"
+                )
 
         return True
 

@@ -233,6 +233,11 @@ class MPCacheEngine:
         self._pending_shm_reads: dict[tuple[str, int], list[ObjectKey]] = {}
         self._shm_lock = threading.Lock()
 
+        # Cache SHM pool info — immutable after construction.
+        _shm_info = self.storage_manager.get_shm_pool_info()
+        self._cached_shm_name: str = str(_shm_info["shm_name"])
+        self._cached_shm_pool_size: int = int(_shm_info["pool_size"])
+
         self._setup_metrics()
 
     def register_kv_cache(
@@ -358,8 +363,7 @@ class MPCacheEngine:
         self.bounce_context_meta[instance_id] = (model_name, world_size)
 
         # Return SHM pool info so workers can attach
-        shm_info = self.storage_manager.get_shm_pool_info()
-        return (str(shm_info["shm_name"]), int(shm_info["pool_size"]))
+        return (self._cached_shm_name, self._cached_shm_pool_size)
 
     # ---- SHM two-phase store/retrieve handlers ----
 
@@ -406,8 +410,7 @@ class MPCacheEngine:
             obj_keys, ctx.layout_desc, "new"
         )
 
-        shm_info = self.storage_manager.get_shm_pool_info()
-        shm_name = str(shm_info["shm_name"])
+        shm_name = self._cached_shm_name
 
         slots: list[ShmSlotMetadata] = []
         for idx, obj_key in enumerate(obj_keys):
@@ -515,8 +518,7 @@ class MPCacheEngine:
                 self.storage_manager.finish_read_prefetched(good_keys)
             return PrepareRetrieveResponse(success=False, slots=[])
 
-        shm_info = self.storage_manager.get_shm_pool_info()
-        shm_name = str(shm_info["shm_name"])
+        shm_name = self._cached_shm_name
 
         slots: list[ShmSlotMetadata] = []
         for obj_key, memory_obj in zip(obj_keys, good_objs, strict=True):

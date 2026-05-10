@@ -76,12 +76,13 @@ class TestL1MemoryManagerShmConfig(unittest.TestCase):
     """Tests for L1MemoryManagerConfig with shm_name."""
 
     def test_default_shm_name(self):
-        """Config defaults to 'lmcache_l1_pool' shm_name."""
+        """Config defaults to 'lmcache_l1_pool_<pid>' shm_name."""
         config = L1MemoryManagerConfig(
             size_in_bytes=1 << 20,
             use_lazy=False,
         )
-        self.assertEqual(config.shm_name, "lmcache_l1_pool")
+        self.assertTrue(config.shm_name.startswith("lmcache_l1_pool_"))
+        self.assertIn(str(os.getpid()), config.shm_name)
 
     def test_shm_name_propagated(self):
         """Config with shm_name passes through to the allocator."""

@@ -47,6 +47,10 @@ class ShmSlotMetadata(msgspec.Struct):
             skipped.
     """
 
+    # TODO: ``shm_name`` is identical for every slot in a response because
+    # the server has a single SHM pool.  Consider lifting it to the
+    # ``PrepareStoreResponse`` / ``PrepareRetrieveResponse`` level to
+    # reduce per-slot serialization overhead for large batches.
     key: str
     shm_name: str
     offset: int

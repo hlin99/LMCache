@@ -5,6 +5,7 @@ Configuration for distributed storage manager
 """
 
 # Standard
+import os
 from dataclasses import dataclass, field
 from typing import Literal
 import argparse
@@ -35,12 +36,17 @@ class L1MemoryManagerConfig:
     align_bytes: int = field(default=0x1000)
     """ The alignment size in bytes. Default is 4KB. """
 
-    shm_name: str = field(default="lmcache_l1_pool")
+    shm_name: str = field(
+        default_factory=lambda: f"lmcache_l1_pool_{os.getpid()}"
+    )
     """Named shared-memory segment for the L1 pool.
 
     The allocator creates a POSIX shared-memory segment with this name
     (via ``shm_open``).  Worker processes attach to the same segment for
     zero-copy store/retrieve.
+
+    The default includes the server PID so that multiple LMCache instances
+    on the same machine do not collide.
     """
 
     def __post_init__(self):
