@@ -234,9 +234,9 @@ class MPCacheEngine:
         self._shm_lock = threading.Lock()
 
         # Cache SHM pool info — immutable after construction.
-        _shm_info = self.storage_manager.get_shm_pool_info()
-        self._cached_shm_name: str = str(_shm_info["shm_name"])
-        self._cached_shm_pool_size: int = int(_shm_info["pool_size"])
+        shm_info = self.storage_manager.get_shm_pool_info()
+        self._cached_shm_name: str = str(shm_info["shm_name"])
+        self._cached_shm_pool_size: int = int(shm_info["pool_size"])
 
         self._setup_metrics()
 

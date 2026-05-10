@@ -1297,9 +1297,10 @@ class LMCacheMPWorkerAdapter:
                     )
                     tensor_view.copy_(cpu_chunks[slot.chunk_index])
         except Exception:
-            logger.exception("SHM store failed, releasing write-locks")
+            logger.exception("SHM store failed; will release write-locks")
         finally:
-            # Phase 3: Always commit to release write-locks
+            # Phase 3: Always commit (even on failure) to release
+            # write-locks and prevent 600s TTL deadlock
             send_lmcache_request(
                 self.mq_client,
                 RequestType.COMMIT_STORE,
