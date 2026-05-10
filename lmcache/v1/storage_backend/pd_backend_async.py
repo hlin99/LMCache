@@ -296,9 +296,24 @@ class PDBackendAsync(AllocatorBackendInterface):
         self.running = True
 
         self.tp_rank = metadata.worker_id
+        logger.info(
+            "[PD-INIT] PDBackendAsync.__init__ starting, tp_rank=%d, pid=%d",
+            self.tp_rank,
+            os.getpid(),
+        )
 
         self.pd_config = PDConfig.from_cache_engine_config(
             config, metadata, self.tp_rank
+        )
+        logger.info(
+            "[PD-INIT] role=%s, peer_host=%s, peer_init_port=%s, "
+            "peer_alloc_port=%s, buffer_size=%s, buffer_device=%s",
+            self.pd_config.role,
+            self.pd_config.peer_host,
+            self.pd_config.peer_init_port,
+            self.pd_config.peer_alloc_port,
+            self.pd_config.buffer_size,
+            self.pd_config.buffer_device,
         )
 
         # Cache timing config values as instance attributes for convenient access.
@@ -354,6 +369,11 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
             self._sender_thread.start()
             event_loop = self._sender_loop
+            logger.info(
+                "[PD-INIT] Sender event loop started, thread=%s, tid=%d",
+                self._sender_thread.name,
+                self._sender_thread.ident or -1,
+            )
         elif self.pd_config.role == "receiver":
             self._recv_loop = asyncio.new_event_loop()
             self._recv_thread = threading.Thread(
@@ -363,6 +383,11 @@ class PDBackendAsync(AllocatorBackendInterface):
             )
             self._recv_thread.start()
             event_loop = self._recv_loop
+            logger.info(
+                "[PD-INIT] Receiver event loop started, thread=%s, tid=%d",
+                self._recv_thread.name,
+                self._recv_thread.ident or -1,
+            )
         else:
             raise ValueError("Invalid PD role.")
 
@@ -664,11 +689,13 @@ class PDBackendAsync(AllocatorBackendInterface):
     def _init_sender(self) -> None:
         """Initialize sender-side sockets and locks on the sender event loop."""
         proxy_url = f"{self.pd_config.proxy_host}:{self.pd_config.proxy_port}"
+        logger.info("[PD-SENDER] Initializing proxy socket at %s", proxy_url)
         future = asyncio.run_coroutine_threadsafe(
             self._async_init_proxy_socket(proxy_url),
             self._sender_loop,
         )
         future.result(timeout=10)
+        logger.info("[PD-SENDER] Proxy socket initialized successfully")
 
     async def _async_init_proxy_socket(self, proxy_url: str) -> None:
         """Create the async ZMQ PUSH socket for ProxyNotif messages.
@@ -700,7 +727,13 @@ class PDBackendAsync(AllocatorBackendInterface):
             receiver_init_url = f"{receiver_host}:{receiver_init_port}"
             receiver_mem_alloc_url = f"{receiver_host}:{receiver_alloc_port}"
 
-            # Establish the connection with the receiver/decoder.
+            logger.info(
+                "[PD-SENDER] Establishing peer connection to receiver=%s "
+                "(init_url=%s, alloc_url=%s)",
+                receiver_id,
+                receiver_init_url,
+                receiver_mem_alloc_url,
+            )
             # The transfer channel uses an async ZMQ context (async_mode=True), so
             # we must call the async version scheduled on the sender event loop.
             future = asyncio.run_coroutine_threadsafe(
@@ -722,6 +755,10 @@ class PDBackendAsync(AllocatorBackendInterface):
             future.result(timeout=10)  # Wait for socket to be created
 
             self.initialized_peers.add(receiver_id)
+            logger.info(
+                "[PD-SENDER] Peer connection established to receiver=%s",
+                receiver_id,
+            )
 
     async def _async_create_alloc_socket(
         self, receiver_id: str, receiver_mem_alloc_url: str
@@ -849,10 +886,24 @@ class PDBackendAsync(AllocatorBackendInterface):
                 is_last_batch=is_last_batch,
                 total_chunks=self._req_total_chunks.get(req_id, 0),
             )
+            logger.info(
+                "[PD-XFER] req=%s sending alloc request to receiver=%s, "
+                "num_chunks=%d, is_last=%s, total_chunks=%d",
+                req_id,
+                receiver_id,
+                num_chunks,
+                is_last_batch,
+                self._req_total_chunks.get(req_id, 0),
+            )
             alloc_response = await self._async_remote_allocate(
                 receiver_id, alloc_request
             )
             remote_indexes = alloc_response.remote_indexes
+            logger.info(
+                "[PD-XFER] req=%s got alloc response, remote_indexes=%s",
+                req_id,
+                remote_indexes[:5] if len(remote_indexes) > 5 else remote_indexes,
+            )
 
             # Abort if any remote slot failed to allocate.
             for idx, (mem_obj, remote_addr) in enumerate(
@@ -887,6 +938,11 @@ class PDBackendAsync(AllocatorBackendInterface):
                 await self.transfer_channel.async_batched_write(
                     objects=memory_objs,
                     transfer_spec=channel_transfer_spec,
+                )
+                logger.info(
+                    "[PD-XFER] req=%s RDMA write completed, num_chunks=%d",
+                    req_id,
+                    num_chunks,
                 )
                 for idx, mem_obj in enumerate(memory_objs):
                     if idx not in completed_indexes:
@@ -998,8 +1054,10 @@ class PDBackendAsync(AllocatorBackendInterface):
         try:
             notif_msg = ProxyNotif(req_id=req_id)
             notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+            logger.info("[PD-PROXY] Sending ProxyNotif for req=%s", req_id)
             async with self._proxy_send_lock:
                 await self._async_proxy_socket.send(notif_msg_bytes)
+            logger.info("[PD-PROXY] ProxyNotif sent for req=%s", req_id)
         except Exception as e:
             logger.error("Failed to send ProxyNotif for req %s: %s", req_id, e)
 
@@ -1156,6 +1214,12 @@ class PDBackendAsync(AllocatorBackendInterface):
                     # ROUTER frames: [identity, empty_delimiter, payload]
                     identity = frames[0]
                     payload = frames[-1]
+                    logger.info(
+                        "[PD-RECV] Received alloc request from identity=%s, "
+                        "payload_size=%d",
+                        identity,
+                        len(payload),
+                    )
                     task = asyncio.create_task(
                         self._handle_alloc_request(socket, identity, payload)
                     )
@@ -1198,6 +1262,11 @@ class PDBackendAsync(AllocatorBackendInterface):
             if isinstance(msg, CancelNotif):
                 # Release keys and reservation for the cancelled request.
                 req_id = msg.req_id
+                logger.info(
+                    "[PD-RECV] CancelNotif for req=%s, keys_count=%d",
+                    req_id,
+                    len(msg.keys),
+                )
                 for key_str in msg.keys:
                     try:
                         key = CacheEngineKey.from_string(key_str)
@@ -1224,7 +1293,23 @@ class PDBackendAsync(AllocatorBackendInterface):
                     f"Expected AllocRequest from remote peer, got {type(msg).__name__}"
                 )
             n_keys = len(msg.keys)
+            logger.info(
+                "[PD-RECV] AllocRequest: req=%s, n_keys=%d, "
+                "total_chunks=%d, is_last=%s, fmt=%d",
+                msg.req_id,
+                n_keys,
+                msg.total_chunks,
+                msg.is_last_batch,
+                msg.fmt,
+            )
             alloc_resp = await self._async_allocate_and_put(msg)
+            logger.info(
+                "[PD-RECV] AllocResponse: req=%s, indexes=%s",
+                msg.req_id,
+                alloc_resp.remote_indexes[:5]
+                if len(alloc_resp.remote_indexes) > 5
+                else alloc_resp.remote_indexes,
+            )
             resp_bytes = msgspec.msgpack.encode(alloc_resp)
             async with self._router_send_lock:
                 await socket.send_multipart([identity, b"", resp_bytes])
@@ -1560,11 +1645,17 @@ class PDBackendAsync(AllocatorBackendInterface):
                 for t in asyncio.all_tasks(loop)
                 if t is not asyncio.current_task() and not t.done()
             ]
+            logger.info(
+                "[PD-SHUTDOWN] Cancelling %d pending tasks on loop %s",
+                len(tasks),
+                thread.name,
+            )
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             loop.stop()
             shutdown_done.set()
+            logger.info("[PD-SHUTDOWN] Loop %s stopped.", thread.name)
 
         if loop.is_running():
             loop.call_soon_threadsafe(loop.create_task, _cancel_and_stop())
@@ -1581,6 +1672,11 @@ class PDBackendAsync(AllocatorBackendInterface):
         """
         Close the storage backend.
         """
+        logger.info(
+            "[PD-CLOSE] PDBackendAsync.close() called, role=%s, pid=%d",
+            self.pd_config.role,
+            os.getpid(),
+        )
         self.running = False
         # Wake up any threads blocked on the sender staging condition so they
         # can observe running=False and exit cleanly.
@@ -1591,11 +1687,13 @@ class PDBackendAsync(AllocatorBackendInterface):
             thread.join()
         # Shut down sender async loop if present
         if hasattr(self, "_sender_loop"):
+            logger.info("[PD-CLOSE] Shutting down sender event loop...")
             self._shutdown_loop(
                 self._sender_loop,
                 self._sender_thread,
                 timeout=self.pd_config.shutdown_timeout_sec,
             )
+            logger.info("[PD-CLOSE] Sender event loop shutdown complete.")
             # Close async alloc sockets
             for sock in self._async_alloc_sockets.values():
                 try:
@@ -1608,6 +1706,7 @@ class PDBackendAsync(AllocatorBackendInterface):
                 pass
         # Shut down receiver async loop if present
         if hasattr(self, "_recv_loop"):
+            logger.info("[PD-CLOSE] Shutting down receiver event loop...")
             # Wait for any in-flight allocation tasks to finish gracefully
             # before tearing down the loop.
             if hasattr(self, "_pending_alloc_tasks"):
@@ -1635,8 +1734,11 @@ class PDBackendAsync(AllocatorBackendInterface):
                 self._recv_thread,
                 timeout=self.pd_config.shutdown_timeout_sec,
             )
+            logger.info("[PD-CLOSE] Receiver event loop shutdown complete.")
         self.transfer_channel.close()
+        logger.info("[PD-CLOSE] Transfer channel closed.")
         self.zmq_context.term()
+        logger.info("[PD-CLOSE] ZMQ context terminated. PDBackendAsync fully closed.")
 
     def pin(self, key: CacheEngineKey) -> bool:
         """Pin the memory object for the given key to prevent eviction.

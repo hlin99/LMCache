@@ -38,13 +38,24 @@ export GIT_TERMINAL_PROMPT=0
 PIDS=()
 on_exit() {
     local rc=$?
-    echo "--- Cleaning up (exit code: $rc)..."
+    echo "--- Cleaning up (exit code: $rc, signal=$(kill -l $rc 2>/dev/null || echo 'N/A'))..."
+    echo "[DEBUG-CLEANUP] Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    echo "[DEBUG-CLEANUP] PIDs to clean: ${PIDS[*]}"
     for p in "${PIDS[@]}"; do
-        kill "$p" 2>/dev/null || true
-        wait "$p" 2>/dev/null || true
+        if kill -0 "$p" 2>/dev/null; then
+            echo "[DEBUG-CLEANUP] Process $p is still alive, killing..."
+            kill "$p" 2>/dev/null || true
+            wait "$p" 2>/dev/null || true
+            echo "[DEBUG-CLEANUP] Process $p terminated."
+        else
+            echo "[DEBUG-CLEANUP] Process $p already dead."
+        fi
     done
     # Copy vLLM server logs to repo root so Buildkite can collect them as artifacts
     cp /tmp/build_${BUILD_ID}_${CFG_NAME%.yaml}*.log "${REPO_ROOT}/" 2>/dev/null || true
+    echo "[DEBUG-CLEANUP] Final GPU state:"
+    nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader 2>/dev/null || true
+    echo "[DEBUG-CLEANUP] Done."
     sleep 5
 }
 trap on_exit EXIT INT TERM
@@ -87,6 +98,9 @@ start_single_server() {
     mapfile -t vllm_cli_args < <(yq -r '.args // [] | .[]' <<<"$vllm_section")
 
     echo "Starting vLLM: model=$vllm_model port=$port gpu=${gpu:-all}"
+    echo "[DEBUG-START] Env vars: ${env_cmd[*]}"
+    echo "[DEBUG-START] CLI args: ${vllm_cli_args[*]}"
+    echo "[DEBUG-START] Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     env "${env_cmd[@]}" \
         vllm serve "$vllm_model" "${vllm_cli_args[@]}" --port "$port" \
         >"$logfile" 2>&1 &
@@ -100,6 +114,7 @@ start_single_server() {
         tail -50 "$logfile" || true
         return 1
     fi
+    echo "[DEBUG-START] Server on port $port ready at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 }
 
 ###############
@@ -144,6 +159,7 @@ if [[ "$feature_type" == "pd" ]]; then
 
     # Start disagg proxy
     echo "--- Starting PD proxy on port $PORT"
+    echo "[DEBUG-PD] Prefiller PID=${PIDS[-2]} on port $PORT1, Decoder PID=${PIDS[-1]} on port $PORT2"
     python3 "${REPO_ROOT}/examples/disagg_prefill/disagg_proxy_server.py" \
         --port "$PORT" \
         --prefiller-port "$PORT1" \
@@ -153,7 +169,20 @@ if [[ "$feature_type" == "pd" ]]; then
         --proxy-port "$proxy" \
         > "${REPO_ROOT}/${CFG_NAME%.yaml}-proxy.log" 2>&1 &
     PIDS+=($!)
+    echo "[DEBUG-PD] Proxy PID=$! on port $PORT"
     sleep 10
+
+    # Check all PD processes are alive before running workload
+    echo "[DEBUG-PD] Pre-workload process health check:"
+    for p in "${PIDS[@]}"; do
+        if kill -0 "$p" 2>/dev/null; then
+            echo "[DEBUG-PD]   PID $p: ALIVE"
+        else
+            echo "[DEBUG-PD]   PID $p: DEAD (unexpected!)"
+            wait "$p" 2>/dev/null
+            echo "[DEBUG-PD]   Exit code: $?"
+        fi
+    done
 
 elif [[ "$feature_type" == "p2p" ]]; then
     # ── Peer-to-Peer mode (2 GPUs) ──────────────────────────
@@ -209,6 +238,23 @@ fi
 ###############
 # WORKLOAD    #
 ###############
+
+# Start background process monitor for PD mode
+if [[ "$feature_type" == "pd" ]]; then
+    (
+        echo "[DEBUG-MONITOR] Background PD process monitor started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        while true; do
+            sleep 15
+            for p in "${PIDS[@]}"; do
+                if ! kill -0 "$p" 2>/dev/null; then
+                    echo "[DEBUG-MONITOR] PID $p DIED at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                fi
+            done
+        done
+    ) &
+    MONITOR_PID=$!
+    # Don't add to PIDS to avoid confusing the monitor itself
+fi
 
 test_mode="$(yq -r '.workload.type' "$cfg_file")"
 

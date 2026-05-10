@@ -93,6 +93,16 @@ class NixlChannel(BaseTransferChannel):
             device=device,
         )
         self.nixl_agent = self.nixl_wrapper.agent
+        logger.info(
+            "[NIXL-INIT] NixlChannel created: role=%s, tp_rank=%d, "
+            "buffer_size=%d, async_mode=%s, backends=%s, device=%s",
+            self.role,
+            kwargs["tp_rank"],
+            kwargs["buffer_size"],
+            async_mode,
+            backends,
+            device,
+        )
 
         # Used for P2P
         self.peer_lookup_url = kwargs.get("peer_lookup_url", None)
@@ -125,6 +135,12 @@ class NixlChannel(BaseTransferChannel):
         peer_init_url: str,
         init_side_msg: Optional[InitSideMsgBase] = None,
     ) -> Optional[InitSideRetMsgBase]:
+        logger.info(
+            "[NIXL-CONN] lazy_init_peer_connection: local=%s, peer=%s, url=%s",
+            local_id,
+            peer_id,
+            peer_init_url,
+        )
         # Initialize temporary socket for nixl initialization
         init_tmp_socket = get_zmq_socket(
             self.zmq_context,
@@ -167,6 +183,11 @@ class NixlChannel(BaseTransferChannel):
             remote_agent_name, remote_xfer_dlist
         )
         self.remote_xfer_handlers_dict[peer_id] = remote_xfer_handlers
+        logger.info(
+            "[NIXL-CONN] Peer connection established: peer=%s, remote_agent=%s",
+            peer_id,
+            remote_agent_name,
+        )
 
         # Send side message if any
         init_ret_msg: Optional[InitSideRetMsgBase] = None
@@ -177,6 +198,10 @@ class NixlChannel(BaseTransferChannel):
             )
 
         init_tmp_socket.close()
+        logger.info(
+            "[NIXL-CONN] lazy_init_peer_connection complete for peer=%s",
+            peer_id,
+        )
         return init_ret_msg
 
     async def async_lazy_init_peer_connection(
@@ -186,6 +211,12 @@ class NixlChannel(BaseTransferChannel):
         peer_init_url: str,
         init_side_msg: Optional[InitSideMsgBase] = None,
     ) -> Optional[InitSideRetMsgBase]:
+        logger.info(
+            "[NIXL-CONN] async_lazy_init_peer_connection: local=%s, peer=%s, url=%s",
+            local_id,
+            peer_id,
+            peer_init_url,
+        )
         # Initialize temporary socket for nixl initialization
         init_tmp_socket = get_zmq_socket(
             self.zmq_context,
@@ -227,6 +258,10 @@ class NixlChannel(BaseTransferChannel):
             remote_agent_name, remote_xfer_dlist
         )
         self.remote_xfer_handlers_dict[peer_id] = remote_xfer_handlers
+        logger.info(
+            "[NIXL-CONN] async peer connection established: peer=%s",
+            peer_id,
+        )
 
         # Send side message if any
         init_ret_msg: Optional[InitSideRetMsgBase] = None
@@ -520,6 +555,13 @@ class NixlChannel(BaseTransferChannel):
         """
 
         assert transfer_spec is not None
+        logger.info(
+            "[NIXL-WRITE] async_batched_write: receiver=%s, "
+            "num_objects=%d, remote_indexes=%s",
+            transfer_spec.get("receiver_id", "?"),
+            len(objects),
+            transfer_spec.get("remote_indexes", [])[:5],
+        )
 
         handle = self.nixl_agent.make_prepped_xfer(
             "WRITE",
@@ -532,18 +574,20 @@ class NixlChannel(BaseTransferChannel):
 
         # TODO(Jiayi) tune hyperparameters
         wait_time = 0.001
+        poll_count = 0
         while True:
             status = self.nixl_agent.check_xfer_state(handle)
+            poll_count += 1
             logger.debug(f"Transfer status: {status}")
 
             if status == "ERR":
-                logger.error("Error in send operation")
+                logger.error("[NIXL-WRITE] RDMA write ERR after %d polls", poll_count)
                 raise RuntimeError("Failed to send objects to remote peer")
             elif status == "PROC":
                 await asyncio.sleep(wait_time)  # Avoid busy waiting
                 continue
             assert status == "DONE", f"Transfer status is {status}, expected DONE"
-            # self._proxy_side_channel.send(notif_msg_bytes)
+            logger.info("[NIXL-WRITE] RDMA write DONE after %d polls", poll_count)
             break
         return len(objects)
 
@@ -594,15 +638,22 @@ class NixlChannel(BaseTransferChannel):
     ############################################################
 
     def close(self):
+        logger.info("[NIXL-CLOSE] NixlChannel.close() called, role=%s", self.role)
         self.running = False
         for thread in self.running_threads:
             thread.join()
+        logger.info("[NIXL-CLOSE] Running threads joined.")
         self.zmq_context.term()
+        logger.info("[NIXL-CLOSE] ZMQ context terminated.")
         self.nixl_agent.deregister_memory(self.nixl_wrapper.reg_descs)
+        logger.info("[NIXL-CLOSE] Memory deregistered.")
         self.nixl_agent.release_dlist_handle(self.nixl_wrapper.xfer_handler)
 
         for remote_xfer_handler in self.remote_xfer_handlers_dict.values():
             self.nixl_agent.release_dlist_handle(remote_xfer_handler)
+        logger.info(
+            "[NIXL-CLOSE] All dlist handles released. NixlChannel fully closed."
+        )
 
 
 @dataclass
@@ -675,3 +726,14 @@ class NixlAgentWrapper:
         self.reg_descs = reg_descs
         self.xfer_descs = xfer_descs
         self.xfer_handler = xfer_handler
+        logger.info(
+            "[NIXL-AGENT] NixlAgentWrapper initialized: "
+            "buffer_size=%d, page_size=%d, tp_rank=%d, "
+            "backends=%s, mem_type=%s, num_xfer_descs=%d",
+            buffer_size,
+            page_size,
+            tp_rank,
+            backends,
+            mem_type,
+            len(xfer_desc),
+        )
