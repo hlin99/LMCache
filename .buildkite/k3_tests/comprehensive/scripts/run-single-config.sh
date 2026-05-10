@@ -38,7 +38,11 @@ export GIT_TERMINAL_PROMPT=0
 PIDS=()
 on_exit() {
     local rc=$?
-    echo "--- Cleaning up (exit code: $rc, signal=$(kill -l $rc 2>/dev/null || echo 'N/A'))..."
+    echo "--- Cleaning up (exit code: $rc)..."
+    # Decode signal if process was killed (exit code > 128)
+    if [[ $rc -gt 128 ]]; then
+        echo "[DEBUG-CLEANUP] Killed by signal: $(kill -l $((rc - 128)) 2>/dev/null || echo 'unknown')"
+    fi
     echo "[DEBUG-CLEANUP] Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     echo "[DEBUG-CLEANUP] PIDs to clean: ${PIDS[*]}"
     for p in "${PIDS[@]}"; do
@@ -55,6 +59,10 @@ on_exit() {
     cp /tmp/build_${BUILD_ID}_${CFG_NAME%.yaml}*.log "${REPO_ROOT}/" 2>/dev/null || true
     echo "[DEBUG-CLEANUP] Final GPU state:"
     nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader 2>/dev/null || true
+    # Kill the background monitor if running
+    if [[ -n "${MONITOR_PID:-}" ]] && kill -0 "$MONITOR_PID" 2>/dev/null; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+    fi
     echo "[DEBUG-CLEANUP] Done."
     sleep 5
 }
