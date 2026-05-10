@@ -129,6 +129,10 @@ async def lifespan(app: FastAPI):
     )
     for host, port in prefill_pairs:
         prefiller_base_url = f"http://{host}:{int(port)}"
+        logger.info(
+            "[PROXY-INIT] Registering prefiller client: url=%s",
+            prefiller_base_url,
+        )
         prefill_client = httpx.AsyncClient(timeout=None, base_url=prefiller_base_url)
         app.state.prefill_clients.append(
             ClientInfo(
@@ -168,10 +172,25 @@ async def lifespan(app: FastAPI):
                 alloc_ports,
             )
         )
+        logger.info(
+            "[PROXY-INIT] Registering decoder client %d: url=%s, "
+            "init_ports=%s, alloc_ports=%s",
+            i,
+            decoder_base_url,
+            init_ports,
+            alloc_ports,
+        )
 
     app.state.total_clients = app.state.prefill_clients + app.state.decode_clients
+    logger.info(
+        "[PROXY-INIT] Total clients: %d prefill + %d decode = %d",
+        len(app.state.prefill_clients),
+        len(app.state.decode_clients),
+        len(app.state.total_clients),
+    )
 
     app.state.zmq_task = asyncio.create_task(zmq_pull_server())
+    logger.info("[PROXY-INIT] ZMQ pull server task created")
 
     global pd_buffer_semaphore
     kv_bytes_per_token = compute_kv_bytes_per_token(global_args.model)
@@ -192,14 +211,18 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: Close clients
+    logger.info("[PROXY-SHUTDOWN] Lifespan shutdown starting...")
     for client in app.state.prefill_clients:
         await client.aclose()
+    logger.info("[PROXY-SHUTDOWN] Prefill clients closed.")
     for client in app.state.decode_clients:
         await client.aclose()
+    logger.info("[PROXY-SHUTDOWN] Decode clients closed.")
 
     global run_proxy
     run_proxy = False
     await app.state.zmq_task  # Wait for background task to finish
+    logger.info("[PROXY-SHUTDOWN] ZMQ task finished. Proxy shutdown complete.")
 
 
 # Update FastAPI app initialization to use lifespan
@@ -360,8 +383,9 @@ async def zmq_pull_server():
     except zmq.ZMQError:
         logger.exception("ZMQ proxy server failed to bind on %s", proxy_url)
         return
-    logger.info("ZMQ proxy server started on %s", proxy_url)
+    logger.info("[PROXY-ZMQ] ZMQ PULL server started on %s", proxy_url)
 
+    msg_count = 0
     while run_proxy:
         try:
             msg_bytes = await socket.recv()
@@ -370,30 +394,57 @@ async def zmq_pull_server():
             continue
         except zmq.ZMQError as exc:
             if exc.errno in (zmq.ETERM, zmq.ENOTSOCK):
+                logger.info(
+                    "[PROXY-ZMQ] ZMQ socket terminated (errno=%d), exiting pull loop",
+                    exc.errno,
+                )
                 break
-            logger.warning("ZMQ recv error: %s", exc)
+            logger.warning("[PROXY-ZMQ] ZMQ recv error: %s", exc)
             await asyncio.sleep(0.05)
             continue
 
         try:
             msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
         except msgspec.DecodeError as exc:
-            logger.warning("ZMQ received non-PD message: %s", exc)
+            logger.warning(
+                "[PROXY-ZMQ] Received non-PD message (size=%d): %s",
+                len(msg_bytes),
+                exc,
+            )
             continue
         except Exception as exc:
-            logger.exception("ZMQ message decode failed: %s", exc)
+            logger.exception(
+                "[PROXY-ZMQ] Message decode failed (size=%d): %s",
+                len(msg_bytes),
+                exc,
+            )
             continue
 
         if not isinstance(msg, ProxyNotif):
-            logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
+            logger.debug(
+                "[PROXY-ZMQ] Ignored message type: %s",
+                type(msg).__name__,
+            )
             continue
 
         req_id = msg.req_id
+        msg_count += 1
         app.state.finished_reqs[req_id] += 1
-        logger.debug("Prefill of req %s done.", req_id)
+        logger.info(
+            "[PROXY-ZMQ] ProxyNotif received: req=%s, "
+            "finished_count=%d, total_zmq_msgs=%d, "
+            "timestamp=%.6f",
+            req_id,
+            app.state.finished_reqs[req_id],
+            msg_count,
+            time.time(),
+        )
 
     socket.close()
-    logger.info("ZMQ PULL server stopped.")
+    logger.info(
+        "[PROXY-ZMQ] ZMQ PULL server stopped. Total msgs received: %d",
+        msg_count,
+    )
 
 
 async def send_request_to_service(
@@ -440,9 +491,21 @@ def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
 
 
 async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
+    wait_start = time.time()
+    poll_count = 0
     while app.state.finished_reqs[req_id] < num_tp_rank:
         await asyncio.sleep(0.0001)  # sleep for 0.1 ms
-    logger.debug(f"Prefill node signaled kv ready for req {req_id}")
+        poll_count += 1
+    wait_elapsed = time.time() - wait_start
+    logger.info(
+        "[PROXY-KV] KV ready for req=%s, waited=%.4fs, "
+        "polls=%d, tp_ranks=%d, timestamp=%.6f",
+        req_id,
+        wait_elapsed,
+        poll_count,
+        num_tp_rank,
+        time.time(),
+    )
     app.state.finished_reqs.pop(req_id)
 
 
@@ -478,6 +541,11 @@ async def handle_completions(request: Request):
     req_id = str(counter)  # we use counter as req_id
 
     st = time.time()
+    logger.info(
+        "[PROXY-REQ] /v1/completions req=%s started, timestamp=%.6f",
+        req_id,
+        st,
+    )
     slots = 0  # slots to release on error; set after successful acquire only
     acquired = False
     try:
@@ -485,11 +553,28 @@ async def handle_completions(request: Request):
 
         # Pick tokenization, prefill and decode client
         tokenization_client, prefill_client, decode_client = pick_up_clients(request)
+        logger.info(
+            "[PROXY-REQ] completions req=%s: prefill_url=%s, "
+            "decode_url=%s, decode_host=%s, "
+            "decode_init_ports=%s, decode_alloc_ports=%s",
+            req_id,
+            prefill_client.client.base_url,
+            decode_client.client.base_url,
+            decode_client.host,
+            decode_client.init_port,
+            decode_client.alloc_port,
+        )
 
         tokenize_output = await send_request_to_service(
             tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
         )
         tokenize_output = tokenize_output.json()
+        logger.info(
+            "[PROXY-REQ] completions req=%s: tokenized, num_tokens=%d, timestamp=%.6f",
+            req_id,
+            len(tokenize_output.get("tokens", [])),
+            time.time(),
+        )
 
         org_max_tokens = req_data["max_tokens"]
         req_data["prompt"] = tokenize_output["tokens"]
@@ -498,8 +583,21 @@ async def handle_completions(request: Request):
         # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
         slots = math.ceil(len(tokenize_output["tokens"]) / global_args.chunk_size)
         if pd_buffer_semaphore is not None:
+            logger.info(
+                "[PROXY-REQ] completions req=%s: acquiring %d "
+                "semaphore slots (available=%d)",
+                req_id,
+                slots,
+                pd_buffer_semaphore.available,
+            )
             await pd_buffer_semaphore.acquire(slots)
             acquired = True
+            logger.info(
+                "[PROXY-REQ] completions req=%s: acquired %d slots (available=%d)",
+                req_id,
+                slots,
+                pd_buffer_semaphore.available,
+            )
 
         disagg_spec = {
             "req_id": req_id,
@@ -518,6 +616,11 @@ async def handle_completions(request: Request):
         stream_options = req_data.pop("stream_options", None)
 
         # Send request to prefill service, ignore the response
+        logger.info(
+            "[PROXY-REQ] completions req=%s: sending to prefiller, timestamp=%.6f",
+            req_id,
+            time.time(),
+        )
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
@@ -525,6 +628,13 @@ async def handle_completions(request: Request):
         prefill_output = prefill_output.json()
 
         et = time.time()
+        logger.info(
+            "[PROXY-REQ] completions req=%s: prefill done, "
+            "prefill_latency=%.4fs, timestamp=%.6f",
+            req_id,
+            et - st,
+            et,
+        )
         stats_calculator.add(et - st)
 
         req_data["max_tokens"] = org_max_tokens - 1
@@ -556,12 +666,32 @@ async def handle_completions(request: Request):
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
 
+            logger.info(
+                "[PROXY-STREAM] completions req=%s: waiting for "
+                "KV ready (tp_ranks=%d), timestamp=%.6f",
+                req_id,
+                num_tp_rank,
+                time.time(),
+            )
             try:
                 await wait_decode_kv_ready(req_id, num_tp_rank)
             finally:
                 if pd_buffer_semaphore is not None:
                     await pd_buffer_semaphore.release(slots)
+                    logger.info(
+                        "[PROXY-STREAM] completions req=%s: released "
+                        "%d slots (available=%d)",
+                        req_id,
+                        slots,
+                        pd_buffer_semaphore.available,
+                    )
 
+            logger.info(
+                "[PROXY-STREAM] completions req=%s: streaming "
+                "decode response, timestamp=%.6f",
+                req_id,
+                time.time(),
+            )
             async for chunk in stream_service_response(
                 decode_client.client, "/v1/completions", req_data
             ):
@@ -570,6 +700,12 @@ async def handle_completions(request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
+        logger.error(
+            "[PROXY-ERR] completions req=%s: exception=%s, timestamp=%.6f",
+            req_id,
+            e,
+            time.time(),
+        )
         if pd_buffer_semaphore is not None and acquired:
             await pd_buffer_semaphore.release(slots)
         # Standard
@@ -590,6 +726,11 @@ async def handle_chat_completions(request: Request):
     req_id = str(counter)
 
     st = time.time()
+    logger.info(
+        "[PROXY-REQ] /v1/chat/completions req=%s started, timestamp=%.6f",
+        req_id,
+        st,
+    )
     slots = 0  # slots to release on error; set after successful acquire only
     acquired = False
     try:
@@ -597,12 +738,29 @@ async def handle_chat_completions(request: Request):
 
         # Pick tokenization, prefill and decode client
         tokenization_client, prefill_client, decode_client = pick_up_clients(request)
+        logger.info(
+            "[PROXY-REQ] chat req=%s: prefill_url=%s, "
+            "decode_url=%s, decode_host=%s, "
+            "decode_init_ports=%s, decode_alloc_ports=%s",
+            req_id,
+            prefill_client.client.base_url,
+            decode_client.client.base_url,
+            decode_client.host,
+            decode_client.init_port,
+            decode_client.alloc_port,
+        )
 
         # For chat completions, we need to tokenize the messages
         tokenize_output = await send_request_to_service(
             tokenization_client.client, "/tokenize", {"messages": req_data["messages"]}
         )
         tokenize_output = tokenize_output.json()
+        logger.info(
+            "[PROXY-REQ] chat req=%s: tokenized, num_tokens=%d, timestamp=%.6f",
+            req_id,
+            len(tokenize_output.get("tokens", [])),
+            time.time(),
+        )
 
         org_max_tokens = req_data["max_tokens"]
         req_data["prompt"] = tokenize_output["tokens"]
@@ -616,8 +774,20 @@ async def handle_chat_completions(request: Request):
         # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
         slots = math.ceil(len(tokenize_output["tokens"]) / global_args.chunk_size)
         if pd_buffer_semaphore is not None:
+            logger.info(
+                "[PROXY-REQ] chat req=%s: acquiring %d semaphore slots (available=%d)",
+                req_id,
+                slots,
+                pd_buffer_semaphore.available,
+            )
             await pd_buffer_semaphore.acquire(slots)
             acquired = True
+            logger.info(
+                "[PROXY-REQ] chat req=%s: acquired %d slots (available=%d)",
+                req_id,
+                slots,
+                pd_buffer_semaphore.available,
+            )
 
         disagg_spec = {
             "req_id": req_id,
@@ -637,6 +807,11 @@ async def handle_chat_completions(request: Request):
         stream_options = req_data.pop("stream_options", None)
 
         # Send request to prefill service, get the response
+        logger.info(
+            "[PROXY-REQ] chat req=%s: sending to prefiller, timestamp=%.6f",
+            req_id,
+            time.time(),
+        )
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
@@ -644,6 +819,13 @@ async def handle_chat_completions(request: Request):
         prefill_output = prefill_output.json()
 
         et = time.time()
+        logger.info(
+            "[PROXY-REQ] chat req=%s: prefill done, "
+            "prefill_latency=%.4fs, timestamp=%.6f",
+            req_id,
+            et - st,
+            et,
+        )
         stats_calculator.add(et - st)
 
         req_data["max_tokens"] = org_max_tokens - 1
@@ -701,7 +883,18 @@ async def handle_chat_completions(request: Request):
             finally:
                 if pd_buffer_semaphore is not None:
                     await pd_buffer_semaphore.release(slots)
+                    logger.info(
+                        "[PROXY-STREAM] chat req=%s: released %d slots (available=%d)",
+                        req_id,
+                        slots,
+                        pd_buffer_semaphore.available,
+                    )
 
+            logger.info(
+                "[PROXY-STREAM] chat req=%s: streaming decode response, timestamp=%.6f",
+                req_id,
+                time.time(),
+            )
             # Stream and convert completion format chunks to chat completion format
             async for chunk in stream_service_response(
                 decode_client.client, "/v1/completions", req_data
@@ -752,6 +945,12 @@ async def handle_chat_completions(request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
+        logger.error(
+            "[PROXY-ERR] chat req=%s: exception=%s, timestamp=%.6f",
+            req_id,
+            e,
+            time.time(),
+        )
         if pd_buffer_semaphore is not None and acquired:
             await pd_buffer_semaphore.release(slots)
         # Standard
@@ -770,6 +969,27 @@ async def handle_chat_completions(request: Request):
 if __name__ == "__main__":
     global global_args
     global_args = parse_args()
+    logger.info(
+        "[PROXY-MAIN] Starting disagg proxy server: "
+        "host=%s, port=%d, proxy_host=%s, proxy_port=%d, "
+        "prefiller_host=%s, prefiller_port=%s, "
+        "decoder_host=%s, decoder_port=%s, "
+        "decoder_init_port=%s, decoder_alloc_port=%s, "
+        "model=%s, pd_buffer_size=%d, chunk_size=%d",
+        global_args.host,
+        global_args.port,
+        global_args.proxy_host,
+        global_args.proxy_port,
+        global_args.prefiller_host,
+        global_args.prefiller_port,
+        global_args.decoder_host,
+        global_args.decoder_port,
+        global_args.decoder_init_port,
+        global_args.decoder_alloc_port,
+        global_args.model,
+        global_args.pd_buffer_size,
+        global_args.chunk_size,
+    )
 
     # Third Party
     import uvicorn
