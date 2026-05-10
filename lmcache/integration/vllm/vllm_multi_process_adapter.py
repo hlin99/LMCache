@@ -916,9 +916,9 @@ class LMCacheMPWorkerAdapter:
         )
         if self._use_bounce_buffer:
             torch_dev.synchronize()
-            self._shm_store(key, op)
+            store_ok = self._shm_store(key, op)
             # SHM store is synchronous (memcpy + commit), mark as done
-            self.store_futures[request_id] = _ImmediateFuture(True)
+            self.store_futures[request_id] = _ImmediateFuture(store_ok)
             return
         else:
             future = send_lmcache_request(
@@ -1261,12 +1261,15 @@ class LMCacheMPWorkerAdapter:
         buf_view = self._l1_buffer[offset : offset + length]
         return torch.frombuffer(buf_view, dtype=torch_dtype).view(*shape)
 
-    def _shm_store(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> None:
+    def _shm_store(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> bool:
         """Execute a two-phase SHM store: prepare → memcpy → commit.
 
         Args:
             key: The IPC cache key.
             op: The load/store operation with block IDs.
+
+        Returns:
+            ``True`` if all chunks were written successfully.
         """
         # Phase 1: Ask server for L1 shm slots
         prep_future = send_lmcache_request(
@@ -1277,8 +1280,9 @@ class LMCacheMPWorkerAdapter:
         response: PrepareStoreResponse = prep_future.result(timeout=self._mq_timeout)
 
         if not response.slots:
-            return
+            return True
 
+        success = True
         try:
             # Gather chunks to CPU tensors (not pickled)
             cpu_chunks = gather_chunks_to_cpu_tensors(
@@ -1298,6 +1302,7 @@ class LMCacheMPWorkerAdapter:
                     tensor_view.copy_(cpu_chunks[slot.chunk_index])
         except Exception:
             logger.exception("SHM store failed; will release write-locks")
+            success = False
         finally:
             # Phase 3: Always commit (even on failure) to release
             # write-locks and prevent 600s TTL deadlock.
@@ -1317,6 +1322,7 @@ class LMCacheMPWorkerAdapter:
                     "Failed to send COMMIT_STORE; "
                     "write-locks will auto-release via TTL"
                 )
+        return success
 
     def _shm_retrieve(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> bool:
         """Execute a two-phase SHM retrieve: prepare → read → finish.
@@ -1356,6 +1362,8 @@ class LMCacheMPWorkerAdapter:
             )
         except Exception:
             logger.exception("Failed to scatter SHM retrieve data")
+            # NOTE: The finally block below uses try/except internally,
+            # so it will not raise and override this return value.
             return False
         finally:
             # Phase 3: Release read-locks
