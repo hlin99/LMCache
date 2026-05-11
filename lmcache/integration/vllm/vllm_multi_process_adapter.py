@@ -901,6 +901,7 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        logger.info("submit_store_request, req id=%s", request_id)
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -916,6 +917,7 @@ class LMCacheMPWorkerAdapter:
         )
         if self._use_bounce_buffer:
             torch_dev.synchronize()
+            logger.info("_shm_store key=%s", key)
             store_ok = self._shm_store(key, op)
             # SHM store is synchronous (memcpy + commit), mark as done
             self.store_futures[request_id] = _ImmediateFuture(store_ok)
@@ -946,6 +948,7 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        logger.info("submit_retrieve_request, req id=%s", request_id)
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -961,6 +964,7 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
         )
         if self._use_bounce_buffer:
+            logger.info("_shm_retrieve key=%s", key)
             success = self._shm_retrieve(key, op)
             self.retrieve_futures[request_id] = (
                 _ImmediateFuture(success),
@@ -1124,7 +1128,7 @@ class LMCacheMPWorkerAdapter:
 
             r_result = r_future.result()
             finished_retrieves.add(request_id)
-
+            logger.info(" updated results ")
             if not r_result:
                 logger.error(
                     "Something went wrong when processing the "
