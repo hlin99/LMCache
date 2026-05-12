@@ -179,11 +179,14 @@ class L1MemoryManager:
         self._shm_lock_fd: int | None = None
         if self._shm_name:
             shm_path = f"/dev/shm/{self._shm_name}"
+            fd = -1
             try:
                 fd = os.open(shm_path, os.O_RDWR)
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 self._shm_lock_fd = fd
             except OSError:
+                if fd >= 0:
+                    os.close(fd)
                 logger.warning(
                     "Failed to acquire flock on SHM segment: %s",
                     shm_path,
