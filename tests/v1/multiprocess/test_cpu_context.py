@@ -10,6 +10,7 @@ import sys
 import pytest
 import torch
 
+# Shared test configuration constants for tensor dimensions and chunk behavior.
 NUM_LAYERS = 2
 DEFAULT_NUM_BLOCKS = 6
 TEST_NUM_BLOCKS = 8
@@ -106,14 +107,14 @@ def test_wrap_kv_caches_cpu_context_returns_empty() -> None:
 
 
 @pytest.mark.parametrize(
-    ("source_builder", "is_mla"),
+    "is_mla",
     [
-        (_make_kv_caches, False),
-        (_make_mla_kv_caches, True),
+        False,
+        True,
     ],
 )
 def test_compute_kv_layout_and_gather_scatter_roundtrip(
-    source_builder: Callable[..., dict[str, torch.Tensor]], is_mla: bool
+    is_mla: bool,
 ) -> None:
     """Validate layout extraction and gather/scatter round-trip for NHD and MLA."""
     # First Party
@@ -124,14 +125,14 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip(
     )
 
     if is_mla:
-        source = source_builder(
+        source = _make_mla_kv_caches(
             num_layers=NUM_LAYERS,
             num_blocks=TEST_NUM_BLOCKS,
             block_size=BLOCK_SIZE,
             hidden_size=HIDDEN_SIZE,
         )
     else:
-        source = source_builder(
+        source = _make_kv_caches(
             num_layers=NUM_LAYERS,
             num_blocks=TEST_NUM_BLOCKS,
             block_size=BLOCK_SIZE,
@@ -230,8 +231,12 @@ def test_gather_scatter_roundtrip_hnd_layout(
             assert torch.allclose(source[name][1], destination[name][5])
 
 
-@pytest.mark.parametrize("skip_first_n_tokens", [8, 5])
-def test_scatter_respects_skip_first_n_tokens(skip_first_n_tokens: int) -> None:
+@pytest.mark.parametrize(
+    "tokens_to_skip",
+    [8, 5],
+    ids=["block_aligned", "non_aligned"],
+)
+def test_scatter_respects_skip_first_n_tokens(tokens_to_skip: int) -> None:
     """Ensure NHD scatter honors token skips; non-aligned values round down."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
@@ -255,10 +260,12 @@ def test_scatter_respects_skip_first_n_tokens(skip_first_n_tokens: int) -> None:
         [0, 1, 2, 3],
         gathered,
         blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
-        skip_first_n_tokens=skip_first_n_tokens,
+        skip_first_n_tokens=tokens_to_skip,
     )
 
-    first_written_block = skip_first_n_tokens // BLOCK_SIZE
+    # The implementation applies skip at block granularity, so non-aligned token
+    # skips are rounded down to the nearest block boundary.
+    first_written_block = tokens_to_skip // BLOCK_SIZE
     for name in destination:
         for block_idx in range(first_written_block):
             assert torch.all(destination[name][:, block_idx] == SENTINEL_VALUE)
@@ -270,15 +277,24 @@ def test_scatter_respects_skip_first_n_tokens(skip_first_n_tokens: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("hnd_builder", "expected_format"),
+    ("hnd_builder", "expected_format", "tokens_to_skip"),
     [
-        (_make_hnd_kv_caches, "NL_X_TWO_NB_NH_BS_HS"),
-        (_make_hnd_flashinfer_kv_caches, "NL_X_NB_TWO_NH_BS_HS"),
+        (_make_hnd_kv_caches, "NL_X_TWO_NB_NH_BS_HS", 8),
+        (_make_hnd_kv_caches, "NL_X_TWO_NB_NH_BS_HS", 5),
+        (_make_hnd_flashinfer_kv_caches, "NL_X_NB_TWO_NH_BS_HS", 8),
+        (_make_hnd_flashinfer_kv_caches, "NL_X_NB_TWO_NH_BS_HS", 5),
+    ],
+    ids=[
+        "hnd_aligned",
+        "hnd_non_aligned",
+        "flashinfer_aligned",
+        "flashinfer_non_aligned",
     ],
 )
 def test_scatter_hnd_respects_skip_first_n_tokens(
     hnd_builder: Callable[[int, int, int, int, int], dict[str, torch.Tensor]],
     expected_format: str,
+    tokens_to_skip: int,
 ) -> None:
     """Ensure HND/HND-FlashInfer scatter honors skip_first_n_tokens."""
     # First Party
@@ -311,22 +327,27 @@ def test_scatter_hnd_respects_skip_first_n_tokens(
         [0, 1, 2, 3],
         gathered,
         blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
-        skip_first_n_tokens=8,
+        skip_first_n_tokens=tokens_to_skip,
         layout_hints=layout_hints,
         gpu_kv_format=detected_kv_format,
     )
 
+    first_written_block = tokens_to_skip // BLOCK_SIZE
     for name in destination:
         if detected_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-            assert torch.all(destination[name][:, 0] == SENTINEL_VALUE)
-            assert torch.all(destination[name][:, 1] == SENTINEL_VALUE)
-            assert torch.allclose(destination[name][:, 2], source[name][:, 2])
-            assert torch.allclose(destination[name][:, 3], source[name][:, 3])
+            for block_idx in range(first_written_block):
+                assert torch.all(destination[name][:, block_idx] == SENTINEL_VALUE)
+            for block_idx in range(first_written_block, SKIP_TEST_BLOCKS_PER_CHUNK):
+                assert torch.allclose(
+                    destination[name][:, block_idx], source[name][:, block_idx]
+                )
         else:
-            assert torch.all(destination[name][0] == SENTINEL_VALUE)
-            assert torch.all(destination[name][1] == SENTINEL_VALUE)
-            assert torch.allclose(destination[name][2], source[name][2])
-            assert torch.allclose(destination[name][3], source[name][3])
+            for block_idx in range(first_written_block):
+                assert torch.all(destination[name][block_idx] == SENTINEL_VALUE)
+            for block_idx in range(first_written_block, SKIP_TEST_BLOCKS_PER_CHUNK):
+                assert torch.allclose(
+                    destination[name][block_idx], source[name][block_idx]
+                )
 
 
 def test_compute_kv_layout_empty_raises_value_error() -> None:
@@ -338,7 +359,12 @@ def test_compute_kv_layout_empty_raises_value_error() -> None:
         compute_kv_layout({})
 
 
-def test_scatter_mla_respects_skip_first_n_tokens() -> None:
+@pytest.mark.parametrize(
+    "tokens_to_skip",
+    [8, 5],
+    ids=["block_aligned", "non_aligned"],
+)
+def test_scatter_mla_respects_skip_first_n_tokens(tokens_to_skip: int) -> None:
     """Ensure MLA scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
@@ -363,14 +389,15 @@ def test_scatter_mla_respects_skip_first_n_tokens() -> None:
         [0, 1, 2, 3],
         gathered,
         blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
-        skip_first_n_tokens=8,
+        skip_first_n_tokens=tokens_to_skip,
     )
 
+    first_written_block = tokens_to_skip // BLOCK_SIZE
     for name in destination:
-        assert torch.all(destination[name][0] == SENTINEL_VALUE)
-        assert torch.all(destination[name][1] == SENTINEL_VALUE)
-        assert torch.allclose(destination[name][2], source[name][2])
-        assert torch.allclose(destination[name][3], source[name][3])
+        for block_idx in range(first_written_block):
+            assert torch.all(destination[name][block_idx] == SENTINEL_VALUE)
+        for block_idx in range(first_written_block, SKIP_TEST_BLOCKS_PER_CHUNK):
+            assert torch.allclose(destination[name][block_idx], source[name][block_idx])
 
 
 def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
@@ -452,7 +479,8 @@ def test_server_register_and_find_cpu_context_layout(
 
     layout = engine._find_layout_desc(MODEL_NAME, 1)
     assert layout is not None
-    # Shape is [K/V=2, num_layers, chunk_size, hidden_dim_size].
+    # Shape is [K/V=2 (Key and Value cache tensors), num_layers, chunk_size,
+    # hidden_dim_size].
     expected_shape = torch.Size([2, NUM_LAYERS, REGISTER_CHUNK_SIZE, HIDDEN_SIZE])
     assert layout.shapes[0] == expected_shape
 
