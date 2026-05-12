@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU bounce-buffer helpers and metadata for multiprocess mode."""
+"""CPU context abstractions and utilities for multiprocess mode.
+
+This module provides:
+- ``CPUContextMetadata``: layout metadata dataclass for non-CUDA workers.
+- ``CPUContext``: abstract base class with a two-phase prepare/commit interface
+  for CPU-side KV data transfer.  Concrete implementations (e.g.
+  ``CPUContextPickle``) each decide *how* data is serialised and transported.
+- ``create_cpu_context()``: factory that returns the appropriate
+  ``CPUContext`` subclass (currently always ``CPUContextPickle``).
+- ``compute_kv_layout``, ``gather_chunks_to_cpu``, ``scatter_cpu_chunks_to_kv``:
+  shared gather/scatter utilities used by all concrete implementations.
+"""
 
 # Standard
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, cast
-import pickle
 
 # Third Party
 import torch
@@ -12,6 +23,139 @@ import torch
 # First Party
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+
+@dataclass
+class CPUContextMetadata:
+    """CPU context layout metadata for non-CUDA workers.
+
+    Attributes:
+        layout_desc: Memory layout descriptor used to interpret chunk payloads.
+        block_size: Number of tokens per paged block.
+        use_mla: Whether the worker KV format is MLA.
+    """
+
+    layout_desc: MemoryLayoutDesc
+    block_size: int
+    use_mla: bool
+
+
+class CPUContext(ABC):
+    """Abstract base class for CPU-side KV data transfer contexts.
+
+    All concrete implementations share a common message-queue client and
+    expose a uniform two-phase ``prepare/commit`` interface so that the
+    worker adapter is implementation-agnostic.
+
+    Args:
+        metadata: Layout metadata describing the chunk format.
+        mq_client: Message-queue client used for server communication.
+        mq_timeout: Timeout in seconds for blocking MQ requests.
+    """
+
+    def __init__(
+        self,
+        metadata: CPUContextMetadata,
+        mq_client: Any,
+        mq_timeout: float,
+    ) -> None:
+        self.metadata = metadata
+        self.mq_client = mq_client
+        self.mq_timeout = mq_timeout
+
+    @property
+    def layout_desc(self) -> MemoryLayoutDesc:
+        """The memory layout descriptor for this context."""
+        return self.metadata.layout_desc
+
+    @abstractmethod
+    def prepare_store(
+        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
+    ) -> Any:
+        """Prepare a store operation.
+
+        Args:
+            key: Cache key for the token range to store.
+            instance_id: Worker instance identifier.
+            chunks: CPU chunk tensors to store.
+
+        Returns:
+            An opaque handle to be passed to :meth:`commit_store`.
+        """
+        ...
+
+    @abstractmethod
+    def commit_store(self, handle: Any) -> bool:
+        """Commit a prepared store operation.
+
+        Args:
+            handle: The opaque handle returned by :meth:`prepare_store`.
+
+        Returns:
+            ``True`` on success, ``False`` otherwise.
+        """
+        ...
+
+    @abstractmethod
+    def prepare_retrieve(
+        self, key: Any, instance_id: int
+    ) -> tuple[Any, list[torch.Tensor] | None]:
+        """Prepare a retrieve operation.
+
+        Args:
+            key: Cache key for the token range to retrieve.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            A ``(handle, chunks)`` pair.  ``chunks`` is a list of CPU tensors
+            on cache hit, or ``None`` on cache miss.  The handle must be
+            passed to :meth:`commit_retrieve`.
+        """
+        ...
+
+    @abstractmethod
+    def commit_retrieve(self, handle: Any) -> None:
+        """Finalise a retrieve operation (release locks, cleanup, etc.).
+
+        Args:
+            handle: The opaque handle returned by :meth:`prepare_retrieve`.
+        """
+        ...
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release any resources held by this context."""
+        ...
+
+
+def create_cpu_context(
+    metadata: CPUContextMetadata,
+    mq_client: Any,
+    mq_timeout: float,
+) -> CPUContext:
+    """Factory that returns the appropriate :class:`CPUContext` implementation.
+
+    Currently always returns a :class:`~lmcache.v1.multiprocess.\
+cpu_context_pickle.CPUContextPickle` instance.  A future SHM-capable PR
+    may probe for shared-memory availability and fall back to pickle.
+
+    Args:
+        metadata: Layout metadata for the CPU context.
+        mq_client: Message-queue client for server communication.
+        mq_timeout: Timeout in seconds for blocking MQ requests.
+
+    Returns:
+        A concrete :class:`CPUContext` instance.
+    """
+    # Local
+    from .cpu_context_pickle import CPUContextPickle
+
+    return CPUContextPickle(metadata, mq_client, mq_timeout)
+
+
+# ---------------------------------------------------------------------------
+# Shared gather / scatter utilities
+# ---------------------------------------------------------------------------
 
 
 def compute_kv_layout(
@@ -59,7 +203,7 @@ def gather_chunks_to_cpu(
     blocks_per_chunk: int,
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
-) -> bytes:
+) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
     Args:
@@ -70,18 +214,20 @@ def gather_chunks_to_cpu(
         gpu_kv_format: Optional pre-detected KV format.
 
     Returns:
-        Pickled list of CPU tensors. For non-MLA, each chunk shape is
+        List of CPU tensors, one per chunk.  For non-MLA each chunk has shape
         ``[2, num_layers, chunk_tokens, hidden_dim]`` where dimension ``0``
-        stores ``(K, V)``. For MLA (multi-head latent attention), each chunk
-        shape is ``[num_layers, chunk_tokens, hidden_dim]``.
+        stores ``(K, V)``.  For MLA (multi-head latent attention) each chunk
+        has shape ``[num_layers, chunk_tokens, hidden_dim]``.
     """
+    # Standard
+    import lmcache.c_ops as lmc_ops
+
     # First Party
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         is_mla,
         normalize_kv_and_discover_format,
     )
-    import lmcache.c_ops as lmc_ops
 
     tensors = list(kv_caches.values())
     fmt, normalized = normalize_kv_and_discover_format(
@@ -166,13 +312,13 @@ def gather_chunks_to_cpu(
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
             chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
-    return pickle.dumps(chunks)
+    return chunks
 
 
 def scatter_cpu_chunks_to_kv(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
-    cpu_data: bytes,
+    chunks: list[torch.Tensor],
     blocks_per_chunk: int,
     skip_first_n_tokens: int = 0,
     layout_hints: Any | None = None,
@@ -183,23 +329,23 @@ def scatter_cpu_chunks_to_kv(
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
         block_ids: Flattened destination block IDs for all chunks.
-        cpu_data: Serialized CPU chunk list (bytes returned by
-            :func:`gather_chunks_to_cpu`, unpickled internally to
-            ``list[torch.Tensor]``).
+        chunks: List of CPU chunk tensors (as returned by
+            :func:`gather_chunks_to_cpu`).
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
         skip_first_n_tokens: Token prefix to skip when scattering.
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
     """
+    # Standard
+    import lmcache.c_ops as lmc_ops
+
     # First Party
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         is_mla,
         normalize_kv_and_discover_format,
     )
-    import lmcache.c_ops as lmc_ops
 
-    chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     if not chunks:
         return
 
@@ -289,12 +435,3 @@ def scatter_cpu_chunks_to_kv(
                 )
                 k_t[effective_block_ids] = k_src_4d
                 v_t[effective_block_ids] = v_src_4d
-
-
-@dataclass
-class CPUBounceContext:
-    """CPU bounce-buffer layout metadata for non-CUDA workers."""
-
-    layout_desc: MemoryLayoutDesc
-    block_size: int
-    use_mla: bool

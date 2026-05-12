@@ -1,52 +1,111 @@
-# CPU Bounce Buffer Path Design (MP mode, non-CUDA)
+# CPU Context Design (MP mode, non-CUDA)
 
 ## Scope
 
-This document describes the non-CUDA CPU bounce-buffer path added for
-LMCache multiprocess mode on the `test` branch, adapted for the branch's
-`torch_dev` / `torch_device_type` behavior.
+This document describes the non-CUDA CPU-based KV transfer path for LMCache
+multiprocess mode.
 
-The goal is to support KV transfer for non-CUDA devices (for example CPU/XPU/HPU)
-without changing the existing CUDA IPC path.
+The goal is to support KV transfer for non-CUDA devices (for example CPU,
+XPU, HPU) without changing the existing CUDA IPC path, while providing a
+clean abstraction layer that makes it easy to add alternative transport
+mechanisms (e.g. shared memory) in a future PR.
 
 ## Why this path exists
 
-The CUDA path uses IPC wrappers around GPU tensors and existing
+The CUDA path uses IPC wrappers around GPU tensors and the existing
 `REGISTER_KV_CACHE` / `STORE` / `RETRIEVE` request flow.
 
-For non-CUDA tensors, CUDA IPC is not available. The bounce-buffer path
+For non-CUDA tensors, CUDA IPC is not available.  The CPU context path
 provides a generic protocol where workers:
 
 1. Gather KV blocks into CPU chunk tensors.
-2. Send/store those CPU chunks through MP server storage flow.
-3. Retrieve CPU chunks and scatter back into device KV tensors.
+2. Transport those CPU chunks to the server storage through a concrete
+   `CPUContext` implementation.
+3. Retrieve CPU chunks from the server and scatter them back into device KV
+   tensors.
 
 ## Protocol additions
 
-Three request types are introduced for bounce mode:
+Three request types are used for non-CUDA mode (unchanged from the original
+bounce-buffer design):
 
 - `REGISTER_KV_CACHE_BOUNCE`
 - `STORE_CPU_CHUNKS`
 - `RETRIEVE_CPU_CHUNKS`
 
-These are registered in MP server dispatch and have corresponding payload/response
-contracts in multiprocess protocol definitions.
+These are registered in the MP server dispatch and have corresponding
+payload/response contracts in the multiprocess protocol definitions.
 
-## Core module
+## File structure
 
-`lmcache/v1/multiprocess/cpu_bounce_context.py` provides:
+```
+lmcache/v1/multiprocess/
+├── cpu_context.py         # CPUContextMetadata, CPUContext(ABC), factory, gather/scatter utils
+└── cpu_context_pickle.py  # CPUContextPickle — pickle-based concrete implementation
+```
 
-- `compute_kv_layout`
-- `gather_chunks_to_cpu`
-- `scatter_cpu_chunks_to_kv`
-- `CPUBounceContext`
+### `cpu_context.py`
 
-`CPUBounceContext` stores layout metadata required to interpret chunk payloads:
-block size, dtype, number of layers, hidden dimension, and MLA/non-MLA format.
+Provides:
+
+- **`CPUContextMetadata`** dataclass — layout metadata (replaces the old
+  `CPUBounceContext` dataclass):
+
+  ```python
+  @dataclass
+  class CPUContextMetadata:
+      layout_desc: MemoryLayoutDesc
+      block_size: int
+      use_mla: bool
+  ```
+
+- **`CPUContext(ABC)`** — abstract base class with `mq_client` as a common
+  dependency.  All concrete implementations share the same two-phase
+  `prepare/commit` interface:
+
+  ```python
+  class CPUContext(ABC):
+      def __init__(self, metadata: CPUContextMetadata, mq_client, mq_timeout: float): ...
+
+      @abstractmethod
+      def prepare_store(self, key, instance_id, chunks: list[torch.Tensor]) -> Any: ...
+      @abstractmethod
+      def commit_store(self, handle: Any) -> bool: ...
+      @abstractmethod
+      def prepare_retrieve(self, key, instance_id) -> tuple[Any, list[torch.Tensor] | None]: ...
+      @abstractmethod
+      def commit_retrieve(self, handle: Any) -> None: ...
+      @abstractmethod
+      def close(self) -> None: ...
+  ```
+
+- **`create_cpu_context()`** factory — currently always returns a
+  `CPUContextPickle` instance; a future SHM-capable PR can extend this to
+  probe for shared-memory availability and fall back to pickle.
+
+- **Shared utility functions** used by all concrete implementations:
+  - `compute_kv_layout` — extract block size, layer count, hidden dim and
+    dtype from live KV tensors.
+  - `gather_chunks_to_cpu` — gather paged KV blocks into a list of CPU
+    tensors (one per LMCache chunk).
+  - `scatter_cpu_chunks_to_kv` — scatter CPU chunk tensors back into paged
+    KV tensors.
+
+### `cpu_context_pickle.py`
+
+Provides **`CPUContextPickle(CPUContext)`**:
+
+| Phase | What happens |
+|---|---|
+| `prepare_store` | `pickle.dumps(chunks)` → returns `(key, instance_id, bytes)` as opaque handle |
+| `commit_store` | sends `STORE_CPU_CHUNKS` via `mq_client`, blocks for server ack, returns `bool` |
+| `prepare_retrieve` | sends `RETRIEVE_CPU_CHUNKS` via `mq_client`, blocks for response, `pickle.loads` → returns `(None, chunks)` or `(None, None)` on miss |
+| `commit_retrieve` | no-op (pickle path holds no server-side locks) |
+| `close` | no-op |
 
 ## Tensor/chunk contracts
 
-Chunk formats are unchanged relative to previous behavior:
+Chunk formats are unchanged:
 
 - non-MLA: `[2, num_layers, chunk_tokens, hidden_dim]`
 - MLA: `[num_layers, chunk_tokens, hidden_dim]`
@@ -56,7 +115,7 @@ expansion and token-wise select/copy operations.
 
 ## Layout handling
 
-Supported KV formats in bounce gather/scatter:
+Supported KV formats in CPU gather/scatter:
 
 - `NL_X_TWO_NB_BS_NH_HS` (NHD)
 - `NL_X_NB_TWO_BS_NH_HS` (NHD flashinfer)
@@ -64,56 +123,67 @@ Supported KV formats in bounce gather/scatter:
 - `NL_X_NB_TWO_NH_BS_HS` (HND flashinfer)
 - `NL_X_NB_BS_HS` (MLA)
 
-### Non-MLA (NHD)
-
-Gather:
-
-- Read K/V blocks directly by `chunk_block_ids`.
-- Reshape to token-major `[chunk_tokens, NH*HS]`.
-
-Scatter:
-
-- Reshape chunk payload to `[n_blocks, BS, NH, HS]`.
-- Assign directly into destination blocks.
-
-### Non-MLA (HND)
-
-Gather:
-
-- Read K/V blocks as `[n_blocks, NH, BS, HS]`.
-- Permute to `[n_blocks, BS, NH, HS]` then flatten to token-major.
-
-Scatter:
-
-- Reshape payload to `[n_blocks, BS, NH, HS]`.
-- Permute to `[n_blocks, NH, BS, HS]` and assign by block index.
-
-### MLA
-
-Gather/scatter is direct block reshape between `[NB, BS, HS]` and
-`[chunk_tokens, HS]` representation.
-
 ## Worker adapter integration
 
-`lmcache/integration/vllm/vllm_multi_process_adapter.py` chooses path by tensor
-`device.type`:
+`lmcache/integration/vllm/vllm_multi_process_adapter.py` chooses the path
+by tensor `device.type`:
 
-- all CUDA -> existing CUDA IPC registration and store/retrieve path
-- all non-CUDA -> bounce registration and CPU chunk store/retrieve path
+- all CUDA → existing CUDA IPC registration and store/retrieve path
+- all non-CUDA → bounce registration and CPU context store/retrieve path
 
-Adapter enforces uniform device type across all layer tensors.
+The adapter holds a `cpu_context: CPUContext` instance and uses the uniform
+`prepare/commit` interface for both store and retrieve.
+
+### Store path (non-CUDA)
+
+```python
+# submit_store_request
+cpu_chunks = gather_chunks_to_cpu(kv_caches, block_ids, blocks_in_chunk, ...)
+handle = self.cpu_context.prepare_store(key, instance_id, cpu_chunks)
+ok = self.cpu_context.commit_store(handle)   # synchronous; blocks for server ack
+self._cpu_store_done[request_id] = ok
+```
+
+`get_finished` drains `_cpu_store_done` on each call.
+
+### Retrieve path (non-CUDA)
+
+```python
+# submit_retrieve_request
+handle, chunks = self.cpu_context.prepare_retrieve(key, instance_id)  # synchronous
+if chunks is not None:
+    scatter_cpu_chunks_to_kv(kv_caches, block_ids, chunks, blocks_in_chunk,
+                             skip_first_n_tokens=op.skip_first_n_tokens, ...)
+self.cpu_context.commit_retrieve(handle)
+self._cpu_retrieve_done[request_id] = (chunks is not None, block_ids)
+```
+
+`get_finished` drains `_cpu_retrieve_done` on each call.
+
+The retrieve is now **synchronous in `submit_retrieve_request`**; there is no
+separate future to poll.  This simplifies `get_finished` which no longer
+needs a `if self._use_bounce_buffer:` branch for retrieve futures.
 
 ## Server integration
 
-`MPCacheEngine` adds bounce registries and handlers for registration/store/retrieve.
+`MPCacheEngine` holds:
+
+- `cpu_contexts: dict[int, CPUContextMetadata]` — per-instance metadata.
+- `cpu_context_meta: dict[int, tuple[str, int]]` — per-instance
+  `(model_name, world_size)` for layout resolution.
+
+Server-side handler methods are unchanged:
+- `register_kv_cache_bounce` — stores `CPUContextMetadata` in `cpu_contexts`.
+- `store_cpu_chunks` — unpickles payload, copies tensors into storage.
+- `retrieve_cpu_chunks` — reads from storage, pickles tensors, returns bytes.
 
 Additional integration points:
 
-- unregister cleanup also removes bounce context metadata
-- layout lookup can resolve both classic GPU registration and bounce registration
-- status reporting includes bounce context metadata
-
-## Runtime behavior summary
+- Unregister cleanup removes both `cpu_contexts` and `cpu_context_meta`.
+- Layout lookup via `_find_layout_desc` resolves both GPU and CPU context
+  registrations.
+- Status reporting (`report_status`) includes `registered_cpu_instance_ids`
+  and `cpu_context_meta`.
 
 ## CUDA vs non-CUDA state machine
 
@@ -130,7 +200,7 @@ Additional integration points:
                      |                                 |
                      v                                 v
        REGISTER_KV_CACHE (CUDA IPC)      REGISTER_KV_CACHE_BOUNCE (CPU metadata)
-                     |                                 |
+                     |                         + create_cpu_context()
                      +----------------+----------------+
                                       |
                                       v
@@ -142,20 +212,23 @@ Additional integration points:
                 submit_store()                    submit_store()
                      |                                 |
                      v                                 v
-            STORE (GPU -> L1)          gather_chunks_to_cpu + torch_dev.synchronize()
-                     |                                 |
-                     v                                 v
-                 [READY]                    STORE_CPU_CHUNKS (CPU -> L1)
+            STORE (GPU -> L1)           gather_chunks_to_cpu()
+                     |                 + cpu_context.prepare_store()
+                     v                 + cpu_context.commit_store()  [sync]
+                 [READY]                    _cpu_store_done[id] = ok
                      |                                 |
                      +----------------+----------------+
                                       |
                                       v
-                submit_retrieve() / get_finished()
+                submit_retrieve() + get_finished()
                                       |
                      +----------------+----------------+
                      |                                 |
                      v                                 v
-          RETRIEVE (L1 -> GPU)          RETRIEVE_CPU_CHUNKS + scatter_cpu_chunks_to_kv
+          RETRIEVE (L1 -> GPU)    cpu_context.prepare_retrieve()  [sync]
+          [async future]          + scatter_cpu_chunks_to_kv()
+                                  + cpu_context.commit_retrieve()
+                                  _cpu_retrieve_done[id] = (ok, block_ids)
                      |                                 |
                      +----------------+----------------+
                                       |
@@ -169,30 +242,32 @@ Additional integration points:
                                   [TERMINATED]
 ```
 
-### Store path (non-CUDA)
+## Future extension: CPUContextShm
 
-1. Adapter gathers chunk tensors from KV tensors.
-2. Adapter calls `torch_dev.synchronize()` before submit.
-3. `STORE_CPU_CHUNKS` sends CPU chunks to server.
-4. Server stores chunks into LMCache storage pipeline.
+The `CPUContext` base class is designed to accommodate a shared-memory
+implementation in a future PR with minimal changes:
 
-### Retrieve path (non-CUDA)
+| Phase | Pickle | SHM (future) |
+|---|---|---|
+| `prepare_store` | `pickle.dumps` | MQ `PREPARE_STORE` → slot metadata → memcpy |
+| `commit_store` | MQ `STORE_CPU_CHUNKS` | MQ `COMMIT_STORE` |
+| `prepare_retrieve` | MQ `RETRIEVE_CPU_CHUNKS` + `pickle.loads` | MQ `PREPARE_RETRIEVE` → tensor views from SHM |
+| `commit_retrieve` | no-op | MQ `FINISH_READ` (release read lock) |
 
-1. Adapter submits `RETRIEVE_CPU_CHUNKS`.
-2. Server returns CPU chunk tensors.
-3. Adapter scatters chunks back into KV tensors using block-level writes.
+The `create_cpu_context()` factory will probe for SHM availability and fall
+back to pickle when SHM is unavailable.
 
 ## Validation coverage
 
 `tests/v1/multiprocess/test_cpu_bounce_buffer.py` covers:
 
-- bounce wrapper behavior
-- NHD and MLA gather/scatter roundtrip
-- HND roundtrip for both HND formats
+- CPU wrapper behavior (`wrap_kv_caches` with bounce mode)
+- NHD and MLA gather/scatter round-trip
+- HND round-trip for both HND formats
 - `skip_first_n_tokens` behavior
-- server-side bounce register/store/retrieve flow
+- Server-side register/store/retrieve flow
 
 ## Non-goals
 
 - No change to existing CUDA IPC path semantics.
-- No bounce-specific logic added to shared `gpu_connector/utils.py`.
+- No CPU-specific logic added to shared `gpu_connector/utils.py`.

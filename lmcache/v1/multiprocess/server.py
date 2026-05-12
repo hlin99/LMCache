@@ -52,7 +52,7 @@ from lmcache.v1.multiprocess.config import (
     add_mp_server_args,
     parse_args_to_mp_server_config,
 )
-from lmcache.v1.multiprocess.cpu_bounce_context import CPUBounceContext
+from lmcache.v1.multiprocess.cpu_context import CPUContextMetadata
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheEngineKey,
@@ -191,8 +191,8 @@ class MPCacheEngine:
         # We assume that if the (model name, world size) is the same, then
         # the layout desc returned by the gpu context is the same.
         self.gpu_context_meta: dict[int, tuple[str, int]] = {}
-        self.bounce_contexts: dict[int, CPUBounceContext] = {}
-        self.bounce_context_meta: dict[int, tuple[str, int]] = {}
+        self.cpu_contexts: dict[int, CPUContextMetadata] = {}
+        self.cpu_context_meta: dict[int, tuple[str, int]] = {}
 
         # chunk size
         self.chunk_size = chunk_size
@@ -277,10 +277,10 @@ class MPCacheEngine:
             del self.gpu_context_meta[instance_id]
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
             torch_dev.empty_cache()
-        elif instance_id in self.bounce_contexts:
-            del self.bounce_contexts[instance_id]
-            del self.bounce_context_meta[instance_id]
-            logger.info("Unregistered bounce context for instance ID %d", instance_id)
+        elif instance_id in self.cpu_contexts:
+            del self.cpu_contexts[instance_id]
+            del self.cpu_context_meta[instance_id]
+            logger.info("Unregistered CPU context for instance ID %d", instance_id)
         else:
             logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
 
@@ -338,12 +338,12 @@ class MPCacheEngine:
             else torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
-        self.bounce_contexts[instance_id] = CPUBounceContext(
+        self.cpu_contexts[instance_id] = CPUContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla,
         )
-        self.bounce_context_meta[instance_id] = (model_name, world_size)
+        self.cpu_context_meta[instance_id] = (model_name, world_size)
 
     @_lmcache_nvtx_annotate
     def store_cpu_chunks(
@@ -377,11 +377,11 @@ class MPCacheEngine:
             raise ValueError("Must store with worker_id != None")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
-        if instance_id not in self.bounce_contexts:
+        if instance_id not in self.cpu_contexts:
             raise ValueError(
-                f"Bounce context not registered for instance ID {instance_id}"
+                f"CPU context not registered for instance ID {instance_id}"
             )
-        ctx = self.bounce_contexts[instance_id]
+        ctx = self.cpu_contexts[instance_id]
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
         reserved_dict = self.storage_manager.reserve_write(
             obj_keys, ctx.layout_desc, "new"
@@ -435,9 +435,9 @@ class MPCacheEngine:
             raise ValueError("Must retrieve with worker_id != None")
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
-        if instance_id not in self.bounce_contexts:
+        if instance_id not in self.cpu_contexts:
             raise ValueError(
-                f"Bounce context not registered for instance ID {instance_id}"
+                f"CPU context not registered for instance ID {instance_id}"
             )
 
         prefetched_keys: list[ObjectKey] = []
@@ -829,12 +829,12 @@ class MPCacheEngine:
         model_name: str,
         world_size: int,
     ) -> MemoryLayoutDesc | None:
-        """Find layout desc from a matching GPU or bounce context.
+        """Find layout desc from a matching GPU or CPU context.
 
         Returns:
             The layout descriptor, or None if no context matches
             ``(model_name, world_size)``. GPU contexts are checked first,
-            then bounce contexts.
+            then CPU contexts.
         """
         for gpu_id, (m, w) in self.gpu_context_meta.items():
             if m == model_name and w == world_size:
@@ -842,9 +842,9 @@ class MPCacheEngine:
                     self.gpu_contexts[gpu_id],
                     self.chunk_size,
                 )
-        for instance_id, (m, w) in self.bounce_context_meta.items():
+        for instance_id, (m, w) in self.cpu_context_meta.items():
             if m == model_name and w == world_size:
-                return self.bounce_contexts[instance_id].layout_desc
+                return self.cpu_contexts[instance_id].layout_desc
         return None
 
     def lookup(
@@ -1189,16 +1189,16 @@ class MPCacheEngine:
             "hash_algorithm": self.token_hasher.hash_algorithm_name,
             "registered_gpu_ids": list(self.gpu_contexts.keys()),
             "gpu_context_meta": gpu_context_meta,
-            "registered_bounce_instance_ids": list(self.bounce_contexts.keys()),
-            "bounce_context_meta": {
+            "registered_cpu_instance_ids": list(self.cpu_contexts.keys()),
+            "cpu_context_meta": {
                 str(instance_id): {
                     "model_name": model_name,
                     "world_size": world_size,
-                    "block_size": self.bounce_contexts[instance_id].block_size,
-                    "use_mla": self.bounce_contexts[instance_id].use_mla,
+                    "block_size": self.cpu_contexts[instance_id].block_size,
+                    "use_mla": self.cpu_contexts[instance_id].use_mla,
                 }
                 for instance_id, (model_name, world_size) in (
-                    self.bounce_context_meta.items()
+                    self.cpu_context_meta.items()
                 )
             },
             "active_sessions": self.session_manager.active_count(),
