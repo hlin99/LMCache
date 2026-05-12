@@ -51,14 +51,16 @@ def _unlink_stale_shm(shm_name: str) -> None:
 
     Args:
         shm_name: POSIX shared-memory name for the new pool (e.g.
-            ``"lmcache_l1_pool_12345"``). Only used for logging context.
+            ``"lmcache_l1_pool_12345"``).
     """
     shm_dir = "/dev/shm"
     prefix = "lmcache_l1_pool_"
     try:
         entries = os.listdir(shm_dir)
-    except OSError:
-        logger.warning("Cannot list %s; skipping stale SHM cleanup", shm_dir)
+    except OSError as exc:
+        logger.warning(
+            "Cannot list %s; skipping stale SHM cleanup: %s", shm_dir, exc
+        )
         return
 
     for entry in entries:
@@ -91,6 +93,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             insufficient free space.
     """
     if config.shm_name:
+        # Clean stale segments first to free space for the capacity check
         _unlink_stale_shm(config.shm_name)
         _check_shm_capacity(config.size_in_bytes)
 
