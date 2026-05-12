@@ -88,7 +88,7 @@ def test_wrap_kv_caches_bounce_returns_empty() -> None:
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
 
-    assert wrap_kv_caches(_make_kv_caches(), use_bounce_buffer=True) == []
+    assert wrap_kv_caches(_make_kv_caches(), use_cpu_context=True) == []
 
 
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:

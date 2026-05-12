@@ -40,9 +40,9 @@ DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 
 
 def wrap_kv_caches(
-    kv_caches: dict[str, torch.Tensor], use_bounce_buffer: bool = False
+    kv_caches: dict[str, torch.Tensor], use_cpu_context: bool = False
 ) -> KVCache:
-    if use_bounce_buffer:
+    if use_cpu_context:
         return []
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
@@ -713,7 +713,7 @@ class LMCacheMPWorkerAdapter:
         ] = {}
 
         # Non-CUDA (bounce-buffer) mode state
-        self._use_bounce_buffer: bool = False
+        self._use_cpu_context: bool = False
         self._device_type: str = "cuda"
         # CPU context for non-CUDA (bounce-buffer) mode
         self.cpu_context: CPUContext | None = None
@@ -856,14 +856,14 @@ class LMCacheMPWorkerAdapter:
                 f"All KV cache tensors must share one device type, got {device_types}"
             )
         self._device_type = next(iter(device_types))
-        self._use_bounce_buffer = self._device_type != "cuda"
+        self._use_cpu_context = self._device_type != "cuda"
         logger.info(
             "Registering kv caches (device_type=%s, bounce=%s)",
             self._device_type,
-            self._use_bounce_buffer,
+            self._use_cpu_context,
         )
 
-        if self._use_bounce_buffer:
+        if self._use_cpu_context:
             # First Party
             from lmcache.v1.distributed.api import MemoryLayoutDesc
             from lmcache.v1.gpu_connector.utils import is_mla
@@ -1019,7 +1019,7 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        if self._use_bounce_buffer:
+        if self._use_cpu_context:
             assert self.cpu_context is not None
             torch_dev.synchronize()
             cpu_chunks = gather_chunks_to_cpu(
@@ -1072,7 +1072,7 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        if self._use_bounce_buffer:
+        if self._use_cpu_context:
             assert self.cpu_context is not None
             handle, chunks = self.cpu_context.prepare_retrieve(key, self.instance_id)
             ok = chunks is not None

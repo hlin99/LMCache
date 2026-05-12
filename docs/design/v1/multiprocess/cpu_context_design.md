@@ -162,7 +162,7 @@ self._cpu_retrieve_done[request_id] = (chunks is not None, block_ids)
 
 The retrieve is now **synchronous in `submit_retrieve_request`**; there is no
 separate future to poll.  This simplifies `get_finished` which no longer
-needs a `if self._use_bounce_buffer:` branch for retrieve futures.
+needs a `if self._use_cpu_context:` branch for retrieve futures.
 
 ## Server integration
 
@@ -259,7 +259,7 @@ back to pickle when SHM is unavailable.
 
 ## Validation coverage
 
-`tests/v1/multiprocess/test_cpu_bounce_buffer.py` covers:
+`tests/v1/multiprocess/test_cpu_context.py` covers:
 
 - CPU wrapper behavior (`wrap_kv_caches` with bounce mode)
 - NHD and MLA gather/scatter round-trip
