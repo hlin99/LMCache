@@ -4,7 +4,6 @@
 # Standard
 from dataclasses import dataclass
 from typing import Any, cast
-import pickle
 
 # Third Party
 import torch
@@ -169,42 +168,6 @@ def _gather_chunks_impl(
     return chunks
 
 
-def gather_chunks_to_cpu(
-    kv_caches: dict[str, torch.Tensor],
-    block_ids: list[int],
-    blocks_per_chunk: int,
-    layout_hints: Any | None = None,
-    gpu_kv_format: Any | None = None,
-) -> bytes:
-    """Gather paged KV blocks into CPU chunk tensors (serialized).
-
-    .. note::
-        Kept for backward compatibility with external consumers.
-        Internal SHM paths use :func:`gather_chunks_to_cpu_tensors` instead.
-
-    Args:
-        kv_caches: Per-layer KV tensor mapping.
-        block_ids: Flattened block IDs for all chunks.
-        blocks_per_chunk: Number of paged blocks in one LMCache chunk.
-        layout_hints: Optional engine layout hints.
-        gpu_kv_format: Optional pre-detected KV format.
-
-    Returns:
-        Pickled list of CPU tensors. For non-MLA, each chunk shape is
-        ``[2, num_layers, chunk_tokens, hidden_dim]`` where dimension ``0``
-        stores ``(K, V)``. For MLA (multi-head latent attention), each chunk
-        shape is ``[num_layers, chunk_tokens, hidden_dim]``.
-    """
-    chunks = _gather_chunks_impl(
-        kv_caches,
-        block_ids,
-        blocks_per_chunk,
-        layout_hints=layout_hints,
-        gpu_kv_format=gpu_kv_format,
-    )
-    return pickle.dumps(chunks)
-
-
 def gather_chunks_to_cpu_tensors(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
@@ -212,11 +175,10 @@ def gather_chunks_to_cpu_tensors(
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
 ) -> list[torch.Tensor]:
-    """Gather paged KV blocks into CPU chunk tensors (no serialization).
+    """Gather paged KV blocks into CPU chunk tensors.
 
-    Same logic as :func:`gather_chunks_to_cpu` but returns a plain list
-    of CPU tensors without pickle serialization.  Used by the SHM store
-    path where data is written directly to shared memory.
+    Used by the SHM store path where data is written directly to
+    shared memory without pickle serialization.
 
     Args:
         kv_caches: Per-layer KV tensor mapping.
@@ -358,44 +320,6 @@ def _scatter_chunks_impl(
                 v_t[effective_block_ids] = v_src_4d
 
 
-def scatter_cpu_chunks_to_kv(
-    kv_caches: dict[str, torch.Tensor],
-    block_ids: list[int],
-    cpu_data: bytes,
-    blocks_per_chunk: int,
-    skip_first_n_tokens: int = 0,
-    layout_hints: Any | None = None,
-    gpu_kv_format: Any | None = None,
-) -> None:
-    """Scatter CPU chunk tensors back into paged KV tensors.
-
-    .. note::
-        Kept for backward compatibility with external consumers.
-        Internal SHM paths use :func:`scatter_tensors_to_kv` instead.
-
-    Args:
-        kv_caches: Per-layer KV tensor mapping to write into.
-        block_ids: Flattened destination block IDs for all chunks.
-        cpu_data: Serialized CPU chunk list (bytes returned by
-            :func:`gather_chunks_to_cpu`, unpickled internally to
-            ``list[torch.Tensor]``).
-        blocks_per_chunk: Number of paged blocks in one LMCache chunk.
-        skip_first_n_tokens: Token prefix to skip when scattering.
-        layout_hints: Optional engine layout hints.
-        gpu_kv_format: Optional pre-detected KV format.
-    """
-    chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-    _scatter_chunks_impl(
-        kv_caches,
-        block_ids,
-        chunks,
-        blocks_per_chunk,
-        skip_first_n_tokens=skip_first_n_tokens,
-        layout_hints=layout_hints,
-        gpu_kv_format=gpu_kv_format,
-    )
-
-
 def scatter_tensors_to_kv(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
@@ -405,10 +329,8 @@ def scatter_tensors_to_kv(
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
 ) -> None:
-    """Scatter pre-deserialized CPU tensors back into paged KV tensors.
+    """Scatter CPU tensors back into paged KV tensors.
 
-    Same as :func:`scatter_cpu_chunks_to_kv` but accepts a list of
-    :class:`torch.Tensor` directly without pickle deserialization.
     Used by the SHM retrieve path where tensors are constructed as
     zero-copy views over shared memory.
 

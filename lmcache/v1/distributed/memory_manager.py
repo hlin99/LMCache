@@ -42,13 +42,29 @@ def _check_shm_capacity(required_bytes: int) -> None:
 
 
 def _unlink_stale_shm(shm_name: str) -> None:
-    """Proactively remove a stale shared-memory segment if it exists.
+    """Remove stale shared-memory segments with the ``lmcache_l1_pool_`` prefix.
+
+    Scans ``/dev/shm`` for all files matching the ``lmcache_l1_pool_*``
+    prefix and removes them. This ensures leftover segments from crashed
+    or previous server instances are cleaned up before a new pool is
+    created, freeing ``/dev/shm`` space so the capacity check succeeds.
 
     Args:
-        shm_name: POSIX shared-memory name (e.g. ``"lmcache_l1_pool"``).
+        shm_name: POSIX shared-memory name for the new pool (e.g.
+            ``"lmcache_l1_pool_12345"``). Only used for logging context.
     """
-    shm_path = f"/dev/shm/{shm_name}"
-    if os.path.exists(shm_path):
+    shm_dir = "/dev/shm"
+    prefix = "lmcache_l1_pool_"
+    try:
+        entries = os.listdir(shm_dir)
+    except OSError:
+        logger.warning("Cannot list %s; skipping stale SHM cleanup", shm_dir)
+        return
+
+    for entry in entries:
+        if not entry.startswith(prefix):
+            continue
+        shm_path = os.path.join(shm_dir, entry)
         try:
             os.unlink(shm_path)
             logger.info("Removed stale shared-memory segment: %s", shm_path)
@@ -75,8 +91,8 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             insufficient free space.
     """
     if config.shm_name:
-        _check_shm_capacity(config.size_in_bytes)
         _unlink_stale_shm(config.shm_name)
+        _check_shm_capacity(config.size_in_bytes)
 
     if config.use_lazy:
         if config.shm_name:
