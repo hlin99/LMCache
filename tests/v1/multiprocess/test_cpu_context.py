@@ -10,13 +10,27 @@ import sys
 import pytest
 import torch
 
+NUM_LAYERS = 2
+DEFAULT_NUM_BLOCKS = 6
+TEST_NUM_BLOCKS = 8
+BLOCK_SIZE = 4
+NUM_HEADS = 2
+HEAD_SIZE = 8
+HIDDEN_SIZE = 16
+ROUNDTRIP_BLOCKS_PER_CHUNK = 2
+SKIP_TEST_BLOCKS_PER_CHUNK = 4
+SENTINEL_VALUE = 999.0
+MODEL_NAME = "m"
+REGISTER_CHUNK_SIZE = 16
+STORE_CHUNK_SIZE = 8
+
 
 def _make_kv_caches(
-    num_layers: int = 2,
-    num_blocks: int = 6,
-    block_size: int = 4,
-    num_heads: int = 2,
-    head_size: int = 8,
+    num_layers: int = NUM_LAYERS,
+    num_blocks: int = DEFAULT_NUM_BLOCKS,
+    block_size: int = BLOCK_SIZE,
+    num_heads: int = NUM_HEADS,
+    head_size: int = HEAD_SIZE,
 ) -> dict[str, torch.Tensor]:
     """Build per-layer NHD KV tensors for CPU cpu context tests."""
     kv_caches = {}
@@ -28,10 +42,10 @@ def _make_kv_caches(
 
 
 def _make_mla_kv_caches(
-    num_layers: int = 2,
-    num_blocks: int = 6,
-    block_size: int = 4,
-    hidden_size: int = 16,
+    num_layers: int = NUM_LAYERS,
+    num_blocks: int = DEFAULT_NUM_BLOCKS,
+    block_size: int = BLOCK_SIZE,
+    hidden_size: int = HIDDEN_SIZE,
 ) -> dict[str, torch.Tensor]:
     """Build per-layer MLA KV tensors for CPU cpu context tests.
 
@@ -52,11 +66,11 @@ def _make_mla_kv_caches(
 
 
 def _make_hnd_kv_caches(
-    num_layers: int = 2,
-    num_blocks: int = 6,
-    block_size: int = 4,
-    num_heads: int = 2,
-    head_size: int = 8,
+    num_layers: int = NUM_LAYERS,
+    num_blocks: int = DEFAULT_NUM_BLOCKS,
+    block_size: int = BLOCK_SIZE,
+    num_heads: int = NUM_HEADS,
+    head_size: int = HEAD_SIZE,
 ) -> dict[str, torch.Tensor]:
     """Build per-layer HND KV tensors for CPU cpu context tests."""
     kv_caches = {}
@@ -68,11 +82,11 @@ def _make_hnd_kv_caches(
 
 
 def _make_hnd_flashinfer_kv_caches(
-    num_layers: int = 2,
-    num_blocks: int = 6,
-    block_size: int = 4,
-    num_heads: int = 2,
-    head_size: int = 8,
+    num_layers: int = NUM_LAYERS,
+    num_blocks: int = DEFAULT_NUM_BLOCKS,
+    block_size: int = BLOCK_SIZE,
+    num_heads: int = NUM_HEADS,
+    head_size: int = HEAD_SIZE,
 ) -> dict[str, torch.Tensor]:
     """Build per-layer HND flash-infer KV tensors for CPU cpu context tests."""
     kv_caches = {}
@@ -91,8 +105,17 @@ def test_wrap_kv_caches_cpu_context_returns_empty() -> None:
     assert wrap_kv_caches(_make_kv_caches(), use_cpu_context=True) == []
 
 
-def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
-    """Validate layout extraction and gather/scatter round-trip on CPU tensors."""
+@pytest.mark.parametrize(
+    ("source_builder", "is_mla"),
+    [
+        (_make_kv_caches, False),
+        (_make_mla_kv_caches, True),
+    ],
+)
+def test_compute_kv_layout_and_gather_scatter_roundtrip(
+    source_builder: Callable[..., dict[str, torch.Tensor]], is_mla: bool
+) -> None:
+    """Validate layout extraction and gather/scatter round-trip for NHD and MLA."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         compute_kv_layout,
@@ -100,7 +123,21 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
         scatter_cpu_chunks_to_kv,
     )
 
-    source = _make_kv_caches(num_layers=2, num_blocks=8, block_size=4)
+    if is_mla:
+        source = source_builder(
+            num_layers=NUM_LAYERS,
+            num_blocks=TEST_NUM_BLOCKS,
+            block_size=BLOCK_SIZE,
+            hidden_size=HIDDEN_SIZE,
+        )
+    else:
+        source = source_builder(
+            num_layers=NUM_LAYERS,
+            num_blocks=TEST_NUM_BLOCKS,
+            block_size=BLOCK_SIZE,
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+        )
     (
         block_size,
         num_layers,
@@ -108,20 +145,28 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
         dtype_str,
         detected_kv_format,
     ) = compute_kv_layout(source)
-    assert block_size == 4
-    assert num_layers == 2
-    assert hidden_dim == 16
+    assert block_size == BLOCK_SIZE
+    assert num_layers == NUM_LAYERS
+    assert hidden_dim == HIDDEN_SIZE
     assert dtype_str == "float32"
     assert detected_kv_format is not None
 
-    blocks_per_chunk = 2
-    gathered = gather_chunks_to_cpu(source, [0, 1], blocks_per_chunk)
+    gathered = gather_chunks_to_cpu(source, [0, 1], ROUNDTRIP_BLOCKS_PER_CHUNK)
     destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
-    scatter_cpu_chunks_to_kv(destination, [4, 5], gathered, blocks_per_chunk)
+    scatter_cpu_chunks_to_kv(
+        destination,
+        [4, 5],
+        gathered,
+        ROUNDTRIP_BLOCKS_PER_CHUNK,
+    )
 
     for name in source:
-        assert torch.allclose(source[name][:, 0], destination[name][:, 4])
-        assert torch.allclose(source[name][:, 1], destination[name][:, 5])
+        if is_mla:
+            assert torch.allclose(source[name][0], destination[name][4])
+            assert torch.allclose(source[name][1], destination[name][5])
+        else:
+            assert torch.allclose(source[name][:, 0], destination[name][:, 4])
+            assert torch.allclose(source[name][:, 1], destination[name][:, 5])
 
 
 @pytest.mark.parametrize(
@@ -144,7 +189,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
     )
     import lmcache.c_ops as lmc_ops
 
-    source = hnd_builder(2, 8, 4, 2, 8)
+    source = hnd_builder(NUM_LAYERS, TEST_NUM_BLOCKS, BLOCK_SIZE, NUM_HEADS, HEAD_SIZE)
     layout_hints = {"kv_layout": "HND"}
     (
         block_size,
@@ -153,17 +198,16 @@ def test_gather_scatter_roundtrip_hnd_layout(
         dtype_str,
         detected_kv_format,
     ) = compute_kv_layout(source, layout_hints=layout_hints)
-    assert block_size == 4
-    assert num_layers == 2
-    assert hidden_dim == 16
+    assert block_size == BLOCK_SIZE
+    assert num_layers == NUM_LAYERS
+    assert hidden_dim == HIDDEN_SIZE
     assert dtype_str == "float32"
     assert detected_kv_format == getattr(lmc_ops.GPUKVFormat, expected_format)
 
-    blocks_per_chunk = 2
     gathered = gather_chunks_to_cpu(
         source,
         [0, 1],
-        blocks_per_chunk,
+        ROUNDTRIP_BLOCKS_PER_CHUNK,
         layout_hints=layout_hints,
         gpu_kv_format=detected_kv_format,
     )
@@ -172,7 +216,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
         destination,
         [4, 5],
         gathered,
-        blocks_per_chunk,
+        ROUNDTRIP_BLOCKS_PER_CHUNK,
         layout_hints=layout_hints,
         gpu_kv_format=detected_kv_format,
     )
@@ -186,67 +230,103 @@ def test_gather_scatter_roundtrip_hnd_layout(
             assert torch.allclose(source[name][1], destination[name][5])
 
 
-def test_scatter_respects_skip_first_n_tokens() -> None:
-    """Ensure scatter honors skip_first_n_tokens and preserves skipped blocks."""
+@pytest.mark.parametrize("skip_first_n_tokens", [8, 5])
+def test_scatter_respects_skip_first_n_tokens(skip_first_n_tokens: int) -> None:
+    """Ensure NHD scatter honors token skips; non-aligned values round down."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         gather_chunks_to_cpu,
         scatter_cpu_chunks_to_kv,
     )
 
-    source = _make_kv_caches(num_layers=2, num_blocks=8, block_size=4)
+    source = _make_kv_caches(
+        num_layers=NUM_LAYERS,
+        num_blocks=TEST_NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+    )
     destination = {
-        name: torch.full_like(tensor, 999.0) for name, tensor in source.items()
+        name: torch.full_like(tensor, SENTINEL_VALUE) for name, tensor in source.items()
     }
-    gathered = gather_chunks_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=4)
+    gathered = gather_chunks_to_cpu(
+        source, [0, 1, 2, 3], blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK
+    )
     scatter_cpu_chunks_to_kv(
         destination,
         [0, 1, 2, 3],
         gathered,
-        blocks_per_chunk=4,
-        skip_first_n_tokens=8,
+        blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
+        skip_first_n_tokens=skip_first_n_tokens,
     )
 
+    first_written_block = skip_first_n_tokens // BLOCK_SIZE
     for name in destination:
-        assert torch.all(destination[name][:, 0] == 999.0)
-        assert torch.all(destination[name][:, 1] == 999.0)
-        assert torch.allclose(destination[name][:, 2], source[name][:, 2])
-        assert torch.allclose(destination[name][:, 3], source[name][:, 3])
+        for block_idx in range(first_written_block):
+            assert torch.all(destination[name][:, block_idx] == SENTINEL_VALUE)
+        for block_idx in range(first_written_block, SKIP_TEST_BLOCKS_PER_CHUNK):
+            assert torch.allclose(
+                destination[name][:, block_idx],
+                source[name][:, block_idx],
+            )
 
 
-def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
-    """Validate gather/scatter round-trip for MLA KV tensors."""
+@pytest.mark.parametrize(
+    ("hnd_builder", "expected_format"),
+    [
+        (_make_hnd_kv_caches, "NL_X_TWO_NB_NH_BS_HS"),
+        (_make_hnd_flashinfer_kv_caches, "NL_X_NB_TWO_NH_BS_HS"),
+    ],
+)
+def test_scatter_hnd_respects_skip_first_n_tokens(
+    hnd_builder: Callable[[int, int, int, int, int], dict[str, torch.Tensor]],
+    expected_format: str,
+) -> None:
+    """Ensure HND/HND-FlashInfer scatter honors skip_first_n_tokens."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         compute_kv_layout,
         gather_chunks_to_cpu,
         scatter_cpu_chunks_to_kv,
     )
+    import lmcache.c_ops as lmc_ops
 
-    source = _make_mla_kv_caches(
-        num_layers=2, num_blocks=8, block_size=4, hidden_size=16
+    source = hnd_builder(NUM_LAYERS, TEST_NUM_BLOCKS, BLOCK_SIZE, NUM_HEADS, HEAD_SIZE)
+    layout_hints = {"kv_layout": "HND"}
+    _, _, _, _, detected_kv_format = compute_kv_layout(
+        source, layout_hints=layout_hints
     )
-    (
-        block_size,
-        num_layers,
-        hidden_dim,
-        dtype_str,
-        detected_kv_format,
-    ) = compute_kv_layout(source)
-    assert block_size == 4
-    assert num_layers == 2
-    assert hidden_dim == 16
-    assert dtype_str == "float32"
-    assert detected_kv_format is not None
+    assert detected_kv_format == getattr(lmc_ops.GPUKVFormat, expected_format)
 
-    blocks_per_chunk = 2
-    gathered = gather_chunks_to_cpu(source, [0, 1], blocks_per_chunk)
-    destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
-    scatter_cpu_chunks_to_kv(destination, [4, 5], gathered, blocks_per_chunk)
+    destination = {
+        name: torch.full_like(tensor, SENTINEL_VALUE) for name, tensor in source.items()
+    }
+    gathered = gather_chunks_to_cpu(
+        source,
+        [0, 1, 2, 3],
+        blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
+        layout_hints=layout_hints,
+        gpu_kv_format=detected_kv_format,
+    )
+    scatter_cpu_chunks_to_kv(
+        destination,
+        [0, 1, 2, 3],
+        gathered,
+        blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
+        skip_first_n_tokens=8,
+        layout_hints=layout_hints,
+        gpu_kv_format=detected_kv_format,
+    )
 
-    for name in source:
-        assert torch.allclose(source[name][0], destination[name][4])
-        assert torch.allclose(source[name][1], destination[name][5])
+    for name in destination:
+        if detected_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+            assert torch.all(destination[name][:, 0] == SENTINEL_VALUE)
+            assert torch.all(destination[name][:, 1] == SENTINEL_VALUE)
+            assert torch.allclose(destination[name][:, 2], source[name][:, 2])
+            assert torch.allclose(destination[name][:, 3], source[name][:, 3])
+        else:
+            assert torch.all(destination[name][0] == SENTINEL_VALUE)
+            assert torch.all(destination[name][1] == SENTINEL_VALUE)
+            assert torch.allclose(destination[name][2], source[name][2])
+            assert torch.allclose(destination[name][3], source[name][3])
 
 
 def test_compute_kv_layout_empty_raises_value_error() -> None:
@@ -267,23 +347,28 @@ def test_scatter_mla_respects_skip_first_n_tokens() -> None:
     )
 
     source = _make_mla_kv_caches(
-        num_layers=2, num_blocks=8, block_size=4, hidden_size=16
+        num_layers=NUM_LAYERS,
+        num_blocks=TEST_NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        hidden_size=HIDDEN_SIZE,
     )
     destination = {
-        name: torch.full_like(tensor, 999.0) for name, tensor in source.items()
+        name: torch.full_like(tensor, SENTINEL_VALUE) for name, tensor in source.items()
     }
-    gathered = gather_chunks_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=4)
+    gathered = gather_chunks_to_cpu(
+        source, [0, 1, 2, 3], blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK
+    )
     scatter_cpu_chunks_to_kv(
         destination,
         [0, 1, 2, 3],
         gathered,
-        blocks_per_chunk=4,
+        blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
         skip_first_n_tokens=8,
     )
 
     for name in destination:
-        assert torch.all(destination[name][0] == 999.0)
-        assert torch.all(destination[name][1] == 999.0)
+        assert torch.all(destination[name][0] == SENTINEL_VALUE)
+        assert torch.all(destination[name][1] == SENTINEL_VALUE)
         assert torch.allclose(destination[name][2], source[name][2])
         assert torch.allclose(destination[name][3], source[name][3])
 
@@ -297,17 +382,22 @@ def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
     )
 
     source = _make_mla_kv_caches(
-        num_layers=2, num_blocks=8, block_size=4, hidden_size=16
+        num_layers=NUM_LAYERS,
+        num_blocks=TEST_NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        hidden_size=HIDDEN_SIZE,
     )
     destination = {
         name: torch.full_like(tensor, 123.0) for name, tensor in source.items()
     }
-    gathered = gather_chunks_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=4)
+    gathered = gather_chunks_to_cpu(
+        source, [0, 1, 2, 3], blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK
+    )
     scatter_cpu_chunks_to_kv(
         destination,
         [0, 1, 2, 3],
         gathered,
-        blocks_per_chunk=4,
+        blocks_per_chunk=SKIP_TEST_BLOCKS_PER_CHUNK,
         skip_first_n_tokens=40,
     )
 
@@ -344,23 +434,27 @@ def test_server_register_and_find_cpu_context_layout(
         patch("lmcache.v1.multiprocess.server.SessionManager"),
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
     ):
-        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=16)
+        engine = MPCacheEngine(
+            storage_manager_config=MagicMock(), chunk_size=REGISTER_CHUNK_SIZE
+        )
     engine.register_kv_cache_cpu_context(
         instance_id=1,
-        model_name="m",
+        model_name=MODEL_NAME,
         world_size=1,
         engine_type=MagicMock(),
         layout_hints={},
-        block_size=4,
-        num_layers=2,
-        hidden_dim_size=16,
+        block_size=BLOCK_SIZE,
+        num_layers=NUM_LAYERS,
+        hidden_dim_size=HIDDEN_SIZE,
         dtype_str="float32",
         use_mla=False,
     )
 
-    layout = engine._find_layout_desc("m", 1)
+    layout = engine._find_layout_desc(MODEL_NAME, 1)
     assert layout is not None
-    assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
+    # Shape is [K/V=2, num_layers, chunk_size, hidden_dim_size].
+    expected_shape = torch.Size([2, NUM_LAYERS, REGISTER_CHUNK_SIZE, HIDDEN_SIZE])
+    assert layout.shapes[0] == expected_shape
 
 
 def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> None:
@@ -370,7 +464,7 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     from lmcache.v1.multiprocess.server import MPCacheEngine
 
     mock_storage = MagicMock()
-    target_tensor = torch.zeros(2, 2, 8, 16)
+    target_tensor = torch.zeros(2, NUM_LAYERS, STORE_CHUNK_SIZE, HIDDEN_SIZE)
     mock_memory_obj = MagicMock()
     mock_memory_obj.tensor = target_tensor
     mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
@@ -396,28 +490,30 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
         ),
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
-        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
+        engine = MPCacheEngine(
+            storage_manager_config=MagicMock(), chunk_size=STORE_CHUNK_SIZE
+        )
 
     engine.register_kv_cache_cpu_context(
         instance_id=2,
-        model_name="m",
+        model_name=MODEL_NAME,
         world_size=1,
         engine_type=MagicMock(),
         layout_hints={},
-        block_size=4,
-        num_layers=2,
-        hidden_dim_size=16,
+        block_size=BLOCK_SIZE,
+        num_layers=NUM_LAYERS,
+        hidden_dim_size=HIDDEN_SIZE,
         dtype_str="float32",
         use_mla=False,
     )
-    payload = torch.ones(2, 2, 8, 16)
+    payload = torch.ones(2, NUM_LAYERS, STORE_CHUNK_SIZE, HIDDEN_SIZE)
     key = IPCCacheEngineKey.from_token_ids(
-        "m",
+        MODEL_NAME,
         1,
         0,
-        [1] * 8,
+        [1] * STORE_CHUNK_SIZE,
         start=0,
-        end=8,
+        end=STORE_CHUNK_SIZE,
         request_id="req",
     )
     with patch(
@@ -426,7 +522,7 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     ):
         store_ok = engine.store_cpu_chunks(key, 2, pickle.dumps([payload]))
         success, cpu_data = engine.retrieve_cpu_chunks(key, 2)
-    assert isinstance(store_ok, bool)
+    assert store_ok is True
     assert torch.allclose(mock_memory_obj.tensor, payload)
 
     assert success is True
