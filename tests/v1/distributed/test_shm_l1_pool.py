@@ -52,24 +52,52 @@ class TestShmCapacityCheck(unittest.TestCase):
 
 
 class TestStaleShm(unittest.TestCase):
-    """Tests for stale SHM cleanup."""
+    """Tests for stale SHM cleanup with flock-based liveness detection."""
 
     def test_unlink_nonexistent_is_safe(self):
         """No error when unlinking a non-existent SHM segment."""
         _unlink_stale_shm("lmcache_test_nonexistent_12345")
 
     def test_unlink_removes_stale_file(self):
-        """Stale SHM file is removed on startup."""
+        """Stale (unlocked) SHM file is removed on startup."""
         # Standard
         from multiprocessing import shared_memory
 
-        name = "lmcache_test_stale_shm"
+        name = "lmcache_l1_pool_test_stale"
         shm = shared_memory.SharedMemory(name=name, create=True, size=4096)
         shm.close()
         self.assertTrue(os.path.exists(f"/dev/shm/{name}"))
 
         _unlink_stale_shm(name)
         self.assertFalse(os.path.exists(f"/dev/shm/{name}"))
+
+    def test_unlink_skips_locked_file(self):
+        """Locked SHM file (active server) is not removed."""
+        # Standard
+        import fcntl
+        from multiprocessing import shared_memory
+
+        name = "lmcache_l1_pool_test_locked"
+        shm = shared_memory.SharedMemory(name=name, create=True, size=4096)
+        shm.close()
+        shm_path = f"/dev/shm/{name}"
+        self.assertTrue(os.path.exists(shm_path))
+
+        # Simulate an active server holding a flock
+        fd = os.open(shm_path, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # Cleanup should skip this file
+            _unlink_stale_shm(name)
+            self.assertTrue(
+                os.path.exists(shm_path),
+                "Locked SHM segment should NOT be deleted",
+            )
+        finally:
+            os.close(fd)
+            # Now it's unlocked → cleanup should remove it
+            _unlink_stale_shm(name)
+            self.assertFalse(os.path.exists(shm_path))
 
 
 class TestL1MemoryManagerShmConfig(unittest.TestCase):

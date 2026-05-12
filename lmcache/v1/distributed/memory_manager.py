@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import fcntl
 import os
 import shutil
 
@@ -45,9 +46,11 @@ def _unlink_stale_shm(shm_name: str) -> None:
     """Remove stale shared-memory segments with the ``lmcache_l1_pool_`` prefix.
 
     Scans ``/dev/shm`` for all files matching the ``lmcache_l1_pool_*``
-    prefix and removes them. This ensures leftover segments from crashed
-    or previous server instances are cleaned up before a new pool is
-    created, freeing ``/dev/shm`` space so the capacity check succeeds.
+    prefix and removes only those that are **not** held by a running
+    server.  Each active server holds an exclusive ``flock`` on its SHM
+    file for its entire lifetime; a non-blocking ``flock`` attempt here
+    distinguishes stale (lock succeeds → safe to delete) from live (lock
+    fails → another server is using it, skip).
 
     Args:
         shm_name: POSIX shared-memory name for the new pool (e.g.
@@ -68,11 +71,27 @@ def _unlink_stale_shm(shm_name: str) -> None:
             continue
         shm_path = os.path.join(shm_dir, entry)
         try:
-            os.unlink(shm_path)
-            logger.info("Removed stale shared-memory segment: %s", shm_path)
+            fd = os.open(shm_path, os.O_RDWR)
+            try:
+                # Non-blocking exclusive lock: succeeds only if no
+                # other process holds a lock (i.e. the segment is stale).
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Lock acquired → stale segment, safe to remove.
+                os.unlink(shm_path)
+                logger.info(
+                    "Removed stale shared-memory segment: %s", shm_path
+                )
+            except OSError:
+                # Lock failed → another server is actively using it.
+                logger.debug(
+                    "SHM segment in use by another server, skipping: %s",
+                    shm_path,
+                )
+            finally:
+                os.close(fd)
         except OSError:
             logger.warning(
-                "Failed to remove stale shared-memory segment: %s",
+                "Failed to check/remove stale SHM segment: %s",
                 shm_path,
                 exc_info=True,
             )
@@ -150,6 +169,26 @@ class L1MemoryManager:
             self._shm_name = ""
         else:
             self._shm_name = config.shm_name
+
+        # Hold an exclusive flock on the SHM file for the server's
+        # lifetime.  _unlink_stale_shm uses a non-blocking flock to
+        # detect whether a segment is still in use; this lock prevents
+        # another server's cleanup from deleting our segment.  The
+        # kernel releases the lock automatically on process crash /
+        # SIGKILL, so stale segments become unlocked and removable.
+        self._shm_lock_fd: int | None = None
+        if self._shm_name:
+            shm_path = f"/dev/shm/{self._shm_name}"
+            try:
+                fd = os.open(shm_path, os.O_RDWR)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._shm_lock_fd = fd
+            except OSError:
+                logger.warning(
+                    "Failed to acquire flock on SHM segment: %s",
+                    shm_path,
+                    exc_info=True,
+                )
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -270,11 +309,19 @@ class L1MemoryManager:
         """
         Close the memory manager and release all resources.
 
-        If the pool is backed by named shared memory, the segment is
-        unlinked so that the kernel can reclaim the pages once all
-        processes detach.
+        If the pool is backed by named shared memory, the flock is
+        released and the segment is unlinked so that the kernel can
+        reclaim the pages once all processes detach.
         """
         self._allocator.close()
+        # Release the flock before unlinking so _unlink_stale_shm
+        # (called by other servers) can detect this segment as stale.
+        if self._shm_lock_fd is not None:
+            try:
+                os.close(self._shm_lock_fd)
+            except OSError:
+                pass
+            self._shm_lock_fd = None
         if self._shm_name:
             _unlink_stale_shm(self._shm_name)
 
