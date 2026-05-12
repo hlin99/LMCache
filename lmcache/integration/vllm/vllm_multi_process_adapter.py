@@ -711,6 +711,8 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
+
+        # Non-CUDA (bounce-buffer) mode state
         self._use_bounce_buffer: bool = False
         self._device_type: str = "cuda"
         # CPU context for non-CUDA (bounce-buffer) mode
