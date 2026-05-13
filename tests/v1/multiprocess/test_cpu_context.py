@@ -83,12 +83,16 @@ def _make_hnd_flashinfer_kv_caches(
     return kv_caches
 
 
-def test_wrap_kv_caches_cpu_context_returns_empty() -> None:
-    """Verify wrap_kv_caches returns no IPC wrappers in cpu context mode."""
+def test_wrap_kv_caches_wraps_all_layers() -> None:
+    """Verify wrap_kv_caches wraps each layer tensor."""
     # First Party
-    from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
+    import lmcache.integration.vllm.vllm_multi_process_adapter as mp_adapter
 
-    assert wrap_kv_caches(_make_kv_caches(), use_cpu_context=True) == []
+    kv_caches = _make_kv_caches()
+    expected = [object() for _ in kv_caches]
+    with patch.object(mp_adapter, "CudaIPCWrapper", side_effect=expected):
+        wrapped = mp_adapter.wrap_kv_caches(kv_caches)
+    assert wrapped == expected
 
 
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:

@@ -36,11 +36,7 @@ DEFAULT_MQ_TIMEOUT: float = 300.0
 DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 
 
-def wrap_kv_caches(
-    kv_caches: dict[str, torch.Tensor], use_cpu_context: bool = False
-) -> KVCache:
-    if use_cpu_context:
-        return []
+def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
 
