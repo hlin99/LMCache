@@ -36,6 +36,21 @@ cpu context design):
 These are registered in the MP server dispatch and have corresponding
 payload/response contracts in the multiprocess protocol definitions.
 
+Current registration payload for `REGISTER_KV_CACHE_CPU_CONTEXT` is:
+
+```python
+[
+    instance_id,      # int
+    model_name,       # str
+    world_size,       # int
+    block_size,       # int
+    num_layers,       # int
+    hidden_dim_size,  # int
+    dtype_str,        # str
+    use_mla,          # bool
+]
+```
+
 ## File structure
 
 ```
@@ -138,7 +153,11 @@ and calls:
 - `transfer_ctx.register(...)`
 - `transfer_ctx.submit_store(...)`
 - `transfer_ctx.submit_retrieve(...)`
-- `transfer_ctx.poll_finished()` (healthy) or `transfer_ctx.drain_all()` (unhealthy)
+- `transfer_ctx.close()`
+
+The adapter owns request completion tracking via
+`self.store_futures` / `self.retrieve_futures`. It polls each future through
+`query()` / `result()` in `get_finished()`.
 
 ### Store path (non-CUDA)
 
@@ -147,10 +166,10 @@ and calls:
 cpu_chunks = gather_paged_kv_to_cpu(kv_caches, block_ids, blocks_in_chunk, ...)
 handle = self._cpu_context.prepare_store(key, instance_id, cpu_chunks)
 ok = self._cpu_context.commit_store(handle)   # synchronous; blocks for server ack
-self._store_done[request_id] = ok
+future = MessagingFuture()
+future.set_result(ok)
+return future
 ```
-
-`CPUTransferContext.poll_finished()` drains `_store_done` on each call.
 
 ### Retrieve path (non-CUDA)
 
@@ -165,15 +184,15 @@ if chunks is not None:
     except (RuntimeError, ValueError, TypeError, IndexError):
         ok = False
 self._cpu_context.commit_retrieve(handle)
-self._retrieve_done[request_id] = (ok, block_ids)
+future = MessagingFuture()
+future.set_result(ok)
+return future
 ```
-
-`CPUTransferContext.poll_finished()` drains `_retrieve_done` on each call.
 The adapter passes `op.skip_first_n_tokens` into
 `transfer_ctx.submit_retrieve(..., skip_first_n_tokens=...)`.
 
 The retrieve is **synchronous inside `CPUTransferContext.submit_retrieve`**;
-`poll_finished()` just drains request ids recorded by submit methods.
+the returned future is already resolved by the time the method returns.
 
 ## Server integration
 
@@ -211,7 +230,7 @@ Additional integration points:
                      |                                 |
                      v                                 v
       CudaTransferContext.register()      CPUTransferContext.register()
-      REGISTER_KV_CACHE (CUDA IPC)        REGISTER_KV_CACHE_CPU_CONTEXT (CPU metadata)
+       REGISTER_KV_CACHE (CUDA IPC)        REGISTER_KV_CACHE_CPU_CONTEXT (scalar metadata)
                      |                         + create_cpu_context()
                      +----------------+----------------+
                                       |
@@ -224,10 +243,10 @@ Additional integration points:
         transfer_ctx.submit_store()       transfer_ctx.submit_store()
                      |                                 |
                      v                                 v
-             STORE (GPU -> L1)           gather_paged_kv_to_cpu()
-                      |                 + _cpu_context.prepare_store()
-                      v                 + _cpu_context.commit_store()  [sync]
-                  [READY]                       _store_done[id] = ok
+              STORE (GPU -> L1)           gather_paged_kv_to_cpu()
+                       |                 + _cpu_context.prepare_store()
+                       v                 + _cpu_context.commit_store()  [sync]
+                   [READY]                       return resolved future
                      |                                 |
                      +----------------+----------------+
                                       |
@@ -237,10 +256,10 @@ Additional integration points:
                      +----------------+----------------+
                      |                                 |
                      v                                 v
-           RETRIEVE (L1 -> GPU)    _cpu_context.prepare_retrieve()  [sync]
-           [async future]          + scatter_cpu_to_paged_kv()
-                                   + _cpu_context.commit_retrieve()
-                                   _retrieve_done[id] = (ok, block_ids)
+            RETRIEVE (L1 -> GPU)    _cpu_context.prepare_retrieve()  [sync]
+            [async future]          + scatter_cpu_to_paged_kv()
+                                    + _cpu_context.commit_retrieve()
+                                    return resolved future
                      |                                 |
                      +----------------+----------------+
                                       |
@@ -273,7 +292,7 @@ back to pickle when SHM is unavailable.
 
 `tests/v1/multiprocess/test_cpu_context.py` covers:
 
-- CPU wrapper behavior (`wrap_kv_caches` with cpu context mode)
+- CPU wrapper behavior (`wrap_kv_caches`)
 - NHD and MLA gather/scatter round-trip
 - HND round-trip for both HND formats
 - `skip_first_n_tokens` behavior
