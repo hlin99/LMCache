@@ -3,7 +3,7 @@
 
 # Standard
 from abc import ABC, abstractmethod
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 # Third Party
 import torch
@@ -21,11 +21,22 @@ from lmcache.v1.multiprocess.cpu_context import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType
 
 logger = init_logger(__name__)
 
-SendRequest = Callable[[Any, RequestType, list[Any]], Any]
+
+class IPCEvent(Protocol):
+    """Protocol for IPC-capable CUDA events used by transport operations."""
+
+    def ipc_handle(self) -> object:
+        """Return an IPC handle consumable by the multiprocess server."""
+
+
+SendRequest = Callable[
+    [MessageQueueClient, RequestType, list[object]], MessagingFuture[object]
+]
 
 
 def _require_kwarg(kwargs: dict[str, Any], key: str) -> Any:
@@ -36,7 +47,12 @@ def _require_kwarg(kwargs: dict[str, Any], key: str) -> Any:
 
 
 class TransferContext(ABC):
-    """Abstract transport layer for worker-side KV transfer."""
+    """Abstract transport layer for worker-side KV transfer.
+
+    Concrete implementations encapsulate how worker-side store/retrieve
+    operations are transmitted to the multiprocess server (for example,
+    CUDA IPC futures or CPU-context gather/scatter flows).
+    """
 
     @abstractmethod
     def register(
@@ -46,11 +62,22 @@ class TransferContext(ABC):
         model_name: str,
         world_size: int,
         blocks_in_chunk: int,
-        mq_client: Any,
+        mq_client: MessageQueueClient,
         mq_timeout: float,
         **kwargs: Any,
     ) -> None:
-        """Register KV caches with the server and wait for ACK."""
+        """Register KV caches with the server and wait for ACK.
+
+        Args:
+            instance_id: Worker process instance id.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            model_name: Model name used by cache keys.
+            world_size: KV world size.
+            blocks_in_chunk: Number of vLLM blocks in one LMCache chunk.
+            mq_client: Message queue client used to communicate with server.
+            mq_timeout: Timeout in seconds for synchronous request wait.
+            **kwargs: Implementation-specific arguments.
+        """
 
     @abstractmethod
     def submit_store(
@@ -60,11 +87,22 @@ class TransferContext(ABC):
         instance_id: int,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[int],
-        event: Any,
+        event: IPCEvent,
         blocks_in_chunk: int,
         **kwargs: Any,
     ) -> None:
-        """Submit a store request."""
+        """Submit a store request.
+
+        Args:
+            request_id: Request identifier.
+            key: LMCache key object.
+            instance_id: Worker process instance id.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            block_ids: vLLM block ids to store.
+            event: Synchronization event object.
+            blocks_in_chunk: Number of vLLM blocks in one LMCache chunk.
+            **kwargs: Implementation-specific arguments.
+        """
 
     @abstractmethod
     def submit_retrieve(
@@ -74,24 +112,44 @@ class TransferContext(ABC):
         instance_id: int,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[int],
-        event: Any,
+        event: IPCEvent,
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
         **kwargs: Any,
     ) -> None:
-        """Submit a retrieve request."""
+        """Submit a retrieve request.
+
+        Args:
+            request_id: Request identifier.
+            key: LMCache key object.
+            instance_id: Worker process instance id.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            block_ids: vLLM block ids to retrieve.
+            event: Synchronization event object.
+            blocks_in_chunk: Number of vLLM blocks in one LMCache chunk.
+            skip_first_n_tokens: Number of tokens to skip for partial scatter.
+            **kwargs: Implementation-specific arguments.
+        """
 
     @abstractmethod
     def poll_finished(self) -> tuple[set[str], set[str], set[int]]:
-        """Return ``(finished_store_ids, finished_retrieve_ids, error_block_ids)``."""
+        """Poll completed requests.
+
+        Returns:
+            Tuple of ``(finished_store_ids, finished_retrieve_ids, error_block_ids)``.
+        """
 
     @abstractmethod
     def drain_all(self) -> tuple[set[str], set[str], set[int]]:
-        """Drain all pending requests for unhealthy mode."""
+        """Drain all pending requests.
+
+        Returns:
+            Tuple of ``(finished_store_ids, finished_retrieve_ids, error_block_ids)``.
+        """
 
     @abstractmethod
     def close(self) -> None:
-        """Release resources."""
+        """Release resources held by this context."""
 
 
 class CudaTransferContext(TransferContext):
@@ -107,15 +165,14 @@ class CudaTransferContext(TransferContext):
         kv_caches: dict[str, torch.Tensor],
         model_name: str,
         world_size: int,
-        blocks_in_chunk: int,
-        mq_client: Any,
+        _blocks_in_chunk: int,
+        mq_client: MessageQueueClient,
         mq_timeout: float,
         **kwargs: Any,
     ) -> None:
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
-        del blocks_in_chunk
         send_request: SendRequest = _require_kwarg(kwargs, "send_request")
         wrap_kv_caches: Callable[[dict[str, torch.Tensor]], Any] = _require_kwarg(
             kwargs, "wrap_kv_caches"
@@ -140,13 +197,12 @@ class CudaTransferContext(TransferContext):
         request_id: str,
         key: Any,
         instance_id: int,
-        kv_caches: dict[str, torch.Tensor],
+        _kv_caches: dict[str, torch.Tensor],
         block_ids: list[int],
-        event: Any,
-        blocks_in_chunk: int,
+        event: IPCEvent,
+        _blocks_in_chunk: int,
         **kwargs: Any,
     ) -> None:
-        del kv_caches, blocks_in_chunk
         send_request: SendRequest = _require_kwarg(kwargs, "send_request")
         future = send_request(
             _require_kwarg(kwargs, "mq_client"),
@@ -160,14 +216,13 @@ class CudaTransferContext(TransferContext):
         request_id: str,
         key: Any,
         instance_id: int,
-        kv_caches: dict[str, torch.Tensor],
+        _kv_caches: dict[str, torch.Tensor],
         block_ids: list[int],
-        event: Any,
-        blocks_in_chunk: int,
+        event: IPCEvent,
+        _blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
         **kwargs: Any,
     ) -> None:
-        del kv_caches, blocks_in_chunk
         send_request: SendRequest = _require_kwarg(kwargs, "send_request")
         future = send_request(
             _require_kwarg(kwargs, "mq_client"),
@@ -243,7 +298,7 @@ class CPUTransferContext(TransferContext):
         model_name: str,
         world_size: int,
         blocks_in_chunk: int,
-        mq_client: Any,
+        mq_client: MessageQueueClient,
         mq_timeout: float,
         **kwargs: Any,
     ) -> None:
@@ -303,13 +358,16 @@ class CPUTransferContext(TransferContext):
         instance_id: int,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[int],
-        event: Any,
+        _event: IPCEvent,
         blocks_in_chunk: int,
         **kwargs: Any,
     ) -> None:
-        del kwargs, event
+        _ = kwargs
         if self._cpu_context is None:
-            raise RuntimeError("CPU transfer context is not registered")
+            raise RuntimeError(
+                "CPU transfer context is not registered. "
+                "Call register() before submit_store()."
+            )
         torch_dev.synchronize()
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
@@ -329,14 +387,17 @@ class CPUTransferContext(TransferContext):
         instance_id: int,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[int],
-        event: Any,
+        _event: IPCEvent,
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
         **kwargs: Any,
     ) -> None:
-        del kwargs, event
+        _ = kwargs
         if self._cpu_context is None:
-            raise RuntimeError("CPU transfer context is not registered")
+            raise RuntimeError(
+                "CPU transfer context is not registered. "
+                "Call register() before submit_retrieve()."
+            )
         handle, chunks = self._cpu_context.prepare_retrieve(key, instance_id)
         ok = chunks is not None
         if chunks is not None:
@@ -350,7 +411,7 @@ class CPUTransferContext(TransferContext):
                     layout_hints=self._layout_hints,
                     gpu_kv_format=self._gpu_kv_format,
                 )
-            except Exception:
+            except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
         self._cpu_context.commit_retrieve(handle)
@@ -380,13 +441,22 @@ class CPUTransferContext(TransferContext):
 
 def create_transfer_context(
     kv_caches: dict[str, torch.Tensor],
-    **kwargs: Any,
+    **_kwargs: Any,
 ) -> TransferContext:
     """Create a transfer context from KV cache device type.
 
     The device check is intentionally centralized here.
+
+    Args:
+        kv_caches: Worker KV cache tensors keyed by layer name.
+        **kwargs: Unused placeholder for forward-compatible factory extension.
+
+    Returns:
+        A concrete :class:`TransferContext` implementation.
+
+    Raises:
+        ValueError: If ``kv_caches`` is empty or has mixed device types.
     """
-    del kwargs
     if not kv_caches:
         raise ValueError("kv_caches is empty")
     device_types = {tensor.device.type for tensor in kv_caches.values()}

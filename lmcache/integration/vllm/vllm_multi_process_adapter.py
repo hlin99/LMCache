@@ -930,7 +930,10 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
         )
         if self.transfer_ctx is None:
-            raise RuntimeError("Transfer context is not initialized")
+            raise RuntimeError(
+                "Transfer context is not initialized. "
+                "Call register_kv_caches() before submitting store requests."
+            )
         self.transfer_ctx.submit_store(
             request_id,
             key,
@@ -977,7 +980,10 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
         )
         if self.transfer_ctx is None:
-            raise RuntimeError("Transfer context is not initialized")
+            raise RuntimeError(
+                "Transfer context is not initialized. "
+                "Call register_kv_caches() before submitting retrieve requests."
+            )
         self.transfer_ctx.submit_retrieve(
             request_id,
             key,
@@ -1093,7 +1099,7 @@ class LMCacheMPWorkerAdapter:
             return set(), set()
 
         unhealthy = not self.is_healthy
-        if not self.is_healthy:
+        if unhealthy:
             finished_stores, finished_retrieves, error_block_ids = (
                 self.transfer_ctx.drain_all()
             )
