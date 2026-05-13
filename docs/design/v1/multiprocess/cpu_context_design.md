@@ -159,13 +159,18 @@ self._store_done[request_id] = ok
 handle, chunks = self._cpu_context.prepare_retrieve(key, instance_id)  # synchronous
 ok = chunks is not None
 if chunks is not None:
-    scatter_cpu_to_paged_kv(kv_caches, block_ids, chunks, blocks_in_chunk,
-                             skip_first_n_tokens=skip_first_n_tokens, ...)
+    try:
+        scatter_cpu_to_paged_kv(kv_caches, block_ids, chunks, blocks_in_chunk,
+                                skip_first_n_tokens=skip_first_n_tokens, ...)
+    except (RuntimeError, ValueError, TypeError, IndexError):
+        ok = False
 self._cpu_context.commit_retrieve(handle)
 self._retrieve_done[request_id] = (ok, block_ids)
 ```
 
 `CPUTransferContext.poll_finished()` drains `_retrieve_done` on each call.
+The adapter passes `op.skip_first_n_tokens` into
+`transfer_ctx.submit_retrieve(..., skip_first_n_tokens=...)`.
 
 The retrieve is **synchronous inside `CPUTransferContext.submit_retrieve`**;
 `poll_finished()` just drains request ids recorded by submit methods.
