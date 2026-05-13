@@ -40,7 +40,13 @@ SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], Messagin
 
 
 class TransferContext(ABC):
-    """Abstract transport layer for worker-side KV transfer."""
+    """Abstract transport layer for worker-side KV transfer.
+
+    Concrete implementations encapsulate how worker-side store/retrieve
+    operations are transmitted to the multiprocess server. CUDA paths return
+    CUDA-aware futures backed by MQ requests, while CPU paths may perform
+    gather/scatter synchronously and return already-resolved futures.
+    """
 
     @abstractmethod
     def register(
@@ -54,7 +60,23 @@ class TransferContext(ABC):
         mq_timeout: float,
         send_request: SendRequest,
     ) -> None:
-        """Register KV caches with the server and wait for ACK."""
+        """Register KV caches with the server and wait for ACK.
+
+        Args:
+            instance_id: Worker process instance identifier.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            model_name: Model name used by cache keys.
+            world_size: KV world size.
+            blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
+            mq_client: Message queue client used to communicate with server.
+            mq_timeout: Timeout in seconds for synchronous request wait.
+            send_request: Request sender callable used to issue MQ requests.
+
+        Raises:
+            TimeoutError: If server registration does not complete before
+                ``mq_timeout``.
+            RuntimeError: If a concrete context cannot initialize.
+        """
 
     @abstractmethod
     def submit_store(
@@ -67,7 +89,23 @@ class TransferContext(ABC):
         event: IPCEvent,
         blocks_in_chunk: int,
     ) -> MessagingFuture:
-        """Submit a store request and return a future."""
+        """Submit a store request and return a completion future.
+
+        Args:
+            request_id: External request identifier.
+            key: LMCache key object for the store range.
+            instance_id: Worker process instance identifier.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            block_ids: vLLM block IDs to store.
+            event: Synchronization event object.
+            blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
+
+        Returns:
+            A future compatible with adapter-side ``query()``/``result()`` flow.
+
+        Raises:
+            RuntimeError: If register() was not called first.
+        """
 
     @abstractmethod
     def submit_retrieve(
@@ -81,7 +119,24 @@ class TransferContext(ABC):
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
     ) -> MessagingFuture:
-        """Submit a retrieve request and return a future."""
+        """Submit a retrieve request and return a completion future.
+
+        Args:
+            request_id: External request identifier.
+            key: LMCache key object for the retrieve range.
+            instance_id: Worker process instance identifier.
+            kv_caches: Worker KV cache tensors keyed by layer name.
+            block_ids: vLLM block IDs to retrieve into.
+            event: Synchronization event object.
+            blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
+            skip_first_n_tokens: Number of initial tokens to skip when writing.
+
+        Returns:
+            A future compatible with adapter-side ``query()``/``result()`` flow.
+
+        Raises:
+            RuntimeError: If register() was not called first.
+        """
 
     @abstractmethod
     def close(self) -> None:

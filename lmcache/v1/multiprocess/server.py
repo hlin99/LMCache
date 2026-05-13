@@ -313,7 +313,17 @@ class MPCacheEngine:
         self.cpu_context_meta[instance_id] = (model_name, world_size)
 
     def _resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
-        """Resolve object keys from an IPC cache key."""
+        """Resolve object keys from an IPC cache key.
+
+        Args:
+            key: IPC cache key describing model/session/token range.
+
+        Returns:
+            Resolved object keys for the requested token range.
+
+        Raises:
+            ValueError: If ``key.worker_id`` is ``None``.
+        """
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [
