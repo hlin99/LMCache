@@ -4,6 +4,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Protocol
+import pickle
 
 # Third Party
 import torch
@@ -330,24 +331,6 @@ class CPUTransferContext(TransferContext):
         ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
         self._layout_hints = layout_hints
         self._gpu_kv_format = gpu_kv_format
-
-        future = send_request(
-            mq_client,
-            RequestType.REGISTER_KV_CACHE_CPU_CONTEXT,
-            [
-                instance_id,
-                model_name,
-                world_size,
-                EngineType.VLLM,
-                layout_hints,
-                block_size,
-                num_layers,
-                hidden_dim_size,
-                dtype_str,
-                is_mla(gpu_kv_format),
-            ],
-        )
-
         use_mla_flag = is_mla(gpu_kv_format)
         shape = (
             torch.Size([num_layers, blocks_in_chunk * block_size, hidden_dim_size])
@@ -357,8 +340,23 @@ class CPUTransferContext(TransferContext):
             )
         )
         dtype = getattr(torch, dtype_str)
+        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+
+        future = send_request(
+            mq_client,
+            RequestType.REGISTER_KV_CACHE_CPU_CONTEXT,
+            [
+                instance_id,
+                model_name,
+                world_size,
+                pickle.dumps(layout_desc),
+                block_size,
+                use_mla_flag,
+            ],
+        )
+
         metadata = CPUContextMetadata(
-            layout_desc=MemoryLayoutDesc(shapes=[shape], dtypes=[dtype]),
+            layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
         )

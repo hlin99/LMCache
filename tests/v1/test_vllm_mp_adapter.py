@@ -11,6 +11,7 @@ deliberately not reachable through any public interface.
 
 # Standard
 from unittest.mock import MagicMock
+import pickle
 
 # Third Party
 import pytest
@@ -120,6 +121,18 @@ def test_register_kv_caches_cpu_submits_cpu_context_registration(
     assert send_mock.call_count == 1
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE_CPU_CONTEXT
+    payload = args[2]
+    assert len(payload) == 6
+    assert payload[0] == adapter.instance_id
+    assert payload[1] == "test-model"
+    assert payload[2] == 1
+    assert isinstance(payload[3], bytes)
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+    assert isinstance(pickle.loads(payload[3]), MemoryLayoutDesc)
+    assert payload[4] == 4
+    assert payload[5] is False
 
 
 def test_submit_store_request_passes_no_transport_kwargs(fake_adapter, monkeypatch):
