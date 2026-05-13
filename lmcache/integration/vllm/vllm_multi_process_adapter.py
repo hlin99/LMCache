@@ -942,8 +942,6 @@ class LMCacheMPWorkerAdapter:
             op.block_ids,
             event,
             self.blocks_in_chunk,
-            mq_client=self.mq_client,
-            send_request=send_lmcache_request,
         )
         self._pending_store_request_ids.add(request_id)
 
@@ -993,8 +991,6 @@ class LMCacheMPWorkerAdapter:
             event,
             self.blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
-            mq_client=self.mq_client,
-            send_request=send_lmcache_request,
         )
 
     @_lmcache_nvtx_annotate

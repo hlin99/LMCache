@@ -64,6 +64,7 @@ class TransferContext(ABC):
         blocks_in_chunk: int,
         mq_client: MessageQueueClient,
         mq_timeout: float,
+        send_request: SendRequest,
         **kwargs: Any,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
@@ -76,6 +77,7 @@ class TransferContext(ABC):
             blocks_in_chunk: Number of vLLM blocks in one LMCache chunk.
             mq_client: Message queue client used to communicate with server.
             mq_timeout: Timeout in seconds for synchronous request wait.
+            send_request: Request sender callable used to issue MQ requests.
             **kwargs: Implementation-specific arguments.
         """
 
@@ -89,7 +91,6 @@ class TransferContext(ABC):
         block_ids: list[int],
         event: IPCEvent,
         blocks_in_chunk: int,
-        **kwargs: Any,
     ) -> None:
         """Submit a store request.
 
@@ -101,7 +102,6 @@ class TransferContext(ABC):
             block_ids: vLLM block ids to store.
             event: Synchronization event object.
             blocks_in_chunk: Number of vLLM blocks in one LMCache chunk.
-            **kwargs: Implementation-specific arguments.
         """
 
     @abstractmethod
@@ -115,7 +115,6 @@ class TransferContext(ABC):
         event: IPCEvent,
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
-        **kwargs: Any,
     ) -> None:
         """Submit a retrieve request.
 
@@ -128,7 +127,6 @@ class TransferContext(ABC):
             event: Synchronization event object.
             blocks_in_chunk: Number of vLLM blocks in one LMCache chunk.
             skip_first_n_tokens: Number of tokens to skip for partial scatter.
-            **kwargs: Implementation-specific arguments.
         """
 
     @abstractmethod
@@ -158,6 +156,9 @@ class CudaTransferContext(TransferContext):
     def __init__(self) -> None:
         self._store_futures: dict[str, Any] = {}
         self._retrieve_futures: dict[str, tuple[Any, list[int]]] = {}
+        self._mq_client: MessageQueueClient | None = None
+        self._mq_timeout: float = 0.0
+        self._send_request: SendRequest | None = None
 
     def register(
         self,
@@ -168,12 +169,15 @@ class CudaTransferContext(TransferContext):
         _blocks_in_chunk: int,
         mq_client: MessageQueueClient,
         mq_timeout: float,
+        send_request: SendRequest,
         **kwargs: Any,
     ) -> None:
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
-        send_request: SendRequest = _require_kwarg(kwargs, "send_request")
+        self._mq_client = mq_client
+        self._mq_timeout = mq_timeout
+        self._send_request = send_request
         wrap_kv_caches: Callable[[dict[str, torch.Tensor]], Any] = _require_kwarg(
             kwargs, "wrap_kv_caches"
         )
@@ -201,11 +205,11 @@ class CudaTransferContext(TransferContext):
         block_ids: list[int],
         event: IPCEvent,
         _blocks_in_chunk: int,
-        **kwargs: Any,
     ) -> None:
-        send_request: SendRequest = _require_kwarg(kwargs, "send_request")
-        future = send_request(
-            _require_kwarg(kwargs, "mq_client"),
+        if self._mq_client is None or self._send_request is None:
+            raise RuntimeError("CUDA transfer context is not registered")
+        future = self._send_request(
+            self._mq_client,
             RequestType.STORE,
             [key, instance_id, block_ids, event.ipc_handle()],
         ).to_cuda_future()
@@ -221,11 +225,11 @@ class CudaTransferContext(TransferContext):
         event: IPCEvent,
         _blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
-        **kwargs: Any,
     ) -> None:
-        send_request: SendRequest = _require_kwarg(kwargs, "send_request")
-        future = send_request(
-            _require_kwarg(kwargs, "mq_client"),
+        if self._mq_client is None or self._send_request is None:
+            raise RuntimeError("CUDA transfer context is not registered")
+        future = self._send_request(
+            self._mq_client,
             RequestType.RETRIEVE,
             [key, instance_id, block_ids, event.ipc_handle(), skip_first_n_tokens],
         ).to_cuda_future()
@@ -279,6 +283,9 @@ class CudaTransferContext(TransferContext):
     def close(self) -> None:
         self._store_futures.clear()
         self._retrieve_futures.clear()
+        self._mq_client = None
+        self._send_request = None
+        self._mq_timeout = 0.0
 
 
 class CPUTransferContext(TransferContext):
@@ -290,6 +297,9 @@ class CPUTransferContext(TransferContext):
         self._gpu_kv_format: Any = None
         self._store_done: dict[str, bool] = {}
         self._retrieve_done: dict[str, tuple[bool, list[int]]] = {}
+        self._mq_client: MessageQueueClient | None = None
+        self._mq_timeout: float = 0.0
+        self._send_request: SendRequest | None = None
 
     def register(
         self,
@@ -300,12 +310,15 @@ class CPUTransferContext(TransferContext):
         blocks_in_chunk: int,
         mq_client: MessageQueueClient,
         mq_timeout: float,
+        send_request: SendRequest,
         **kwargs: Any,
     ) -> None:
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
-        send_request: SendRequest = _require_kwarg(kwargs, "send_request")
+        self._mq_client = mq_client
+        self._mq_timeout = mq_timeout
+        self._send_request = send_request
         layout_hints = vllm_layout_hints()
         (
             block_size,
@@ -360,9 +373,7 @@ class CPUTransferContext(TransferContext):
         block_ids: list[int],
         _event: IPCEvent,
         blocks_in_chunk: int,
-        **kwargs: Any,
     ) -> None:
-        _ = kwargs
         if self._cpu_context is None:
             raise RuntimeError(
                 "CPU transfer context is not registered. "
@@ -390,9 +401,7 @@ class CPUTransferContext(TransferContext):
         _event: IPCEvent,
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
-        **kwargs: Any,
     ) -> None:
-        _ = kwargs
         if self._cpu_context is None:
             raise RuntimeError(
                 "CPU transfer context is not registered. "
@@ -437,6 +446,9 @@ class CPUTransferContext(TransferContext):
             self._cpu_context = None
         self._store_done.clear()
         self._retrieve_done.clear()
+        self._mq_client = None
+        self._send_request = None
+        self._mq_timeout = 0.0
 
 
 def create_transfer_context(
