@@ -37,6 +37,7 @@ DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
+    """Wrap each KV cache tensor with CUDA IPC wrapper metadata."""
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
 

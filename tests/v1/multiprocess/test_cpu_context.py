@@ -89,7 +89,7 @@ def test_wrap_kv_caches_wraps_all_tensors() -> None:
     import lmcache.integration.vllm.vllm_multi_process_adapter as mp_adapter
 
     kv_caches = _make_kv_caches()
-    expected = [object() for _ in kv_caches]
+    expected = [MagicMock(name=f"wrapped_tensor_{idx}") for idx, _ in enumerate(kv_caches)]
     wrapper = MagicMock(side_effect=expected)
     with patch.object(mp_adapter, "CudaIPCWrapper", wrapper):
         wrapped = mp_adapter.wrap_kv_caches(kv_caches)
