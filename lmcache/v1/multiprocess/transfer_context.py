@@ -206,8 +206,15 @@ class CudaTransferContext(TransferContext):
         event: IPCEvent,
         _blocks_in_chunk: int,
     ) -> None:
-        if self._mq_client is None or self._send_request is None:
-            raise RuntimeError("CUDA transfer context is not registered")
+        if (
+            self._mq_client is None
+            or self._send_request is None
+            or self._mq_timeout <= 0
+        ):
+            raise RuntimeError(
+                "CUDA transfer context is not registered. "
+                "Call register() before submit_store()."
+            )
         future = self._send_request(
             self._mq_client,
             RequestType.STORE,
@@ -226,8 +233,15 @@ class CudaTransferContext(TransferContext):
         _blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
     ) -> None:
-        if self._mq_client is None or self._send_request is None:
-            raise RuntimeError("CUDA transfer context is not registered")
+        if (
+            self._mq_client is None
+            or self._send_request is None
+            or self._mq_timeout <= 0
+        ):
+            raise RuntimeError(
+                "CUDA transfer context is not registered. "
+                "Call register() before submit_retrieve()."
+            )
         future = self._send_request(
             self._mq_client,
             RequestType.RETRIEVE,
@@ -284,8 +298,8 @@ class CudaTransferContext(TransferContext):
         self._store_futures.clear()
         self._retrieve_futures.clear()
         self._mq_client = None
-        self._send_request = None
         self._mq_timeout = 0.0
+        self._send_request = None
 
 
 class CPUTransferContext(TransferContext):
@@ -447,8 +461,8 @@ class CPUTransferContext(TransferContext):
         self._store_done.clear()
         self._retrieve_done.clear()
         self._mq_client = None
-        self._send_request = None
         self._mq_timeout = 0.0
+        self._send_request = None
 
 
 def create_transfer_context(
