@@ -39,13 +39,6 @@ SendRequest = Callable[
 ]
 
 
-def _require_kwarg(kwargs: dict[str, Any], key: str) -> Any:
-    """Return a required keyword argument or raise ValueError."""
-    if key not in kwargs:
-        raise ValueError(f"Missing required keyword argument: {key}")
-    return kwargs[key]
-
-
 class TransferContext(ABC):
     """Abstract transport layer for worker-side KV transfer.
 
@@ -65,7 +58,6 @@ class TransferContext(ABC):
         mq_client: MessageQueueClient,
         mq_timeout: float,
         send_request: SendRequest,
-        **kwargs: Any,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -78,7 +70,6 @@ class TransferContext(ABC):
             mq_client: Message queue client used to communicate with server.
             mq_timeout: Timeout in seconds for synchronous request wait.
             send_request: Request sender callable used to issue MQ requests.
-            **kwargs: Implementation-specific arguments.
         """
 
     @abstractmethod
@@ -170,17 +161,14 @@ class CudaTransferContext(TransferContext):
         mq_client: MessageQueueClient,
         mq_timeout: float,
         send_request: SendRequest,
-        **kwargs: Any,
     ) -> None:
         # First Party
+        from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
         self._mq_client = mq_client
         self._mq_timeout = mq_timeout
         self._send_request = send_request
-        wrap_kv_caches: Callable[[dict[str, torch.Tensor]], Any] = _require_kwarg(
-            kwargs, "wrap_kv_caches"
-        )
         layout_hints = vllm_layout_hints()
         future = send_request(
             mq_client,
@@ -325,7 +313,6 @@ class CPUTransferContext(TransferContext):
         mq_client: MessageQueueClient,
         mq_timeout: float,
         send_request: SendRequest,
-        **kwargs: Any,
     ) -> None:
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints

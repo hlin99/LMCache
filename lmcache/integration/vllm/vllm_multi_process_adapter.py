@@ -838,7 +838,6 @@ class LMCacheMPWorkerAdapter:
                 self.mq_client,
                 self._mq_timeout,
                 send_request=send_lmcache_request,
-                wrap_kv_caches=wrap_kv_caches,
             )
         except TimeoutError:
             raise ConnectionError(
