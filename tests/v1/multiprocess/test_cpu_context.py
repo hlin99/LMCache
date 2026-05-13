@@ -10,6 +10,9 @@ import sys
 import pytest
 import torch
 
+# First Party
+from lmcache.v1.distributed.api import MemoryLayoutDesc
+
 
 def _make_kv_caches(
     num_layers: int = 2,
@@ -345,8 +348,6 @@ def test_server_register_and_find_cpu_context_layout(
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
     ):
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=16)
-    # First Party
-    from lmcache.v1.distributed.api import MemoryLayoutDesc
 
     engine.register_kv_cache_cpu_context(
         instance_id=1,
@@ -401,8 +402,6 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-    # First Party
-    from lmcache.v1.distributed.api import MemoryLayoutDesc
 
     engine.register_kv_cache_cpu_context(
         instance_id=2,

@@ -299,7 +299,9 @@ class MPCacheEngine:
             instance_id: Worker instance identifier (typically PID).
             model_name: Model name associated with this worker.
             world_size: Worker world size used in cache keys.
-            layout_desc_bytes: Pickled :class:`MemoryLayoutDesc`.
+            layout_desc_bytes: Pickled :class:`MemoryLayoutDesc` carrying
+                KV cache tensor shape/dtype metadata (for both MLA and
+                non-MLA layouts).
             block_size: Tokens per paged block.
             use_mla: Whether the worker KV format is MLA.
 
@@ -320,14 +322,25 @@ class MPCacheEngine:
         self.cpu_context_meta[instance_id] = (model_name, world_size)
 
     def _resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
-        """Resolve object keys from request/session token hashes."""
+        """Resolve object keys from request/session token hashes.
+
+        Args:
+            key: IPC cache key carrying request/session metadata.
+
+        Returns:
+            Object keys derived from hashed chunk ranges.
+
+        Raises:
+            ValueError: If ``key.worker_id`` is ``None``. This method is
+                only valid for worker-originated IPC operations.
+        """
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [
             TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
         ]
         if key.worker_id is None:
-            raise ValueError("Must operate with worker_id != None")
+            raise ValueError("worker_id must not be None for this operation")
         return ipc_key_to_object_keys(key, chunk_hashes)
 
     @_lmcache_nvtx_annotate

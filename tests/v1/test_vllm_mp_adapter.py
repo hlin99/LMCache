@@ -10,8 +10,8 @@ deliberately not reachable through any public interface.
 """
 
 # Standard
-from unittest.mock import MagicMock
 import pickle
+from unittest.mock import MagicMock
 
 # Third Party
 import pytest
@@ -24,6 +24,7 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LoadStoreOp,
     ParallelStrategy,
 )
+from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.multiprocess.protocol import RequestType
 
 
@@ -127,8 +128,6 @@ def test_register_kv_caches_cpu_submits_cpu_context_registration(
     assert payload[1] == "test-model"
     assert payload[2] == 1
     assert isinstance(payload[3], bytes)
-    # First Party
-    from lmcache.v1.distributed.api import MemoryLayoutDesc
 
     assert isinstance(pickle.loads(payload[3]), MemoryLayoutDesc)
     assert payload[4] == 4
