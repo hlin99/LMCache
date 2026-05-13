@@ -135,6 +135,7 @@ def test_submit_store_request_passes_no_transport_kwargs(fake_adapter, monkeypat
 
     adapter.submit_store_request("req-1", op, event=MagicMock())
 
+    assert transfer_ctx.submit_store.called
     assert transfer_ctx.submit_store.call_args.kwargs == {}
 
 
@@ -157,4 +158,5 @@ def test_submit_retrieve_request_passes_no_transport_kwargs(fake_adapter, monkey
 
     adapter.submit_retrieve_request("req-1", op, event=MagicMock())
 
+    assert transfer_ctx.submit_retrieve.called
     assert transfer_ctx.submit_retrieve.call_args.kwargs == {"skip_first_n_tokens": 1}

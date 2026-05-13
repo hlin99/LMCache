@@ -209,7 +209,7 @@ class CudaTransferContext(TransferContext):
         if (
             self._mq_client is None
             or self._send_request is None
-            or self._mq_timeout <= 0
+            or self._mq_timeout < 0
         ):
             raise RuntimeError(
                 "CUDA transfer context is not registered. "
@@ -236,7 +236,7 @@ class CudaTransferContext(TransferContext):
         if (
             self._mq_client is None
             or self._send_request is None
-            or self._mq_timeout <= 0
+            or self._mq_timeout < 0
         ):
             raise RuntimeError(
                 "CUDA transfer context is not registered. "
