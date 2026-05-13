@@ -83,15 +83,17 @@ def _make_hnd_flashinfer_kv_caches(
     return kv_caches
 
 
-def test_wrap_kv_caches_wraps_all_layers() -> None:
-    """Verify wrap_kv_caches wraps each layer tensor."""
+def test_wrap_kv_caches_wraps_all_tensors() -> None:
+    """Verify wrap_kv_caches wraps each KV cache tensor."""
     # First Party
     import lmcache.integration.vllm.vllm_multi_process_adapter as mp_adapter
 
     kv_caches = _make_kv_caches()
     expected = [object() for _ in kv_caches]
-    with patch.object(mp_adapter, "CudaIPCWrapper", side_effect=expected):
+    wrapper = MagicMock(side_effect=expected)
+    with patch.object(mp_adapter, "CudaIPCWrapper", wrapper):
         wrapped = mp_adapter.wrap_kv_caches(kv_caches)
+    assert wrapper.call_args_list == [((tensor,),) for tensor in kv_caches.values()]
     assert wrapped == expected
 
 
