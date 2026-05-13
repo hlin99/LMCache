@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
@@ -98,3 +99,23 @@ def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
         fake_tensor = MagicMock()
         fake_tensor.device.type = "cuda"
         adapter.register_kv_caches({"layer.0": fake_tensor})
+
+
+def test_register_kv_caches_cpu_submits_cpu_context_registration(
+    fake_adapter, monkeypatch
+):
+    """CPU KV cache registration routes to REGISTER_KV_CACHE_CPU_CONTEXT."""
+    adapter, send_mock, _ = fake_adapter
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.utils.vllm_layout_hints",
+        lambda: {},
+        raising=False,
+    )
+    cpu_kv = {"layer.0": torch.randn(2, 8, 4, 2, 8)}
+
+    adapter.register_kv_caches(cpu_kv)
+
+    assert adapter.kv_caches is cpu_kv
+    assert send_mock.call_count == 1
+    args, _kwargs = send_mock.call_args
+    assert args[1] == RequestType.REGISTER_KV_CACHE_CPU_CONTEXT
