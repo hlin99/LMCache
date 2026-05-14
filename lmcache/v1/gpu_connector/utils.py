@@ -425,9 +425,11 @@ def normalize_kv_and_discover_format(
             logger.warning(
                 "No KV Cache Layout hint provided when using vLLM, defaulting to NHD"
             )
-            # vLLM uses HND layout for CPU attention, but its get_kv_cache_layout()
-            # does not reflect this correctly, so we hardcode the fallback here.
-            kv_layout = "HND" if torch_device_type == "cpu" else "NHD"
+            kv_layout = "NHD"
+        # vLLM uses HND layout for CPU attention, but its get_kv_cache_layout()
+        # does not reflect this correctly, so we hardcode the fallback here.
+        if torch_device_type == "cpu":
+            kv_layout = "HND"
         logger.info("vLLM KV cache layout: %s", kv_layout)
         is_hnd = kv_layout == "HND"
         if list_depth == 0:

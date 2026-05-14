@@ -53,6 +53,7 @@ def _detect_device() -> tuple[Any, str]:
 
 torch_dev, torch_device_type = _detect_device()
 
+logger.info(" torch_dev=%s, torch_device_type=%s", torch_dev, torch_device_type)
 
 # --------------------------
 # Dynamic backend selection
