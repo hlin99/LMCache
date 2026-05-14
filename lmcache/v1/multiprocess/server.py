@@ -337,6 +337,7 @@ class MPCacheEngine:
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla,
+            inference_engine_logical_block_size=inference_engine_logical_block_size,
         )
         self.cpu_context_meta[instance_id] = (model_name, world_size)
 
@@ -1209,6 +1210,11 @@ class MPCacheEngine:
                     "world_size": world_size,
                     "block_size": self.cpu_contexts[instance_id].block_size,
                     "use_mla": self.cpu_contexts[instance_id].use_mla,
+                    "inference_engine_logical_block_size": (
+                        self.cpu_contexts[
+                            instance_id
+                        ].inference_engine_logical_block_size
+                    ),
                 }
                 for instance_id, (model_name, world_size) in (
                     self.cpu_context_meta.items()

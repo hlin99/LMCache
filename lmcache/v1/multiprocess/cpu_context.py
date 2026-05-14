@@ -33,11 +33,15 @@ class CPUContextMetadata:
         layout_desc: Memory layout descriptor used to interpret chunk payloads.
         block_size: Number of tokens per paged block.
         use_mla: Whether the worker KV format is MLA.
+        inference_engine_logical_block_size: Logical tokens per
+            inference-engine block (e.g. ``cache_config.block_size`` for
+            vLLM). ``0`` means the value was not provided by the caller.
     """
 
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
+    inference_engine_logical_block_size: int = 0
 
 
 class CPUContext(ABC):
