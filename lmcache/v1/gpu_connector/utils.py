@@ -23,6 +23,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache import torch_device_type
 
 if TYPE_CHECKING:
     # First Party
@@ -424,7 +425,9 @@ def normalize_kv_and_discover_format(
             logger.warning(
                 "No KV Cache Layout hint provided when using vLLM, defaulting to NHD"
             )
-            kv_layout = "NHD"
+            # vLLM uses HND layout for CPU attention, but its get_kv_cache_layout()
+            # does not reflect this correctly, so we hardcode the fallback here.
+            kv_layout = "HND" if torch_device_type == "cpu" else "NHD"
         logger.info("vLLM KV cache layout: %s", kv_layout)
         is_hnd = kv_layout == "HND"
         if list_depth == 0:
