@@ -160,6 +160,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 str,
                 bool,
                 int,
+                bytes,
             ],
             response_class=None,
             handler_type=HandlerType.SYNC,

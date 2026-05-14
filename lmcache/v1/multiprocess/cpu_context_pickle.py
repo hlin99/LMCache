@@ -39,14 +39,14 @@ message, waits for the response, and deserialises the returned bytes with \
         super().__init__(metadata, mq_client, mq_timeout)
 
     def prepare_store(
-        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
+        self, key: Any, instance_id: int, chunks: list[list[torch.Tensor]]
     ) -> Any:
         """Serialise *chunks* with ``pickle.dumps``.
 
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
-            chunks: CPU chunk tensors to serialise.
+            chunks: Per-chunk, per-group CPU tensors to serialise.
 
         Returns:
             Opaque handle ``(key, instance_id, serialised_bytes)`` to be
@@ -80,7 +80,7 @@ message, waits for the response, and deserialises the returned bytes with \
 
     def prepare_retrieve(
         self, key: Any, instance_id: int
-    ) -> tuple[Any, list[torch.Tensor] | None]:
+    ) -> tuple[Any, list[list[torch.Tensor]] | None]:
         """Fetch serialised chunks from the server via ``RETRIEVE_CPU_CHUNKS``.
 
         Blocks until the server responds with the cached data (or reports a
@@ -92,9 +92,10 @@ message, waits for the response, and deserialises the returned bytes with \
 
         Returns:
             ``(None, chunks)`` on cache hit where *chunks* is the
-            deserialised list of CPU tensors, or ``(None, None)`` on cache
-            miss or timeout.  The handle is ``None`` because the pickle path
-            has no resources to release in :meth:`commit_retrieve`.
+            deserialised list of per-chunk, per-group CPU tensors, or
+            ``(None, None)`` on cache miss or timeout.  The handle is
+            ``None`` because the pickle path has no resources to release in
+            :meth:`commit_retrieve`.
         """
         future = self.mq_client.submit_request(
             RequestType.RETRIEVE_CPU_CHUNKS,
@@ -107,7 +108,7 @@ message, waits for the response, and deserialises the returned bytes with \
             return (None, None)
         if not success or not cpu_data_bytes:
             return (None, None)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data_bytes)
+        chunks: list[list[torch.Tensor]] = pickle.loads(cpu_data_bytes)
         return (None, chunks)
 
     def commit_retrieve(self, handle: Any) -> None:

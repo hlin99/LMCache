@@ -362,6 +362,8 @@ def test_server_register_and_find_cpu_context_layout(
         hidden_dim_size=16,
         dtype_str="float32",
         use_mla=False,
+        inference_engine_logical_block_size=0,
+        layout_desc_bytes=b"",
     )
 
     layout = engine._find_layout_desc("m", 1)
@@ -376,9 +378,18 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     from lmcache.v1.multiprocess.server import MPCacheEngine
 
     mock_storage = MagicMock()
-    target_tensor = torch.zeros(2, 2, 8, 16)
+
+    # Set up a mock memory object that supports per-group access.
+    shape = torch.Size([2, 2, 8, 16])
+    dtype = torch.float32
+    size_bytes = shape.numel() * dtype.itemsize
+    raw_data = torch.zeros(size_bytes, dtype=torch.uint8)
+
     mock_memory_obj = MagicMock()
-    mock_memory_obj.tensor = target_tensor
+    mock_memory_obj.get_shapes.return_value = [shape]
+    mock_memory_obj.get_dtypes.return_value = [dtype]
+    mock_memory_obj.group_prefix_sum = [0, size_bytes]
+    mock_memory_obj.raw_data = raw_data
     mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
 
     @contextmanager
@@ -413,8 +424,11 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
         hidden_dim_size=16,
         dtype_str="float32",
         use_mla=False,
+        inference_engine_logical_block_size=0,
+        layout_desc_bytes=b"",
     )
-    payload = torch.ones(2, 2, 8, 16)
+    # Payload is now list[list[torch.Tensor]]: one chunk, one group.
+    payload = torch.ones(shape, dtype=dtype)
     key = IPCCacheEngineKey.from_token_ids(
         "m",
         1,
@@ -428,12 +442,13 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
         "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
         return_value=["obj"],
     ):
-        store_ok = engine.store_cpu_chunks(key, 2, pickle.dumps([payload]))
+        store_ok = engine.store_cpu_chunks(key, 2, pickle.dumps([[payload]]))
         success, cpu_data = engine.retrieve_cpu_chunks(key, 2)
     assert isinstance(store_ok, bool)
-    assert torch.allclose(mock_memory_obj.tensor, payload)
 
     assert success is True
-    recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+    recovered_chunks: list[list[torch.Tensor]] = pickle.loads(cpu_data)
+    # One chunk, one group.
     assert len(recovered_chunks) == 1
-    assert torch.allclose(recovered_chunks[0], payload)
+    assert len(recovered_chunks[0]) == 1
+    assert torch.allclose(recovered_chunks[0][0], payload)

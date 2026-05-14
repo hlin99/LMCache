@@ -249,6 +249,7 @@ class CPUTransferContext(TransferContext):
         self._cpu_context: CPUContext | None = None
         self._layout_hints: Any = None
         self._gpu_kv_format: Any = None
+        self._ie_logical_block_size: int = 0
 
     def register(
         self,
@@ -262,14 +263,24 @@ class CPUTransferContext(TransferContext):
         send_request: SendRequest,
         vllm_logical_block_size: int = 0,
     ) -> None:
+        # Standard
+        import pickle
+
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints
+        from lmcache.v1.gpu_connector.utils import (
+            get_block_size,
+            get_head_size,
+            get_num_heads,
+            get_num_layers,
+        )
 
         layout_hints = vllm_layout_hints()
         if vllm_logical_block_size > 0:
             layout_hints["inference_engine_logical_block_size"] = (
                 vllm_logical_block_size
             )
+        self._ie_logical_block_size = vllm_logical_block_size
         (
             block_size,
             num_layers,
@@ -281,15 +292,44 @@ class CPUTransferContext(TransferContext):
         self._gpu_kv_format = gpu_kv_format
 
         use_mla_flag = is_mla(gpu_kv_format)
-        shape = (
-            torch.Size([num_layers, blocks_in_chunk * block_size, hidden_dim_size])
-            if use_mla_flag
-            else torch.Size(
-                [2, num_layers, blocks_in_chunk * block_size, hidden_dim_size]
-            )
-        )
         dtype = getattr(torch, dtype_str)
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+
+        # Build per-group MemoryLayoutDesc so the server allocates the right
+        # amount of memory per group per chunk (compressed groups have fewer
+        # physical slots than non-compressed ones).
+        tensors = list(kv_caches.values())
+        # Standard
+        from collections import defaultdict
+
+        # First Party
+        from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
+
+        _fmt, normalized = normalize_kv_and_discover_format(
+            tensors, EngineType.VLLM, layout_hints=layout_hints
+        )
+        total_layers = get_num_layers(normalized, gpu_kv_format)
+        block_size_to_layers: dict[int, list[int]] = defaultdict(list)
+        for layer_idx in range(total_layers):
+            bs = get_block_size(normalized, gpu_kv_format, layer_idx)
+            block_size_to_layers[bs].append(layer_idx)
+        sorted_groups = sorted(block_size_to_layers.items(), key=lambda kv: kv[1][0])
+
+        shapes: list[torch.Size] = []
+        dtypes: list[torch.dtype] = []
+        for group_bs, layer_indices in sorted_groups:
+            nl = len(layer_indices)
+            first_idx = layer_indices[0]
+            tokens = blocks_in_chunk * group_bs
+            nh = get_num_heads(normalized, gpu_kv_format, first_idx)
+            hs = get_head_size(normalized, gpu_kv_format, first_idx)
+            hidden = nh * hs
+            if use_mla_flag:
+                shapes.append(torch.Size([nl, tokens, hidden]))
+            else:
+                shapes.append(torch.Size([2, nl, tokens, hidden]))
+            dtypes.append(dtype)
+        layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
+        layout_desc_bytes: bytes = pickle.dumps(layout_desc)
 
         future = send_request(
             mq_client,
@@ -304,6 +344,7 @@ class CPUTransferContext(TransferContext):
                 dtype_str,
                 use_mla_flag,
                 vllm_logical_block_size,
+                layout_desc_bytes,
             ],
         )
 
@@ -311,6 +352,7 @@ class CPUTransferContext(TransferContext):
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
+            inference_engine_logical_block_size=vllm_logical_block_size,
         )
         self._cpu_context = create_cpu_context(metadata, mq_client, mq_timeout)
         future.result(timeout=mq_timeout)
@@ -336,6 +378,7 @@ class CPUTransferContext(TransferContext):
             kv_caches,
             block_ids,
             blocks_in_chunk,
+            inference_engine_logical_block_size=self._ie_logical_block_size,
             layout_hints=self._layout_hints,
             gpu_kv_format=self._gpu_kv_format,
         )
@@ -373,6 +416,7 @@ class CPUTransferContext(TransferContext):
                     chunks,
                     blocks_in_chunk,
                     skip_first_n_tokens=skip_first_n_tokens,
+                    inference_engine_logical_block_size=self._ie_logical_block_size,
                     layout_hints=self._layout_hints,
                     gpu_kv_format=self._gpu_kv_format,
                 )

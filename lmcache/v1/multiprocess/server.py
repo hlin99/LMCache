@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from functools import partial
 from itertools import islice
-from typing import Generator
+from typing import Any, Generator
 import argparse
 import pickle
 import threading
@@ -296,6 +296,7 @@ class MPCacheEngine:
         dtype_str: str,
         use_mla: bool,
         inference_engine_logical_block_size: int = 0,
+        layout_desc_bytes: bytes = b"",
     ) -> None:
         """Register non-CUDA KV layout metadata for CPU context mode.
 
@@ -303,9 +304,9 @@ class MPCacheEngine:
             instance_id: Worker instance identifier (typically PID).
             model_name: Model name associated with this worker.
             world_size: Worker world size used in cache keys.
-            block_size: Tokens per paged block.
-            num_layers: Number of model layers.
-            hidden_dim_size: Flattened hidden dimension per token.
+            block_size: Tokens per paged block (first group, for observability).
+            num_layers: Number of model layers (total, for observability).
+            hidden_dim_size: Flattened hidden dimension per token (first group).
             dtype_str: Torch dtype name (for example ``"float16"``).
             use_mla: Whether the worker KV format is MLA.
             inference_engine_logical_block_size: Logical tokens per
@@ -313,8 +314,12 @@ class MPCacheEngine:
                 vLLM). Used to derive per-group compression ratios when
                 some KV layer groups compress multiple logical tokens
                 into a single physical slot. A value of ``0`` means
-                the caller did not provide this information (treated as
-                "not available").
+                the caller did not provide this information.
+            layout_desc_bytes: Pickled :class:`~lmcache.v1.distributed.api.\
+MemoryLayoutDesc` with one entry per KV layer group.  When non-empty it
+                overrides the shape derived from the scalar parameters; when
+                empty the server falls back to computing a single-group shape
+                from the scalar parameters for backward compatibility.
 
         Raises:
             ValueError: If ``dtype_str`` is not a valid torch dtype name.
@@ -327,12 +332,17 @@ class MPCacheEngine:
                 "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
             )
 
-        shape = (
-            torch.Size([num_layers, self.chunk_size, hidden_dim_size])
-            if use_mla
-            else torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])
-        )
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        if layout_desc_bytes:
+            layout_desc: MemoryLayoutDesc = pickle.loads(layout_desc_bytes)
+        else:
+            # Backward-compat fallback: single-group shape from scalar params.
+            shape = (
+                torch.Size([num_layers, self.chunk_size, hidden_dim_size])
+                if use_mla
+                else torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])
+            )
+            layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+
         self.cpu_contexts[instance_id] = CPUContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
@@ -374,7 +384,9 @@ class MPCacheEngine:
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
-            cpu_data: Pickled list of CPU tensors produced by the worker.
+            cpu_data: Pickled list of per-chunk, per-group CPU tensors
+                produced by the worker.  Each element is a list of
+                per-group tensors for one chunk.
 
         Returns:
             ``True`` when all reserved objects are written, otherwise ``False``.
@@ -389,7 +401,7 @@ class MPCacheEngine:
                 f"CPU context not registered for instance ID {instance_id}"
             )
         ctx = self.cpu_contexts[instance_id]
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        chunks: list[list[torch.Tensor]] = pickle.loads(cpu_data)
         reserved_dict = self.storage_manager.reserve_write(
             obj_keys, ctx.layout_desc, "new"
         )
@@ -401,18 +413,56 @@ class MPCacheEngine:
                 if idx >= len(chunks):
                     continue
                 memory_obj = reserved_dict[obj_key]
-                if memory_obj.tensor is None:
+                chunk_groups = chunks[idx]
+                if not self._write_groups_to_memory_obj(memory_obj, chunk_groups):
                     continue
-                chunk_cpu = chunks[idx]
-                if chunk_cpu.shape != memory_obj.tensor.shape:
-                    continue
-                memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
             if written_keys:
                 self.storage_manager.finish_write(written_keys)
 
         return len(written_keys) == len(reserved_dict)
+
+    def _write_groups_to_memory_obj(
+        self,
+        memory_obj: Any,
+        group_tensors: list[torch.Tensor],
+    ) -> bool:
+        """Write per-group tensors into a memory object's raw buffer.
+
+        For single-group memory objects this is equivalent to a simple
+        ``tensor.copy_``.  For multi-group objects each group's tensor is
+        written into its dedicated slice of the flat raw-data buffer using
+        the ``group_prefix_sum`` offsets.
+
+        Args:
+            memory_obj: The target :class:`~lmcache.v1.memory_management.\
+TensorMemoryObj`.
+            group_tensors: Per-group tensors to write.  Must be ordered the
+                same way as the groups in ``memory_obj.meta.shapes``.
+
+        Returns:
+            ``True`` on success, ``False`` if a shape or group-count mismatch
+            is detected.
+        """
+        shapes = memory_obj.get_shapes()
+        dtypes = memory_obj.get_dtypes()
+        if len(group_tensors) != len(shapes):
+            return False
+        for g_idx, (g_tensor, g_shape, g_dtype) in enumerate(
+            zip(group_tensors, shapes, dtypes, strict=True)
+        ):
+            if g_tensor.shape != g_shape:
+                return False
+            start = memory_obj.group_prefix_sum[g_idx]
+            end = memory_obj.group_prefix_sum[g_idx + 1]
+            size_bytes = g_shape.numel() * g_dtype.itemsize
+            if end - start != size_bytes:
+                return False
+            memory_obj.raw_data[start:end].copy_(
+                g_tensor.contiguous().view(torch.uint8).view(-1)
+            )
+        return True
 
     @_lmcache_nvtx_annotate
     def retrieve_cpu_chunks(
@@ -428,7 +478,7 @@ class MPCacheEngine:
 
         Returns:
             Tuple ``(success, payload)`` where ``payload`` is a pickled
-            list of CPU chunk tensors.
+            list of per-chunk, per-group CPU tensor lists.
 
         Raises:
             ValueError: If the instance has no registered cpu context.
@@ -440,21 +490,57 @@ class MPCacheEngine:
                 f"CPU context not registered for instance ID {instance_id}"
             )
 
+        ctx = self.cpu_contexts[instance_id]
         prefetched_keys: list[ObjectKey] = []
         try:
             with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
                 if not memory_objs or len(memory_objs) != len(obj_keys):
                     return False, b""
                 prefetched_keys = obj_keys[: len(memory_objs)]
-                chunks = []
+                chunks: list[list[torch.Tensor]] = []
                 for memory_obj in memory_objs:
-                    if memory_obj.tensor is None:
+                    group_tensors = self._read_groups_from_memory_obj(
+                        memory_obj, ctx.layout_desc
+                    )
+                    if group_tensors is None:
                         return False, b""
-                    chunks.append(memory_obj.tensor.cpu().clone())
+                    chunks.append(group_tensors)
                 return True, pickle.dumps(chunks)
         finally:
             if prefetched_keys:
                 self.storage_manager.finish_read_prefetched(prefetched_keys)
+
+    def _read_groups_from_memory_obj(
+        self,
+        memory_obj: Any,
+        layout_desc: MemoryLayoutDesc,
+    ) -> list[torch.Tensor] | None:
+        """Read per-group tensors from a memory object's raw buffer.
+
+        Args:
+            memory_obj: The source :class:`~lmcache.v1.memory_management.\
+TensorMemoryObj`.
+            layout_desc: The per-group memory layout descriptor for this
+                instance (from ``CPUContextMetadata.layout_desc``).
+
+        Returns:
+            A list of CPU tensors, one per group, or ``None`` if the memory
+            object is invalid or group metadata is missing.
+        """
+        shapes = memory_obj.get_shapes()
+        dtypes = memory_obj.get_dtypes()
+        if not shapes or not dtypes:
+            return None
+        group_tensors: list[torch.Tensor] = []
+        for g_idx, (g_shape, g_dtype) in enumerate(zip(shapes, dtypes, strict=True)):
+            start = memory_obj.group_prefix_sum[g_idx]
+            end = memory_obj.group_prefix_sum[g_idx + 1]
+            size_bytes = g_shape.numel() * g_dtype.itemsize
+            if end - start != size_bytes:
+                return None
+            raw_slice = memory_obj.raw_data[start:end]
+            group_tensors.append(raw_slice.view(g_dtype).view(g_shape).cpu().clone())
+        return group_tensors
 
     @_lmcache_nvtx_annotate
     def store(

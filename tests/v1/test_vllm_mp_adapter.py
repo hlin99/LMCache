@@ -140,11 +140,12 @@ def test_register_kv_caches_cpu_submits_cpu_context_registration(
     assert send_mock.call_count == 1
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE_CPU_CONTEXT
-    assert len(args[2]) == 9
+    assert len(args[2]) == 10
     # REGISTER_KV_CACHE_CPU_CONTEXT payload: [instance_id, model_name,
     #   world_size, block_size, num_layers, hidden_dim_size, dtype_str,
-    #   use_mla, vllm_logical_block_size]
+    #   use_mla, vllm_logical_block_size, layout_desc_bytes]
     assert args[2][8] == 16  # vllm_logical_block_size from fake_adapter fixture
+    assert isinstance(args[2][9], bytes)  # serialized MemoryLayoutDesc
 
 
 def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):

@@ -14,6 +14,7 @@ This module provides:
 
 # Standard
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -21,8 +22,11 @@ from typing import Any, cast
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -74,14 +78,14 @@ class CPUContext(ABC):
 
     @abstractmethod
     def prepare_store(
-        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
+        self, key: Any, instance_id: int, chunks: list[list[torch.Tensor]]
     ) -> Any:
         """Prepare a store operation.
 
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
-            chunks: CPU chunk tensors to store.
+            chunks: Per-chunk, per-group CPU tensors to store.
 
         Returns:
             An opaque handle to be passed to :meth:`commit_store`.
@@ -103,7 +107,7 @@ class CPUContext(ABC):
     @abstractmethod
     def prepare_retrieve(
         self, key: Any, instance_id: int
-    ) -> tuple[Any, list[torch.Tensor] | None]:
+    ) -> tuple[Any, list[list[torch.Tensor]] | None]:
         """Prepare a retrieve operation.
 
         Args:
@@ -111,9 +115,9 @@ class CPUContext(ABC):
             instance_id: Worker instance identifier.
 
         Returns:
-            A ``(handle, chunks)`` pair.  ``chunks`` is a list of CPU tensors
-            on cache hit, or ``None`` on cache miss.  The handle must be
-            passed to :meth:`commit_retrieve`.
+            A ``(handle, chunks)`` pair.  ``chunks`` is a list of per-chunk,
+            per-group CPU tensors on cache hit, or ``None`` on cache miss.
+            The handle must be passed to :meth:`commit_retrieve`.
         """
         ...
 
@@ -205,23 +209,38 @@ def gather_paged_kv_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
     blocks_per_chunk: int,
+    inference_engine_logical_block_size: int = 0,
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
-) -> list[torch.Tensor]:
-    """Gather paged KV blocks into CPU chunk tensors.
+) -> list[list[torch.Tensor]]:
+    """Gather paged KV blocks into CPU chunk tensors, handling per-group compression.
+
+    Layers are grouped by their physical block size.  Groups with a smaller
+    physical block size (i.e. compressed groups whose ``compress_ratio =
+    inference_engine_logical_block_size // physical_block_size > 1``) are
+    gathered with their own per-group block size so the resulting token
+    dimension is correct.
 
     Args:
         kv_caches: Per-layer KV tensor mapping.
         block_ids: Flattened block IDs for all chunks.
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
+        inference_engine_logical_block_size: Logical tokens per
+            inference-engine block (``cache_config.block_size`` for vLLM).
+            Used only for documentation and future callers; the actual
+            per-group physical block size is read directly from the tensor
+            shape.  Pass ``0`` if not available.
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
 
     Returns:
-        List of CPU tensors, one per chunk.  For non-MLA each chunk has shape
-        ``[2, num_layers, chunk_tokens, hidden_dim]`` where dimension ``0``
-        stores ``(K, V)``.  For MLA (multi-head latent attention) each chunk
-        has shape ``[num_layers, chunk_tokens, hidden_dim]``.
+        ``chunks`` — a list of length ``len(block_ids) // blocks_per_chunk``.
+        Each element is a list of per-group tensors for that chunk.  Groups
+        are ordered by the index of their first layer.  For non-MLA, each
+        group tensor has shape
+        ``[2, num_layers_in_group, group_tokens, hidden_dim]`` where
+        ``group_tokens = blocks_per_chunk * group_block_size``.  For MLA,
+        shape is ``[num_layers_in_group, group_tokens, hidden_dim]``.
     """
     # First Party
     from lmcache.v1.gpu_connector.utils import (
@@ -243,99 +262,131 @@ def gather_paged_kv_to_cpu(
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     )
 
-    block_size = get_block_size(normalized, gpu_kv_format)
-    num_chunks = len(block_ids) // blocks_per_chunk
-
-    # After normalization the structure is always a list of per-layer
-    # tensors.  Cast once so all downstream indexing is typed correctly.
     layer_tensors = cast(list[torch.Tensor], normalized)
+    num_layers = len(layer_tensors)
 
-    chunks: list[torch.Tensor] = []
+    # Group layers by their physical block size (deterministic: sort groups
+    # by the index of their first layer so order is stable across calls).
+    block_size_to_layers: dict[int, list[int]] = defaultdict(list)
+    for layer_idx in range(num_layers):
+        bs = get_block_size(normalized, gpu_kv_format, layer_idx)
+        block_size_to_layers[bs].append(layer_idx)
+    sorted_groups: list[tuple[int, list[int]]] = sorted(
+        block_size_to_layers.items(), key=lambda kv: kv[1][0]
+    )
+
+    num_chunks = len(block_ids) // blocks_per_chunk
+    chunks: list[list[torch.Tensor]] = []
+
     for chunk_idx in range(num_chunks):
         chunk_block_ids = block_ids[
             chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
         ]
-        if use_mla:
-            mla_layers: list[torch.Tensor] = []
+        group_tensors: list[torch.Tensor] = []
+
+        for group_bs, layer_indices in sorted_groups:
             idx = torch.tensor(chunk_block_ids, dtype=torch.long)
-            for layer in layer_tensors:
-                layer_blocks = layer[idx]
-                mla_layers.append(
-                    layer_blocks.reshape(
-                        len(chunk_block_ids) * block_size, layer_blocks.shape[-1]
+            if use_mla:
+                mla_layers: list[torch.Tensor] = []
+                for layer_idx in layer_indices:
+                    layer = layer_tensors[layer_idx]
+                    layer_blocks = layer[idx]
+                    mla_layers.append(
+                        layer_blocks.reshape(
+                            len(chunk_block_ids) * group_bs, layer_blocks.shape[-1]
+                        )
                     )
-                )
-            chunks.append(torch.stack(mla_layers, dim=0).cpu())
-        else:
-            k_layers: list[torch.Tensor] = []
-            v_layers: list[torch.Tensor] = []
-            for layer in layer_tensors:
-                if is_hnd:
-                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                        k_t = layer[0]
-                        v_t = layer[1]
+                group_tensors.append(torch.stack(mla_layers, dim=0).cpu())
+            else:
+                k_layers: list[torch.Tensor] = []
+                v_layers: list[torch.Tensor] = []
+                for layer_idx in layer_indices:
+                    layer = layer_tensors[layer_idx]
+                    if is_hnd:
+                        if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+                            k_t = layer[0]
+                            v_t = layer[1]
+                        else:
+                            k_t = layer[:, 0]
+                            v_t = layer[:, 1]
+                        _num_blocks, num_heads, _block_size, head_size = k_t.shape
+                        k_blocks = k_t[idx]
+                        v_blocks = v_t[idx]
+                        k_layers.append(
+                            k_blocks.permute(0, 2, 1, 3).reshape(
+                                len(chunk_block_ids) * group_bs,
+                                num_heads * head_size,
+                            )
+                        )
+                        v_layers.append(
+                            v_blocks.permute(0, 2, 1, 3).reshape(
+                                len(chunk_block_ids) * group_bs,
+                                num_heads * head_size,
+                            )
+                        )
                     else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _num_blocks, num_heads, _block_size, head_size = k_t.shape
-                    k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    # HND blocks are [NB, NH, BS, HS]; convert to token-major
-                    # [NB, BS, NH, HS] before flattening to [tokens, NH*HS].
-                    k_layers.append(
-                        k_blocks.permute(0, 2, 1, 3).reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
+                        if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+                            k_t = layer[0]
+                            v_t = layer[1]
+                        else:
+                            k_t = layer[:, 0]
+                            v_t = layer[:, 1]
+                        _num_blocks, _block_size, num_heads, head_size = k_t.shape
+                        k_blocks = k_t[idx]
+                        v_blocks = v_t[idx]
+                        k_layers.append(
+                            k_blocks.reshape(
+                                len(chunk_block_ids) * group_bs,
+                                num_heads * head_size,
+                            )
                         )
-                    )
-                    v_layers.append(
-                        v_blocks.permute(0, 2, 1, 3).reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
+                        v_layers.append(
+                            v_blocks.reshape(
+                                len(chunk_block_ids) * group_bs,
+                                num_heads * head_size,
+                            )
                         )
-                    )
-                else:
-                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                        k_t = layer[0]
-                        v_t = layer[1]
-                    else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _num_blocks, _block_size, num_heads, head_size = k_t.shape
-                    k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    k_layers.append(
-                        k_blocks.reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
-                        )
-                    )
-                    v_layers.append(
-                        v_blocks.reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
-                        )
-                    )
-            k_stacked = torch.stack(k_layers, dim=0)
-            v_stacked = torch.stack(v_layers, dim=0)
-            chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
+                k_stacked = torch.stack(k_layers, dim=0)
+                v_stacked = torch.stack(v_layers, dim=0)
+                group_tensors.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
+
+        chunks.append(group_tensors)
     return chunks
 
 
 def scatter_cpu_to_paged_kv(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
-    chunks: list[torch.Tensor],
+    chunks: list[list[torch.Tensor]],
     blocks_per_chunk: int,
     skip_first_n_tokens: int = 0,
+    inference_engine_logical_block_size: int = 0,
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
+    Handles per-group compression: layers are grouped by their physical block
+    size and each group is scattered using its own physical block size.
+    ``skip_first_n_tokens`` is aligned to
+    ``inference_engine_logical_block_size`` (when provided) so that the skip
+    boundary always falls on an inference-engine logical block boundary, which
+    is required for correct partial-chunk restoration.
+
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
         block_ids: Flattened destination block IDs for all chunks.
-        chunks: List of CPU chunk tensors (as returned by
-            :func:`gather_paged_kv_to_cpu`).
+        chunks: List of chunk groups as returned by
+            :func:`gather_paged_kv_to_cpu`.  Each element is a list of
+            per-group tensors for one chunk.
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
-        skip_first_n_tokens: Token prefix to skip when scattering.
+        skip_first_n_tokens: Logical token prefix to skip when scattering.
+            Aligned to ``inference_engine_logical_block_size`` (rounded down).
+        inference_engine_logical_block_size: Logical tokens per
+            inference-engine block.  Used to align ``skip_first_n_tokens``
+            and to compute the logical token offset for each chunk.  Pass
+            ``0`` to fall back to the first group's physical block size
+            (non-compressed models).
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
     """
@@ -358,82 +409,123 @@ def scatter_cpu_to_paged_kv(
         gpu_kv_format = fmt
     use_mla = is_mla(gpu_kv_format)
 
-    block_size = get_block_size(normalized, gpu_kv_format)
     device = tensors[0].device
     is_hnd = gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     )
 
-    # After normalization the structure is always a list of per-layer
-    # tensors.  Cast once so all downstream indexing is typed correctly.
     layer_tensors = cast(list[torch.Tensor], normalized)
+    num_layers = len(layer_tensors)
 
-    for chunk_idx, chunk_cpu in enumerate(chunks):
+    # Same grouping as gather_paged_kv_to_cpu
+    block_size_to_layers: dict[int, list[int]] = defaultdict(list)
+    for layer_idx in range(num_layers):
+        bs = get_block_size(normalized, gpu_kv_format, layer_idx)
+        block_size_to_layers[bs].append(layer_idx)
+    sorted_groups: list[tuple[int, list[int]]] = sorted(
+        block_size_to_layers.items(), key=lambda kv: kv[1][0]
+    )
+
+    # The skip boundary must be expressed in logical (inference-engine) token
+    # units so that compressed groups with a smaller physical block size skip
+    # the correct number of physical blocks.  For non-compressed models this
+    # coincides with the physical block size.
+    first_group_bs = sorted_groups[0][0]
+    ie_block_size = (
+        inference_engine_logical_block_size
+        if inference_engine_logical_block_size > 0
+        else first_group_bs
+    )
+
+    for chunk_idx, chunk_group_list in enumerate(chunks):
         chunk_block_ids = block_ids[
             chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
         ]
         if not chunk_block_ids:
             continue
 
-        chunk_start_token = chunk_idx * blocks_per_chunk * block_size
-        chunk_end_token = chunk_start_token + len(chunk_block_ids) * block_size
+        # chunk_start_token / chunk_end_token are in *logical* token units.
+        chunk_start_token = chunk_idx * blocks_per_chunk * ie_block_size
+        chunk_end_token = chunk_start_token + len(chunk_block_ids) * ie_block_size
         effective_start = max(chunk_start_token, skip_first_n_tokens)
         if effective_start >= chunk_end_token:
             continue
 
-        skip_blocks_in_chunk = (effective_start - chunk_start_token) // block_size
+        skip_tokens_in_chunk = effective_start - chunk_start_token
+        if skip_tokens_in_chunk % ie_block_size != 0:
+            logger.warning(
+                "skip_first_n_tokens (%d) is not aligned to "
+                "inference_engine_logical_block_size (%d); "
+                "rounding down from %d tokens to %d blocks",
+                skip_first_n_tokens,
+                ie_block_size,
+                skip_tokens_in_chunk,
+                skip_tokens_in_chunk // ie_block_size,
+            )
+        # skip_blocks_in_chunk: number of IE logical blocks (= physical blocks)
+        # to skip at the start of this chunk.
+        skip_blocks_in_chunk = skip_tokens_in_chunk // ie_block_size
         effective_block_ids = chunk_block_ids[skip_blocks_in_chunk:]
         if not effective_block_ids:
             continue
 
-        skip_tokens = skip_blocks_in_chunk * block_size
-        chunk_device = chunk_cpu.to(device)
+        for group_idx, (group_bs, layer_indices) in enumerate(sorted_groups):
+            if group_idx >= len(chunk_group_list):
+                continue
+            chunk_tensor = chunk_group_list[group_idx]
+            chunk_device = chunk_tensor.to(device)
 
-        if use_mla:
-            eff_idx = torch.tensor(effective_block_ids, dtype=torch.long)
-            for layer_idx, layer in enumerate(layer_tensors):
-                mla_src = chunk_device[layer_idx, skip_tokens:]
-                hidden_size = layer.shape[-1]
-                mla_src_3d = mla_src.reshape(
-                    len(effective_block_ids), block_size, hidden_size
-                )
-                layer[eff_idx] = mla_src_3d
-        elif is_hnd:
-            for layer_idx, layer in enumerate(layer_tensors):
-                k_src = chunk_device[0, layer_idx, skip_tokens:]
-                v_src = chunk_device[1, layer_idx, skip_tokens:]
-                if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                    k_t = layer[0]
-                    v_t = layer[1]
-                else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
-                _nb, nh, _bs, hs = k_t.shape
-                k_blocks = k_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                ).permute(0, 2, 1, 3)
-                v_blocks = v_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                ).permute(0, 2, 1, 3)
-                k_t[effective_block_ids] = k_blocks
-                v_t[effective_block_ids] = v_blocks
-        else:
-            for layer_idx, layer in enumerate(layer_tensors):
-                k_src = chunk_device[0, layer_idx, skip_tokens:]
-                v_src = chunk_device[1, layer_idx, skip_tokens:]
-                if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                    k_t = layer[0]
-                    v_t = layer[1]
-                else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
-                _num_blocks, _block_size, num_heads, head_size = k_t.shape
-                k_src_4d = k_src.reshape(
-                    len(effective_block_ids), block_size, num_heads, head_size
-                )
-                v_src_4d = v_src.reshape(
-                    len(effective_block_ids), block_size, num_heads, head_size
-                )
-                k_t[effective_block_ids] = k_src_4d
-                v_t[effective_block_ids] = v_src_4d
+            # Physical tokens to skip in the chunk tensor for this group.
+            skip_physical_tokens = skip_blocks_in_chunk * group_bs
+
+            if use_mla:
+                eff_idx = torch.tensor(effective_block_ids, dtype=torch.long)
+                for list_idx, layer_idx in enumerate(layer_indices):
+                    layer = layer_tensors[layer_idx]
+                    mla_src = chunk_device[list_idx, skip_physical_tokens:]
+                    hidden_size = layer.shape[-1]
+                    mla_src_3d = mla_src.reshape(
+                        len(effective_block_ids), group_bs, hidden_size
+                    )
+                    layer[eff_idx] = mla_src_3d
+            elif is_hnd:
+                for list_idx, layer_idx in enumerate(layer_indices):
+                    layer = layer_tensors[layer_idx]
+                    k_src = chunk_device[0, list_idx, skip_physical_tokens:]
+                    v_src = chunk_device[1, list_idx, skip_physical_tokens:]
+                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
+                        k_t = layer[0]
+                        v_t = layer[1]
+                    else:
+                        k_t = layer[:, 0]
+                        v_t = layer[:, 1]
+                    _nb, nh, _bs, hs = k_t.shape
+                    k_blocks = k_src.reshape(
+                        len(effective_block_ids), group_bs, nh, hs
+                    ).permute(0, 2, 1, 3)
+                    v_blocks = v_src.reshape(
+                        len(effective_block_ids), group_bs, nh, hs
+                    ).permute(0, 2, 1, 3)
+                    k_t[effective_block_ids] = k_blocks
+                    v_t[effective_block_ids] = v_blocks
+            else:
+                for list_idx, layer_idx in enumerate(layer_indices):
+                    layer = layer_tensors[layer_idx]
+                    k_src = chunk_device[0, list_idx, skip_physical_tokens:]
+                    v_src = chunk_device[1, list_idx, skip_physical_tokens:]
+                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+                        k_t = layer[0]
+                        v_t = layer[1]
+                    else:
+                        k_t = layer[:, 0]
+                        v_t = layer[:, 1]
+                    _num_blocks, _block_size, num_heads, head_size = k_t.shape
+                    k_src_4d = k_src.reshape(
+                        len(effective_block_ids), group_bs, num_heads, head_size
+                    )
+                    v_src_4d = v_src.reshape(
+                        len(effective_block_ids), group_bs, num_heads, head_size
+                    )
+                    k_t[effective_block_ids] = k_src_4d
+                    v_t[effective_block_ids] = v_src_4d
