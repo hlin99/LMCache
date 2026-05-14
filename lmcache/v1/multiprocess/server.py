@@ -315,8 +315,9 @@ class MPCacheEngine:
                 some KV layer groups compress multiple logical tokens
                 into a single physical slot. A value of ``0`` means
                 the caller did not provide this information.
-            layout_desc_bytes: Pickled :class:`~lmcache.v1.distributed.api.\
-MemoryLayoutDesc` with one entry per KV layer group.  When non-empty it
+            layout_desc_bytes: Pickled
+                :class:`~lmcache.v1.distributed.api.MemoryLayoutDesc`
+                with one entry per KV layer group.  When non-empty it
                 overrides the shape derived from the scalar parameters; when
                 empty the server falls back to computing a single-group shape
                 from the scalar parameters for backward compatibility.
@@ -436,8 +437,8 @@ MemoryLayoutDesc` with one entry per KV layer group.  When non-empty it
         the ``group_prefix_sum`` offsets.
 
         Args:
-            memory_obj: The target :class:`~lmcache.v1.memory_management.\
-TensorMemoryObj`.
+            memory_obj: The target
+                :class:`~lmcache.v1.memory_management.TensorMemoryObj`.
             group_tensors: Per-group tensors to write.  Must be ordered the
                 same way as the groups in ``memory_obj.meta.shapes``.
 
@@ -518,8 +519,8 @@ TensorMemoryObj`.
         """Read per-group tensors from a memory object's raw buffer.
 
         Args:
-            memory_obj: The source :class:`~lmcache.v1.memory_management.\
-TensorMemoryObj`.
+            memory_obj: The source
+                :class:`~lmcache.v1.memory_management.TensorMemoryObj`.
             layout_desc: The per-group memory layout descriptor for this
                 instance (from ``CPUContextMetadata.layout_desc``).
 

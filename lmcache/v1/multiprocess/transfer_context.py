@@ -3,7 +3,9 @@
 
 # Standard
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from typing import Any, Callable, Protocol
+import pickle
 
 # Third Party
 import torch
@@ -12,7 +14,14 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.gpu_connector.utils import is_mla
+from lmcache.v1.gpu_connector.utils import (
+    get_block_size,
+    get_head_size,
+    get_num_heads,
+    get_num_layers,
+    is_mla,
+    normalize_kv_and_discover_format,
+)
 from lmcache.v1.multiprocess.cpu_context import (
     CPUContext,
     CPUContextMetadata,
@@ -263,17 +272,8 @@ class CPUTransferContext(TransferContext):
         send_request: SendRequest,
         vllm_logical_block_size: int = 0,
     ) -> None:
-        # Standard
-        import pickle
-
         # First Party
         from lmcache.integration.vllm.utils import vllm_layout_hints
-        from lmcache.v1.gpu_connector.utils import (
-            get_block_size,
-            get_head_size,
-            get_num_heads,
-            get_num_layers,
-        )
 
         layout_hints = vllm_layout_hints()
         if vllm_logical_block_size > 0:
@@ -298,12 +298,6 @@ class CPUTransferContext(TransferContext):
         # amount of memory per group per chunk (compressed groups have fewer
         # physical slots than non-compressed ones).
         tensors = list(kv_caches.values())
-        # Standard
-        from collections import defaultdict
-
-        # First Party
-        from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
-
         _fmt, normalized = normalize_kv_and_discover_format(
             tensors, EngineType.VLLM, layout_hints=layout_hints
         )
