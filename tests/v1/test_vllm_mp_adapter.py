@@ -95,6 +95,20 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     assert args[1] == RequestType.REGISTER_KV_CACHE
 
 
+def test_register_kv_caches_includes_logical_block_size_in_layout_hints(fake_adapter):
+    """register_kv_caches passes vllm_logical_block_size via layout_hints."""
+    adapter, send_mock, _ = fake_adapter
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    args, _kwargs = send_mock.call_args
+    assert args[1] == RequestType.REGISTER_KV_CACHE
+    layout_hints = args[2][5]
+    assert layout_hints.get("inference_engine_logical_block_size") == 16
+
+
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     """Public register_kv_caches surfaces ConnectionError on MQ timeout."""
     adapter, _send_mock, future = fake_adapter
@@ -124,7 +138,8 @@ def test_register_kv_caches_cpu_submits_cpu_context_registration(
     assert send_mock.call_count == 1
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE_CPU_CONTEXT
-    assert len(args[2]) == 8
+    assert len(args[2]) == 9
+    assert args[2][8] == 16  # vllm_block_size from fake_adapter fixture
 
 
 def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):

@@ -295,6 +295,7 @@ class MPCacheEngine:
         hidden_dim_size: int,
         dtype_str: str,
         use_mla: bool,
+        inference_engine_logical_block_size: int = 0,
     ) -> None:
         """Register non-CUDA KV layout metadata for CPU context mode.
 
@@ -307,6 +308,11 @@ class MPCacheEngine:
             hidden_dim_size: Flattened hidden dimension per token.
             dtype_str: Torch dtype name (for example ``"float16"``).
             use_mla: Whether the worker KV format is MLA.
+            inference_engine_logical_block_size: Logical tokens per
+                inference-engine block (``cache_config.block_size`` for
+                vLLM). Used to derive per-group compression ratios when
+                some KV layer groups compress multiple logical tokens
+                into a single physical slot.
 
         Raises:
             ValueError: If ``dtype_str`` is not a valid torch dtype name.
