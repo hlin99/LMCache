@@ -916,6 +916,7 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        logger.error(" submit_store_request ")
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:

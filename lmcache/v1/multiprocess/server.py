@@ -388,21 +388,28 @@ class MPCacheEngine:
         try:
             for idx, obj_key in enumerate(obj_keys):
                 if obj_key not in reserved_dict:
+                    logger.error("skip idx=%s: obj_key not reserved", idx)
                     continue
                 if idx >= len(chunks):
+                    logger.error("skip idx=%s: idx >= len(chunks) (%s >= %s)", idx, idx, len(chunks))
                     continue
                 memory_obj = reserved_dict[obj_key]
                 if memory_obj.tensor is None:
+                    logger.error("skip idx=%s: memory_obj.tensor is None", idx)
                     continue
                 chunk_cpu = chunks[idx]
                 if chunk_cpu.shape != memory_obj.tensor.shape:
+                    logger.error(
+                       "skip idx=%s: shape mismatch chunk=%s target=%s",
+                        idx, tuple(chunk_cpu.shape), tuple(memory_obj.tensor.shape)
+                    )
                     continue
                 memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
             if written_keys:
                 self.storage_manager.finish_write(written_keys)
-
+        logger.error(" store_cpu_chunks: %s == %s ? ", len(written_keys), len(reserved_dict))
         return len(written_keys) == len(reserved_dict)
 
     @_lmcache_nvtx_annotate

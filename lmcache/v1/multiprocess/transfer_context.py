@@ -24,6 +24,7 @@ from lmcache.v1.multiprocess.cpu_context import (
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.utils import EngineType, init_logger
 
 logger = init_logger(__name__)
 
@@ -252,6 +253,9 @@ class CPUTransferContext(TransferContext):
         from lmcache.integration.vllm.utils import vllm_layout_hints
 
         layout_hints = vllm_layout_hints()
+        layout_hints["kv_layout"] = "HND"
+
+        logger.error(" layout_hints=%s", layout_hints)
         (
             block_size,
             num_layers,
@@ -259,6 +263,17 @@ class CPUTransferContext(TransferContext):
             dtype_str,
             gpu_kv_format,
         ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
+        logger.error(
+           "CPU register: block_size=%s num_layers=%s hidden_dim_size=%s dtype=%s "
+            "gpu_kv_format=%r blocks_in_chunk=%s",
+            block_size,
+            num_layers,
+            hidden_dim_size,
+            dtype_str,
+            gpu_kv_format,
+            blocks_in_chunk,
+        )
+
         self._layout_hints = layout_hints
         self._gpu_kv_format = gpu_kv_format
 
@@ -270,6 +285,7 @@ class CPUTransferContext(TransferContext):
                 [2, num_layers, blocks_in_chunk * block_size, hidden_dim_size]
             )
         )
+        logger.error("CPU register: layout_desc shape=%s", tuple(shape))
         dtype = getattr(torch, dtype_str)
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
 
@@ -311,8 +327,10 @@ class CPUTransferContext(TransferContext):
                 "CPU transfer context is not registered. "
                 "Call register() before submit_store()."
             )
-
+        logger.error(" cpu, submit_store ")
         torch_dev.synchronize()
+        logger.error(" cpu, submit_store 1")
+
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
             block_ids,
@@ -320,11 +338,16 @@ class CPUTransferContext(TransferContext):
             layout_hints=self._layout_hints,
             gpu_kv_format=self._gpu_kv_format,
         )
+        logger.error(" cpu, submit_store 2")
+
         handle = self._cpu_context.prepare_store(key, instance_id, cpu_chunks)
         ok = self._cpu_context.commit_store(handle)
+        logger.error(" cpu, submit_store 3")
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
+        logger.error(" cpu, submit_store done ")
+
         return future
 
     def submit_retrieve(
