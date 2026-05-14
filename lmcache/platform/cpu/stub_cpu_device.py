@@ -107,6 +107,10 @@ class StubCPUDevice:
     def is_available(self) -> bool:
         return False
 
+    def init(self) -> None:
+        """No-op matching torch.cuda.init()."""
+        return None
+
     def device(self, device: Any = None):
         """Context manager matching torch.cuda.device()."""
         return nullcontext()
@@ -127,7 +131,7 @@ class StubCPUDevice:
         self._stream = stream
 
     def device_count(self) -> int:
-        return 0
+        return 1
 
     def current_device(self) -> int:
         return 0
@@ -138,8 +142,9 @@ class StubCPUDevice:
     def get_device_properties(self, device: Any = 0) -> StubDeviceProperties:
         return StubDeviceProperties()
 
-    def _is_in_bad_fork(self) -> bool:
-        return False
+    def empty_cache(self) -> None:
+        """No-op matching torch.cuda.empty_cache()."""
+        return None
 
     def __getattr__(self, name: str):
         raise AttributeError(
