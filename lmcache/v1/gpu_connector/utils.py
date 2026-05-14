@@ -421,9 +421,7 @@ def normalize_kv_and_discover_format(
             detected_format = lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS
     elif serving_engine == EngineType.VLLM:
         kv_layout = layout_hints.get("kv_layout")
-
-        # hlin99
-        # vLLM's CPU attention backend stores KV cache in HND layout.
+        # NOTE: vLLM's CPU attention backend stores KV cache in HND layout.
         # get_kv_cache_layout() is unavailable in MP mode and defaults
         # to NHD even when reachable, so we override unconditionally.
         if torch_device_type == "cpu":
@@ -431,11 +429,10 @@ def normalize_kv_and_discover_format(
             logger.info("CPU backend detected, using HND KV cache layout")
         elif kv_layout is None:
             logger.warning(
-            "No KV Cache Layout hint provided when using vLLM, "
+                "No KV Cache Layout hint provided when using vLLM, "
                 "defaulting to NHD"
             )
             kv_layout = "NHD"
-
         logger.info("vLLM KV cache layout: %s", kv_layout)
         is_hnd = kv_layout == "HND"
         if list_depth == 0:
