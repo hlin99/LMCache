@@ -23,9 +23,6 @@ import torch
 # First Party
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.utils import EngineType, init_logger
-
-logger = init_logger(__name__)
 
 
 @dataclass
@@ -229,12 +226,11 @@ def gather_paged_kv_to_cpu(
         normalize_kv_and_discover_format,
     )
     import lmcache.c_ops as lmc_ops
-    logger.warning(" gather_paged_kv_to_cpu 0")
+
     tensors = list(kv_caches.values())
     fmt, normalized = normalize_kv_and_discover_format(
         tensors, EngineType.VLLM, layout_hints=layout_hints
     )
-    logger.warning(" gather_paged_kv_to_cpu 1")
     if gpu_kv_format is None:
         gpu_kv_format = fmt
     use_mla = is_mla(gpu_kv_format)
@@ -245,25 +241,16 @@ def gather_paged_kv_to_cpu(
 
     block_size = get_block_size(normalized, gpu_kv_format)
     num_chunks = len(block_ids) // blocks_per_chunk
-    logger.warning(" gather_paged_kv_to_cpu 2")
-    logger.error(
-        "gather: block_size=%s blocks_per_chunk=%s len(block_ids)=%s num_chunks=%s",
-        block_size,
-        blocks_per_chunk,
-        len(block_ids),
-        num_chunks,
-    )
+
     # After normalization the structure is always a list of per-layer
     # tensors.  Cast once so all downstream indexing is typed correctly.
     layer_tensors = cast(list[torch.Tensor], normalized)
 
     chunks: list[torch.Tensor] = []
-    logger.warning(" gather_paged_kv_to_cpu 3")
     for chunk_idx in range(num_chunks):
         chunk_block_ids = block_ids[
             chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
         ]
-        logger.warning(" gather_paged_kv_to_cpu 4")
         if use_mla:
             mla_layers: list[torch.Tensor] = []
             idx = torch.tensor(chunk_block_ids, dtype=torch.long)
@@ -287,14 +274,6 @@ def gather_paged_kv_to_cpu(
                         k_t = layer[:, 0]
                         v_t = layer[:, 1]
                     _num_blocks, num_heads, _block_size, head_size = k_t.shape
-                    logger.error(
-                        "gather NHD: k_t.shape=%s _block_size=%s num_heads=%s head_size=%s",
-                        tuple(k_t.shape),
-                        _block_size,
-                        num_heads,
-                        head_size,
-                    )
-
                     k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
                     # HND blocks are [NB, NH, BS, HS]; convert to token-major
@@ -332,7 +311,6 @@ def gather_paged_kv_to_cpu(
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
             chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
-    logger.warning(" gather_paged_kv_to_cpu 5")
     return chunks
 
 
