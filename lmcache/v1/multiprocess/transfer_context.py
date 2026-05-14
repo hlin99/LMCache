@@ -74,7 +74,10 @@ class TransferContext(ABC):
             vllm_logical_block_size: Logical tokens per vLLM block (i.e.
                 ``cache_config.block_size``). Forwarded to the server as
                 ``layout_hints["inference_engine_logical_block_size"]``
-                so it can derive per-group compression ratios.
+                so it can derive per-group compression ratios. A value
+                of ``0`` (the default) means the caller did not provide
+                this information and the key is omitted from
+                ``layout_hints``.
 
         Raises:
             TimeoutError: If server registration does not complete before

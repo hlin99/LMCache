@@ -312,7 +312,9 @@ class MPCacheEngine:
                 inference-engine block (``cache_config.block_size`` for
                 vLLM). Used to derive per-group compression ratios when
                 some KV layer groups compress multiple logical tokens
-                into a single physical slot.
+                into a single physical slot. A value of ``0`` means
+                the caller did not provide this information (treated as
+                "not available").
 
         Raises:
             ValueError: If ``dtype_str`` is not a valid torch dtype name.

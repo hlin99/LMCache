@@ -105,6 +105,8 @@ def test_register_kv_caches_includes_logical_block_size_in_layout_hints(fake_ada
 
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE
+    # REGISTER_KV_CACHE payload: [instance_id, kv_caches, model_name,
+    #                              world_size, engine_type, layout_hints]
     layout_hints = args[2][5]
     assert layout_hints.get("inference_engine_logical_block_size") == 16
 
@@ -139,7 +141,10 @@ def test_register_kv_caches_cpu_submits_cpu_context_registration(
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE_CPU_CONTEXT
     assert len(args[2]) == 9
-    assert args[2][8] == 16  # vllm_block_size from fake_adapter fixture
+    # REGISTER_KV_CACHE_CPU_CONTEXT payload: [instance_id, model_name,
+    #   world_size, block_size, num_layers, hidden_dim_size, dtype_str,
+    #   use_mla, vllm_logical_block_size]
+    assert args[2][8] == 16  # vllm_logical_block_size from fake_adapter fixture
 
 
 def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):
