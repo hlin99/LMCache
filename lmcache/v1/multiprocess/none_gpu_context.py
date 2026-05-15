@@ -135,8 +135,8 @@ def create_none_gpu_context(
 ) -> NoneGpuContext:
     """Factory that returns the appropriate :class:`NoneGpuContext` implementation.
 
-    Currently always returns a :class:`~lmcache.v1.multiprocess.\
-cpu_context_pickle.CPUContextPickle` instance. A future SHM-capable PR
+    Currently always returns a pickle-based implementation
+    (``CPUContextPickle``). A future SHM-capable PR
     may probe for shared-memory availability and fall back to pickle.
 
     Args:
