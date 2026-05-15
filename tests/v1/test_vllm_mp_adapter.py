@@ -52,10 +52,7 @@ def fake_adapter(monkeypatch):
     # (``layout_hints["inference_engine_logical_block_size"] = ...``), so
     # the stub must also be a real dict — a string would raise
     # ``TypeError: 'str' object does not support item assignment``.
-    monkeypatch.setattr(
-        "lmcache.integration.vllm.utils.vllm_layout_hints",
-        lambda: {},
-    )
+    monkeypatch.setattr(adapter_mod, "vllm_layout_hints", lambda: {})
 
     parallel_strategy = ParallelStrategy(
         use_mla=False,
@@ -93,6 +90,29 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     assert send_mock.call_count == 1
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE
+    assert args[2][5] == {"inference_engine_logical_block_size": 16}
+
+
+def test_register_kv_caches_passes_layout_hints_to_transfer_context(
+    fake_adapter, monkeypatch
+):
+    """register_kv_caches builds layout hints before calling transfer context."""
+    adapter, _send_mock, _ = fake_adapter
+    transfer_ctx = MagicMock()
+    monkeypatch.setattr(
+        adapter_mod, "create_transfer_context", lambda _kv: transfer_ctx
+    )
+    monkeypatch.setattr(adapter_mod, "vllm_layout_hints", lambda: {"kv_layout": "HND"})
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    new_caches = {"layer.0": fake_tensor}
+
+    adapter.register_kv_caches(new_caches)
+
+    assert transfer_ctx.register.call_args.kwargs["layout_hints"] == {
+        "kv_layout": "HND",
+        "inference_engine_logical_block_size": 16,
+    }
 
 
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
@@ -111,11 +131,7 @@ def test_register_kv_caches_cpu_submits_non_gpu_context_registration(
 ):
     """CPU KV cache registration routes to REGISTER_KV_CACHE_NON_GPU_CONTEXT."""
     adapter, send_mock, _ = fake_adapter
-    monkeypatch.setattr(
-        "lmcache.integration.vllm.utils.vllm_layout_hints",
-        lambda: {},
-        raising=False,
-    )
+    monkeypatch.setattr(adapter_mod, "vllm_layout_hints", lambda: {}, raising=False)
     cpu_kv = {"layer.0": torch.randn(2, 8, 4, 2, 8)}
 
     adapter.register_kv_caches(cpu_kv)

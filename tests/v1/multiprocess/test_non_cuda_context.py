@@ -10,6 +10,9 @@ import sys
 import pytest
 import torch
 
+# First Party
+from lmcache.v1.gpu_connector.utils import LayoutHints
+
 
 def _make_kv_caches(
     num_layers: int = 2,
@@ -109,6 +112,46 @@ def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
 
     context = create_transfer_context({"layer_0": torch.randn(2, 2)})
     assert isinstance(context, NonCudaTransferContext)
+
+
+def test_non_cuda_transfer_context_register_uses_passed_layout_hints(
+    monkeypatch: Any,
+) -> None:
+    """Ensure non-CUDA registration forwards caller-provided layout hints."""
+    # First Party
+    from lmcache.v1.multiprocess import transfer_context as transfer_mod
+
+    context = transfer_mod.NonCudaTransferContext()
+    kv_caches = {"layer_0": torch.randn(2, 8, 4, 2, 8)}
+    layout_hints: LayoutHints = {
+        "kv_layout": "HND",
+        "inference_engine_logical_block_size": 16,
+    }
+    compute_kv_layout = MagicMock(
+        return_value=(4, 1, 16, "float32", "fake_gpu_kv_format")
+    )
+    future = MagicMock()
+    future.result.return_value = None
+    send_request = MagicMock(return_value=future)
+
+    monkeypatch.setattr(transfer_mod, "compute_kv_layout", compute_kv_layout)
+    monkeypatch.setattr(transfer_mod, "create_non_gpu_context", MagicMock())
+    monkeypatch.setattr(transfer_mod, "is_mla", lambda _fmt: False)
+
+    context.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="test-model",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=5.0,
+        send_request=send_request,
+        layout_hints=layout_hints,
+    )
+
+    compute_kv_layout.assert_called_once_with(kv_caches, layout_hints=layout_hints)
+    future.result.assert_called_once_with(timeout=5.0)
 
 
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
