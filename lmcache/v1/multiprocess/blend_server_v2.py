@@ -38,6 +38,7 @@ Workflow (example: chunk_size = 3)
 """
 
 # Standard
+from dataclasses import dataclass
 from typing import Any
 import threading
 import time
@@ -99,6 +100,15 @@ from lmcache.v1.multiprocess.token_hasher import (
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _CBRegisteredContext:
+    """Registered CB GPU context metadata."""
+
+    model_name: str
+    world_size: int
+    gpu_context: PlainGPUCacheContext
 
 
 class BlendTokenRangeMatcher:
@@ -390,11 +400,9 @@ class BlendEngineV2(MPCacheEngine):
             storage_manager_config, chunk_size, hash_algorithm=hash_algorithm
         )
 
-        self._cb_gpu_contexts: dict[int, PlainGPUCacheContext] = {}
-
-        # CB GPU ID -> (model name, world size) as metadata
+        # CB instance ID -> registered context
         # NOTE: This is mainly for determining the layout desc during prefetch
-        self._cb_gpu_context_meta: dict[int, tuple[str, int]] = {}
+        self._cb_contexts: dict[int, _CBRegisteredContext] = {}
 
         # Fast local matcher: indexes pre-computed chunk hashes for sub-sequence lookup
         self._token_range_matcher = BlendTokenRangeMatcher(chunk_size)
@@ -418,8 +426,11 @@ class BlendEngineV2(MPCacheEngine):
             world_size: The world size associated with this KV cache.
         """
         gpu_context = PlainGPUCacheContext(kv_caches, self.chunk_size)
-        self._cb_gpu_contexts[instance_id] = gpu_context
-        self._cb_gpu_context_meta[instance_id] = (model_name, world_size)
+        self._cb_contexts[instance_id] = _CBRegisteredContext(
+            model_name=model_name,
+            world_size=world_size,
+            gpu_context=gpu_context,
+        )
         logger.info(
             "Registered CB KV cache for instance_id %d with %d layers",
             instance_id,
@@ -451,9 +462,8 @@ class BlendEngineV2(MPCacheEngine):
         Args:
             instance_id: Unique identifier for the blend engine instance to unregister
         """
-        if instance_id in self._cb_gpu_contexts:
-            del self._cb_gpu_contexts[instance_id]
-            del self._cb_gpu_context_meta[instance_id]
+        context = self._cb_contexts.pop(instance_id, None)
+        if context is not None:
             logger.info("Unregistered CB KV cache for instance_id %d", instance_id)
         else:
             logger.warning(
@@ -471,30 +481,28 @@ class BlendEngineV2(MPCacheEngine):
         status = super().report_status()
 
         cb_gpu_context_meta: dict[str, dict] = {}
-        for gpu_id, meta in self._cb_gpu_context_meta.items():
-            model_name, world_size = meta
+        for instance_id, context in self._cb_contexts.items():
             entry: dict = {
-                "model_name": model_name,
-                "world_size": world_size,
+                "model_name": context.model_name,
+                "world_size": context.world_size,
             }
-            ctx = self._cb_gpu_contexts.get(gpu_id)
-            if ctx is not None:
-                # bytes per token = 2 (K+V) * num_layers * hidden_dim_size *
-                # itemsize; num_tokens is the cache capacity, not a per-token
-                # cost.
-                cache_size_per_token = (
-                    2 * ctx.num_layers * ctx.hidden_dim_size * ctx.dtype.itemsize
-                )
-                entry["kv_cache_layout"] = {
-                    "num_layers": ctx.num_layers,
-                    "num_tokens": ctx.num_tokens,
-                    "hidden_dim_size": ctx.hidden_dim_size,
-                    "dtype": str(ctx.dtype),
-                    "cache_size_per_token": cache_size_per_token,
-                }
-            cb_gpu_context_meta[str(gpu_id)] = entry
+            ctx = context.gpu_context
+            # bytes per token = 2 (K+V) * num_layers * hidden_dim_size *
+            # itemsize; num_tokens is the cache capacity, not a per-token
+            # cost.
+            cache_size_per_token = (
+                2 * ctx.num_layers * ctx.hidden_dim_size * ctx.dtype.itemsize
+            )
+            entry["kv_cache_layout"] = {
+                "num_layers": ctx.num_layers,
+                "num_tokens": ctx.num_tokens,
+                "hidden_dim_size": ctx.hidden_dim_size,
+                "dtype": str(ctx.dtype),
+                "cache_size_per_token": cache_size_per_token,
+            }
+            cb_gpu_context_meta[str(instance_id)] = entry
 
-        status["registered_cb_gpu_ids"] = list(self._cb_gpu_contexts.keys())
+        status["registered_cb_gpu_ids"] = list(self._cb_contexts.keys())
         status["cb_gpu_context_meta"] = cb_gpu_context_meta
         return status
 
@@ -593,9 +601,9 @@ class BlendEngineV2(MPCacheEngine):
 
         # Find the cb gpu context and calculate the layout desc
         layout_desc: MemoryLayoutDesc | None = None
-        for gpu_id, (m_name, w_size) in self._cb_gpu_context_meta.items():
-            if m_name == model_name and w_size == world_size:
-                cb_ctx = self._cb_gpu_contexts[gpu_id]
+        for context in self._cb_contexts.values():
+            if context.model_name == model_name and context.world_size == world_size:
+                cb_ctx = context.gpu_context
                 layout_desc = MemoryLayoutDesc(
                     shapes=[cb_ctx.get_kv_buffer_shape(self.chunk_size)],
                     dtypes=[cb_ctx.dtype],
@@ -845,10 +853,10 @@ class BlendEngineV2(MPCacheEngine):
         """
         num_tokens = key.end - key.start
 
-        assert instance_id in self._cb_gpu_contexts, (
+        assert instance_id in self._cb_contexts, (
             f"Instance ID {instance_id} not registered for CB KV cache"
         )
-        gpu_context = self._cb_gpu_contexts[instance_id]
+        gpu_context = self._cb_contexts[instance_id].gpu_context
 
         # CPU-synchronous sentinel: GPU store is about to be enqueued.
         self._event_bus.publish(
@@ -968,10 +976,10 @@ class BlendEngineV2(MPCacheEngine):
         Note:
             We must call `cb_lookup_pre_computed` first before calling this function
         """
-        assert instance_id in self._cb_gpu_contexts, (
+        assert instance_id in self._cb_contexts, (
             f"Instance ID {instance_id} not registered for CB KV cache"
         )
-        gpu_context = self._cb_gpu_contexts[instance_id]
+        gpu_context = self._cb_contexts[instance_id].gpu_context
 
         # One obj_key per match_result, in cur_st order
         cb_match_result = sorted(cb_match_result, key=lambda r: r.cur_st)
@@ -1113,10 +1121,10 @@ class BlendEngineV2(MPCacheEngine):
         num_tokens = key.end - key.start
 
         # Get GPU context
-        assert instance_id in self._cb_gpu_contexts, (
+        assert instance_id in self._cb_contexts, (
             f"Instance ID {instance_id} not registered for CB KV cache"
         )
-        gpu_context = self._cb_gpu_contexts[instance_id]
+        gpu_context = self._cb_contexts[instance_id].gpu_context
 
         # CPU-synchronous sentinels: SUBMITTED before SESSION_END so the
         # tracing subscriber's in-flight counter is non-zero when SESSION_END

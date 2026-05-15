@@ -119,6 +119,14 @@ async def kvcache_check(
 
     gpu_ctxs = getattr(engine, "gpu_contexts", None)
     if gpu_ctxs is None:
+        contexts = getattr(engine, "contexts", None)
+        if isinstance(contexts, dict):
+            gpu_ctxs = {
+                instance_id: context.gpu_context
+                for instance_id, context in contexts.items()
+                if context.gpu_context is not None
+            }
+    if gpu_ctxs is None:
         return JSONResponse(
             status_code=501,
             content={"error": "checksum not supported for this engine type"},

@@ -176,6 +176,29 @@ class _PrefetchJob:
     cache_salt: str = ""
 
 
+@dataclass
+class RegisteredContext:
+    """Registry entry for a registered worker cache context."""
+
+    model_name: str
+    world_size: int
+    gpu_context: GPUCacheContext | None = None
+    non_cuda_metadata: NonGpuContextMetadata | None = None
+
+    @property
+    def is_gpu(self) -> bool:
+        """Whether this entry represents a GPU cache context."""
+        return self.gpu_context is not None
+
+    def get_layout_desc(self, chunk_size: int) -> MemoryLayoutDesc:
+        """Return memory layout descriptor for this context."""
+        if self.gpu_context is not None:
+            return get_layout_desc(self.gpu_context, chunk_size)
+        if self.non_cuda_metadata is not None:
+            return self.non_cuda_metadata.layout_desc
+        raise ValueError("RegisteredContext has neither gpu_context nor non_cuda")
+
+
 # Main class for the mp cache engine
 class MPCacheEngine:
     def __init__(
@@ -184,16 +207,11 @@ class MPCacheEngine:
         chunk_size: int = 256,
         hash_algorithm: str = "blake3",
     ):
-        # GPU ID -> KV cache tensors
-        self.gpu_contexts: dict[int, GPUCacheContext] = {}
-
-        # GPU ID -> (model name, world size) as metadata
+        # Instance ID -> registered context
         # NOTE: This is mainly for determining the layout desc during prefetch
         # We assume that if the (model name, world size) is the same, then
-        # the layout desc returned by the gpu context is the same.
-        self.gpu_context_meta: dict[int, tuple[str, int]] = {}
-        self.non_cuda_contexts: dict[int, NonGpuContextMetadata] = {}
-        self.non_cuda_context_meta: dict[int, tuple[str, int]] = {}
+        # the layout desc returned by the context is the same.
+        self.contexts: dict[int, RegisteredContext] = {}
 
         # chunk size
         self.chunk_size = chunk_size
@@ -244,7 +262,7 @@ class MPCacheEngine:
             layout_hints: See :class:`LayoutHints`.  Forwarded to
                 :class:`GPUCacheContext` for GPU KV format detection.
         """
-        if instance_id in self.gpu_contexts:
+        if instance_id in self.contexts:
             logger.warning(
                 "Instance %s's KV cache is already registered, "
                 "skipping the new registration",
@@ -258,8 +276,11 @@ class MPCacheEngine:
             layout_hints=layout_hints or None,
             engine_type=engine_type,
         )
-        self.gpu_contexts[instance_id] = gpu_context
-        self.gpu_context_meta[instance_id] = (model_name, world_size)
+        self.contexts[instance_id] = RegisteredContext(
+            model_name=model_name,
+            world_size=world_size,
+            gpu_context=gpu_context,
+        )
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
             instance_id,
@@ -273,17 +294,16 @@ class MPCacheEngine:
         Args:
             instance_id (int): The GPU instance ID (such as PID).
         """
-        if instance_id in self.gpu_contexts:
-            del self.gpu_contexts[instance_id]
-            del self.gpu_context_meta[instance_id]
+        context = self.contexts.pop(instance_id, None)
+        if context is None:
+            logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
+            return
+
+        if context.is_gpu:
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
             torch_dev.empty_cache()
-        elif instance_id in self.non_cuda_contexts:
-            del self.non_cuda_contexts[instance_id]
-            del self.non_cuda_context_meta[instance_id]
-            logger.info("Unregistered non-CUDA context for instance ID %d", instance_id)
         else:
-            logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
+            logger.info("Unregistered non-CUDA context for instance ID %d", instance_id)
 
     def register_kv_cache_non_gpu_context(
         self,
@@ -325,12 +345,15 @@ class MPCacheEngine:
             else torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
-        self.non_cuda_contexts[instance_id] = NonGpuContextMetadata(
-            layout_desc=layout_desc,
-            block_size=block_size,
-            use_mla=use_mla,
+        self.contexts[instance_id] = RegisteredContext(
+            model_name=model_name,
+            world_size=world_size,
+            non_cuda_metadata=NonGpuContextMetadata(
+                layout_desc=layout_desc,
+                block_size=block_size,
+                use_mla=use_mla,
+            ),
         )
-        self.non_cuda_context_meta[instance_id] = (model_name, world_size)
 
     def _resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
         """Resolve object keys from an IPC cache key.
@@ -375,14 +398,15 @@ class MPCacheEngine:
         """
         obj_keys = self._resolve_obj_keys(key)
 
-        if instance_id not in self.non_cuda_contexts:
+        context = self.contexts.get(instance_id)
+        if context is None or context.non_cuda_metadata is None:
             raise ValueError(
                 f"non-CUDA context not registered for instance ID {instance_id}"
             )
-        ctx = self.non_cuda_contexts[instance_id]
+        non_cuda_metadata = context.non_cuda_metadata
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
         reserved_dict = self.storage_manager.reserve_write(
-            obj_keys, ctx.layout_desc, "new"
+            obj_keys, non_cuda_metadata.layout_desc, "new"
         )
         written_keys: list[ObjectKey] = []
         try:
@@ -426,7 +450,8 @@ class MPCacheEngine:
         """
         obj_keys = self._resolve_obj_keys(key)
 
-        if instance_id not in self.non_cuda_contexts:
+        context = self.contexts.get(instance_id)
+        if context is None or context.non_cuda_metadata is None:
             raise ValueError(
                 f"non-CUDA context not registered for instance ID {instance_id}"
             )
@@ -473,11 +498,16 @@ class MPCacheEngine:
         st = time.perf_counter()
         obj_keys = self._resolve_obj_keys(key)
 
-        assert instance_id in self.gpu_contexts, (
+        assert instance_id in self.contexts, (
             f"KV cache not registered for GPU ID {instance_id}"
         )
-        gpu_context = self.gpu_contexts[instance_id]
-        model_name = self.gpu_context_meta[instance_id][0]
+        registered_context = self.contexts[instance_id]
+        gpu_context = registered_context.gpu_context
+        if gpu_context is None:
+            raise ValueError(
+                f"GPU KV cache not registered for instance ID {instance_id}"
+            )
+        model_name = registered_context.model_name
 
         # ``blocks_per_chunk`` is counted in inference-engine-side
         # blocks (each block addresses
@@ -656,11 +686,16 @@ class MPCacheEngine:
         st = time.perf_counter()
         obj_keys = self._resolve_obj_keys(key)
 
-        assert instance_id in self.gpu_contexts, (
+        assert instance_id in self.contexts, (
             f"KV cache not registered for GPU ID {instance_id}"
         )
-        gpu_context = self.gpu_contexts[instance_id]
-        model_name = self.gpu_context_meta[instance_id][0]
+        registered_context = self.contexts[instance_id]
+        gpu_context = registered_context.gpu_context
+        if gpu_context is None:
+            raise ValueError(
+                f"GPU KV cache not registered for instance ID {instance_id}"
+            )
+        model_name = registered_context.model_name
 
         # CPU-synchronous sentinel: a GPU retrieve is about to be enqueued.
         # Must be published via publish() (not publish_on_stream) so the
@@ -834,18 +869,11 @@ class MPCacheEngine:
 
         Returns:
             The layout descriptor, or None if no context matches
-            ``(model_name, world_size)``. GPU contexts are checked first,
-            then CPU contexts.
+            ``(model_name, world_size)``.
         """
-        for gpu_id, (m, w) in self.gpu_context_meta.items():
-            if m == model_name and w == world_size:
-                return get_layout_desc(
-                    self.gpu_contexts[gpu_id],
-                    self.chunk_size,
-                )
-        for instance_id, (m, w) in self.non_cuda_context_meta.items():
-            if m == model_name and w == world_size:
-                return self.non_cuda_contexts[instance_id].layout_desc
+        for context in self.contexts.values():
+            if context.model_name == model_name and context.world_size == world_size:
+                return context.get_layout_desc(self.chunk_size)
         return None
 
     def lookup(
@@ -1161,13 +1189,19 @@ class MPCacheEngine:
         sm = self.storage_manager.report_status()
 
         gpu_context_meta: dict[str, dict] = {}
-        for gpu_id, meta in self.gpu_context_meta.items():
+        non_cuda_context_meta: dict[str, dict] = {}
+        registered_gpu_ids: list[int] = []
+        registered_non_cuda_instance_ids: list[int] = []
+        for instance_id, context in self.contexts.items():
             entry: dict = {
-                "model_name": meta[0],
-                "world_size": meta[1],
+                "model_name": context.model_name,
+                "world_size": context.world_size,
             }
-            ctx = self.gpu_contexts.get(gpu_id)
-            if ctx is not None:
+            if context.is_gpu:
+                registered_gpu_ids.append(instance_id)
+                ctx = context.gpu_context
+                if ctx is None:
+                    continue
                 entry["kv_cache_layout"] = {
                     "num_layers": ctx.num_layers,
                     "inference_engine_logical_block_size": (
@@ -1185,27 +1219,26 @@ class MPCacheEngine:
                     "attention_backend": ctx.attention_backend,
                     "cache_size_per_token": ctx.cache_size_per_token(),
                 }
-            gpu_context_meta[str(gpu_id)] = entry
+                gpu_context_meta[str(instance_id)] = entry
+                continue
+
+            registered_non_cuda_instance_ids.append(instance_id)
+            non_cuda_metadata = context.non_cuda_metadata
+            if non_cuda_metadata is None:
+                continue
+            entry["block_size"] = non_cuda_metadata.block_size
+            entry["use_mla"] = non_cuda_metadata.use_mla
+            non_cuda_context_meta[str(instance_id)] = entry
 
         return {
             "is_healthy": sm["is_healthy"],
             "engine_type": self.__class__.__name__,
             "chunk_size": self.chunk_size,
             "hash_algorithm": self.token_hasher.hash_algorithm_name,
-            "registered_gpu_ids": list(self.gpu_contexts.keys()),
+            "registered_gpu_ids": registered_gpu_ids,
             "gpu_context_meta": gpu_context_meta,
-            "registered_non_cuda_instance_ids": list(self.non_cuda_contexts.keys()),
-            "non_cuda_context_meta": {
-                str(instance_id): {
-                    "model_name": model_name,
-                    "world_size": world_size,
-                    "block_size": self.non_cuda_contexts[instance_id].block_size,
-                    "use_mla": self.non_cuda_contexts[instance_id].use_mla,
-                }
-                for instance_id, (model_name, world_size) in (
-                    self.non_cuda_context_meta.items()
-                )
-            },
+            "registered_non_cuda_instance_ids": registered_non_cuda_instance_ids,
+            "non_cuda_context_meta": non_cuda_context_meta,
             "active_sessions": self.session_manager.active_count(),
             "active_prefetch_jobs": self._active_prefetch_count(),
             "storage_manager": sm,
@@ -1257,7 +1290,7 @@ class MPCacheEngine:
         logger.info("MPCacheEngine closed")
 
         # Release GPU contexts
-        self.gpu_contexts.clear()
+        self.contexts.clear()
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""
