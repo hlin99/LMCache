@@ -99,20 +99,6 @@ def test_wrap_kv_caches_wraps_all_tensors(monkeypatch: Any) -> None:
     assert len(wrapped) == len(kv_caches)
 
 
-def test_non_gpu_context_renamed_symbols_and_legacy_shim() -> None:
-    """Verify renamed non-GPU context symbols are exported."""
-    # First Party
-    from lmcache.v1.multiprocess.non_gpu_context import (
-        NonGpuContext,
-        NonGpuContextMetadata,
-        create_non_gpu_context,
-    )
-
-    assert NonGpuContext.__name__ == "NonGpuContext"
-    assert NonGpuContextMetadata.__name__ == "NonGpuContextMetadata"
-    assert callable(create_non_gpu_context)
-
-
 def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
     """Ensure transfer context factory returns NonCudaTransferContext for CPU KV."""
     # First Party

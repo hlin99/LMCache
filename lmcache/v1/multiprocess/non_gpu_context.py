@@ -148,7 +148,7 @@ def create_non_gpu_context(
         A concrete :class:`NonGpuContext` instance.
     """
     # Local
-    from .cpu_context_pickle import CPUContextPickle
+    from .non_gpu_context_pickle import CPUContextPickle
 
     return CPUContextPickle(metadata, mq_client, mq_timeout)
 
