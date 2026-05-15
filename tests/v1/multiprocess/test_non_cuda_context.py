@@ -18,7 +18,7 @@ def _make_kv_caches(
     num_heads: int = 2,
     head_size: int = 8,
 ) -> dict[str, torch.Tensor]:
-    """Build per-layer NHD KV tensors for CPU cpu context tests."""
+    """Build per-layer NHD KV tensors for non-CUDA context tests."""
     kv_caches = {}
     for i in range(num_layers):
         kv_caches[f"layer_{i}"] = torch.randn(
@@ -33,7 +33,7 @@ def _make_mla_kv_caches(
     block_size: int = 4,
     hidden_size: int = 16,
 ) -> dict[str, torch.Tensor]:
-    """Build per-layer MLA KV tensors for CPU cpu context tests.
+    """Build per-layer MLA KV tensors for non-CUDA context tests.
 
     Args:
         num_layers: Number of KV layers to generate.
@@ -58,7 +58,7 @@ def _make_hnd_kv_caches(
     num_heads: int = 2,
     head_size: int = 8,
 ) -> dict[str, torch.Tensor]:
-    """Build per-layer HND KV tensors for CPU cpu context tests."""
+    """Build per-layer HND KV tensors for non-CUDA context tests."""
     kv_caches = {}
     for i in range(num_layers):
         kv_caches[f"layer_{i}"] = torch.randn(
@@ -74,7 +74,7 @@ def _make_hnd_flashinfer_kv_caches(
     num_heads: int = 2,
     head_size: int = 8,
 ) -> dict[str, torch.Tensor]:
-    """Build per-layer HND flash-infer KV tensors for CPU cpu context tests."""
+    """Build per-layer HND flash-infer KV tensors for non-CUDA context tests."""
     kv_caches = {}
     for i in range(num_layers):
         kv_caches[f"layer_{i}"] = torch.randn(
@@ -100,22 +100,17 @@ def test_wrap_kv_caches_wraps_all_tensors(monkeypatch: Any) -> None:
 
 
 def test_none_gpu_context_renamed_symbols_and_legacy_shim() -> None:
-    """Verify renamed non-GPU context symbols and legacy aliases coexist."""
+    """Verify renamed non-GPU context symbols are exported."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import (
-        CPUContext,
-        CPUContextMetadata,
-        create_cpu_context,
-    )
     from lmcache.v1.multiprocess.none_gpu_context import (
         NoneGpuContext,
         NoneGpuContextMetadata,
         create_none_gpu_context,
     )
 
-    assert CPUContext is NoneGpuContext
-    assert CPUContextMetadata is NoneGpuContextMetadata
-    assert create_cpu_context is create_none_gpu_context
+    assert NoneGpuContext.__name__ == "NoneGpuContext"
+    assert NoneGpuContextMetadata.__name__ == "NoneGpuContextMetadata"
+    assert callable(create_none_gpu_context)
 
 
 def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
@@ -133,7 +128,7 @@ def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     """Validate layout extraction and gather/scatter round-trip on CPU tensors."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import (
+    from lmcache.v1.multiprocess.none_gpu_context import (
         compute_kv_layout,
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
@@ -176,7 +171,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
 ) -> None:
     """Validate gather/scatter round-trip for HND vLLM KV layout."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import (
+    from lmcache.v1.multiprocess.none_gpu_context import (
         compute_kv_layout,
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
@@ -228,7 +223,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
 def test_scatter_respects_skip_first_n_tokens() -> None:
     """Ensure scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import (
+    from lmcache.v1.multiprocess.none_gpu_context import (
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )
@@ -256,7 +251,7 @@ def test_scatter_respects_skip_first_n_tokens() -> None:
 def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
     """Validate gather/scatter round-trip for MLA KV tensors."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import (
+    from lmcache.v1.multiprocess.none_gpu_context import (
         compute_kv_layout,
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
@@ -291,7 +286,7 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
 def test_compute_kv_layout_empty_raises_value_error() -> None:
     """Ensure compute_kv_layout rejects empty KV cache input."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import compute_kv_layout
+    from lmcache.v1.multiprocess.none_gpu_context import compute_kv_layout
 
     with pytest.raises(ValueError, match="kv_caches is empty"):
         compute_kv_layout({})
@@ -300,7 +295,7 @@ def test_compute_kv_layout_empty_raises_value_error() -> None:
 def test_scatter_mla_respects_skip_first_n_tokens() -> None:
     """Ensure MLA scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import (
+    from lmcache.v1.multiprocess.none_gpu_context import (
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )
@@ -330,7 +325,7 @@ def test_scatter_mla_respects_skip_first_n_tokens() -> None:
 def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
     """Ensure MLA scatter is a no-op when skip_first_n_tokens exceeds chunk tokens."""
     # First Party
-    from lmcache.v1.multiprocess.cpu_context import (
+    from lmcache.v1.multiprocess.none_gpu_context import (
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )
@@ -370,10 +365,10 @@ def stub_native_storage_ops() -> Any:
         yield
 
 
-def test_server_register_and_find_cpu_context_layout(
+def test_server_register_and_find_non_cuda_context_layout(
     stub_native_storage_ops: Any,
 ) -> None:
-    """Ensure cpu context registration stores metadata and lookup finds its layout."""
+    """Ensure non-CUDA registration stores metadata and lookup finds layout."""
     # First Party
     from lmcache.v1.multiprocess.server import MPCacheEngine
 
