@@ -133,9 +133,10 @@ def test_non_cuda_transfer_context_register_uses_passed_layout_hints(
     future = MagicMock()
     future.result.return_value = None
     send_request = MagicMock(return_value=future)
+    create_non_gpu_context = MagicMock()
 
     monkeypatch.setattr(transfer_mod, "compute_kv_layout", compute_kv_layout)
-    monkeypatch.setattr(transfer_mod, "create_non_gpu_context", MagicMock())
+    monkeypatch.setattr(transfer_mod, "create_non_gpu_context", create_non_gpu_context)
     monkeypatch.setattr(transfer_mod, "is_mla", lambda _fmt: False)
 
     context.register(
@@ -151,6 +152,16 @@ def test_non_cuda_transfer_context_register_uses_passed_layout_hints(
     )
 
     compute_kv_layout.assert_called_once_with(kv_caches, layout_hints=layout_hints)
+    assert send_request.call_args.args[1] == (
+        transfer_mod.RequestType.REGISTER_KV_CACHE_NON_GPU_CONTEXT
+    )
+    payload = send_request.call_args.args[2][0]
+    assert payload.block_size == 4
+    assert payload.num_layers == 1
+    assert payload.hidden_dim_size == 16
+    assert payload.dtype_str == "float32"
+    assert payload.use_mla is False
+    create_non_gpu_context.assert_called_once()
     future.result.assert_called_once_with(timeout=5.0)
 
 
