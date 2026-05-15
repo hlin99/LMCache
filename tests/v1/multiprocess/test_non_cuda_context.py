@@ -99,18 +99,18 @@ def test_wrap_kv_caches_wraps_all_tensors(monkeypatch: Any) -> None:
     assert len(wrapped) == len(kv_caches)
 
 
-def test_none_gpu_context_renamed_symbols_and_legacy_shim() -> None:
+def test_non_gpu_context_renamed_symbols_and_legacy_shim() -> None:
     """Verify renamed non-GPU context symbols are exported."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import (
-        NoneGpuContext,
-        NoneGpuContextMetadata,
-        create_none_gpu_context,
+    from lmcache.v1.multiprocess.non_gpu_context import (
+        NonGpuContext,
+        NonGpuContextMetadata,
+        create_non_gpu_context,
     )
 
-    assert NoneGpuContext.__name__ == "NoneGpuContext"
-    assert NoneGpuContextMetadata.__name__ == "NoneGpuContextMetadata"
-    assert callable(create_none_gpu_context)
+    assert NonGpuContext.__name__ == "NonGpuContext"
+    assert NonGpuContextMetadata.__name__ == "NonGpuContextMetadata"
+    assert callable(create_non_gpu_context)
 
 
 def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
@@ -128,7 +128,7 @@ def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     """Validate layout extraction and gather/scatter round-trip on CPU tensors."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import (
+    from lmcache.v1.multiprocess.non_gpu_context import (
         compute_kv_layout,
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
@@ -171,7 +171,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
 ) -> None:
     """Validate gather/scatter round-trip for HND vLLM KV layout."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import (
+    from lmcache.v1.multiprocess.non_gpu_context import (
         compute_kv_layout,
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
@@ -223,7 +223,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
 def test_scatter_respects_skip_first_n_tokens() -> None:
     """Ensure scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import (
+    from lmcache.v1.multiprocess.non_gpu_context import (
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )
@@ -251,7 +251,7 @@ def test_scatter_respects_skip_first_n_tokens() -> None:
 def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
     """Validate gather/scatter round-trip for MLA KV tensors."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import (
+    from lmcache.v1.multiprocess.non_gpu_context import (
         compute_kv_layout,
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
@@ -286,7 +286,7 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
 def test_compute_kv_layout_empty_raises_value_error() -> None:
     """Ensure compute_kv_layout rejects empty KV cache input."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import compute_kv_layout
+    from lmcache.v1.multiprocess.non_gpu_context import compute_kv_layout
 
     with pytest.raises(ValueError, match="kv_caches is empty"):
         compute_kv_layout({})
@@ -295,7 +295,7 @@ def test_compute_kv_layout_empty_raises_value_error() -> None:
 def test_scatter_mla_respects_skip_first_n_tokens() -> None:
     """Ensure MLA scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import (
+    from lmcache.v1.multiprocess.non_gpu_context import (
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )
@@ -325,7 +325,7 @@ def test_scatter_mla_respects_skip_first_n_tokens() -> None:
 def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
     """Ensure MLA scatter is a no-op when skip_first_n_tokens exceeds chunk tokens."""
     # First Party
-    from lmcache.v1.multiprocess.none_gpu_context import (
+    from lmcache.v1.multiprocess.non_gpu_context import (
         gather_paged_kv_to_cpu,
         scatter_cpu_to_paged_kv,
     )

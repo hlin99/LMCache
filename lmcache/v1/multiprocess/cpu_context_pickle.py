@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pickle-based NoneGpuContext implementation for multiprocess mode."""
+"""Pickle-based NonGpuContext implementation for multiprocess mode."""
 
 # Standard
 from typing import Any
@@ -9,15 +9,15 @@ import pickle
 import torch
 
 # First Party
-from lmcache.v1.multiprocess.none_gpu_context import (
-    NoneGpuContext,
-    NoneGpuContextMetadata,
+from lmcache.v1.multiprocess.non_gpu_context import (
+    NonGpuContext,
+    NonGpuContextMetadata,
 )
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 
 
-class CPUContextPickle(NoneGpuContext):
-    """Pickle-based implementation of :class:`NoneGpuContext`.
+class CPUContextPickle(NonGpuContext):
+    """Pickle-based implementation of :class:`NonGpuContext`.
 
     Transport mechanism:
     - **Store**: ``prepare_store`` serialises chunks with ``pickle.dumps``; \
@@ -35,7 +35,7 @@ message, waits for the response, and deserialises the returned bytes with \
 
     def __init__(
         self,
-        metadata: NoneGpuContextMetadata,
+        metadata: NonGpuContextMetadata,
         mq_client: Any,
         mq_timeout: float,
     ) -> None:

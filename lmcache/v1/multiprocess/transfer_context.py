@@ -13,11 +13,11 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import is_mla
-from lmcache.v1.multiprocess.none_gpu_context import (
-    NoneGpuContext,
-    NoneGpuContextMetadata,
+from lmcache.v1.multiprocess.non_gpu_context import (
+    NonGpuContext,
+    NonGpuContextMetadata,
     compute_kv_layout,
-    create_none_gpu_context,
+    create_non_gpu_context,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
@@ -238,7 +238,7 @@ class NonCudaTransferContext(TransferContext):
     """Non-CUDA context transport for non-CUDA workers."""
 
     def __init__(self) -> None:
-        self._cpu_context: NoneGpuContext | None = None
+        self._cpu_context: NonGpuContext | None = None
         self._layout_hints: Any = None
         self._gpu_kv_format: Any = None
 
@@ -295,12 +295,12 @@ class NonCudaTransferContext(TransferContext):
             ],
         )
 
-        metadata = NoneGpuContextMetadata(
+        metadata = NonGpuContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
         )
-        self._cpu_context = create_none_gpu_context(metadata, mq_client, mq_timeout)
+        self._cpu_context = create_non_gpu_context(metadata, mq_client, mq_timeout)
         future.result(timeout=mq_timeout)
 
     def submit_store(

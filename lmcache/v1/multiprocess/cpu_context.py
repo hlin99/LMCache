@@ -2,11 +2,10 @@
 """Backward-compatible re-exports for legacy CPU context module path."""
 
 # First Party
-from lmcache.v1.multiprocess.none_gpu_context import (  # noqa: F401
-    NoneGpuContext as CPUContext,
-    NoneGpuContextMetadata as CPUContextMetadata,
-    compute_kv_layout,
-    create_none_gpu_context as create_cpu_context,
-    gather_paged_kv_to_cpu,
-    scatter_cpu_to_paged_kv,
+# Backward compatibility — canonical module is non_gpu_context
+from lmcache.v1.multiprocess.non_gpu_context import *  # noqa: F401,F403
+from lmcache.v1.multiprocess.non_gpu_context import (  # noqa: F401
+    NonGpuContext as CPUContext,
+    NonGpuContextMetadata as CPUContextMetadata,
+    create_non_gpu_context as create_cpu_context,
 )

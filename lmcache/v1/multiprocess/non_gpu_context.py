@@ -2,12 +2,12 @@
 """Non-GPU context abstractions and utilities for multiprocess mode.
 
 This module provides:
-- ``NoneGpuContextMetadata``: layout metadata dataclass for non-CUDA workers.
-- ``NoneGpuContext``: abstract base class with a two-phase prepare/commit
+- ``NonGpuContextMetadata``: layout metadata dataclass for non-CUDA workers.
+- ``NonGpuContext``: abstract base class with a two-phase prepare/commit
   interface for CPU-side KV data transfer. Concrete implementations (e.g.
   ``CPUContextPickle``) each decide *how* data is serialised and transported.
-- ``create_none_gpu_context()``: factory that returns the appropriate
-  ``NoneGpuContext`` subclass (currently always ``CPUContextPickle``).
+- ``create_non_gpu_context()``: factory that returns the appropriate
+  ``NonGpuContext`` subclass (currently always ``CPUContextPickle``).
 - ``compute_kv_layout``, ``gather_paged_kv_to_cpu``, ``scatter_cpu_to_paged_kv``:
   shared gather/scatter utilities used by all concrete implementations.
 """
@@ -26,7 +26,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 
 
 @dataclass
-class NoneGpuContextMetadata:
+class NonGpuContextMetadata:
     """Non-GPU context layout metadata for non-CUDA workers.
 
     Attributes:
@@ -40,7 +40,7 @@ class NoneGpuContextMetadata:
     use_mla: bool
 
 
-class NoneGpuContext(ABC):
+class NonGpuContext(ABC):
     """Abstract base class for CPU-side KV data transfer contexts.
 
     All concrete implementations share a common message-queue client and
@@ -55,7 +55,7 @@ class NoneGpuContext(ABC):
 
     def __init__(
         self,
-        metadata: NoneGpuContextMetadata,
+        metadata: NonGpuContextMetadata,
         mq_client: Any,
         mq_timeout: float,
     ) -> None:
@@ -128,12 +128,12 @@ class NoneGpuContext(ABC):
         ...
 
 
-def create_none_gpu_context(
-    metadata: NoneGpuContextMetadata,
+def create_non_gpu_context(
+    metadata: NonGpuContextMetadata,
     mq_client: Any,
     mq_timeout: float,
-) -> NoneGpuContext:
-    """Factory that returns the appropriate :class:`NoneGpuContext` implementation.
+) -> NonGpuContext:
+    """Factory that returns the appropriate :class:`NonGpuContext` implementation.
 
     Currently always returns a pickle-based implementation
     (``CPUContextPickle``). A future SHM-capable PR
@@ -145,7 +145,7 @@ def create_none_gpu_context(
         mq_timeout: Timeout in seconds for blocking MQ requests.
 
     Returns:
-        A concrete :class:`NoneGpuContext` instance.
+        A concrete :class:`NonGpuContext` instance.
     """
     # Local
     from .cpu_context_pickle import CPUContextPickle

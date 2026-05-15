@@ -53,7 +53,7 @@ from lmcache.v1.multiprocess.config import (
     add_mp_server_args,
     parse_args_to_mp_server_config,
 )
-from lmcache.v1.multiprocess.none_gpu_context import NoneGpuContextMetadata
+from lmcache.v1.multiprocess.non_gpu_context import NonGpuContextMetadata
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheEngineKey,
@@ -192,7 +192,7 @@ class MPCacheEngine:
         # We assume that if the (model name, world size) is the same, then
         # the layout desc returned by the gpu context is the same.
         self.gpu_context_meta: dict[int, tuple[str, int]] = {}
-        self.non_cuda_contexts: dict[int, NoneGpuContextMetadata] = {}
+        self.non_cuda_contexts: dict[int, NonGpuContextMetadata] = {}
         self.non_cuda_context_meta: dict[int, tuple[str, int]] = {}
 
         # chunk size
@@ -325,7 +325,7 @@ class MPCacheEngine:
             else torch.Size([2, num_layers, self.chunk_size, hidden_dim_size])
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
-        self.non_cuda_contexts[instance_id] = NoneGpuContextMetadata(
+        self.non_cuda_contexts[instance_id] = NonGpuContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla,
