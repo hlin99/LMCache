@@ -285,7 +285,7 @@ class MPCacheEngine:
         else:
             logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
 
-    def register_kv_cache_cpu_context(
+    def register_kv_cache_non_gpu_context(
         self,
         instance_id: int,
         model_name: str,
@@ -296,7 +296,7 @@ class MPCacheEngine:
         dtype_str: str,
         use_mla: bool,
     ) -> None:
-        """Register non-CUDA KV layout metadata for CPU context mode.
+        """Register non-CUDA KV layout metadata for non-GPU context mode.
 
         Args:
             instance_id: Worker instance identifier (typically PID).
@@ -1343,8 +1343,8 @@ def run_cache_server(
     add_handler_helper(server, RequestType.STORE, engine.store)
     add_handler_helper(
         server,
-        RequestType.REGISTER_KV_CACHE_CPU_CONTEXT,
-        engine.register_kv_cache_cpu_context,
+        RequestType.REGISTER_KV_CACHE_NON_GPU_CONTEXT,
+        engine.register_kv_cache_non_gpu_context,
     )
     add_handler_helper(server, RequestType.STORE_CPU_CHUNKS, engine.store_cpu_chunks)
     add_handler_helper(server, RequestType.LOOKUP, engine.lookup)

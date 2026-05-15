@@ -238,7 +238,7 @@ class NonCudaTransferContext(TransferContext):
     """Non-CUDA context transport for non-CUDA workers."""
 
     def __init__(self) -> None:
-        self._cpu_context: NonGpuContext | None = None
+        self._non_gpu_context: NonGpuContext | None = None
         self._layout_hints: Any = None
         self._gpu_kv_format: Any = None
 
@@ -282,7 +282,7 @@ class NonCudaTransferContext(TransferContext):
 
         future = send_request(
             mq_client,
-            RequestType.REGISTER_KV_CACHE_CPU_CONTEXT,
+            RequestType.REGISTER_KV_CACHE_NON_GPU_CONTEXT,
             [
                 instance_id,
                 model_name,
@@ -300,7 +300,7 @@ class NonCudaTransferContext(TransferContext):
             block_size=block_size,
             use_mla=use_mla_flag,
         )
-        self._cpu_context = create_non_gpu_context(metadata, mq_client, mq_timeout)
+        self._non_gpu_context = create_non_gpu_context(metadata, mq_client, mq_timeout)
         future.result(timeout=mq_timeout)
 
     def submit_store(
@@ -313,7 +313,7 @@ class NonCudaTransferContext(TransferContext):
         _event: IPCEvent,
         blocks_in_chunk: int,
     ) -> MessagingFuture:
-        if self._cpu_context is None:
+        if self._non_gpu_context is None:
             raise RuntimeError(
                 "Non-CUDA transfer context is not registered. "
                 "Call register() before submit_store()."
@@ -327,8 +327,8 @@ class NonCudaTransferContext(TransferContext):
             layout_hints=self._layout_hints,
             gpu_kv_format=self._gpu_kv_format,
         )
-        handle = self._cpu_context.prepare_store(key, instance_id, cpu_chunks)
-        ok = self._cpu_context.commit_store(handle)
+        handle = self._non_gpu_context.prepare_store(key, instance_id, cpu_chunks)
+        ok = self._non_gpu_context.commit_store(handle)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
@@ -345,13 +345,13 @@ class NonCudaTransferContext(TransferContext):
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
     ) -> MessagingFuture:
-        if self._cpu_context is None:
+        if self._non_gpu_context is None:
             raise RuntimeError(
                 "Non-CUDA transfer context is not registered. "
                 "Call register() before submit_retrieve()."
             )
 
-        handle, chunks = self._cpu_context.prepare_retrieve(key, instance_id)
+        handle, chunks = self._non_gpu_context.prepare_retrieve(key, instance_id)
         ok = chunks is not None
         if chunks is not None:
             try:
@@ -367,16 +367,16 @@ class NonCudaTransferContext(TransferContext):
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
-        self._cpu_context.commit_retrieve(handle)
+        self._non_gpu_context.commit_retrieve(handle)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
         return future
 
     def close(self) -> None:
-        if self._cpu_context is not None:
-            self._cpu_context.close()
-            self._cpu_context = None
+        if self._non_gpu_context is not None:
+            self._non_gpu_context.close()
+            self._non_gpu_context = None
 
 
 def create_transfer_context(

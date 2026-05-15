@@ -365,7 +365,7 @@ def test_server_register_and_find_non_cuda_context_layout(
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
     ):
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=16)
-    engine.register_kv_cache_cpu_context(
+    engine.register_kv_cache_non_gpu_context(
         instance_id=1,
         model_name="m",
         world_size=1,
@@ -416,7 +416,7 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
 
-    engine.register_kv_cache_cpu_context(
+    engine.register_kv_cache_non_gpu_context(
         instance_id=2,
         model_name="m",
         world_size=1,
