@@ -16,7 +16,7 @@ from lmcache.v1.multiprocess.non_gpu_context import (
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 
 
-class CPUContextPickle(NonGpuContext):
+class NonGpuContextPickle(NonGpuContext):
     """Pickle-based implementation of :class:`NonGpuContext`.
 
     Transport mechanism:

@@ -5,9 +5,9 @@ This module provides:
 - ``NonGpuContextMetadata``: layout metadata dataclass for non-CUDA workers.
 - ``NonGpuContext``: abstract base class with a two-phase prepare/commit
   interface for CPU-side KV data transfer. Concrete implementations (e.g.
-  ``CPUContextPickle``) each decide *how* data is serialised and transported.
+  ``NonGpuContextPickle``) each decide *how* data is serialised and transported.
 - ``create_non_gpu_context()``: factory that returns the appropriate
-  ``NonGpuContext`` subclass (currently always ``CPUContextPickle``).
+  ``NonGpuContext`` subclass (currently always ``NonGpuContextPickle``).
 - ``compute_kv_layout``, ``gather_paged_kv_to_cpu``, ``scatter_cpu_to_paged_kv``:
   shared gather/scatter utilities used by all concrete implementations.
 """
@@ -136,7 +136,7 @@ def create_non_gpu_context(
     """Factory that returns the appropriate :class:`NonGpuContext` implementation.
 
     Currently always returns a pickle-based implementation
-    (``CPUContextPickle``). A future SHM-capable PR
+    (``NonGpuContextPickle``). A future SHM-capable PR
     may probe for shared-memory availability and fall back to pickle.
 
     Args:
@@ -148,9 +148,9 @@ def create_non_gpu_context(
         A concrete :class:`NonGpuContext` instance.
     """
     # Local
-    from .non_gpu_context_pickle import CPUContextPickle
+    from .non_gpu_context_pickle import NonGpuContextPickle
 
-    return CPUContextPickle(metadata, mq_client, mq_timeout)
+    return NonGpuContextPickle(metadata, mq_client, mq_timeout)
 
 
 # ---------------------------------------------------------------------------
