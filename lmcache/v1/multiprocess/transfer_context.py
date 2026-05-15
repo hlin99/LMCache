@@ -13,11 +13,11 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import is_mla
-from lmcache.v1.multiprocess.cpu_context import (
-    CPUContext,
-    CPUContextMetadata,
+from lmcache.v1.multiprocess.none_gpu_context import (
+    NoneGpuContext,
+    NoneGpuContextMetadata,
     compute_kv_layout,
-    create_cpu_context,
+    create_none_gpu_context,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
@@ -234,11 +234,11 @@ class CudaTransferContext(TransferContext):
         self._send_request = None
 
 
-class CPUTransferContext(TransferContext):
-    """CPU context transport for non-CUDA workers."""
+class NonCudaTransferContext(TransferContext):
+    """Non-CUDA context transport for non-CUDA workers."""
 
     def __init__(self) -> None:
-        self._cpu_context: CPUContext | None = None
+        self._cpu_context: NoneGpuContext | None = None
         self._layout_hints: Any = None
         self._gpu_kv_format: Any = None
 
@@ -295,12 +295,12 @@ class CPUTransferContext(TransferContext):
             ],
         )
 
-        metadata = CPUContextMetadata(
+        metadata = NoneGpuContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
         )
-        self._cpu_context = create_cpu_context(metadata, mq_client, mq_timeout)
+        self._cpu_context = create_none_gpu_context(metadata, mq_client, mq_timeout)
         future.result(timeout=mq_timeout)
 
     def submit_store(
@@ -315,7 +315,7 @@ class CPUTransferContext(TransferContext):
     ) -> MessagingFuture:
         if self._cpu_context is None:
             raise RuntimeError(
-                "CPU transfer context is not registered. "
+                "Non-CUDA transfer context is not registered. "
                 "Call register() before submit_store()."
             )
 
@@ -347,7 +347,7 @@ class CPUTransferContext(TransferContext):
     ) -> MessagingFuture:
         if self._cpu_context is None:
             raise RuntimeError(
-                "CPU transfer context is not registered. "
+                "Non-CUDA transfer context is not registered. "
                 "Call register() before submit_retrieve()."
             )
 
@@ -408,4 +408,4 @@ def create_transfer_context(
     logger.info("Creating transfer context (device_type=%s)", device_type)
     if device_type == "cuda":
         return CudaTransferContext()
-    return CPUTransferContext()
+    return NonCudaTransferContext()

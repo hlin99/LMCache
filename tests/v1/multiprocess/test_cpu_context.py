@@ -99,6 +99,37 @@ def test_wrap_kv_caches_wraps_all_tensors(monkeypatch: Any) -> None:
     assert len(wrapped) == len(kv_caches)
 
 
+def test_none_gpu_context_renamed_symbols_and_legacy_shim() -> None:
+    """Verify renamed non-GPU context symbols and legacy aliases coexist."""
+    # First Party
+    from lmcache.v1.multiprocess.cpu_context import (
+        CPUContext,
+        CPUContextMetadata,
+        create_cpu_context,
+    )
+    from lmcache.v1.multiprocess.none_gpu_context import (
+        NoneGpuContext,
+        NoneGpuContextMetadata,
+        create_none_gpu_context,
+    )
+
+    assert CPUContext is NoneGpuContext
+    assert CPUContextMetadata is NoneGpuContextMetadata
+    assert create_cpu_context is create_none_gpu_context
+
+
+def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
+    """Ensure transfer context factory returns NonCudaTransferContext for CPU KV."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        NonCudaTransferContext,
+        create_transfer_context,
+    )
+
+    context = create_transfer_context({"layer_0": torch.randn(2, 2)})
+    assert isinstance(context, NonCudaTransferContext)
+
+
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     """Validate layout extraction and gather/scatter round-trip on CPU tensors."""
     # First Party
