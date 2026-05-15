@@ -178,6 +178,12 @@ class _PrefetchJob:
 
 @dataclass
 class RegisteredContext:
+    """Registered context metadata for a single worker instance.
+
+    At least one of ``gpu_context`` or ``non_cuda_metadata`` is expected to be
+    populated for valid registrations.
+    """
+
     model_name: str
     world_size: int
     gpu_context: GPUCacheContext | None = None
@@ -185,13 +191,27 @@ class RegisteredContext:
 
     @property
     def is_gpu(self) -> bool:
+        """Return whether this registration uses a GPU transfer context."""
         return self.gpu_context is not None
 
     def get_layout_desc(self, chunk_size: int) -> MemoryLayoutDesc:
+        """Return the layout descriptor for this registration.
+
+        Args:
+            chunk_size: Chunk size in tokens used for GPU layout derivation.
+
+        Returns:
+            The resolved memory layout descriptor.
+
+        Raises:
+            ValueError: If no GPU context or non-CUDA metadata is configured.
+        """
         if self.gpu_context is not None:
             return get_layout_desc(self.gpu_context, chunk_size)
         if self.non_cuda_metadata is None:
-            raise ValueError("Neither gpu_context nor non_cuda_metadata is set")
+            raise ValueError(
+                "Invalid RegisteredContext: no GPU or non-CUDA metadata configured"
+            )
         return self.non_cuda_metadata.layout_desc
 
 
@@ -203,7 +223,7 @@ class MPCacheEngine:
         chunk_size: int = 256,
         hash_algorithm: str = "blake3",
     ):
-        # Instance ID -> registered context metadata
+        # Worker instance ID -> registered context metadata
         self.contexts: dict[int, RegisteredContext] = {}
 
         # chunk size
@@ -234,6 +254,7 @@ class MPCacheEngine:
 
     @property
     def gpu_contexts(self) -> dict[int, GPUCacheContext]:
+        """Return GPU-only context mapping for backward compatibility."""
         return {
             instance_id: ctx.gpu_context
             for instance_id, ctx in self.contexts.items()
@@ -297,7 +318,9 @@ class MPCacheEngine:
         """
         context = self.contexts.pop(instance_id, None)
         if context is None:
-            logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
+            logger.warning(
+                "No registered context found for instance ID %d", instance_id
+            )
             return
 
         if context.is_gpu:
@@ -508,8 +531,11 @@ class MPCacheEngine:
         obj_keys = self._resolve_obj_keys(key)
 
         context = self.contexts.get(instance_id)
-        assert context is not None and context.gpu_context is not None, (
-            f"KV cache not registered for GPU ID {instance_id}"
+        assert context is not None, (
+            f"No context registered for instance ID {instance_id}"
+        )
+        assert context.gpu_context is not None, (
+            f"GPU context not registered for instance ID {instance_id}"
         )
         gpu_context = context.gpu_context
         model_name = context.model_name
@@ -692,8 +718,11 @@ class MPCacheEngine:
         obj_keys = self._resolve_obj_keys(key)
 
         context = self.contexts.get(instance_id)
-        assert context is not None and context.gpu_context is not None, (
-            f"KV cache not registered for GPU ID {instance_id}"
+        assert context is not None, (
+            f"No context registered for instance ID {instance_id}"
+        )
+        assert context.gpu_context is not None, (
+            f"GPU context not registered for instance ID {instance_id}"
         )
         gpu_context = context.gpu_context
         model_name = context.model_name
