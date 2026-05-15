@@ -151,6 +151,15 @@ class TestKVCacheCheckEndpoint:
         resp = client_with_engine.get("/kvcache/check?block_ids=0&chunk_size=1")
         assert resp.status_code == 200
 
+    def test_context_registry_ignores_non_gpu_entries(
+        self, client_with_engine, mock_engine
+    ):
+        """Entries with ``gpu_context=None`` are filtered from fallback registry."""
+        mock_engine.gpu_contexts = None
+        mock_engine.contexts = {0: MagicMock(gpu_context=None)}
+        resp = client_with_engine.get("/kvcache/check?block_ids=0&chunk_size=1")
+        assert resp.status_code == 404
+
     def test_unknown_instance_id(self, client_with_engine):
         """404 when instance_id is not registered."""
         resp = client_with_engine.get(

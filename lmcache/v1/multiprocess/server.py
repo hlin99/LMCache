@@ -180,9 +180,13 @@ class _PrefetchJob:
 class RegisteredContext:
     """Registry entry for a registered worker cache context."""
 
+    # Model identity for resolving layout desc during lookup.
     model_name: str
+    # World size used with model_name to match cache layout.
     world_size: int
+    # GPU context for CUDA IPC registrations; None for non-CUDA registrations.
     gpu_context: GPUCacheContext | None = None
+    # Non-CUDA metadata for CPU context registrations; None for GPU registrations.
     non_cuda_metadata: NonGpuContextMetadata | None = None
 
     @property
@@ -196,7 +200,11 @@ class RegisteredContext:
             return get_layout_desc(self.gpu_context, chunk_size)
         if self.non_cuda_metadata is not None:
             return self.non_cuda_metadata.layout_desc
-        raise ValueError("RegisteredContext has neither gpu_context nor non_cuda")
+        raise ValueError(
+            "RegisteredContext must have either gpu_context or "
+            "non_cuda_metadata, but both are None. Register via "
+            "register_kv_cache or register_kv_cache_non_gpu_context."
+        )
 
 
 # Main class for the mp cache engine
@@ -296,11 +304,13 @@ class MPCacheEngine:
         """
         context = self.contexts.pop(instance_id, None)
         if context is None:
-            logger.warning("No KV cache found for GPU ID %d to unregister", instance_id)
+            logger.warning(
+                "No context found for instance ID %d to unregister", instance_id
+            )
             return
 
         if context.is_gpu:
-            logger.info("Unregistered KV cache for GPU ID %d", instance_id)
+            logger.info("Unregistered KV cache for instance ID %d", instance_id)
             torch_dev.empty_cache()
         else:
             logger.info("Unregistered non-CUDA context for instance ID %d", instance_id)
@@ -499,7 +509,7 @@ class MPCacheEngine:
         obj_keys = self._resolve_obj_keys(key)
 
         assert instance_id in self.contexts, (
-            f"KV cache not registered for GPU ID {instance_id}"
+            f"KV cache not registered for instance ID {instance_id}"
         )
         registered_context = self.contexts[instance_id]
         gpu_context = registered_context.gpu_context
@@ -687,7 +697,7 @@ class MPCacheEngine:
         obj_keys = self._resolve_obj_keys(key)
 
         assert instance_id in self.contexts, (
-            f"KV cache not registered for GPU ID {instance_id}"
+            f"KV cache not registered for instance ID {instance_id}"
         )
         registered_context = self.contexts[instance_id]
         gpu_context = registered_context.gpu_context

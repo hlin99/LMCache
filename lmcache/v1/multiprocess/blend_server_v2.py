@@ -106,8 +106,11 @@ logger = init_logger(__name__)
 class _CBRegisteredContext:
     """Registered CB GPU context metadata."""
 
+    # Model identity for resolving CB layout desc during lookup.
     model_name: str
+    # World size used with model_name to match CB layout.
     world_size: int
+    # GPU context for CB store/retrieve operations.
     gpu_context: PlainGPUCacheContext
 
 

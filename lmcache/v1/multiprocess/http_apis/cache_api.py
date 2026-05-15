@@ -120,11 +120,14 @@ async def kvcache_check(
     gpu_ctxs = getattr(engine, "gpu_contexts", None)
     if gpu_ctxs is None:
         contexts = getattr(engine, "contexts", None)
+        # Unified registry fallback: contexts is expected to be
+        # dict[int, RegisteredContext]-like, where each value may expose a
+        # nullable ``gpu_context`` attribute.
         if isinstance(contexts, dict):
             gpu_ctxs = {
                 instance_id: context.gpu_context
                 for instance_id, context in contexts.items()
-                if context.gpu_context is not None
+                if hasattr(context, "gpu_context") and context.gpu_context is not None
             }
     if gpu_ctxs is None:
         return JSONResponse(
