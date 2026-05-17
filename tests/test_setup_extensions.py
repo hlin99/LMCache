@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import types
+from typing import Iterator
 import unittest
 from unittest.mock import patch
 
@@ -17,7 +18,13 @@ class _FakeExtension:
 
 
 @contextmanager
-def _fake_torch_cpp_extension() -> object:
+def _fake_torch_cpp_extension() -> Iterator[types.SimpleNamespace]:
+    """Provide a temporary fake `torch.utils.cpp_extension` module for tests.
+
+    Yields:
+        A namespace exposing fake CppExtension/CUDAExtension/SyclExtension and
+        BuildExtension symbols used by setup.py helper functions.
+    """
     cpp_extension = types.SimpleNamespace(
         CppExtension=_FakeExtension,
         CUDAExtension=_FakeExtension,
@@ -44,7 +51,15 @@ def _fake_torch_cpp_extension() -> object:
                 sys.modules[key] = value
 
 
-def _load_setup_module() -> object:
+def _load_setup_module() -> types.ModuleType:
+    """Load setup.py as a module so helper functions can be tested directly.
+
+    Returns:
+        The imported setup.py module object.
+
+    Raises:
+        RuntimeError: If setup.py cannot be loaded from disk.
+    """
     setup_path = Path(__file__).resolve().parents[1] / "setup.py"
     spec = importlib.util.spec_from_file_location("lmcache_setup", setup_path)
     if spec is None or spec.loader is None:
@@ -94,11 +109,14 @@ class SetupExtensionsTests(unittest.TestCase):
 
     def test_collect_extensions_keeps_common_cpp_when_no_cuda_ext(self) -> None:
         module = _load_setup_module()
-        with _fake_torch_cpp_extension(), patch.dict("os.environ", {}, clear=False):
-            module.BUILDING_SDIST = False
-            module.NO_CUDA_EXT = True
-            module.BUILD_WITH_HIP = False
-            module.BUILD_WITH_SYCL = False
+        with (
+            _fake_torch_cpp_extension(),
+            patch.dict("os.environ", {}, clear=False),
+            patch.object(module, "BUILDING_SDIST", False),
+            patch.object(module, "NO_CUDA_EXT", True),
+            patch.object(module, "BUILD_WITH_HIP", False),
+            patch.object(module, "BUILD_WITH_SYCL", False),
+        ):
             ext_modules, _ = module._collect_extensions()
 
         names = [ext.name for ext in ext_modules]

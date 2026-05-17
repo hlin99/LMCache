@@ -118,7 +118,18 @@ def _mooncake_extension(
 
 
 def _common_cpp_extensions(extra_cxx_flags: list[str]) -> tuple[list, dict]:
-    """Build pure C++ extensions that do not depend on any GPU backend."""
+    """Build pure C++ extensions that do not depend on any GPU backend.
+
+    Args:
+        extra_cxx_flags: Additional C++ compiler flags to apply to all pure
+            C++ extensions.
+
+    Returns:
+        A tuple of:
+            - list: CppExtension modules for native storage backends,
+              including optional mooncake when enabled.
+            - dict: cmdclass containing BuildExtension.
+    """
     # Third Party
     from torch.utils import cpp_extension
 
@@ -331,6 +342,11 @@ def source_dist_extension() -> tuple[list, dict]:
 
 
 def _get_common_cpp_flags() -> list[str]:
+    """Select common pure C++ ABI flags based on the configured build backend.
+
+    Returns:
+        A list of compiler flags for pure C++ extensions.
+    """
     if BUILD_WITH_HIP:
         return []
     if BUILD_WITH_SYCL:
@@ -341,6 +357,19 @@ def _get_common_cpp_flags() -> list[str]:
 
 
 def _collect_extensions() -> tuple[list, dict]:
+    """Collect extension modules according to current setup.py build settings.
+
+    Returns:
+        A tuple of:
+            - list: extension modules selected for the current build mode.
+            - dict: cmdclass containing BuildExtension when extensions are built.
+
+    Notes:
+        - `sdist` builds skip all extension compilation.
+        - `NO_CUDA_EXT=1` keeps pure C++ extensions and skips GPU extensions.
+        - Otherwise, pure C++ extensions are combined with one GPU backend
+          extension set (CUDA, ROCm, or SYCL).
+    """
     if BUILDING_SDIST:
         return source_dist_extension()
 
