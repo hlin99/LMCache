@@ -39,8 +39,7 @@ class NonGpuContextShm(NonGpuContext):
         if self._shm.size < pool_size:
             self._shm.close()
             raise ValueError(
-                f"SHM pool size mismatch: expected at least {pool_size}, "
-                f"got {self._shm.size}"
+                f"SHM pool size mismatch: expected {pool_size}, got {self._shm.size}"
             )
         self._buffer = self._shm.buf
 
@@ -63,7 +62,7 @@ class NonGpuContextShm(NonGpuContext):
                 self._make_tensor_view(
                     slot.offset, slot.length, slot.shape, slot.dtype
                 ).copy_(chunks[slot.chunk_index])
-        except Exception:
+        except (RuntimeError, ValueError, IndexError):
             logger.exception("Failed to copy prepared store chunks into SHM")
             success = False
         return (key, instance_id, success)
@@ -99,7 +98,7 @@ class NonGpuContextShm(NonGpuContext):
                 self._make_tensor_view(slot.offset, slot.length, slot.shape, slot.dtype)
                 for slot in response.slots
             ]
-        except Exception:
+        except (RuntimeError, ValueError):
             logger.exception("Failed to construct SHM tensor views for retrieve")
             return ((key, instance_id), None)
         return ((key, instance_id), chunks)

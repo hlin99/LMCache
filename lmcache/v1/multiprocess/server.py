@@ -255,8 +255,11 @@ class MPCacheEngine:
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
 
+        # Track reserved keys for in-flight two-phase non-CUDA SHM stores.
         self._pending_shm_stores: dict[tuple[str, int], list[ObjectKey]] = {}
+        # Track read-locked keys for in-flight two-phase non-CUDA SHM retrieves.
         self._pending_shm_reads: dict[tuple[str, int], list[ObjectKey]] = {}
+        # Serialize access to the pending SHM store/read dictionaries.
         self._shm_lock = threading.Lock()
         shm_info = self.storage_manager.get_shm_pool_info()
         self._cached_shm_name = cast(str, shm_info["shm_name"])

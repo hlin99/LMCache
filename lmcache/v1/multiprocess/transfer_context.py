@@ -341,7 +341,7 @@ class NonCudaTransferContext(TransferContext):
             ok = self._non_gpu_context.commit_store(handle)
         except TimeoutError:
             ok = False
-        except Exception:
+        except (RuntimeError, ValueError, OSError):
             logger.exception("Failed to prepare or commit non-CUDA SHM store")
             ok = False
 
@@ -387,7 +387,7 @@ class NonCudaTransferContext(TransferContext):
                     ok = False
         except TimeoutError:
             ok = False
-        except Exception:
+        except (RuntimeError, ValueError, OSError):
             logger.exception("Failed to prepare non-CUDA SHM retrieve")
             ok = False
         finally:
