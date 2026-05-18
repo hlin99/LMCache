@@ -167,16 +167,26 @@ def test_get_finished_logs_store_result_exception(fake_adapter, monkeypatch):
     logger_exception.assert_called_once()
     log_args = logger_exception.call_args[0]
     assert log_args[0].startswith("mp_store_path store_result_exception")
-    assert log_args[1:10] == (
-        "req-store-exception",
-        "test-model",
-        0,
-        1,
-        3,
-        1,
-        0,
-        3,
-        "RuntimeError",
-    )
-    assert isinstance(log_args[10], RuntimeError)
-    assert str(log_args[10]) == "store boom"
+    (
+        request_id_arg,
+        model_name_arg,
+        worker_id_arg,
+        world_size_arg,
+        token_count_arg,
+        block_count_arg,
+        start_arg,
+        end_arg,
+        exception_type_arg,
+        exception_arg,
+    ) = log_args[1:]
+    assert request_id_arg == "req-store-exception"
+    assert model_name_arg == "test-model"
+    assert worker_id_arg == 0
+    assert world_size_arg == 1
+    assert token_count_arg == 3
+    assert block_count_arg == 1
+    assert start_arg == 0
+    assert end_arg == 3
+    assert exception_type_arg == "RuntimeError"
+    assert isinstance(exception_arg, RuntimeError)
+    assert str(exception_arg) == "store boom"

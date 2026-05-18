@@ -30,6 +30,7 @@ logger = init_logger(__name__)
 DEFAULT_MQ_TIMEOUT: float = 300.0
 # Interval (seconds) between periodic heartbeat pings to the server.
 DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
+MISSING_STORE_DEBUG_VALUE: int = -1
 
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
@@ -300,8 +301,8 @@ class StoreRequestDebugInfo:
     end: int
     token_count: int
     block_count: int
-    first_block_id: int | None
-    last_block_id: int | None
+    first_block_id: int
+    last_block_id: int
 
 
 StoreResult = bool
@@ -948,8 +949,8 @@ class LMCacheMPWorkerAdapter:
             return
 
         assert op.token_ids is not None
-        first_block_id = op.block_ids[0] if op.block_ids else None
-        last_block_id = op.block_ids[-1] if op.block_ids else None
+        first_block_id = op.block_ids[0] if op.block_ids else MISSING_STORE_DEBUG_VALUE
+        last_block_id = op.block_ids[-1] if op.block_ids else MISSING_STORE_DEBUG_VALUE
         logger.info(
             "mp_store_path submit_start request_id=%s model_name=%s worker_id=%s "
             "world_size=%s token_count=%s block_count=%s start=%s end=%s "
@@ -1195,26 +1196,17 @@ class LMCacheMPWorkerAdapter:
         finished_stores = set()
         finished_retrieves = set()
         for request_id, s_future in self.store_futures.items():
-            store_debug_info = self.store_request_debug_infos.get(request_id)
-            log_model_name = self.model_name
-            log_worker_id = self.worker_id
-            log_world_size = self.world_size
-            log_token_count = None
-            log_block_count = None
-            log_start = None
-            log_end = None
-            log_first_block_id = None
-            log_last_block_id = None
-            if store_debug_info is not None:
-                log_model_name = store_debug_info.model_name
-                log_worker_id = store_debug_info.worker_id
-                log_world_size = store_debug_info.world_size
-                log_token_count = store_debug_info.token_count
-                log_block_count = store_debug_info.block_count
-                log_start = store_debug_info.start
-                log_end = store_debug_info.end
-                log_first_block_id = store_debug_info.first_block_id
-                log_last_block_id = store_debug_info.last_block_id
+            (
+                log_model_name,
+                log_worker_id,
+                log_world_size,
+                log_token_count,
+                log_block_count,
+                log_start,
+                log_end,
+                log_first_block_id,
+                log_last_block_id,
+            ) = self._get_store_debug_log_values(request_id)
             try:
                 future_ready = s_future.query()
             except Exception as exception:
@@ -1408,4 +1400,34 @@ class LMCacheMPWorkerAdapter:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+        )
+
+    def _get_store_debug_log_values(
+        self,
+        request_id: str,
+    ) -> tuple[str, int, int, int, int, int, int, int, int]:
+        """Return stable store debug values for logging."""
+        debug_info = self.store_request_debug_infos.get(request_id)
+        if debug_info is None:
+            return (
+                self.model_name,
+                self.worker_id,
+                self.world_size,
+                MISSING_STORE_DEBUG_VALUE,
+                MISSING_STORE_DEBUG_VALUE,
+                MISSING_STORE_DEBUG_VALUE,
+                MISSING_STORE_DEBUG_VALUE,
+                MISSING_STORE_DEBUG_VALUE,
+                MISSING_STORE_DEBUG_VALUE,
+            )
+        return (
+            debug_info.model_name,
+            debug_info.worker_id,
+            debug_info.world_size,
+            debug_info.token_count,
+            debug_info.block_count,
+            debug_info.start,
+            debug_info.end,
+            debug_info.first_block_id,
+            debug_info.last_block_id,
         )
