@@ -132,8 +132,10 @@ def _common_cpp_extensions(
             `native_storage_ops` and `lmcache_redis` pure C++ extensions.
         fs_extra_cxx_flags: Additional C++ compiler flags to apply to the
             `lmcache_fs` extension. Defaults to `extra_cxx_flags` when not set.
-            This keeps SYCL behavior bit-for-bit compatible with pre-refactor
-            builds where `lmcache_fs` intentionally omitted the ABI flag.
+
+    Notes:
+        `fs_extra_cxx_flags` exists to preserve pre-refactor SYCL compile-flag
+        behavior where `lmcache_fs` intentionally omitted the ABI define.
 
     Returns:
         A tuple of:
@@ -388,7 +390,8 @@ def _collect_extensions() -> tuple[list, dict]:
         return source_dist_extension()
 
     common_cpp_flags = _get_common_cpp_flags()
-    # Preserve pre-refactor SYCL behavior: lmcache_fs compiles without ABI flag.
+    # Preserve historical SYCL compatibility: lmcache_fs was compiled without
+    # _GLIBCXX_USE_CXX11_ABI in pre-refactor builds.
     fs_cpp_flags = [] if BUILD_WITH_SYCL else common_cpp_flags
     ext_modules, cmdclass = _common_cpp_extensions(common_cpp_flags, fs_cpp_flags)
     if NO_CUDA_EXT:
