@@ -3,9 +3,14 @@
 from pathlib import Path
 import os
 import sys
+from typing import TYPE_CHECKING
 
 # Third Party
 from setuptools import find_packages, setup
+
+if TYPE_CHECKING:
+    # Third Party
+    from setuptools.extension import Extension
 
 ROOT_DIR = Path(__file__).parent
 HIPIFY_DIR = os.path.join(ROOT_DIR, "csrc/")
@@ -119,7 +124,7 @@ def _mooncake_extension(
 
 def _common_cpp_extensions(
     extra_cxx_flags: list[str], fs_extra_cxx_flags: list[str] | None = None
-) -> tuple[list, dict]:
+) -> tuple[list["Extension"], dict[str, type]]:
     """Build pure C++ extensions that do not depend on any GPU backend.
 
     Args:
@@ -127,6 +132,8 @@ def _common_cpp_extensions(
             `native_storage_ops` and `lmcache_redis` pure C++ extensions.
         fs_extra_cxx_flags: Additional C++ compiler flags to apply to the
             `lmcache_fs` extension. Defaults to `extra_cxx_flags` when not set.
+            This keeps SYCL behavior bit-for-bit compatible with pre-refactor
+            builds where `lmcache_fs` intentionally omitted the ABI flag.
 
     Returns:
         A tuple of:
@@ -381,6 +388,7 @@ def _collect_extensions() -> tuple[list, dict]:
         return source_dist_extension()
 
     common_cpp_flags = _get_common_cpp_flags()
+    # Preserve pre-refactor SYCL behavior: lmcache_fs compiles without ABI flag.
     fs_cpp_flags = [] if BUILD_WITH_SYCL else common_cpp_flags
     ext_modules, cmdclass = _common_cpp_extensions(common_cpp_flags, fs_cpp_flags)
     if NO_CUDA_EXT:
