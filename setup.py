@@ -117,12 +117,16 @@ def _mooncake_extension(
     ]
 
 
-def _common_cpp_extensions(extra_cxx_flags: list[str]) -> tuple[list, dict]:
+def _common_cpp_extensions(
+    extra_cxx_flags: list[str], fs_extra_cxx_flags: list[str] | None = None
+) -> tuple[list, dict]:
     """Build pure C++ extensions that do not depend on any GPU backend.
 
     Args:
-        extra_cxx_flags: Additional C++ compiler flags to apply to all pure
-            C++ extensions.
+        extra_cxx_flags: Additional C++ compiler flags to apply to the
+            `native_storage_ops` and `lmcache_redis` pure C++ extensions.
+        fs_extra_cxx_flags: Additional C++ compiler flags to apply to the
+            `lmcache_fs` extension. Defaults to `extra_cxx_flags` when not set.
 
     Returns:
         A tuple of:
@@ -132,6 +136,9 @@ def _common_cpp_extensions(extra_cxx_flags: list[str]) -> tuple[list, dict]:
     """
     # Third Party
     from torch.utils import cpp_extension
+
+    if fs_extra_cxx_flags is None:
+        fs_extra_cxx_flags = extra_cxx_flags
 
     storage_manager_sources = [
         "csrc/storage_manager/bitmap.cpp",
@@ -173,7 +180,7 @@ def _common_cpp_extensions(extra_cxx_flags: list[str]) -> tuple[list, dict]:
             sources=fs_sources,
             include_dirs=["csrc/storage_backends", "csrc/storage_backends/fs"],
             extra_compile_args={
-                "cxx": extra_cxx_flags + ["-O3", "-std=c++17"],
+                "cxx": fs_extra_cxx_flags + ["-O3", "-std=c++17"],
             },
         ),
     ]
@@ -373,7 +380,9 @@ def _collect_extensions() -> tuple[list, dict]:
     if BUILDING_SDIST:
         return source_dist_extension()
 
-    ext_modules, cmdclass = _common_cpp_extensions(_get_common_cpp_flags())
+    common_cpp_flags = _get_common_cpp_flags()
+    fs_cpp_flags = [] if BUILD_WITH_SYCL else common_cpp_flags
+    ext_modules, cmdclass = _common_cpp_extensions(common_cpp_flags, fs_cpp_flags)
     if NO_CUDA_EXT:
         return ext_modules, cmdclass
 

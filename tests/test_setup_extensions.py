@@ -134,6 +134,36 @@ class SetupExtensionsTests(unittest.TestCase):
         self.assertEqual(ext_modules, [])
         self.assertEqual(cmdclass, {})
 
+    def test_collect_extensions_keeps_sycl_fs_flags_identical_to_pre_refactor(
+        self,
+    ) -> None:
+        module = _load_setup_module()
+        with (
+            _fake_torch_cpp_extension(),
+            patch.object(module, "BUILDING_SDIST", False),
+            patch.object(module, "NO_CUDA_EXT", True),
+            patch.object(module, "BUILD_WITH_HIP", False),
+            patch.object(module, "BUILD_WITH_SYCL", True),
+            patch.object(module, "ENABLE_CXX11_ABI", True),
+        ):
+            ext_modules, _ = module._collect_extensions()
+
+        compile_flags_by_name = {
+            ext.name: ext.kwargs["extra_compile_args"]["cxx"] for ext in ext_modules
+        }
+        self.assertEqual(
+            compile_flags_by_name["lmcache.native_storage_ops"],
+            ["-D_GLIBCXX_USE_CXX11_ABI=1", "-O3", "-std=c++17"],
+        )
+        self.assertEqual(
+            compile_flags_by_name["lmcache.lmcache_redis"],
+            ["-D_GLIBCXX_USE_CXX11_ABI=1", "-O3", "-std=c++17"],
+        )
+        self.assertEqual(
+            compile_flags_by_name["lmcache.lmcache_fs"],
+            ["-O3", "-std=c++17"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
