@@ -49,8 +49,12 @@ class RequestType(enum.Enum):
     FREE_LOOKUP_LOCKS = enum.auto()
     END_SESSION = enum.auto()
     REGISTER_KV_CACHE_BOUNCE = enum.auto()
-    STORE_CPU_CHUNKS = enum.auto()
-    RETRIEVE_CPU_CHUNKS = enum.auto()
+
+    # SHM two-phase store/retrieve operations
+    PREPARE_STORE = enum.auto()
+    COMMIT_STORE = enum.auto()
+    PREPARE_RETRIEVE = enum.auto()
+    FINISH_READ = enum.auto()
 
     # Controller operations
     CLEAR = enum.auto()

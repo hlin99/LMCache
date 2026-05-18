@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 import os
 import threading
 
@@ -16,8 +16,8 @@ from lmcache.integration.request_telemetry.factory import RequestTelemetryFactor
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.multiprocess.cpu_bounce_context import (
     compute_kv_layout,
-    gather_chunks_to_cpu,
-    scatter_cpu_chunks_to_kv,
+    gather_chunks_to_cpu_tensors,
+    scatter_tensors_to_kv,
 )
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
@@ -27,6 +27,10 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.protocols.engine import (
+    PrepareRetrieveResponse,
+    PrepareStoreResponse,
+)
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 
 logger = init_logger(__name__)
@@ -263,6 +267,25 @@ class LoadStoreOp:
 StoreResult = bool
 RetrieveResult = bool
 LookupResult = int
+
+
+class _ImmediateFuture:
+    """A future-like object that immediately returns a result.
+
+    Used for synchronous SHM store/retrieve operations that complete
+    in-line rather than waiting for an async server response.
+    """
+
+    def __init__(self, value: Any):
+        self._value = value
+
+    def query(self) -> bool:
+        """Always returns ``True`` (result is ready)."""
+        return True
+
+    def result(self, timeout: float | None = None) -> Any:
+        """Return the pre-computed result."""
+        return self._value
 
 
 class LMCacheMPSchedulerAdapter:
@@ -670,11 +693,14 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
-        self._bounce_skip_tokens: dict[str, int] = {}
         self._bounce_layout_hints: Any = None
         self._bounce_gpu_kv_format: Any = None
         self._use_bounce_buffer: bool = False
         self._device_type: str = "cuda"
+
+        # SHM pool attachment (populated during register_kv_caches)
+        self._l1_shm: Any = None  # multiprocessing.shared_memory.SharedMemory
+        self._l1_buffer: memoryview | None = None
 
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
@@ -829,13 +855,19 @@ class LMCacheMPWorkerAdapter:
                 ],
             )
         try:
-            future.result(timeout=self._mq_timeout)
+            result = future.result(timeout=self._mq_timeout)
         except TimeoutError:
             raise ConnectionError(
                 "LMCache server did not respond to "
                 "register_kv_caches within "
                 f"{self._mq_timeout}s. Is the server running?"
             ) from None
+
+        # Attach to SHM pool for bounce-buffer workers
+        if self._use_bounce_buffer and result is not None:
+            shm_name, pool_size = result
+            if shm_name:
+                self._attach_shm(shm_name, pool_size)
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first use."""
@@ -869,6 +901,7 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        logger.info("submit_store_request, req id=%s", request_id)
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -884,18 +917,11 @@ class LMCacheMPWorkerAdapter:
         )
         if self._use_bounce_buffer:
             torch_dev.synchronize()
-            cpu_data = gather_chunks_to_cpu(
-                self.kv_caches,
-                op.block_ids,
-                self.blocks_in_chunk,
-                layout_hints=self._bounce_layout_hints,
-                gpu_kv_format=self._bounce_gpu_kv_format,
-            )
-            future = send_lmcache_request(
-                self.mq_client,
-                RequestType.STORE_CPU_CHUNKS,
-                [key, self.instance_id, cpu_data],
-            )
+            logger.info("_shm_store key=%s", key)
+            store_ok = self._shm_store(key, op)
+            # SHM store is synchronous (memcpy + commit), mark as done
+            self.store_futures[request_id] = _ImmediateFuture(store_ok)
+            return
         else:
             future = send_lmcache_request(
                 self.mq_client,
@@ -922,6 +948,7 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        logger.info("submit_retrieve_request, req id=%s", request_id)
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -937,12 +964,15 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
         )
         if self._use_bounce_buffer:
-            future = send_lmcache_request(
-                self.mq_client,
-                RequestType.RETRIEVE_CPU_CHUNKS,
-                [key, self.instance_id],
+            logger.info("_shm_retrieve key=%s", key)
+            success = self._shm_retrieve(key, op)
+            self.retrieve_futures[request_id] = (
+                _ImmediateFuture(success),
+                list(op.block_ids),
             )
-            self._bounce_skip_tokens[request_id] = op.skip_first_n_tokens
+            if not success:
+                self.error_block_ids.update(op.block_ids)
+            return
         else:
             future = send_lmcache_request(
                 self.mq_client,
@@ -1064,7 +1094,6 @@ class LMCacheMPWorkerAdapter:
                 self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
-            self._bounce_skip_tokens.clear()
 
             ret_stores = self._process_finished_stores(
                 finished_stores, finished_req_ids_from_engine
@@ -1097,33 +1126,9 @@ class LMCacheMPWorkerAdapter:
             if not r_future.query():
                 continue
 
-            if self._use_bounce_buffer:
-                success, cpu_data = cast(tuple[bool, bytes], r_future.result())
-                r_result = success
-                if success and cpu_data:
-                    try:
-                        scatter_cpu_chunks_to_kv(
-                            self.kv_caches,
-                            r_block_ids,
-                            cpu_data,
-                            self.blocks_in_chunk,
-                            skip_first_n_tokens=self._bounce_skip_tokens.pop(
-                                request_id, 0
-                            ),
-                            layout_hints=self._bounce_layout_hints,
-                            gpu_kv_format=self._bounce_gpu_kv_format,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to scatter retrieved bounce-buffer chunks"
-                        )
-                        r_result = False
-                else:
-                    self._bounce_skip_tokens.pop(request_id, None)
-            else:
-                r_result = r_future.result()
+            r_result = r_future.result()
             finished_retrieves.add(request_id)
-
+            logger.info(" updated results ")
             if not r_result:
                 logger.error(
                     "Something went wrong when processing the "
@@ -1193,6 +1198,12 @@ class LMCacheMPWorkerAdapter:
         self.mq_client.close()
         self.request_telemetry.close()
 
+        # Detach from SHM pool (workers never unlink)
+        if self._l1_shm is not None:
+            self._l1_buffer = None
+            self._l1_shm.close()
+            self._l1_shm = None
+
     # Helper functions
     def _update_and_get_finished_store(
         self,
@@ -1205,6 +1216,174 @@ class LMCacheMPWorkerAdapter:
         self.previously_finished.difference_update(safe_finished_s)
 
         return safe_finished_s
+
+    # SHM helper methods
+
+    def _attach_shm(self, shm_name: str, pool_size: int) -> None:
+        """Attach to the server's shared-memory L1 pool.
+
+        Called once during ``register_kv_caches`` when the server
+        reports a non-empty ``shm_name``.
+
+        Args:
+            shm_name: POSIX shared-memory segment name.
+            pool_size: Expected pool size in bytes.
+
+        Raises:
+            ValueError: If the attached segment size does not match.
+        """
+        # Standard
+        from multiprocessing import shared_memory
+
+        shm = shared_memory.SharedMemory(name=shm_name, create=False)
+        if shm.size < pool_size:
+            shm.close()
+            raise ValueError(
+                f"SHM pool size mismatch: expected at least {pool_size}, got {shm.size}"
+            )
+        self._l1_shm = shm
+        self._l1_buffer = shm.buf
+        logger.info("Attached to SHM pool %s (size=%d bytes)", shm_name, pool_size)
+
+    def _make_tensor_view(
+        self, offset: int, length: int, shape: list[int], dtype: str
+    ) -> torch.Tensor:
+        """Construct a zero-copy tensor view over the SHM pool.
+
+        Args:
+            offset: Byte offset into the SHM pool.
+            length: Byte length of the slot.
+            shape: Tensor shape.
+            dtype: Torch dtype name (e.g. ``"float16"``).
+
+        Returns:
+            A :class:`torch.Tensor` backed by the SHM buffer.
+        """
+        if self._l1_buffer is None:
+            raise ValueError("SHM pool not attached; call _attach_shm first")
+        torch_dtype = getattr(torch, dtype)
+        buf_view = self._l1_buffer[offset : offset + length]
+        return torch.frombuffer(buf_view, dtype=torch_dtype).view(*shape)
+
+    def _shm_store(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> bool:
+        """Execute a two-phase SHM store: prepare → memcpy → commit.
+
+        Args:
+            key: The IPC cache key.
+            op: The load/store operation with block IDs.
+
+        Returns:
+            ``True`` if all chunks were written successfully.
+        """
+        # Phase 1: Ask server for L1 shm slots
+        prep_future = send_lmcache_request(
+            self.mq_client,
+            RequestType.PREPARE_STORE,
+            [key, self.instance_id],
+        )
+        response: PrepareStoreResponse = prep_future.result(timeout=self._mq_timeout)
+
+        if not response.slots:
+            return True
+
+        success = True
+        try:
+            # Gather chunks to CPU tensors (not pickled)
+            cpu_chunks = gather_chunks_to_cpu_tensors(
+                self.kv_caches,
+                op.block_ids,
+                self.blocks_in_chunk,
+                layout_hints=self._bounce_layout_hints,
+                gpu_kv_format=self._bounce_gpu_kv_format,
+            )
+
+            # Phase 2: Copy data into SHM slots (match by chunk_index)
+            for slot in response.slots:
+                if slot.chunk_index < len(cpu_chunks):
+                    tensor_view = self._make_tensor_view(
+                        slot.offset, slot.length, slot.shape, slot.dtype
+                    )
+                    tensor_view.copy_(cpu_chunks[slot.chunk_index])
+        except Exception:
+            logger.exception("SHM store failed; will release write-locks")
+            success = False
+        finally:
+            # Phase 3: Always commit (even on failure) to release
+            # write-locks and prevent 600s TTL deadlock.
+            # TODO: On partial write failure, commit_store still calls
+            # finish_write for all reserved keys, making partially-written
+            # data visible to readers.  Consider adding ABORT_STORE that
+            # releases write-locks without triggering StoreListener, so
+            # corrupted slots are not promoted to L2.
+            try:
+                send_lmcache_request(
+                    self.mq_client,
+                    RequestType.COMMIT_STORE,
+                    [key, self.instance_id],
+                ).result(timeout=self._mq_timeout)
+            except Exception:
+                logger.warning(
+                    "Failed to send COMMIT_STORE; "
+                    "write-locks will auto-release via TTL"
+                )
+        return success
+
+    def _shm_retrieve(self, key: IPCCacheEngineKey, op: LoadStoreOp) -> bool:
+        """Execute a two-phase SHM retrieve: prepare → read → finish.
+
+        Args:
+            key: The IPC cache key.
+            op: The load/store operation with block IDs.
+
+        Returns:
+            ``True`` if retrieve succeeded.
+        """
+        # Phase 1: Ask server for read-locked SHM slots
+        prep_future = send_lmcache_request(
+            self.mq_client,
+            RequestType.PREPARE_RETRIEVE,
+            [key, self.instance_id],
+        )
+        response: PrepareRetrieveResponse = prep_future.result(timeout=self._mq_timeout)
+
+        if not response.success or not response.slots:
+            return False
+
+        try:
+            # Phase 2: Read from SHM and scatter to KV caches
+            cpu_tensors = [
+                self._make_tensor_view(slot.offset, slot.length, slot.shape, slot.dtype)
+                for slot in response.slots
+            ]
+            scatter_tensors_to_kv(
+                self.kv_caches,
+                op.block_ids,
+                cpu_tensors,
+                self.blocks_in_chunk,
+                skip_first_n_tokens=op.skip_first_n_tokens,
+                layout_hints=self._bounce_layout_hints,
+                gpu_kv_format=self._bounce_gpu_kv_format,
+            )
+        except Exception:
+            logger.exception("Failed to scatter SHM retrieve data")
+            # NOTE: The finally block below uses try/except internally,
+            # so it will not raise and override this return value.
+            return False
+        finally:
+            # Phase 3: Release read-locks
+            try:
+                send_lmcache_request(
+                    self.mq_client,
+                    RequestType.FINISH_READ,
+                    [key, self.instance_id],
+                ).result(timeout=self._mq_timeout)
+            except Exception:
+                logger.warning(
+                    "Failed to send FINISH_READ; "
+                    "read-locks will auto-release via TTL"
+                )
+
+        return True
 
     def _create_key(
         self,

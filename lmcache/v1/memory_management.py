@@ -350,6 +350,27 @@ class MemoryObj(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @property
+    def shm_offset(self) -> int:
+        """Offset of this object relative to the shared-memory pool base.
+
+        This is the ``address`` from the slab allocator, which represents
+        the byte offset into the pre-allocated buffer. When the buffer is
+        backed by named shared memory, workers can use this offset to
+        construct a zero-copy tensor view.
+        """
+        return self.meta.address
+
+    @property
+    def shm_byte_length(self) -> int:
+        """Logical byte length of this object in the shared-memory pool.
+
+        Returns the unpadded (logical) byte size of the stored data.
+        Workers use this together with :attr:`shm_offset` to create
+        correctly-sized tensor views over the shared-memory segment.
+        """
+        return self.get_size()
+
+    @property
     @abc.abstractmethod
     def raw_tensor(self) -> Optional[torch.Tensor]:
         """

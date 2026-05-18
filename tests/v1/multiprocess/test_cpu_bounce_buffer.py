@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from contextlib import contextmanager
 from typing import Any, Callable
 from unittest.mock import MagicMock, patch
-import pickle
 import sys
 
 # Third Party
@@ -96,8 +94,8 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         compute_kv_layout,
-        gather_chunks_to_cpu,
-        scatter_cpu_chunks_to_kv,
+        gather_chunks_to_cpu_tensors,
+        scatter_tensors_to_kv,
     )
 
     source = _make_kv_caches(num_layers=2, num_blocks=8, block_size=4)
@@ -115,9 +113,9 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     assert detected_kv_format is not None
 
     blocks_per_chunk = 2
-    gathered = gather_chunks_to_cpu(source, [0, 1], blocks_per_chunk)
+    gathered = gather_chunks_to_cpu_tensors(source, [0, 1], blocks_per_chunk)
     destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
-    scatter_cpu_chunks_to_kv(destination, [4, 5], gathered, blocks_per_chunk)
+    scatter_tensors_to_kv(destination, [4, 5], gathered, blocks_per_chunk)
 
     for name in source:
         assert torch.allclose(source[name][:, 0], destination[name][:, 4])
@@ -139,8 +137,8 @@ def test_gather_scatter_roundtrip_hnd_layout(
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         compute_kv_layout,
-        gather_chunks_to_cpu,
-        scatter_cpu_chunks_to_kv,
+        gather_chunks_to_cpu_tensors,
+        scatter_tensors_to_kv,
     )
     import lmcache.c_ops as lmc_ops
 
@@ -160,7 +158,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
     assert detected_kv_format == getattr(lmc_ops.GPUKVFormat, expected_format)
 
     blocks_per_chunk = 2
-    gathered = gather_chunks_to_cpu(
+    gathered = gather_chunks_to_cpu_tensors(
         source,
         [0, 1],
         blocks_per_chunk,
@@ -168,7 +166,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
         gpu_kv_format=detected_kv_format,
     )
     destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
-    scatter_cpu_chunks_to_kv(
+    scatter_tensors_to_kv(
         destination,
         [4, 5],
         gathered,
@@ -190,16 +188,16 @@ def test_scatter_respects_skip_first_n_tokens() -> None:
     """Ensure scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
-        gather_chunks_to_cpu,
-        scatter_cpu_chunks_to_kv,
+        gather_chunks_to_cpu_tensors,
+        scatter_tensors_to_kv,
     )
 
     source = _make_kv_caches(num_layers=2, num_blocks=8, block_size=4)
     destination = {
         name: torch.full_like(tensor, 999.0) for name, tensor in source.items()
     }
-    gathered = gather_chunks_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=4)
-    scatter_cpu_chunks_to_kv(
+    gathered = gather_chunks_to_cpu_tensors(source, [0, 1, 2, 3], blocks_per_chunk=4)
+    scatter_tensors_to_kv(
         destination,
         [0, 1, 2, 3],
         gathered,
@@ -219,8 +217,8 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
         compute_kv_layout,
-        gather_chunks_to_cpu,
-        scatter_cpu_chunks_to_kv,
+        gather_chunks_to_cpu_tensors,
+        scatter_tensors_to_kv,
     )
 
     source = _make_mla_kv_caches(
@@ -240,9 +238,9 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip_mla() -> None:
     assert detected_kv_format is not None
 
     blocks_per_chunk = 2
-    gathered = gather_chunks_to_cpu(source, [0, 1], blocks_per_chunk)
+    gathered = gather_chunks_to_cpu_tensors(source, [0, 1], blocks_per_chunk)
     destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
-    scatter_cpu_chunks_to_kv(destination, [4, 5], gathered, blocks_per_chunk)
+    scatter_tensors_to_kv(destination, [4, 5], gathered, blocks_per_chunk)
 
     for name in source:
         assert torch.allclose(source[name][0], destination[name][4])
@@ -262,8 +260,8 @@ def test_scatter_mla_respects_skip_first_n_tokens() -> None:
     """Ensure MLA scatter honors skip_first_n_tokens and preserves skipped blocks."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
-        gather_chunks_to_cpu,
-        scatter_cpu_chunks_to_kv,
+        gather_chunks_to_cpu_tensors,
+        scatter_tensors_to_kv,
     )
 
     source = _make_mla_kv_caches(
@@ -272,8 +270,8 @@ def test_scatter_mla_respects_skip_first_n_tokens() -> None:
     destination = {
         name: torch.full_like(tensor, 999.0) for name, tensor in source.items()
     }
-    gathered = gather_chunks_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=4)
-    scatter_cpu_chunks_to_kv(
+    gathered = gather_chunks_to_cpu_tensors(source, [0, 1, 2, 3], blocks_per_chunk=4)
+    scatter_tensors_to_kv(
         destination,
         [0, 1, 2, 3],
         gathered,
@@ -292,8 +290,8 @@ def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
     """Ensure MLA scatter is a no-op when skip_first_n_tokens exceeds chunk tokens."""
     # First Party
     from lmcache.integration.vllm.vllm_multi_process_adapter import (
-        gather_chunks_to_cpu,
-        scatter_cpu_chunks_to_kv,
+        gather_chunks_to_cpu_tensors,
+        scatter_tensors_to_kv,
     )
 
     source = _make_mla_kv_caches(
@@ -302,8 +300,8 @@ def test_scatter_mla_skip_past_chunk_keeps_destination_unchanged() -> None:
     destination = {
         name: torch.full_like(tensor, 123.0) for name, tensor in source.items()
     }
-    gathered = gather_chunks_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=4)
-    scatter_cpu_chunks_to_kv(
+    gathered = gather_chunks_to_cpu_tensors(source, [0, 1, 2, 3], blocks_per_chunk=4)
+    scatter_tensors_to_kv(
         destination,
         [0, 1, 2, 3],
         gathered,
@@ -359,75 +357,3 @@ def test_server_register_and_find_bounce_layout(stub_native_storage_ops: Any) ->
     layout = engine._find_layout_desc("m", 1)
     assert layout is not None
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
-
-
-def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> None:
-    """Validate mocked server-side CPU chunk store and retrieve behavior."""
-    # First Party
-    from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
-    from lmcache.v1.multiprocess.server import MPCacheEngine
-
-    mock_storage = MagicMock()
-    target_tensor = torch.zeros(2, 2, 8, 16)
-    mock_memory_obj = MagicMock()
-    mock_memory_obj.tensor = target_tensor
-    mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
-
-    @contextmanager
-    def _read_prefetched_results(_keys: Any) -> Any:
-        yield [mock_memory_obj]
-
-    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
-    mock_session = MagicMock()
-    mock_session.get_hashes.return_value = [b"h"]
-    with (
-        patch(
-            "lmcache.v1.multiprocess.server.StorageManager",
-            return_value=mock_storage,
-        ),
-        patch("lmcache.v1.multiprocess.server.TokenHasher"),
-        patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
-        patch("lmcache.v1.multiprocess.server.get_event_bus"),
-        patch(
-            "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
-            return_value=["obj"],
-        ),
-    ):
-        session_cls.return_value.get_or_create.return_value = mock_session
-        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-
-    engine.register_kv_cache_bounce(
-        instance_id=2,
-        model_name="m",
-        world_size=1,
-        engine_type=MagicMock(),
-        layout_hints={},
-        block_size=4,
-        num_layers=2,
-        hidden_dim_size=16,
-        dtype_str="float32",
-        use_mla=False,
-    )
-    payload = torch.ones(2, 2, 8, 16)
-    key = IPCCacheEngineKey.from_token_ids(
-        "m",
-        1,
-        0,
-        [1] * 8,
-        start=0,
-        end=8,
-        request_id="req",
-    )
-    with patch(
-        "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
-        return_value=["obj"],
-    ):
-        store_ok = engine.store_cpu_chunks(key, 2, pickle.dumps([payload]))
-        success, cpu_data = engine.retrieve_cpu_chunks(key, 2)
-    assert isinstance(store_ok, bool)
-    assert torch.allclose(mock_memory_obj.tensor, payload)
-
-    assert success is True
-    recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-    assert len(recovered_chunks) == 1
-    assert torch.allclose(recovered_chunks[0], payload)
