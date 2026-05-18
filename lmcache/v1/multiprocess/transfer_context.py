@@ -298,7 +298,11 @@ class NonCudaTransferContext(TransferContext):
             use_mla=use_mla_flag,
         )
         response = future.result(timeout=mq_timeout)
-        shm_name, pool_size = ("", 0) if response is None else response
+        if response is None:
+            raise RuntimeError(
+                "REGISTER_KV_CACHE_NON_GPU_CONTEXT did not return SHM pool info"
+            )
+        shm_name, pool_size = response
         self._non_gpu_context = create_non_gpu_context(
             metadata,
             mq_client,
@@ -338,7 +342,7 @@ class NonCudaTransferContext(TransferContext):
         except TimeoutError:
             ok = False
         except Exception:
-            logger.exception("Failed to execute non-CUDA SHM store")
+            logger.exception("Failed to prepare or commit non-CUDA SHM store")
             ok = False
 
         future: MessagingFuture[bool] = MessagingFuture()
@@ -384,7 +388,7 @@ class NonCudaTransferContext(TransferContext):
         except TimeoutError:
             ok = False
         except Exception:
-            logger.exception("Failed to execute non-CUDA SHM retrieve")
+            logger.exception("Failed to prepare non-CUDA SHM retrieve")
             ok = False
         finally:
             try:

@@ -125,7 +125,9 @@ class NonGpuContextShm(NonGpuContext):
         self, offset: int, length: int, shape: list[int], dtype_name: str
     ) -> torch.Tensor:
         """Construct a zero-copy tensor view over the SHM pool."""
-        dtype = getattr(torch, dtype_name)
+        dtype = getattr(torch, dtype_name, None)
+        if dtype is None or not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Invalid SHM tensor dtype {dtype_name!r}")
         return torch.frombuffer(
             self._buffer[offset : offset + length],
             dtype=dtype,

@@ -259,7 +259,7 @@ class MPCacheEngine:
         self._pending_shm_reads: dict[tuple[str, int], list[ObjectKey]] = {}
         self._shm_lock = threading.Lock()
         shm_info = self.storage_manager.get_shm_pool_info()
-        self._cached_shm_name = str(cast(str, shm_info["shm_name"]))
+        self._cached_shm_name = cast(str, shm_info["shm_name"])
         self._cached_shm_pool_size = cast(int, shm_info["pool_size"])
 
         self._setup_metrics()

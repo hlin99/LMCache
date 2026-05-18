@@ -30,8 +30,9 @@ def _check_shm_capacity(required_bytes: int) -> None:
         raise RuntimeError(
             f"Insufficient /dev/shm space: need {required_bytes / 2**30:.1f} GiB, "
             f"available {shm_stat.free / 2**30:.1f} GiB. "
-            f"Use 'docker run --shm-size={size_gib}g' or set a larger "
-            "memory-backed /dev/shm."
+            f"Increase /dev/shm capacity (for example, 'docker run "
+            f"--shm-size={size_gib}g' or a Kubernetes emptyDir with "
+            "medium=Memory)."
         )
 
 
@@ -150,6 +151,9 @@ class L1MemoryManager:
                     shm_path,
                     exc_info=True,
                 )
+                raise RuntimeError(
+                    f"Failed to acquire liveness flock for SHM segment {shm_path}"
+                ) from None
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
