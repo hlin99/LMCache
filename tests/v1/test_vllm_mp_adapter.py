@@ -19,6 +19,7 @@ import pytest
 from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPWorkerAdapter,
+    LoadStoreOp,
     ParallelStrategy,
 )
 from lmcache.v1.multiprocess.protocol import RequestType
@@ -94,3 +95,88 @@ def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
 
     with pytest.raises(ConnectionError, match="did not respond"):
         adapter.register_kv_caches({"layer.0": object()})
+
+
+def test_get_finished_logs_store_failure_context(fake_adapter, monkeypatch):
+    """Store failure should log request context for narrowing down root cause."""
+    adapter, send_mock, future = fake_adapter
+    adapter._ensure_heartbeat_started = lambda: None
+    adapter._health_event.set()
+    logger_error = MagicMock(name="logger_error")
+    monkeypatch.setattr(adapter_mod.logger, "error", logger_error)
+    request_id = "req-store-fail"
+    op = LoadStoreOp(
+        token_ids=[1, 2, 3, 4],
+        block_ids=[10, 11],
+        start=0,
+        end=4,
+    )
+    event = MagicMock(name="cuda_event")
+    event.ipc_handle.return_value = b"fake-ipc"
+    cuda_future = MagicMock(name="cuda_future")
+    cuda_future.query.return_value = True
+    cuda_future.result.return_value = False
+    future.to_cuda_future.return_value = cuda_future
+
+    adapter.submit_store_request(request_id, op, event, cache_salt="salt")
+
+    adapter.get_finished(set())
+    logger_error.assert_called_once()
+    log_args = logger_error.call_args[0]
+    assert log_args[0].startswith("mp_store_path store_result_false")
+    assert log_args[1:] == (
+        "req-store-fail",
+        "test-model",
+        0,
+        1,
+        4,
+        2,
+        0,
+        4,
+        10,
+        11,
+    )
+    send_mock.assert_called_once()
+
+
+def test_get_finished_logs_store_result_exception(fake_adapter, monkeypatch):
+    """Store result exceptions should include exception type in logs."""
+    adapter, _send_mock, future = fake_adapter
+    adapter._ensure_heartbeat_started = lambda: None
+    adapter._health_event.set()
+    logger_exception = MagicMock(name="logger_exception")
+    monkeypatch.setattr(adapter_mod.logger, "exception", logger_exception)
+    request_id = "req-store-exception"
+    op = LoadStoreOp(
+        token_ids=[9, 8, 7],
+        block_ids=[21],
+        start=0,
+        end=3,
+    )
+    event = MagicMock(name="cuda_event")
+    event.ipc_handle.return_value = b"fake-ipc"
+    cuda_future = MagicMock(name="cuda_future")
+    cuda_future.query.return_value = True
+    cuda_future.result.side_effect = RuntimeError("store boom")
+    future.to_cuda_future.return_value = cuda_future
+
+    adapter.submit_store_request(request_id, op, event)
+
+    with pytest.raises(RuntimeError, match="store boom"):
+        adapter.get_finished(set())
+    logger_exception.assert_called_once()
+    log_args = logger_exception.call_args[0]
+    assert log_args[0].startswith("mp_store_path store_result_exception")
+    assert log_args[1:10] == (
+        "req-store-exception",
+        "test-model",
+        0,
+        1,
+        3,
+        1,
+        0,
+        3,
+        "RuntimeError",
+    )
+    assert isinstance(log_args[10], RuntimeError)
+    assert str(log_args[10]) == "store boom"

@@ -290,6 +290,20 @@ class LoadStoreOp:
         return len(self.block_ids)
 
 
+@dataclass
+class StoreRequestDebugInfo:
+    request_id: str
+    model_name: str
+    worker_id: int
+    world_size: int
+    start: int
+    end: int
+    token_count: int
+    block_count: int
+    first_block_id: int | None
+    last_block_id: int | None
+
+
 StoreResult = bool
 RetrieveResult = bool
 LookupResult = int
@@ -696,6 +710,7 @@ class LMCacheMPWorkerAdapter:
 
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
+        self.store_request_debug_infos: dict[str, StoreRequestDebugInfo] = {}
         # request_id -> (future, block_ids)
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
@@ -917,22 +932,100 @@ class LMCacheMPWorkerAdapter:
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
+            logger.warning(
+                "mp_store_path submit_skipped_unhealthy request_id=%s "
+                "model_name=%s worker_id=%s world_size=%s token_count=%s "
+                "block_count=%s start=%s end=%s",
+                request_id,
+                self.model_name,
+                self.worker_id,
+                self.world_size,
+                len(op.token_ids),
+                len(op.block_ids),
+                op.start,
+                op.end,
+            )
             return
 
         assert op.token_ids is not None
-        key = self._create_key(
-            op.token_ids,
+        first_block_id = op.block_ids[0] if op.block_ids else None
+        last_block_id = op.block_ids[-1] if op.block_ids else None
+        logger.info(
+            "mp_store_path submit_start request_id=%s model_name=%s worker_id=%s "
+            "world_size=%s token_count=%s block_count=%s start=%s end=%s "
+            "first_block_id=%s last_block_id=%s cache_salt_len=%s",
+            request_id,
+            self.model_name,
+            self.worker_id,
+            self.world_size,
+            len(op.token_ids),
+            len(op.block_ids),
             op.start,
             op.end,
-            request_id=request_id,
-            cache_salt=cache_salt,
+            first_block_id,
+            last_block_id,
+            len(cache_salt),
         )
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.STORE,
-            [key, self.instance_id, op.block_ids, event.ipc_handle()],
-        ).to_cuda_future()
-        self.store_futures[request_id] = future
+        try:
+            key = self._create_key(
+                op.token_ids,
+                op.start,
+                op.end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+            )
+            event_ipc_handle = event.ipc_handle()
+            future = send_lmcache_request(
+                self.mq_client,
+                RequestType.STORE,
+                [key, self.instance_id, op.block_ids, event_ipc_handle],
+            ).to_cuda_future()
+            self.store_futures[request_id] = future
+            self.store_request_debug_infos[request_id] = StoreRequestDebugInfo(
+                request_id=request_id,
+                model_name=self.model_name,
+                worker_id=self.worker_id,
+                world_size=self.world_size,
+                start=op.start,
+                end=op.end,
+                token_count=len(op.token_ids),
+                block_count=len(op.block_ids),
+                first_block_id=first_block_id,
+                last_block_id=last_block_id,
+            )
+            logger.info(
+                "mp_store_path submit_enqueued request_id=%s "
+                "model_name=%s worker_id=%s "
+                "world_size=%s token_count=%s block_count=%s start=%s end=%s "
+                "ipc_handle_size=%s",
+                request_id,
+                self.model_name,
+                self.worker_id,
+                self.world_size,
+                len(op.token_ids),
+                len(op.block_ids),
+                op.start,
+                op.end,
+                len(event_ipc_handle),
+            )
+        except Exception as exception:
+            logger.exception(
+                "mp_store_path submit_exception request_id=%s "
+                "model_name=%s worker_id=%s "
+                "world_size=%s token_count=%s block_count=%s start=%s end=%s "
+                "exception_type=%s exception=%s",
+                request_id,
+                self.model_name,
+                self.worker_id,
+                self.world_size,
+                len(op.token_ids),
+                len(op.block_ids),
+                op.start,
+                op.end,
+                type(exception).__name__,
+                exception,
+            )
+            raise
 
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
@@ -1085,6 +1178,7 @@ class LMCacheMPWorkerAdapter:
                 finished_retrieves.add(request_id)
                 self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
+            self.store_request_debug_infos.clear()
             self.retrieve_futures.clear()
 
             ret_stores = self._process_finished_stores(
@@ -1101,17 +1195,98 @@ class LMCacheMPWorkerAdapter:
         finished_stores = set()
         finished_retrieves = set()
         for request_id, s_future in self.store_futures.items():
-            if not s_future.query():
+            store_debug_info = self.store_request_debug_infos.get(request_id)
+            log_model_name = self.model_name
+            log_worker_id = self.worker_id
+            log_world_size = self.world_size
+            log_token_count = None
+            log_block_count = None
+            log_start = None
+            log_end = None
+            log_first_block_id = None
+            log_last_block_id = None
+            if store_debug_info is not None:
+                log_model_name = store_debug_info.model_name
+                log_worker_id = store_debug_info.worker_id
+                log_world_size = store_debug_info.world_size
+                log_token_count = store_debug_info.token_count
+                log_block_count = store_debug_info.block_count
+                log_start = store_debug_info.start
+                log_end = store_debug_info.end
+                log_first_block_id = store_debug_info.first_block_id
+                log_last_block_id = store_debug_info.last_block_id
+            try:
+                future_ready = s_future.query()
+            except Exception as exception:
+                logger.exception(
+                    "mp_store_path store_query_exception request_id=%s "
+                    "model_name=%s worker_id=%s world_size=%s token_count=%s "
+                    "block_count=%s start=%s end=%s exception_type=%s exception=%s",
+                    request_id,
+                    log_model_name,
+                    log_worker_id,
+                    log_world_size,
+                    log_token_count,
+                    log_block_count,
+                    log_start,
+                    log_end,
+                    type(exception).__name__,
+                    exception,
+                )
+                raise
+            if not future_ready:
                 continue
 
-            s_result = s_future.result()
+            try:
+                s_result = s_future.result()
+            except Exception as exception:
+                logger.exception(
+                    "mp_store_path store_result_exception request_id=%s "
+                    "model_name=%s worker_id=%s world_size=%s token_count=%s "
+                    "block_count=%s start=%s end=%s exception_type=%s exception=%s",
+                    request_id,
+                    log_model_name,
+                    log_worker_id,
+                    log_world_size,
+                    log_token_count,
+                    log_block_count,
+                    log_start,
+                    log_end,
+                    type(exception).__name__,
+                    exception,
+                )
+                raise
             finished_stores.add(request_id)
 
             if not s_result:
                 logger.error(
-                    "Something went wrong when processing the "
-                    "store request for request_id=%s",
+                    "mp_store_path store_result_false request_id=%s "
+                    "model_name=%s worker_id=%s world_size=%s token_count=%s "
+                    "block_count=%s start=%s end=%s first_block_id=%s last_block_id=%s",
                     request_id,
+                    log_model_name,
+                    log_worker_id,
+                    log_world_size,
+                    log_token_count,
+                    log_block_count,
+                    log_start,
+                    log_end,
+                    log_first_block_id,
+                    log_last_block_id,
+                )
+            else:
+                logger.info(
+                    "mp_store_path store_result_true request_id=%s model_name=%s "
+                    "worker_id=%s world_size=%s token_count=%s block_count=%s "
+                    "start=%s end=%s",
+                    request_id,
+                    log_model_name,
+                    log_worker_id,
+                    log_world_size,
+                    log_token_count,
+                    log_block_count,
+                    log_start,
+                    log_end,
                 )
 
         for request_id, (r_future, _) in self.retrieve_futures.items():
@@ -1132,6 +1307,7 @@ class LMCacheMPWorkerAdapter:
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
+            self.store_request_debug_infos.pop(request_id, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
 
