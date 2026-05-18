@@ -4,10 +4,9 @@
 This module provides:
 - ``NonGpuContextMetadata``: layout metadata dataclass for non-CUDA workers.
 - ``NonGpuContext``: abstract base class with a two-phase prepare/commit
-  interface for CPU-side KV data transfer. Concrete implementations (e.g.
-  ``NonGpuContextPickle``) each decide *how* data is serialised and transported.
+  interface for CPU-side KV data transfer.
 - ``create_non_gpu_context()``: factory that returns the appropriate
-  ``NonGpuContext`` subclass (currently always ``NonGpuContextPickle``).
+  ``NonGpuContext`` subclass for the current transport.
 - ``compute_kv_layout``, ``gather_paged_kv_to_cpu``, ``scatter_cpu_to_paged_kv``:
   shared gather/scatter utilities used by all concrete implementations.
 """
@@ -132,25 +131,31 @@ def create_non_gpu_context(
     metadata: NonGpuContextMetadata,
     mq_client: Any,
     mq_timeout: float,
+    shm_name: str,
+    pool_size: int,
 ) -> NonGpuContext:
     """Factory that returns the appropriate :class:`NonGpuContext` implementation.
-
-    Currently always returns a pickle-based implementation
-    (``NonGpuContextPickle``). A future SHM-capable PR
-    may probe for shared-memory availability and fall back to pickle.
 
     Args:
         metadata: Layout metadata for the non-GPU context.
         mq_client: Message-queue client for server communication.
         mq_timeout: Timeout in seconds for blocking MQ requests.
+        shm_name: POSIX shared-memory segment name.
+        pool_size: Shared-memory pool size in bytes.
 
     Returns:
         A concrete :class:`NonGpuContext` instance.
     """
     # Local
-    from .non_gpu_context_pickle import NonGpuContextPickle
+    from .non_gpu_context_shm import NonGpuContextShm
 
-    return NonGpuContextPickle(metadata, mq_client, mq_timeout)
+    return NonGpuContextShm(
+        metadata=metadata,
+        mq_client=mq_client,
+        mq_timeout=mq_timeout,
+        shm_name=shm_name,
+        pool_size=pool_size,
+    )
 
 
 # ---------------------------------------------------------------------------

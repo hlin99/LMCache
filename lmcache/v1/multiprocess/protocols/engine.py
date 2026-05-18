@@ -10,7 +10,14 @@ This module defines the protocol for:
 - LOOKUP: Submit a prefix lookup and return a prefetch job ID
 - QUERY_PREFETCH_STATUS: Poll a prefetch job for its result
 - END_SESSION: End a session and clean up associated resources
+- PREPARE_STORE: Reserve SHM slots for a two-phase store
+- COMMIT_STORE: Commit a SHM store after worker writes
+- PREPARE_RETRIEVE: Acquire read-locks and return SHM slot metadata
+- FINISH_READ: Release read-locks after worker reads from SHM
 """
+
+# Third Party
+import msgspec
 
 # First Party
 from lmcache.utils import EngineType
@@ -21,6 +28,32 @@ from lmcache.v1.multiprocess.custom_types import (
     RegisterNonGpuContextPayload,
 )
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
+
+
+class ShmSlotMetadata(msgspec.Struct):
+    """Metadata describing one L1 shared-memory slot."""
+
+    key: str
+    shm_name: str
+    offset: int
+    length: int
+    shape: list[int]
+    dtype: str
+    chunk_index: int = 0
+
+
+class PrepareStoreResponse(msgspec.Struct):
+    """Response payload for ``PREPARE_STORE``."""
+
+    slots: list[ShmSlotMetadata]
+
+
+class PrepareRetrieveResponse(msgspec.Struct):
+    """Response payload for ``PREPARE_RETRIEVE``."""
+
+    success: bool
+    slots: list[ShmSlotMetadata]
+
 
 # Define request names for this protocol group
 REQUEST_NAMES = [
@@ -34,8 +67,10 @@ REQUEST_NAMES = [
     "FREE_LOOKUP_LOCKS",
     "END_SESSION",
     "REGISTER_KV_CACHE_NON_GPU_CONTEXT",
-    "STORE_CPU_CHUNKS",
-    "RETRIEVE_CPU_CHUNKS",
+    "PREPARE_STORE",
+    "COMMIT_STORE",
+    "PREPARE_RETRIEVE",
+    "FINISH_READ",
 ]
 
 # Type alias for cache keys
@@ -156,17 +191,27 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # Returns: None
         "REGISTER_KV_CACHE_NON_GPU_CONTEXT": ProtocolDefinition(
             payload_classes=[RegisterNonGpuContextPayload],
-            response_class=None,
+            response_class=tuple[str, int],
             handler_type=HandlerType.SYNC,
         ),
-        "STORE_CPU_CHUNKS": ProtocolDefinition(
-            payload_classes=[KeyType, int, bytes],
+        "PREPARE_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareStoreResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "COMMIT_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
-        "RETRIEVE_CPU_CHUNKS": ProtocolDefinition(
+        "PREPARE_RETRIEVE": ProtocolDefinition(
             payload_classes=[KeyType, int],
-            response_class=tuple[bool, bytes],
+            response_class=PrepareRetrieveResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "FINISH_READ": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
     }

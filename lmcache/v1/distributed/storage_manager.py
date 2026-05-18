@@ -630,6 +630,23 @@ class StorageManager:
             "num_l2_adapters": len(self._l2_adapters),
         }
 
+    def get_shm_pool_info(self) -> dict[str, object]:
+        """Return shared-memory pool metadata for worker attachment."""
+        return self._l1_manager.get_shm_pool_info()
+
+    def unsafe_read(
+        self, keys: list[ObjectKey]
+    ) -> tuple[list[ObjectKey], list[MemoryObj]]:
+        """Read already-read-locked objects without acquiring new locks."""
+        read_results = self._l1_manager.unsafe_read(keys)
+        good_keys: list[ObjectKey] = []
+        good_objs: list[MemoryObj] = []
+        for key, (_err, obj) in read_results.items():
+            if obj is not None:
+                good_keys.append(key)
+                good_objs.append(obj)
+        return good_keys, good_objs
+
     # Functions for debugging and testing
     def memcheck(self) -> bool:
         """

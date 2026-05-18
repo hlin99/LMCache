@@ -41,7 +41,7 @@ def fake_adapter(monkeypatch):
     monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda mq: 256)
 
     future = MagicMock(name="future")
-    future.result.return_value = None
+    future.result.return_value = ("lmcache_test_shm", 4096)
     send_mock = MagicMock(name="send_lmcache_request", return_value=future)
     monkeypatch.setattr(adapter_mod, "send_lmcache_request", send_mock)
 
@@ -116,6 +116,11 @@ def test_register_kv_caches_cpu_submits_non_gpu_context_registration(
         lambda: {},
         raising=False,
     )
+    create_context = MagicMock(name="create_non_gpu_context")
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.transfer_context.create_non_gpu_context",
+        create_context,
+    )
     cpu_kv = {"layer.0": torch.randn(2, 8, 4, 2, 8)}
 
     adapter.register_kv_caches(cpu_kv)
@@ -125,6 +130,11 @@ def test_register_kv_caches_cpu_submits_non_gpu_context_registration(
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE_NON_GPU_CONTEXT
     assert len(args[2]) == 1
+    create_context.assert_called_once()
+    assert create_context.call_args.kwargs == {
+        "shm_name": "lmcache_test_shm",
+        "pool_size": 4096,
+    }
 
 
 def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):

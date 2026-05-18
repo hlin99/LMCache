@@ -3,9 +3,8 @@
 from dataclasses import dataclass
 from functools import partial
 from itertools import islice
-from typing import Generator
+from typing import Generator, cast
 import argparse
-import pickle
 import threading
 import time
 
@@ -68,6 +67,11 @@ from lmcache.v1.multiprocess.protocol import (
     RequestType,
     get_handler_type,
     get_payload_classes,
+)
+from lmcache.v1.multiprocess.protocols.engine import (
+    PrepareRetrieveResponse,
+    PrepareStoreResponse,
+    ShmSlotMetadata,
 )
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -251,6 +255,13 @@ class MPCacheEngine:
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
 
+        self._pending_shm_stores: dict[tuple[str, int], list[ObjectKey]] = {}
+        self._pending_shm_reads: dict[tuple[str, int], list[ObjectKey]] = {}
+        self._shm_lock = threading.Lock()
+        shm_info = self.storage_manager.get_shm_pool_info()
+        self._cached_shm_name = str(cast(str, shm_info["shm_name"]))
+        self._cached_shm_pool_size = cast(int, shm_info["pool_size"])
+
         self._setup_metrics()
 
     @property
@@ -333,7 +344,7 @@ class MPCacheEngine:
     def register_kv_cache_non_gpu_context(
         self,
         payload: RegisterNonGpuContextPayload,
-    ) -> None:
+    ) -> tuple[str, int]:
         """Register non-CUDA KV layout metadata for non-GPU context mode.
 
         Args:
@@ -350,7 +361,7 @@ class MPCacheEngine:
                 "skipping the new registration",
                 payload.instance_id,
             )
-            return
+            return self._cached_shm_name, self._cached_shm_pool_size
 
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
@@ -377,6 +388,7 @@ class MPCacheEngine:
                 use_mla=payload.use_mla,
             ),
         )
+        return self._cached_shm_name, self._cached_shm_pool_size
 
     def _resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
         """Resolve object keys from an IPC cache key.
@@ -400,25 +412,12 @@ class MPCacheEngine:
         return ipc_key_to_object_keys(key, chunk_hashes)
 
     @_lmcache_nvtx_annotate
-    def store_cpu_chunks(
+    def prepare_store(
         self,
         key: IPCCacheEngineKey,
         instance_id: int,
-        cpu_data: bytes,
-    ) -> bool:
-        """Store worker-provided CPU chunks for non-CUDA cpu context mode.
-
-        Args:
-            key: Cache key for the token range to store.
-            instance_id: Worker instance identifier.
-            cpu_data: Pickled list of CPU tensors produced by the worker.
-
-        Returns:
-            ``True`` when all reserved objects are written, otherwise ``False``.
-
-        Raises:
-            ValueError: If the instance has no registered cpu context.
-        """
+    ) -> PrepareStoreResponse:
+        """Reserve SHM-backed L1 slots for a two-phase non-CUDA store."""
         obj_keys = self._resolve_obj_keys(key)
 
         context = self.contexts.get(instance_id)
@@ -426,51 +425,58 @@ class MPCacheEngine:
             raise ValueError(
                 f"non-CUDA context not registered for instance ID {instance_id}"
             )
-        ctx = context.non_cuda_metadata
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-        reserved_dict = self.storage_manager.reserve_write(
-            obj_keys, ctx.layout_desc, "new"
-        )
-        written_keys: list[ObjectKey] = []
-        try:
-            for idx, obj_key in enumerate(obj_keys):
-                if obj_key not in reserved_dict:
-                    continue
-                if idx >= len(chunks):
-                    continue
-                memory_obj = reserved_dict[obj_key]
-                if memory_obj.tensor is None:
-                    continue
-                chunk_cpu = chunks[idx]
-                if chunk_cpu.shape != memory_obj.tensor.shape:
-                    continue
-                memory_obj.tensor.copy_(chunk_cpu)
-                written_keys.append(obj_key)
-        finally:
-            if written_keys:
-                self.storage_manager.finish_write(written_keys)
 
-        return len(written_keys) == len(reserved_dict)
+        reserved_dict = self.storage_manager.reserve_write(
+            obj_keys, context.non_cuda_metadata.layout_desc, "new"
+        )
+        slots: list[ShmSlotMetadata] = []
+        reserved_keys: list[ObjectKey] = []
+        for idx, obj_key in enumerate(obj_keys):
+            if obj_key not in reserved_dict:
+                continue
+            memory_obj = reserved_dict[obj_key]
+            tensor = memory_obj.tensor
+            if tensor is None:
+                continue
+            reserved_keys.append(obj_key)
+            slots.append(
+                ShmSlotMetadata(
+                    key=str(obj_key),
+                    shm_name=self._cached_shm_name,
+                    offset=memory_obj.shm_offset,
+                    length=memory_obj.shm_byte_length,
+                    shape=list(tensor.shape),
+                    dtype=str(tensor.dtype).removeprefix("torch."),
+                    chunk_index=idx,
+                )
+            )
+
+        if reserved_keys:
+            with self._shm_lock:
+                self._pending_shm_stores[(key.request_id, instance_id)] = reserved_keys
+
+        return PrepareStoreResponse(slots=slots)
 
     @_lmcache_nvtx_annotate
-    def retrieve_cpu_chunks(
+    def commit_store(
         self,
         key: IPCCacheEngineKey,
         instance_id: int,
-    ) -> tuple[bool, bytes]:
-        """Retrieve prefetched chunks and return serialized CPU tensors.
+    ) -> bool:
+        """Finish a prepared SHM store and release write locks."""
+        with self._shm_lock:
+            obj_keys = self._pending_shm_stores.pop((key.request_id, instance_id), [])
+        if obj_keys:
+            self.storage_manager.finish_write(obj_keys)
+        return True
 
-        Args:
-            key: Cache key for the token range to retrieve.
-            instance_id: Worker instance identifier.
-
-        Returns:
-            Tuple ``(success, payload)`` where ``payload`` is a pickled
-            list of CPU chunk tensors.
-
-        Raises:
-            ValueError: If the instance has no registered cpu context.
-        """
+    @_lmcache_nvtx_annotate
+    def prepare_retrieve(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> PrepareRetrieveResponse:
+        """Return SHM metadata for read-locked non-CUDA objects."""
         obj_keys = self._resolve_obj_keys(key)
 
         context = self.contexts.get(instance_id)
@@ -479,21 +485,49 @@ class MPCacheEngine:
                 f"non-CUDA context not registered for instance ID {instance_id}"
             )
 
-        prefetched_keys: list[ObjectKey] = []
-        try:
-            with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
-                if not memory_objs or len(memory_objs) != len(obj_keys):
-                    return False, b""
-                prefetched_keys = obj_keys[: len(memory_objs)]
-                chunks = []
-                for memory_obj in memory_objs:
-                    if memory_obj.tensor is None:
-                        return False, b""
-                    chunks.append(memory_obj.tensor.cpu().clone())
-                return True, pickle.dumps(chunks)
-        finally:
-            if prefetched_keys:
-                self.storage_manager.finish_read_prefetched(prefetched_keys)
+        good_keys, good_objs = self.storage_manager.unsafe_read(obj_keys)
+        if len(good_objs) != len(obj_keys):
+            if good_keys:
+                self.storage_manager.finish_read_prefetched(good_keys)
+            return PrepareRetrieveResponse(success=False, slots=[])
+
+        slots: list[ShmSlotMetadata] = []
+        for idx, (obj_key, memory_obj) in enumerate(
+            zip(obj_keys, good_objs, strict=True)
+        ):
+            tensor = memory_obj.tensor
+            if tensor is None:
+                self.storage_manager.finish_read_prefetched(good_keys)
+                return PrepareRetrieveResponse(success=False, slots=[])
+            slots.append(
+                ShmSlotMetadata(
+                    key=str(obj_key),
+                    shm_name=self._cached_shm_name,
+                    offset=memory_obj.shm_offset,
+                    length=memory_obj.shm_byte_length,
+                    shape=list(tensor.shape),
+                    dtype=str(tensor.dtype).removeprefix("torch."),
+                    chunk_index=idx,
+                )
+            )
+
+        with self._shm_lock:
+            self._pending_shm_reads[(key.request_id, instance_id)] = good_keys
+
+        return PrepareRetrieveResponse(success=True, slots=slots)
+
+    @_lmcache_nvtx_annotate
+    def finish_read(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+    ) -> bool:
+        """Release read locks held by a prepared SHM retrieve."""
+        with self._shm_lock:
+            obj_keys = self._pending_shm_reads.pop((key.request_id, instance_id), [])
+        if obj_keys:
+            self.storage_manager.finish_read_prefetched(obj_keys)
+        return True
 
     @_lmcache_nvtx_annotate
     def store(
@@ -1400,7 +1434,8 @@ def run_cache_server(
         RequestType.REGISTER_KV_CACHE_NON_GPU_CONTEXT,
         engine.register_kv_cache_non_gpu_context,
     )
-    add_handler_helper(server, RequestType.STORE_CPU_CHUNKS, engine.store_cpu_chunks)
+    add_handler_helper(server, RequestType.PREPARE_STORE, engine.prepare_store)
+    add_handler_helper(server, RequestType.COMMIT_STORE, engine.commit_store)
     add_handler_helper(server, RequestType.LOOKUP, engine.lookup)
     add_handler_helper(
         server, RequestType.QUERY_PREFETCH_STATUS, engine.query_prefetch_status
@@ -1412,9 +1447,8 @@ def run_cache_server(
     )
     add_handler_helper(server, RequestType.FREE_LOOKUP_LOCKS, engine.free_lookup_locks)
     add_handler_helper(server, RequestType.RETRIEVE, engine.retrieve)
-    add_handler_helper(
-        server, RequestType.RETRIEVE_CPU_CHUNKS, engine.retrieve_cpu_chunks
-    )
+    add_handler_helper(server, RequestType.PREPARE_RETRIEVE, engine.prepare_retrieve)
+    add_handler_helper(server, RequestType.FINISH_READ, engine.finish_read)
     add_handler_helper(server, RequestType.CLEAR, engine.clear)
     add_handler_helper(server, RequestType.GET_CHUNK_SIZE, engine.get_chunk_size)
     add_handler_helper(server, RequestType.PING, engine.ping)
@@ -1431,8 +1465,6 @@ def run_cache_server(
         [
             RequestType.STORE,
             RequestType.RETRIEVE,
-            RequestType.STORE_CPU_CHUNKS,
-            RequestType.RETRIEVE_CPU_CHUNKS,
         ],
         max_workers=mp_config.max_gpu_workers,
     )
@@ -1446,6 +1478,10 @@ def run_cache_server(
             RequestType.CLEAR,
             RequestType.PING,
             RequestType.REPORT_BLOCK_ALLOCATION,
+            RequestType.PREPARE_STORE,
+            RequestType.COMMIT_STORE,
+            RequestType.PREPARE_RETRIEVE,
+            RequestType.FINISH_READ,
         ],
         max_workers=mp_config.max_cpu_workers,
     )

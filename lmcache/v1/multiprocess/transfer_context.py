@@ -297,8 +297,15 @@ class NonCudaTransferContext(TransferContext):
             block_size=block_size,
             use_mla=use_mla_flag,
         )
-        self._non_gpu_context = create_non_gpu_context(metadata, mq_client, mq_timeout)
-        future.result(timeout=mq_timeout)
+        response = future.result(timeout=mq_timeout)
+        shm_name, pool_size = ("", 0) if response is None else response
+        self._non_gpu_context = create_non_gpu_context(
+            metadata,
+            mq_client,
+            mq_timeout,
+            shm_name=shm_name,
+            pool_size=pool_size,
+        )
 
     def submit_store(
         self,
@@ -316,16 +323,23 @@ class NonCudaTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
-        torch_dev.synchronize()
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            block_ids,
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            gpu_kv_format=self._gpu_kv_format,
-        )
-        handle = self._non_gpu_context.prepare_store(key, instance_id, cpu_chunks)
-        ok = self._non_gpu_context.commit_store(handle)
+        ok = False
+        try:
+            torch_dev.synchronize()
+            cpu_chunks = gather_paged_kv_to_cpu(
+                kv_caches,
+                block_ids,
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                gpu_kv_format=self._gpu_kv_format,
+            )
+            handle = self._non_gpu_context.prepare_store(key, instance_id, cpu_chunks)
+            ok = self._non_gpu_context.commit_store(handle)
+        except TimeoutError:
+            ok = False
+        except Exception:
+            logger.exception("Failed to execute non-CUDA SHM store")
+            ok = False
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
@@ -348,23 +362,38 @@ class NonCudaTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
-        handle, chunks = self._non_gpu_context.prepare_retrieve(key, instance_id)
-        ok = chunks is not None
-        if chunks is not None:
+        handle: Any = None
+        ok = False
+        try:
+            handle, chunks = self._non_gpu_context.prepare_retrieve(key, instance_id)
+            ok = chunks is not None
+            if chunks is not None:
+                try:
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        block_ids,
+                        chunks,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        gpu_kv_format=self._gpu_kv_format,
+                    )
+                except (RuntimeError, ValueError, TypeError, IndexError):
+                    logger.exception("Failed to scatter retrieved CPU context chunks")
+                    ok = False
+        except TimeoutError:
+            ok = False
+        except Exception:
+            logger.exception("Failed to execute non-CUDA SHM retrieve")
+            ok = False
+        finally:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    block_ids,
-                    chunks,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    gpu_kv_format=self._gpu_kv_format,
-                )
-            except (RuntimeError, ValueError, TypeError, IndexError):
-                logger.exception("Failed to scatter retrieved CPU context chunks")
+                self._non_gpu_context.commit_retrieve(handle)
+            except TimeoutError:
                 ok = False
-        self._non_gpu_context.commit_retrieve(handle)
+            except Exception:
+                logger.exception("Failed to finish non-CUDA SHM retrieve")
+                ok = False
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)

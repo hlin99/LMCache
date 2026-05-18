@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from contextlib import contextmanager
 from typing import Any, Callable
 from unittest.mock import MagicMock, patch
-import pickle
 import sys
 
 # Third Party
@@ -384,12 +382,16 @@ def test_server_register_and_find_non_cuda_context_layout(
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
-def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> None:
-    """Validate mocked server-side CPU chunk store and retrieve behavior."""
+def test_server_prepare_store_and_retrieve_shm(stub_native_storage_ops: Any) -> None:
+    """Validate mocked server-side SHM prepare/commit/read behavior."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         IPCCacheEngineKey,
         RegisterNonGpuContextPayload,
+    )
+    from lmcache.v1.multiprocess.protocols.engine import (
+        PrepareRetrieveResponse,
+        PrepareStoreResponse,
     )
     from lmcache.v1.multiprocess.server import MPCacheEngine
 
@@ -397,13 +399,16 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     target_tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj = MagicMock()
     mock_memory_obj.tensor = target_tensor
+    mock_memory_obj.shm_offset = 128
+    mock_memory_obj.shm_byte_length = (
+        target_tensor.numel() * target_tensor.element_size()
+    )
     mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
-
-    @contextmanager
-    def _read_prefetched_results(_keys: Any) -> Any:
-        yield [mock_memory_obj]
-
-    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    mock_storage.unsafe_read.return_value = (["obj"], [mock_memory_obj])
+    mock_storage.get_shm_pool_info.return_value = {
+        "shm_name": "lmcache_test_pool",
+        "pool_size": 4096,
+    }
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h"]
     with (
@@ -448,12 +453,21 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
         "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
         return_value=["obj"],
     ):
-        store_ok = engine.store_cpu_chunks(key, 2, pickle.dumps([payload]))
-        success, cpu_data = engine.retrieve_cpu_chunks(key, 2)
-    assert isinstance(store_ok, bool)
-    assert torch.allclose(mock_memory_obj.tensor, payload)
+        prepared_store = engine.prepare_store(key, 2)
+        store_ok = engine.commit_store(key, 2)
+        prepared_retrieve = engine.prepare_retrieve(key, 2)
+        read_ok = engine.finish_read(key, 2)
 
-    assert success is True
-    recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-    assert len(recovered_chunks) == 1
-    assert torch.allclose(recovered_chunks[0], payload)
+    assert isinstance(prepared_store, PrepareStoreResponse)
+    assert len(prepared_store.slots) == 1
+    assert prepared_store.slots[0].offset == 128
+    assert prepared_store.slots[0].dtype == "float32"
+    assert store_ok is True
+    mock_storage.finish_write.assert_called_once_with(["obj"])
+
+    assert isinstance(prepared_retrieve, PrepareRetrieveResponse)
+    assert prepared_retrieve.success is True
+    assert len(prepared_retrieve.slots) == 1
+    assert prepared_retrieve.slots[0].shape == list(payload.shape)
+    assert read_ok is True
+    mock_storage.finish_read_prefetched.assert_called_once_with(["obj"])
