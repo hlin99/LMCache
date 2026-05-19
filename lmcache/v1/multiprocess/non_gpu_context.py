@@ -70,26 +70,30 @@ class NonGpuContext(ABC):
 
     @abstractmethod
     def prepare_store(
-        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
-    ) -> Any:
+        self, key: Any, instance_id: int, block_ids: list[int], blocks_per_chunk: int
+    ) -> tuple[Any, list[torch.Tensor] | None]:
         """Prepare a store operation.
 
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
-            chunks: CPU chunk tensors to store.
+            block_ids: Block IDs to store.
+            blocks_per_chunk: Number of blocks per chunk.
 
         Returns:
-            An opaque handle to be passed to :meth:`commit_store`.
+            A ``(handle, out_buffers)`` pair. ``out_buffers`` is a list of
+            pre-allocated CPU tensors for gather to write into, or ``None``
+            if gather should allocate its own.
         """
         ...
 
     @abstractmethod
-    def commit_store(self, handle: Any) -> bool:
+    def commit_store(self, handle: Any, chunks: list[torch.Tensor]) -> bool:
         """Commit a prepared store operation.
 
         Args:
             handle: The opaque handle returned by :meth:`prepare_store`.
+            chunks: CPU chunk tensors to store.
 
         Returns:
             ``True`` on success, ``False`` otherwise.
@@ -203,6 +207,7 @@ def gather_paged_kv_to_cpu(
     blocks_per_chunk: int,
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
+    out: list[torch.Tensor] | None = None,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -246,7 +251,7 @@ def gather_paged_kv_to_cpu(
     # tensors. Cast once so all downstream indexing is typed correctly.
     layer_tensors = cast(list[torch.Tensor], normalized)
 
-    chunks: list[torch.Tensor] = []
+    chunks: list[torch.Tensor] = [] if out is None else out
     for chunk_idx in range(num_chunks):
         chunk_block_ids = block_ids[
             chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
@@ -261,7 +266,11 @@ def gather_paged_kv_to_cpu(
                         len(chunk_block_ids) * block_size, layer_blocks.shape[-1]
                     )
                 )
-            chunks.append(torch.stack(mla_layers, dim=0).cpu())
+            chunk_tensor = torch.stack(mla_layers, dim=0)
+            if out is not None:
+                out[chunk_idx].copy_(chunk_tensor, non_blocking=True)
+            else:
+                chunks.append(chunk_tensor.cpu())
         else:
             k_layers: list[torch.Tensor] = []
             v_layers: list[torch.Tensor] = []
@@ -310,7 +319,11 @@ def gather_paged_kv_to_cpu(
                     )
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
-            chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
+            chunk_tensor = torch.stack([k_stacked, v_stacked], dim=0)
+            if out is not None:
+                out[chunk_idx].copy_(chunk_tensor, non_blocking=True)
+            else:
+                chunks.append(chunk_tensor.cpu())
     return chunks
 
 

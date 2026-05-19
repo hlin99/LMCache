@@ -317,15 +317,18 @@ class NonCudaTransferContext(TransferContext):
             )
 
         torch_dev.synchronize()
+        handle, out_buffers = self._non_gpu_context.prepare_store(
+            key, instance_id, block_ids, blocks_in_chunk
+        )
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
             block_ids,
             blocks_in_chunk,
             layout_hints=self._layout_hints,
             gpu_kv_format=self._gpu_kv_format,
+            out=out_buffers,
         )
-        handle = self._non_gpu_context.prepare_store(key, instance_id, cpu_chunks)
-        ok = self._non_gpu_context.commit_store(handle)
+        ok = self._non_gpu_context.commit_store(handle, cpu_chunks)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)

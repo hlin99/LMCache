@@ -12,6 +12,9 @@ This module defines the protocol for:
 - END_SESSION: End a session and clean up associated resources
 """
 
+# Standard
+from dataclasses import dataclass, field
+
 # First Party
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
@@ -21,6 +24,35 @@ from lmcache.v1.multiprocess.custom_types import (
     RegisterNonGpuContextPayload,
 )
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
+
+
+@dataclass
+class ShmSlotMetadata:
+    """Metadata for one SHM slot."""
+
+    key: str
+    shm_name: str
+    offset: int
+    length: int
+    shape: list[int]
+    dtype: str
+
+
+@dataclass
+class PrepareStoreResponse:
+    """Response for PREPARE_STORE."""
+
+    slots: list[ShmSlotMetadata] = field(default_factory=list)
+
+
+@dataclass
+class PrepareRetrieveResponse:
+    """Response for PREPARE_RETRIEVE."""
+
+    success: bool
+    data: bytes = b""
+    slots: list[ShmSlotMetadata] = field(default_factory=list)
+
 
 # Define request names for this protocol group
 REQUEST_NAMES = [
@@ -34,8 +66,10 @@ REQUEST_NAMES = [
     "FREE_LOOKUP_LOCKS",
     "END_SESSION",
     "REGISTER_KV_CACHE_NON_GPU_CONTEXT",
-    "STORE_CPU_CHUNKS",
-    "RETRIEVE_CPU_CHUNKS",
+    "PREPARE_STORE",
+    "COMMIT_STORE",
+    "PREPARE_RETRIEVE",
+    "COMMIT_RETRIEVE",
 ]
 
 # Type alias for cache keys
@@ -159,14 +193,24 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             response_class=None,
             handler_type=HandlerType.SYNC,
         ),
-        "STORE_CPU_CHUNKS": ProtocolDefinition(
+        "PREPARE_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareStoreResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "COMMIT_STORE": ProtocolDefinition(
             payload_classes=[KeyType, int, bytes],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
-        "RETRIEVE_CPU_CHUNKS": ProtocolDefinition(
+        "PREPARE_RETRIEVE": ProtocolDefinition(
             payload_classes=[KeyType, int],
-            response_class=tuple[bool, bytes],
+            response_class=PrepareRetrieveResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "COMMIT_RETRIEVE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
     }
