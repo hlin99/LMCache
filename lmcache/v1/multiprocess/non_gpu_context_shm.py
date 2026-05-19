@@ -35,6 +35,9 @@ class NonGpuContextShm(NonGpuContext):
     ) -> None:
         super().__init__(metadata, mq_client, mq_timeout)
         self._shm = SharedMemory(name=shm_name, create=False)
+        # Prevent worker from unlinking the segment on GC/exit —
+        # the segment lifecycle is owned by the server process.
+        self._shm.unlink = lambda: None  # type: ignore[method-assign]
         self._pool_size = pool_size
         self._buffer = self._shm.buf
 
