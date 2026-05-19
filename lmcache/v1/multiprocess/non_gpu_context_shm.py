@@ -43,10 +43,63 @@ class NonGpuContextShm(NonGpuContext):
             )
         self._buffer = self._shm.buf
 
+    def allocate_store_buffers(
+        self, num_chunks: int, chunk_shape: list[int], dtype: torch.dtype
+    ) -> list[torch.Tensor] | None:
+        """Reserve SHM slots and return shm-backed tensor views for store."""
+        future = self.mq_client.submit_request(
+            RequestType.PREPARE_STORE,
+            [None, None, num_chunks],
+            get_response_class(RequestType.PREPARE_STORE),
+        )
+        response: PrepareStoreResponse = future.result(timeout=self.mq_timeout)
+        if not response.slots:
+            return None
+        buffers: list[torch.Tensor] = []
+        for slot in response.slots:
+            buffers.append(
+                self._make_tensor_view(slot.offset, slot.length, slot.shape, slot.dtype)
+            )
+        # Stash the response for prepare_store to use.
+        self._pending_store_response = response
+        return buffers
+
+    def allocate_retrieve_buffers(
+        self, num_chunks: int, chunk_shape: list[int], dtype: torch.dtype
+    ) -> list[torch.Tensor] | None:
+        """Reserve SHM slots and return shm-backed tensor views for retrieve."""
+        future = self.mq_client.submit_request(
+            RequestType.PREPARE_RETRIEVE,
+            [None, None, num_chunks],
+            get_response_class(RequestType.PREPARE_RETRIEVE),
+        )
+        response: PrepareRetrieveResponse = future.result(timeout=self.mq_timeout)
+        if not response.success or not response.slots:
+            return None
+        buffers: list[torch.Tensor] = []
+        for slot in response.slots:
+            buffers.append(
+                self._make_tensor_view(slot.offset, slot.length, slot.shape, slot.dtype)
+            )
+        self._pending_retrieve_response = response
+        return buffers
+
     def prepare_store(
         self, key: Any, instance_id: int, chunks: list[torch.Tensor]
     ) -> Any:
-        """Prepare a SHM store and copy chunks into reserved slots."""
+        """Prepare a SHM store.
+
+        If allocate_store_buffers was called, data is already in SHM slots
+        and we just need to finalize with key/instance_id. Otherwise fall back
+        to the original copy path.
+        """
+        pending = getattr(self, "_pending_store_response", None)
+        if pending is not None:
+            # Data already in SHM via allocate_store_buffers; just record key.
+            self._pending_store_response = None
+            return (key, instance_id, True)
+
+        # Fallback: RPC for slot reservation and copy chunks in.
         future = self.mq_client.submit_request(
             RequestType.PREPARE_STORE,
             [key, instance_id],

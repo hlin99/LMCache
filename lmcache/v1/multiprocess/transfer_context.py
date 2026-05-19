@@ -330,12 +330,24 @@ class NonCudaTransferContext(TransferContext):
         ok = False
         try:
             torch_dev.synchronize()
+
+            # Compute chunk shape/dtype for buffer pre-allocation.
+            num_chunks = len(block_ids) // blocks_in_chunk
+            layout_desc = self._non_gpu_context.layout_desc
+            chunk_shape = list(layout_desc.shapes[0])
+            chunk_dtype = layout_desc.dtypes[0]
+
+            out_buffers = self._non_gpu_context.allocate_store_buffers(
+                num_chunks, chunk_shape, chunk_dtype
+            )
+
             cpu_chunks = gather_paged_kv_to_cpu(
                 kv_caches,
                 block_ids,
                 blocks_in_chunk,
                 layout_hints=self._layout_hints,
                 gpu_kv_format=self._gpu_kv_format,
+                out=out_buffers,
             )
             handle = self._non_gpu_context.prepare_store(key, instance_id, cpu_chunks)
             ok = self._non_gpu_context.commit_store(handle)

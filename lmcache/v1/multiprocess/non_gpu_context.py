@@ -121,6 +121,36 @@ class NonGpuContext(ABC):
         """
         ...
 
+    def allocate_store_buffers(
+        self, num_chunks: int, chunk_shape: list[int], dtype: torch.dtype
+    ) -> list[torch.Tensor] | None:
+        """Pre-allocate target buffers for store.
+
+        Args:
+            num_chunks: Number of chunks to allocate.
+            chunk_shape: Shape of each chunk tensor.
+            dtype: Data type of the chunk tensors.
+
+        Returns:
+            A list of pre-allocated tensors, or ``None`` to use default.
+        """
+        return None
+
+    def allocate_retrieve_buffers(
+        self, num_chunks: int, chunk_shape: list[int], dtype: torch.dtype
+    ) -> list[torch.Tensor] | None:
+        """Pre-allocate source buffers for retrieve.
+
+        Args:
+            num_chunks: Number of chunks to allocate.
+            chunk_shape: Shape of each chunk tensor.
+            dtype: Data type of the chunk tensors.
+
+        Returns:
+            A list of pre-allocated tensors, or ``None`` to use default.
+        """
+        return None
+
     @abstractmethod
     def close(self) -> None:
         """Release any resources held by this context."""
@@ -208,6 +238,7 @@ def gather_paged_kv_to_cpu(
     blocks_per_chunk: int,
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
+    out: list[torch.Tensor] | None = None,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -266,7 +297,11 @@ def gather_paged_kv_to_cpu(
                         len(chunk_block_ids) * block_size, layer_blocks.shape[-1]
                     )
                 )
-            chunks.append(torch.stack(mla_layers, dim=0).cpu())
+            gpu_chunk = torch.stack(mla_layers, dim=0)
+            if out is not None:
+                out[chunk_idx].copy_(gpu_chunk, non_blocking=True)
+            else:
+                chunks.append(gpu_chunk.cpu())
         else:
             k_layers: list[torch.Tensor] = []
             v_layers: list[torch.Tensor] = []
@@ -315,8 +350,12 @@ def gather_paged_kv_to_cpu(
                     )
             k_stacked = torch.stack(k_layers, dim=0)
             v_stacked = torch.stack(v_layers, dim=0)
-            chunks.append(torch.stack([k_stacked, v_stacked], dim=0).cpu())
-    return chunks
+            gpu_chunk = torch.stack([k_stacked, v_stacked], dim=0)
+            if out is not None:
+                out[chunk_idx].copy_(gpu_chunk, non_blocking=True)
+            else:
+                chunks.append(gpu_chunk.cpu())
+    return out if out is not None else chunks
 
 
 def scatter_cpu_to_paged_kv(
