@@ -2,7 +2,8 @@
 """Shared-memory NonGpuContext implementation for multiprocess mode."""
 
 # Standard
-from multiprocessing.shared_memory import SharedMemory
+import mmap
+import os
 from typing import Any
 
 # Third Party
@@ -34,12 +35,16 @@ class NonGpuContextShm(NonGpuContext):
         pool_size: int,
     ) -> None:
         super().__init__(metadata, mq_client, mq_timeout)
-        self._shm = SharedMemory(name=shm_name, create=False)
-        # Prevent worker from unlinking the segment on GC/exit —
-        # the segment lifecycle is owned by the server process.
-        self._shm.unlink = lambda: None  # type: ignore[method-assign]
+        # Attach to the server's shm segment via mmap (not SharedMemory)
+        # to avoid Python's resource_tracker unlinking on worker exit.
+        shm_path = f"/dev/shm/{shm_name}"
+        fd = os.open(shm_path, os.O_RDWR)
+        try:
+            self._mmap = mmap.mmap(fd, pool_size)
+        finally:
+            os.close(fd)
         self._pool_size = pool_size
-        self._buffer = self._shm.buf
+        self._buffer = self._mmap
 
     def _make_tensor_view(
         self, offset: int, length: int, shape: list[int], dtype_str: str
@@ -131,6 +136,6 @@ class NonGpuContextShm(NonGpuContext):
         """Release buffer and close shared memory attachment."""
         self._buffer = None
         try:
-            self._shm.close()
+            self._mmap.close()
         except Exception:
             pass
