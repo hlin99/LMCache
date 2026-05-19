@@ -419,7 +419,7 @@ class MPCacheEngine:
             PrepareStoreResponse with empty slots for pickle mode.
         """
 
-        return PrepareStoreResponse(slots=[])
+        return PrepareStoreResponse(context={})
 
     @_lmcache_nvtx_annotate
     def commit_store(
@@ -499,14 +499,14 @@ class MPCacheEngine:
         try:
             with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
                 if not memory_objs or len(memory_objs) != len(obj_keys):
-                    return PrepareRetrieveResponse(success=False)
+                    return PrepareRetrieveResponse(success=False, data=b"", context={})
                 prefetched_keys = obj_keys[: len(memory_objs)]
                 chunks = []
                 for memory_obj in memory_objs:
                     if memory_obj.tensor is None:
-                        return PrepareRetrieveResponse(success=False)
+                        return PrepareRetrieveResponse(success=False, data=b"", context={})
                     chunks.append(memory_obj.tensor.cpu().clone())
-                return PrepareRetrieveResponse(success=True, data=pickle.dumps(chunks))
+                return PrepareRetrieveResponse(success=True, data=pickle.dumps(chunks), context={})
         finally:
             if prefetched_keys:
                 self.storage_manager.finish_read_prefetched(prefetched_keys)

@@ -26,23 +26,12 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
 
-@dataclass
-class ShmSlotMetadata:
-    """Metadata for one SHM slot."""
-
-    key: str
-    shm_name: str
-    offset: int
-    length: int
-    shape: list[int]
-    dtype: str
-
 
 @dataclass
 class PrepareStoreResponse:
     """Response for PREPARE_STORE."""
 
-    slots: list[ShmSlotMetadata] = field(default_factory=list)
+    context: dict = field(default_factory=dict)  # pickle: {}, shm will put slot info here
 
 
 @dataclass
@@ -51,7 +40,7 @@ class PrepareRetrieveResponse:
 
     success: bool
     data: bytes = b""
-    slots: list[ShmSlotMetadata] = field(default_factory=list)
+    context: dict = field(default_factory=dict)  # pickle: {}, shm will put slot info here
 
 
 # Define request names for this protocol group
