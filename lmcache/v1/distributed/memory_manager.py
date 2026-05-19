@@ -65,9 +65,19 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         MemoryAllocatorInterface: An instance of a memory allocator.
     """
     shm_name = getattr(config, "shm_name", "") or ""
+    effective_shm_name: str | None = None
     if shm_name and not config.use_lazy:
-        _unlink_stale_shm(shm_name)
-        _check_shm_capacity(config.size_in_bytes)
+        try:
+            _unlink_stale_shm(shm_name)
+            _check_shm_capacity(config.size_in_bytes)
+            effective_shm_name = shm_name
+        except (RuntimeError, OSError) as exc:
+            logger.warning(
+                "Failed to initialize SHM pool (%s), falling back to pickle mode: %s",
+                shm_name,
+                exc,
+            )
+            effective_shm_name = None
 
     if config.use_lazy:
         logger.debug(
@@ -83,14 +93,15 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
     else:
         logger.debug(
             "use mixed memory allocator, total size is %d bytes, "
-            "align bytes is %d bytes",
+            "align bytes is %d bytes, shm_name=%s",
             config.size_in_bytes,
             config.align_bytes,
+            effective_shm_name or "(none, pickle mode)",
         )
         return MixedMemoryAllocator(
             config.size_in_bytes,
             align_bytes=config.align_bytes,
-            shm_name=getattr(config, "shm_name", None) or None,
+            shm_name=effective_shm_name,
         )
 
 
@@ -108,7 +119,11 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
-        self._shm_name = getattr(config, "shm_name", "")
+        # Reflect actual shm state from allocator (may have fallen back to pickle)
+        if isinstance(self._allocator, MixedMemoryAllocator):
+            self._shm_name = getattr(self._allocator, "shm_name", "") or ""
+        else:
+            self._shm_name = ""
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
