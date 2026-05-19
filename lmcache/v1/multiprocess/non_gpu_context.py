@@ -100,24 +100,45 @@ def create_non_gpu_context(
     metadata: NonGpuContextMetadata,
     mq_client: Any,
     mq_timeout: float,
+    shm_name: str = "",
+    pool_size: int = 0,
 ) -> NonGpuContext:
     """Factory that returns the appropriate :class:`NonGpuContext` implementation.
 
-    Currently always returns a pickle-based implementation
-    (``NonGpuContextPickle``). A future SHM-capable PR
-    may probe for shared-memory availability and fall back to pickle.
+    If ``shm_name`` is non-empty and ``pool_size > 0``, returns a shared-memory
+    implementation that uses zero-copy tensor views. Otherwise falls back to
+    the pickle-based implementation.
 
     Args:
         metadata: Layout metadata for the non-GPU context.
         mq_client: Message-queue client for server communication.
         mq_timeout: Timeout in seconds for blocking MQ requests.
+        shm_name: Name of the shared-memory segment (empty → pickle mode).
+        pool_size: Size in bytes of the shared-memory pool (0 → pickle mode).
 
     Returns:
         A concrete :class:`NonGpuContext` instance.
     """
+    # Standard
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    if shm_name and pool_size > 0:
+        # Local
+        from .non_gpu_context_shm import NonGpuContextShm
+
+        logger.info(
+            "Using SHM non-GPU context (shm_name=%s, pool_size=%d)",
+            shm_name,
+            pool_size,
+        )
+        return NonGpuContextShm(metadata, mq_client, mq_timeout, shm_name, pool_size)
+
     # Local
     from .non_gpu_context_pickle import NonGpuContextPickle
 
+    logger.info("Using pickle non-GPU context")
     return NonGpuContextPickle(metadata, mq_client, mq_timeout)
 
 

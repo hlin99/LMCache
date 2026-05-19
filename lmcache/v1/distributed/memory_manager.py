@@ -65,6 +65,7 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
+        self._shm_name = getattr(config, "shm_name", "")
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -167,6 +168,13 @@ class L1MemoryManager:
             size=self._size_in_bytes,
             align_bytes=self._align_bytes,
         )
+
+    def get_shm_pool_info(self) -> dict[str, object]:
+        """Return shared-memory pool metadata for worker attachment."""
+        return {
+            "shm_name": self._shm_name,
+            "pool_size": self._size_in_bytes,
+        }
 
     def close(self) -> None:
         """

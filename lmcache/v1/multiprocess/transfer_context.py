@@ -297,8 +297,28 @@ class NonCudaTransferContext(TransferContext):
             block_size=block_size,
             use_mla=use_mla_flag,
         )
-        self._non_gpu_context = create_non_gpu_context(metadata, mq_client, mq_timeout)
-        future.result(timeout=mq_timeout)
+        register_response = future.result(timeout=mq_timeout)
+
+        # Parse SHM info from register response
+        shm_name = ""
+        pool_size = 0
+        if register_response is not None:
+            shm_name = getattr(register_response, "shm_name", "") or ""
+            pool_size = getattr(register_response, "pool_size", 0) or 0
+
+        if shm_name:
+            logger.info(
+                "Non-GPU context registered with SHM mode "
+                "(shm_name=%s, pool_size=%d)",
+                shm_name,
+                pool_size,
+            )
+        else:
+            logger.info("Non-GPU context registered with pickle mode")
+
+        self._non_gpu_context = create_non_gpu_context(
+            metadata, mq_client, mq_timeout, shm_name=shm_name, pool_size=pool_size
+        )
 
     def submit_store(
         self,

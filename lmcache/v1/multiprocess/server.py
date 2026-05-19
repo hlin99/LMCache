@@ -72,6 +72,7 @@ from lmcache.v1.multiprocess.protocol import (
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
     PrepareStoreResponse,
+    RegisterNonGpuContextResponse,
 )
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -337,13 +338,16 @@ class MPCacheEngine:
     def register_kv_cache_non_gpu_context(
         self,
         payload: RegisterNonGpuContextPayload,
-    ) -> None:
+    ) -> RegisterNonGpuContextResponse:
         """Register non-CUDA KV layout metadata for non-GPU context mode.
 
         Args:
             payload: Struct containing all registration fields
                 (instance_id, model_name, world_size, block_size,
                 num_layers, hidden_dim_size, dtype_str, use_mla).
+
+        Returns:
+            RegisterNonGpuContextResponse with SHM pool info (or empty for pickle).
 
         Raises:
             ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
@@ -354,7 +358,12 @@ class MPCacheEngine:
                 "skipping the new registration",
                 payload.instance_id,
             )
-            return
+            # Still return pool info for re-registered workers
+            pool_info = self.storage_manager.get_shm_pool_info()
+            return RegisterNonGpuContextResponse(
+                shm_name=str(pool_info.get("shm_name", "")),
+                pool_size=int(pool_info.get("pool_size", 0)),
+            )
 
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
@@ -381,6 +390,20 @@ class MPCacheEngine:
                 use_mla=payload.use_mla,
             ),
         )
+
+        pool_info = self.storage_manager.get_shm_pool_info()
+        shm_name = str(pool_info.get("shm_name", ""))
+        pool_size = int(pool_info.get("pool_size", 0))
+        if shm_name:
+            logger.info(
+                "Non-GPU context registered with SHM mode "
+                "(shm_name=%s, pool_size=%d)",
+                shm_name,
+                pool_size,
+            )
+        else:
+            logger.info("Non-GPU context registered with pickle mode")
+        return RegisterNonGpuContextResponse(shm_name=shm_name, pool_size=pool_size)
 
     def _resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
         """Resolve object keys from an IPC cache key.
@@ -409,17 +432,48 @@ class MPCacheEngine:
         key: IPCCacheEngineKey,
         instance_id: int,
     ) -> PrepareStoreResponse:
-        """Prepare a store operation. For pickle mode, returns empty slots.
+        """Prepare a store operation.
+
+        For SHM mode: reserves write slots and returns offset metadata.
+        For pickle mode: returns empty context.
 
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
 
         Returns:
-            PrepareStoreResponse with empty slots for pickle mode.
+            PrepareStoreResponse with slot metadata for SHM or empty for pickle.
         """
+        pool_info = self.storage_manager.get_shm_pool_info()
+        if not pool_info.get("shm_name"):
+            return PrepareStoreResponse(context={})
 
-        return PrepareStoreResponse(context={})
+        # SHM mode: resolve keys and reserve write slots
+        obj_keys = self._resolve_obj_keys(key)
+        context = self.contexts.get(instance_id)
+        if context is None or context.non_cuda_metadata is None:
+            return PrepareStoreResponse(context={})
+
+        ctx = context.non_cuda_metadata
+        reserved_dict = self.storage_manager.reserve_write(
+            obj_keys, ctx.layout_desc, "new"
+        )
+
+        slots = []
+        for obj_key in obj_keys:
+            if obj_key not in reserved_dict:
+                continue
+            memory_obj = reserved_dict[obj_key]
+            if memory_obj.tensor is None:
+                continue
+            slots.append({
+                "offset": memory_obj.shm_offset,
+                "length": memory_obj.shm_byte_length,
+                "shape": list(memory_obj.tensor.shape),
+                "dtype": str(memory_obj.tensor.dtype).replace("torch.", ""),
+            })
+
+        return PrepareStoreResponse(context={"slots": slots} if slots else {})
 
     @_lmcache_nvtx_annotate
     def commit_store(
@@ -428,12 +482,16 @@ class MPCacheEngine:
         instance_id: int,
         cpu_data: bytes,
     ) -> bool:
-        """Commit serialized CPU chunks to storage.
+        """Commit store operation.
+
+        SHM mode (cpu_data is empty): data already written to SHM by worker,
+        just finalize the write.
+        Pickle mode: deserialize and copy data.
 
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
-            cpu_data: Pickled list of CPU tensors produced by the worker.
+            cpu_data: Pickled list of CPU tensors (pickle) or empty bytes (SHM).
 
         Returns:
             ``True`` when all reserved objects are written, otherwise ``False``.
@@ -446,6 +504,13 @@ class MPCacheEngine:
                 f"non-CUDA context not registered for instance ID {instance_id}"
             )
         ctx = context.non_cuda_metadata
+
+        if not cpu_data:
+            # SHM mode: data already in shared memory, just finish write
+            self.storage_manager.finish_write(obj_keys)
+            return True
+
+        # Pickle mode: deserialize and copy
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
         reserved_dict = self.storage_manager.reserve_write(
             obj_keys, ctx.layout_desc, "new"
@@ -477,16 +542,18 @@ class MPCacheEngine:
         key: IPCCacheEngineKey,
         instance_id: int,
     ) -> PrepareRetrieveResponse:
-        """Retrieve prefetched chunks and return serialized CPU tensors.
+        """Retrieve prefetched chunks.
+
+        SHM mode: returns slot metadata so worker can read directly.
+        Pickle mode: serializes and returns data in response.
 
         Args:
             key: Cache key for the token range to retrieve.
             instance_id: Worker instance identifier.
 
         Returns:
-            PrepareRetrieveResponse with serialized data on hit.
+            PrepareRetrieveResponse with slot metadata (SHM) or serialized data (pickle).
         """
-
         obj_keys = self._resolve_obj_keys(key)
 
         context = self.contexts.get(instance_id)
@@ -495,6 +562,29 @@ class MPCacheEngine:
                 f"non-CUDA context not registered for instance ID {instance_id}"
             )
 
+        pool_info = self.storage_manager.get_shm_pool_info()
+        use_shm = bool(pool_info.get("shm_name"))
+
+        if use_shm:
+            # SHM mode: use unsafe_read on already-prefetched (read-locked) objects
+            good_keys, good_objs = self.storage_manager.unsafe_read(obj_keys)
+            if not good_objs or len(good_objs) != len(obj_keys):
+                return PrepareRetrieveResponse(success=False, data=b"", context={})
+            slots = []
+            for memory_obj in good_objs:
+                if memory_obj.tensor is None:
+                    return PrepareRetrieveResponse(success=False, data=b"", context={})
+                slots.append({
+                    "offset": memory_obj.shm_offset,
+                    "length": memory_obj.shm_byte_length,
+                    "shape": list(memory_obj.tensor.shape),
+                    "dtype": str(memory_obj.tensor.dtype).replace("torch.", ""),
+                })
+            return PrepareRetrieveResponse(
+                success=True, data=b"", context={"slots": slots}
+            )
+
+        # Pickle mode
         prefetched_keys: list[ObjectKey] = []
         try:
             with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
@@ -517,15 +607,23 @@ class MPCacheEngine:
         key: IPCCacheEngineKey,
         instance_id: int,
     ) -> bool:
-        """Finalize a retrieve operation. No-op for pickle mode.
+        """Finalize a retrieve operation.
+
+        SHM mode: releases read locks on the prefetched objects.
+        Pickle mode: no-op.
 
         Args:
-            key: Cache key (unused for pickle).
-            instance_id: Worker instance identifier (unused for pickle).
+            key: Cache key for the token range.
+            instance_id: Worker instance identifier.
 
         Returns:
             Always ``True``.
         """
+        pool_info = self.storage_manager.get_shm_pool_info()
+        if pool_info.get("shm_name"):
+            # SHM mode: release read locks
+            obj_keys = self._resolve_obj_keys(key)
+            self.storage_manager.finish_read_prefetched(obj_keys)
         return True
 
     @_lmcache_nvtx_annotate
