@@ -36,14 +36,8 @@ class NonGpuContextPickle(NonGpuContext):
     ) -> None:
         super().__init__(metadata, mq_client, mq_timeout)
 
-    def prepare_store(
-        self, key: Any, instance_id: int, block_ids: list[int], blocks_per_chunk: int
-    ) -> tuple[Any, list[torch.Tensor] | None]:
-        """Send PREPARE_STORE RPC. For pickle, returns no pre-allocated buffers.
-
-        Returns:
-            ``((key, instance_id), None)`` — gather will allocate its own tensors.
-        """
+    def prepare_store(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+        """Send PREPARE_STORE RPC. For pickle, returns no pre-allocated buffers."""
         future = self.mq_client.submit_request(
             RequestType.PREPARE_STORE,
             [key, instance_id],
@@ -53,15 +47,16 @@ class NonGpuContextPickle(NonGpuContext):
             future.result(timeout=self.mq_timeout)
         except TimeoutError:
             pass
-        return ((key, instance_id), None)
+        return None
 
-    def commit_store(self, handle: Any, chunks: list[torch.Tensor]) -> bool:
+    def commit_store(
+        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
+    ) -> bool:
         """Serialize chunks and send via COMMIT_STORE.
 
         Returns:
             ``True`` on success, ``False`` on failure or timeout.
         """
-        key, instance_id = handle
         serialised = pickle.dumps(chunks)
         future = self.mq_client.submit_request(
             RequestType.COMMIT_STORE,
@@ -73,14 +68,11 @@ class NonGpuContextPickle(NonGpuContext):
         except TimeoutError:
             return False
 
-    def prepare_retrieve(
-        self, key: Any, instance_id: int
-    ) -> tuple[Any, list[torch.Tensor] | None]:
+    def prepare_retrieve(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
         """Send PREPARE_RETRIEVE and deserialize the response data.
 
         Returns:
-            ``((key, instance_id), chunks)`` on hit, or
-            ``((key, instance_id), None)`` on miss/timeout.
+            Chunks on hit, or None on miss/timeout.
         """
         future = self.mq_client.submit_request(
             RequestType.PREPARE_RETRIEVE,
@@ -90,15 +82,14 @@ class NonGpuContextPickle(NonGpuContext):
         try:
             response = future.result(timeout=self.mq_timeout)
         except TimeoutError:
-            return ((key, instance_id), None)
+            return None
         if not response.success or not response.data:
-            return ((key, instance_id), None)
+            return None
         chunks: list[torch.Tensor] = pickle.loads(response.data)
-        return ((key, instance_id), chunks)
+        return chunks
 
-    def commit_retrieve(self, handle: Any) -> None:
+    def commit_retrieve(self, key: Any, instance_id: int) -> bool:
         """Send COMMIT_RETRIEVE (no-op for pickle path)."""
-        key, instance_id = handle
         future = self.mq_client.submit_request(
             RequestType.COMMIT_RETRIEVE,
             [key, instance_id],
@@ -108,6 +99,7 @@ class NonGpuContextPickle(NonGpuContext):
             future.result(timeout=self.mq_timeout)
         except TimeoutError:
             pass
+        return True
 
     def close(self) -> None:
         """No-op: the pickle path holds no persistent resources."""

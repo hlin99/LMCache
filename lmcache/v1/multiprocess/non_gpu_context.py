@@ -69,61 +69,25 @@ class NonGpuContext(ABC):
         return self.metadata.layout_desc
 
     @abstractmethod
-    def prepare_store(
-        self, key: Any, instance_id: int, block_ids: list[int], blocks_per_chunk: int
-    ) -> tuple[Any, list[torch.Tensor] | None]:
-        """Prepare a store operation.
-
-        Args:
-            key: Cache key for the token range to store.
-            instance_id: Worker instance identifier.
-            block_ids: Block IDs to store.
-            blocks_per_chunk: Number of blocks per chunk.
-
-        Returns:
-            A ``(handle, out_buffers)`` pair. ``out_buffers`` is a list of
-            pre-allocated CPU tensors for gather to write into, or ``None``
-            if gather should allocate its own.
-        """
+    def prepare_store(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+        """Prepare store. Returns pre-allocated out buffers (shm) or None (pickle)."""
         ...
 
     @abstractmethod
-    def commit_store(self, handle: Any, chunks: list[torch.Tensor]) -> bool:
-        """Commit a prepared store operation.
-
-        Args:
-            handle: The opaque handle returned by :meth:`prepare_store`.
-            chunks: CPU chunk tensors to store.
-
-        Returns:
-            ``True`` on success, ``False`` otherwise.
-        """
+    def commit_store(
+        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
+    ) -> bool:
+        """Commit store. Pickle: serialize and send. Shm: notify server."""
         ...
 
     @abstractmethod
-    def prepare_retrieve(
-        self, key: Any, instance_id: int
-    ) -> tuple[Any, list[torch.Tensor] | None]:
-        """Prepare a retrieve operation.
-
-        Args:
-            key: Cache key for the token range to retrieve.
-            instance_id: Worker instance identifier.
-
-        Returns:
-            A ``(handle, chunks)`` pair. ``chunks`` is a list of CPU tensors
-            on cache hit, or ``None`` on cache miss. The handle must be
-            passed to :meth:`commit_retrieve`.
-        """
+    def prepare_retrieve(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+        """Prepare retrieve. Returns chunks or shm views, or None on miss."""
         ...
 
     @abstractmethod
-    def commit_retrieve(self, handle: Any) -> None:
-        """Finalise a retrieve operation (release locks, cleanup, etc.).
-
-        Args:
-            handle: The opaque handle returned by :meth:`prepare_retrieve`.
-        """
+    def commit_retrieve(self, key: Any, instance_id: int) -> bool:
+        """Commit retrieve. Pickle: no-op. Shm: release read locks."""
         ...
 
     @abstractmethod
