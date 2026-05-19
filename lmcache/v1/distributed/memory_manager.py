@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import os
+import shutil
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -16,6 +20,39 @@ from lmcache.v1.memory_management import (
 logger = init_logger(__name__)
 
 
+def _check_shm_capacity(required_bytes: int) -> None:
+    """Verify that /dev/shm has sufficient free space."""
+    shm_stat = shutil.disk_usage("/dev/shm")
+    if shm_stat.free < required_bytes:
+        size_gib = (required_bytes / 2**30) + 1
+        raise RuntimeError(
+            f"Insufficient /dev/shm space: need {required_bytes / 2**30:.1f} GiB, "
+            f"available {shm_stat.free / 2**30:.1f} GiB. "
+            f"Increase /dev/shm capacity (e.g. 'docker run --shm-size={size_gib:.0f}g')."
+        )
+
+
+def _unlink_stale_shm(shm_name: str) -> None:
+    """Remove stale lmcache shm segments not held by any live process."""
+    shm_dir = "/dev/shm"
+    prefix = "lmcache_l1_pool_"
+    try:
+        entries = os.listdir(shm_dir)
+    except OSError:
+        return
+    for entry in entries:
+        if entry != shm_name and not entry.startswith(prefix):
+            continue
+        if entry == shm_name:
+            # Remove our own stale segment from a previous run
+            shm_path = os.path.join(shm_dir, entry)
+            try:
+                os.unlink(shm_path)
+                logger.info("Removed stale shared-memory segment: %s", shm_path)
+            except OSError:
+                pass
+
+
 # HELPER FUNCTIONS
 def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInterface:
     """
@@ -27,6 +64,11 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
     Returns:
         MemoryAllocatorInterface: An instance of a memory allocator.
     """
+    shm_name = getattr(config, "shm_name", "") or ""
+    if shm_name and not config.use_lazy:
+        _unlink_stale_shm(shm_name)
+        _check_shm_capacity(config.size_in_bytes)
+
     if config.use_lazy:
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
@@ -48,6 +90,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         return MixedMemoryAllocator(
             config.size_in_bytes,
             align_bytes=config.align_bytes,
+            shm_name=getattr(config, "shm_name", None) or None,
         )
 
 
