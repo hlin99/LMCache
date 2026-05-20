@@ -42,7 +42,6 @@ class NonGpuContextShm(NonGpuContext):
             )
         finally:
             os.close(shm_fd)
-        self._buffer: Any = self._mmap_obj
 
     def _make_tensor_view(
         self,
@@ -60,7 +59,7 @@ class NonGpuContextShm(NonGpuContext):
             raise ValueError(f"Invalid dtype size for {dtype_str}")
         count = length // itemsize
         tensor_1d = torch.frombuffer(
-            self._buffer, dtype=dtype, count=count, offset=offset
+            self._mmap_obj, dtype=dtype, count=count, offset=offset
         )
         return tensor_1d.view(torch.Size(shape))
 
@@ -128,5 +127,4 @@ class NonGpuContextShm(NonGpuContext):
             return False
 
     def close(self) -> None:
-        self._buffer = None
         self._mmap_obj.close()
