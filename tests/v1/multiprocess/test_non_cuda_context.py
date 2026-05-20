@@ -464,7 +464,13 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_native_storage_ops: Any,
 ) -> None:
-    """Ensure SHM commit succeeds when prepare_store reserves zero new objects."""
+    """Regression: repeated prompt after worker restart should no-op-store cleanly.
+
+    When all object keys already exist in cache, SHM ``prepare_store`` reserves
+    no new objects and returns empty slots. ``commit_store`` must still succeed
+    as a valid no-op for that prepared transfer, but fail without a matching
+    prepare state.
+    """
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         IPCCacheEngineKey,
@@ -524,3 +530,6 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     store_ok = engine.commit_store(key, 3, b"")
     assert store_ok is True
     mock_storage.finish_write.assert_not_called()
+
+    # A second commit without a matching prepare must fail.
+    assert engine.commit_store(key, 3, b"") is False
