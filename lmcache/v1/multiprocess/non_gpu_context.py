@@ -100,23 +100,32 @@ def create_non_gpu_context(
     metadata: NonGpuContextMetadata,
     mq_client: Any,
     mq_timeout: float,
+    use_shm: bool = True,
 ) -> NonGpuContext:
     """Factory that returns the appropriate :class:`NonGpuContext` implementation.
 
-    Currently always returns a pickle-based implementation
-    (``NonGpuContextPickle``). A future SHM-capable PR
-    may probe for shared-memory availability and fall back to pickle.
+    If ``use_shm=True`` (default), attempts to create a SHM-based context
+    (``NonGpuContextShm``) which falls back to pickle on failure.
+    If ``use_shm=False``, always returns pickle-based implementation
+    (``NonGpuContextPickle``).
 
     Args:
         metadata: Layout metadata for the non-GPU context.
         mq_client: Message-queue client for server communication.
         mq_timeout: Timeout in seconds for blocking MQ requests.
+        use_shm: Whether to attempt SHM transport (default: True).
 
     Returns:
         A concrete :class:`NonGpuContext` instance.
     """
     # Local
     from .non_gpu_context_pickle import NonGpuContextPickle
+    from .non_gpu_context_shm import NonGpuContextShm
+
+    if use_shm:
+        # Try SHM first, with pickle as fallback
+        pickle_ctx = NonGpuContextPickle(metadata, mq_client, mq_timeout)
+        return NonGpuContextShm(metadata, mq_client, mq_timeout, fallback=pickle_ctx)
 
     return NonGpuContextPickle(metadata, mq_client, mq_timeout)
 
