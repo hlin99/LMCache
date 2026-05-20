@@ -37,6 +37,7 @@ Overall data flow:
 
 `TransferContext` is the worker-side transport abstraction with four methods:
 `register`, `submit_store`, `submit_retrieve`, and `close`.
+It intentionally does not expose `poll_finished` or `drain_all`.
 
 - **HandleTransferContext** keeps the original CUDA IPC behavior:
   worker sends a handle and server performs direct GPU-side transfer.
@@ -67,7 +68,7 @@ Why three steps:
   device memory directly.
 - **Non-GPU Context:** server participates in a two-phase protocol exposed by
   `NonGpuContext` (`prepare_store`, `commit_store`, `prepare_retrieve`,
-  `commit_retrieve`).
+  `commit_retrieve`), plus lifecycle cleanup via `close`.
 
 `NonGpuContext` implementations:
 - **NonGpuContextPickle**: serialize/deserialize chunk payloads with pickle.
