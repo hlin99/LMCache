@@ -2,7 +2,7 @@
 
 ## 1. Motivation
 
-LMCache multiprocess mode originally depends on CUDA IPC: workers send IPC handles,
+LMCache multiprocess mode originally depended on CUDA IPC: workers send IPC handles,
 and the server reads/writes worker GPU memory directly. That path works well on
 CUDA, but the required primitives are CUDA-specific (IPC memory handles,
 interprocess CUDA events, CUDA stream semantics).
@@ -51,7 +51,7 @@ four lifecycle and transfer operations.
 
 Why three steps:
 - `prepare_*`: set up transport state (for SHM this allocates/returns shared buffers;
-  for pickle it is an RPC/no-op from a buffer-allocation perspective).
+  for pickle it is a protocol RPC that does not allocate transfer buffers).
 - gather/scatter: perform data movement between paged KV and contiguous CPU chunks.
 - `commit_*`: finalize and notify server to consume or release transfer state.
 
@@ -111,8 +111,8 @@ behind one interface contract.
 The non-GPU path introduces five request types:
 
 1. `REGISTER_KV_CACHE_NON_GPU_CONTEXT`  
-   Worker registers non-CUDA KV layout metadata so the server can build the
-   corresponding memory layout contract.
+   Worker registers non-CUDA KV layout metadata so the server can reconstruct
+   the worker KV memory layout for store/retrieve operations.
 
 2. `PREPARE_STORE`  
    Worker asks server/transport to prepare store-side transfer state.
