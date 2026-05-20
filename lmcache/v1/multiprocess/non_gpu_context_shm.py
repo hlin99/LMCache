@@ -16,6 +16,8 @@ from lmcache.v1.multiprocess.non_gpu_context import (
 )
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 
+INVALID_SHM_FD = -1
+
 
 class NonGpuContextShm(NonGpuContext):
     """Shared-memory implementation of :class:`NonGpuContext`."""
@@ -34,6 +36,7 @@ class NonGpuContextShm(NonGpuContext):
 
         self._shm_name = shm_name
         self._pool_size = pool_size
+        self._shm_fd = INVALID_SHM_FD
         shm_path = os.path.join("/dev/shm", shm_name.lstrip("/"))
         self._shm_fd = os.open(shm_path, os.O_RDWR)
         try:
@@ -42,7 +45,7 @@ class NonGpuContextShm(NonGpuContext):
             )
         except Exception:
             os.close(self._shm_fd)
-            self._shm_fd = -1
+            self._shm_fd = INVALID_SHM_FD
             raise
 
     def _make_tensor_view(
@@ -88,11 +91,9 @@ class NonGpuContextShm(NonGpuContext):
             return None
         context = response.context if isinstance(response.context, dict) else {}
         slots = context.get("slots")
-        if not slots:
+        if not isinstance(slots, list) or not slots:
             return None
-        if not isinstance(slots, list):
-            return None
-        return self._build_slot_tensors(slots) if slots else None
+        return self._build_slot_tensors(slots)
 
     def commit_store(
         self, key: Any, instance_id: int, _chunks: list[torch.Tensor]
@@ -134,11 +135,11 @@ class NonGpuContextShm(NonGpuContext):
             return False
 
     def close(self) -> None:
-        if self._shm_fd < 0:
+        if self._shm_fd == INVALID_SHM_FD:
             return
         try:
             self._mmap_obj.close()
         finally:
             fd = self._shm_fd
-            self._shm_fd = -1
+            self._shm_fd = INVALID_SHM_FD
             os.close(fd)

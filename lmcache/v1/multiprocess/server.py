@@ -260,6 +260,9 @@ class MPCacheEngine:
         # for crash resilience (e.g., client calls lookup but never queries)
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        # Pending SHM transfer tracking, keyed by (instance_id, IPC key).
+        # IPCCacheEngineKey is a frozen dataclass and hashable, so it is safe
+        # and efficient for dict lookups across pending transfer tracking.
         self._pending_shm_writes: dict[
             tuple[int, IPCCacheEngineKey], list[ObjectKey]
         ] = {}
@@ -548,6 +551,9 @@ class MPCacheEngine:
             with self._pending_shm_lock:
                 reserved_keys = self._pending_shm_writes.pop(transfer_key, [])
             if not reserved_keys:
+                # Idempotent SHM semantics: duplicate store or missing prepare
+                # after a prior successful store should still be treated as
+                # success because key data already exists in storage.
                 return True
             self.storage_manager.finish_write(reserved_keys)
             return True
@@ -610,8 +616,8 @@ class MPCacheEngine:
             )
 
         if self._is_shm_active():
-            # Precondition: lookup stage already acquired read locks for obj_keys,
-            # so unsafe_read is valid here and avoids duplicate lock operations.
+            # Precondition: read locks for these keys were acquired during the
+            # lookup/prefetch phase before this retrieve call.
             shm_prefetched_keys, shm_memory_objs = self.storage_manager.unsafe_read(
                 obj_keys
             )

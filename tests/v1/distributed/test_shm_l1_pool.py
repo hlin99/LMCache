@@ -14,8 +14,10 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.config import L1MemoryManagerConfig
 from lmcache.v1.distributed.memory_manager import create_memory_allocator
 from lmcache.v1.memory_management import MixedMemoryAllocator
-from lmcache.v1.multiprocess.non_gpu_context import NonGpuContextMetadata
-from lmcache.v1.multiprocess.non_gpu_context import create_non_gpu_context
+from lmcache.v1.multiprocess.non_gpu_context import (
+    NonGpuContextMetadata,
+    create_non_gpu_context,
+)
 from lmcache.v1.multiprocess.non_gpu_context_pickle import NonGpuContextPickle
 from lmcache.v1.multiprocess.non_gpu_context_shm import NonGpuContextShm
 from lmcache.v1.multiprocess.protocol import RequestType
@@ -165,7 +167,7 @@ def test_non_gpu_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
 
 
 def test_non_gpu_context_shm_init_raises_when_segment_missing() -> None:
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError, match="No such file or directory"):
         NonGpuContextShm(
             metadata=NonGpuContextMetadata(
                 layout_desc=MemoryLayoutDesc(
