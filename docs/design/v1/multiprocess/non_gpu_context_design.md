@@ -28,6 +28,51 @@ Worker adapter (vLLM MP adapter)
              └─ NonGpuContextShm (TODO)
 ```
 
+State machine overview (worker-side):
+
+```text
+                       create_transfer_context()
+                                 |
+                 +---------------+---------------+
+                 |                               |
+                 v                               v
+      HandleTransferContext            DataTransferContext
+          (device == CUDA)            (device != CUDA)
+                 |                               |
+                 v                               v
+              register()                      register()
+                 |                               |
+                 +---------------+---------------+
+                                 |
+                                 v
+                                READY
+                                 |
+                 +---------------+-------------------------------+
+                 |                                               |
+                 v                                               v
+    submit_store (handle path)                  submit_store (data path)
+    -> STORE request (async)                    -> prepare_store -> gather -> commit_store
+                 |                                               |
+                 +---------------+-------------------------------+
+                                 |
+                                 v
+                                READY
+                                 |
+                 +---------------+-------------------------------+
+                 |                                               |
+                 v                                               v
+  submit_retrieve (handle path)               submit_retrieve (data path)
+  -> RETRIEVE request (async)                 -> prepare_retrieve -> scatter -> commit_retrieve
+                 |                                               |
+                 +---------------+-------------------------------+
+                                 |
+                                 v
+                                READY
+                                 |
+                                 v
+                               close()
+```
+
 Overall data flow:
 - **CUDA path**: worker sends a handle, server pulls/pushes data directly.
 - **Non-CUDA path**: worker gathers/scatters paged KV and exchanges CPU-side data
