@@ -109,20 +109,20 @@ Two layers of abstraction serve different purposes:
            STORE (GPU → L1)            gather_paged_kv_to_cpu()
            [async MQ future]           + _non_gpu_context.prepare_store()
                      |                 + _non_gpu_context.commit_store() [sync]
-                     v                         _store_done[id] = ok
-                 [READY]                               |
+                     v                 return pre-resolved MessagingFuture
+                  [READY]                               |
                      +----------------+----------------+
                                       |
                                       v
-      transfer_ctx.submit_retrieve()  +  poll_finished()
+      transfer_ctx.submit_retrieve()  +  adapter polls future.query()/result()
                                       |
                      +----------------+----------------+
                      |                                 |
                      v                                 v
-          RETRIEVE (L1 → GPU)     _non_gpu_context.prepare_retrieve() [sync]
-          [async MQ future]       + scatter_cpu_to_paged_kv()
-                     |            + _non_gpu_context.commit_retrieve()
-                     v            _retrieve_done[id] = (ok, block_ids)
+           RETRIEVE (L1 → GPU)     _non_gpu_context.prepare_retrieve() [sync]
+           [async MQ future]       + scatter_cpu_to_paged_kv()
+                      |            + _non_gpu_context.commit_retrieve()
+                      v            return pre-resolved MessagingFuture
                      +----------------+----------------+
                                       |
                                       v
@@ -147,10 +147,11 @@ branch.
 
 ### 3.2 Solution
 
-`transfer_context.py` defines the `TransferContext` ABC with six methods:
-`register`, `submit_store`, `submit_retrieve`, `poll_finished`, `drain_all`,
-and `close`. The adapter holds a single `TransferContext` and delegates —
-no `if/else` anywhere.
+`transfer_context.py` defines the `TransferContext` ABC with four methods:
+`register`, `submit_store`, `submit_retrieve`, and `close`. Both submit methods
+return a `MessagingFuture`; the adapter uses `future.query()` /
+`future.result()` directly, so polling behavior is implemented in the adapter
+rather than in the ABC.
 
 ### 3.3 `create_transfer_context()` factory
 
@@ -161,16 +162,16 @@ are rejected.
 ### 3.4 `CudaTransferContext`
 
 Wraps the original CUDA IPC path. Sends `REGISTER_KV_CACHE` / `STORE` /
-`RETRIEVE` messages with IPC handles, tracks async MQ futures.
-`poll_finished` queries futures; `drain_all` marks all pending as finished
-for unhealthy shutdown. Semantics identical to pre-refactoring.
+`RETRIEVE` messages with IPC handles and returns async MQ futures. The adapter
+queries those futures and handles unhealthy-drain semantics.
 
 ### 3.5 `NonCudaTransferContext`
 
 Holds a `NonGpuContext` instance internally. Sends
 `REGISTER_KV_CACHE_NON_GPU_CONTEXT` with scalar metadata. Store and retrieve
-are **synchronous**: gather → prepare/commit, then record result in
-`_store_done` / `_retrieve_done`. `poll_finished` simply drains these dicts.
+are **synchronous**: gather/scatter + prepare/commit, and each submit method
+returns a pre-resolved `MessagingFuture[bool]`. The adapter still uses the same
+`future.query()` / `future.result()` flow as CUDA.
 
 ## 4. Server-side: Non-GPU Context Protocol
 
@@ -179,8 +180,8 @@ are **synchronous**: gather → prepare/commit, then record result in
 | | GPU context | non-GPU context |
 |---|---|---|
 | Registration | `REGISTER_KV_CACHE` — IPC handles | `REGISTER_KV_CACHE_NON_GPU_CONTEXT` — scalar fields |
-| Store | `STORE` — event handle + block IDs, server reads GPU directly | `STORE_CPU_CHUNKS` — serialised CPU tensors |
-| Retrieve | `RETRIEVE` — event handle + block IDs, server writes GPU directly | `RETRIEVE_CPU_CHUNKS` — key lookup, returns CPU tensors |
+| Store | `STORE` — event handle + block IDs, server reads GPU directly | `PREPARE_STORE` + `COMMIT_STORE` — prepare then send serialised CPU tensors |
+| Retrieve | `RETRIEVE` — event handle + block IDs, server writes GPU directly | `PREPARE_RETRIEVE` + `COMMIT_RETRIEVE` — fetch CPU tensors then commit |
 
 Registration uses **scalar fields** (`block_size`, `num_layers`,
 `hidden_dim_size`, `dtype_str`, `use_mla`) instead of pickled objects
@@ -195,16 +196,16 @@ and SHM can be swapped without touching `NonCudaTransferContext` or the server.
 The ABC defines: `prepare_store`, `commit_store`, `prepare_retrieve`,
 `commit_retrieve`, `close`.
 
-Why two phases? Pickle can do everything in one step (prepare serialises,
-commit sends). SHM needs prepare to allocate a slot, then the worker writes
-into mapped memory, then commit tells the server "ready". The split
-accommodates both without forcing unnecessary round-trips on pickle.
+Why two phases? SHM needs prepare to allocate a slot, then the worker writes
+into mapped memory, then commit tells the server "ready". Pickle keeps the same
+shape for protocol consistency: `prepare_store` is an RPC handshake and
+`commit_store` performs serialisation + send.
 
 | Phase | Pickle | SHM (TODO) |
 |---|---|---|
-| `prepare_store` | `pickle.dumps(chunks)` → opaque handle | MQ `PREPARE_STORE` → get SHM offset → `memcpy` into SHM |
-| `commit_store` | MQ `STORE_CPU_CHUNKS`, block for ack | MQ `COMMIT_STORE` → server reads from SHM |
-| `prepare_retrieve` | MQ `RETRIEVE_CPU_CHUNKS` → `pickle.loads` | MQ `PREPARE_RETRIEVE` → server writes to SHM → map tensor views |
+| `prepare_store` | MQ `PREPARE_STORE` RPC, returns `None` (no pre-allocated buffers) | MQ `PREPARE_STORE` → get SHM offset → `memcpy` into SHM |
+| `commit_store` | `pickle.dumps(chunks)` + MQ `COMMIT_STORE`, block for ack | MQ `COMMIT_STORE` → server reads from SHM |
+| `prepare_retrieve` | MQ `PREPARE_RETRIEVE` → `pickle.loads` | MQ `PREPARE_RETRIEVE` → server writes to SHM → map tensor views |
 | `commit_retrieve` | no-op | MQ `FINISH_READ` → release SHM read lock |
 
 `create_non_gpu_context()` factory currently always returns `NonGpuContextPickle`.
