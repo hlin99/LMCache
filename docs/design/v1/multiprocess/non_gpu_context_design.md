@@ -242,6 +242,107 @@ rather than per-token `index_select` / `index_copy_`. For HND layouts, a
 - **`gather_paged_kv_to_cpu`** — gathers paged blocks into CPU chunk tensors.
 - **`scatter_cpu_to_paged_kv`** — scatters CPU chunks back into device paged KV tensors. Respects `skip_first_n_tokens` for partial-prefix retrieval.
 
+## 5. Five New Protocol Messages
+
+The non-GPU context path introduces five new messages for two-phase store/retrieve:
+
+| Message | Direction | Payload | Response | Pickle Usage | SHM Usage (TODO) |
+|---------|-----------|---------|----------|--------------|------------------|
+| `REGISTER_KV_CACHE_NON_GPU_CONTEXT` | Worker→Server | `RegisterNonGpuContextPayload` (scalar metadata: block_size, num_layers, hidden_dim_size, dtype_str, use_mla) | None | Sends scalar metadata | Sends scalar metadata |
+| `PREPARE_STORE` | Worker→Server | `key, instance_id` | `PrepareStoreResponse(context={})` | Returns empty slots | Returns SHM slot info |
+| `COMMIT_STORE` | Worker→Server | `key, instance_id, cpu_data: bytes` | `bool` | `pickle.dumps(chunks)` → sends bytes | Confirms write, releases slot |
+| `PREPARE_RETRIEVE` | Worker→Server | `key, instance_id` | `PrepareRetrieveResponse(success, data: bytes, context)` | Server returns `pickle.dumps(chunks)` | Returns SHM slot info |
+| `COMMIT_RETRIEVE` | Worker→Server | `key, instance_id` | `bool` | No-op | Releases SHM read lock |
+
+### Message signatures
+
+```python
+# From protocols/engine.py
+PREPARE_STORE:   (KeyType, int) → PrepareStoreResponse(context: dict)
+COMMIT_STORE:    (KeyType, int, bytes) → bool
+PREPARE_RETRIEVE: (KeyType, int) → PrepareRetrieveResponse(success, data: bytes, context: dict)
+COMMIT_RETRIEVE: (KeyType, int) → bool
+```
+
+### Pickle path flow
+
+```
+Store:
+  worker: gather_paged_kv_to_cpu()
+  worker: prepare_store()    → PREPARE_STORE
+  worker: pickle.dumps(chunks) → COMMIT_STORE (payload: bytes)
+  server: pickle.loads() → write to memory
+
+Retrieve:
+  worker: prepare_retrieve() → PREPARE_RETRIEVE
+  server: pickle.dumps(chunks) → response.data
+  worker: pickle.loads() → chunks → scatter_cpu_to_paged_kv()
+  worker: commit_retrieve() → COMMIT_RETRIEVE (no-op)
+```
+
+### SHM path flow (TODO)
+
+```
+Store:
+  worker: prepare_store() → PREPARE_STORE
+  server: allocate SHM slot → return context={slot_id: xxx}
+  worker: memcpy to SHM (via mapped memory)
+  worker: commit_store() → COMMIT_STORE (confirmation)
+  server: read from SHM → free slot
+
+Retrieve:
+  worker: prepare_retrieve() → PREPARE_RETRIEVE
+  server: write data to SHM → return context={slot_id: xxx}
+  worker: read from SHM (via mapped memory) → scatter to GPU
+  worker: commit_retrieve() → COMMIT_RETRIEVE (release lock)
+```
+
+## 6. SHM Implementation Details (TODO)
+
+### 6.1 NonGpuContext ABC extensions
+
+```python
+class NonGpuContext(ABC):
+    def prepare_store(self, key, instance_id) -> list[torch.Tensor] | None:
+        """Allocate store buffers. Returns pre-allocated buffers or None."""
+        ...
+
+    def allocate_store_buffers(self, size: int) -> list[torch.Tensor] | None:
+        """Allocate shared memory buffers for store. Default: None."""
+        return None
+
+    def commit_store(self, key, instance_id, chunks) -> bool:
+        ...
+
+    def prepare_retrieve(self, key, instance_id) -> list[torch.Tensor] | None:
+        """Get retrieve buffers. For SHM, returns data from shared memory."""
+        ...
+
+    def allocate_retrieve_buffers(self, size: int) -> list[torch.Tensor] | None:
+        """Allocate shared memory buffers for retrieve. Default: None."""
+        return None
+
+    def commit_retrieve(self, key, instance_id) -> bool:
+        ...
+```
+
+### 6.2 SHM fallback conditions
+
+SHM is the **optimal** transport with only **1 copy**, but requires:
+
+- `/dev/shm` must exist and be writable
+- `/dev/shm` capacity ≥ L1 cache size (`worker_l1_cached_chunks * chunk_size_bytes`)
+
+If conditions are not met, automatically fall back to **Pickle** (3 copies).
+
+### 6.3 TODO items
+
+- [ ] Implement `NonGpuContextShm` class
+- [ ] Implement SHM slot allocation / lifecycle management
+- [ ] Add `/dev/shm` capacity check in `create_non_gpu_context()`
+- [ ] Implement async SHM read/write with proper locking
+- [ ] Add error handling and auto-fallback to Pickle
+
 ## Non-goals
 
 - No change to existing CUDA IPC path semantics.
