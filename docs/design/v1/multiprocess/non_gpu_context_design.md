@@ -106,8 +106,8 @@ Two layers of abstraction serve different purposes:
        transfer_ctx.submit_store()      transfer_ctx.submit_store()
                      |                                 |
                      v                                 v
-           STORE (GPU → L1)            gather_paged_kv_to_cpu()
-           [async MQ future]           + _non_gpu_context.prepare_store()
+           STORE (GPU → L1)            _non_gpu_context.prepare_store()
+           [async MQ future]           + gather_paged_kv_to_cpu()
                      |                 + _non_gpu_context.commit_store() [sync]
                      v                 return pre-resolved MessagingFuture
                   [READY]                               |
@@ -211,37 +211,6 @@ shape for protocol consistency: `prepare_store` is an RPC handshake and
 `create_non_gpu_context()` factory currently always returns `NonGpuContextPickle`.
 Future: probe `/dev/shm` availability and capacity, fall back to pickle if
 insufficient.
-
-## 5. Data Path: Gather / Scatter
-
-### 5.1 Chunk format
-
-- **Non-MLA**: `[2, num_layers, chunk_tokens, hidden_dim]` — dim 0 = `(K, V)`.
-- **MLA**: `[num_layers, chunk_tokens, hidden_dim]` — single latent vector.
-
-Where `chunk_tokens = blocks_per_chunk × block_size`.
-
-### 5.2 Supported KV layouts
-
-| Format enum | Layout | Shape per layer |
-|---|---|---|
-| `NL_X_TWO_NB_BS_NH_HS` | NHD | `[2, NB, BS, NH, HS]` |
-| `NL_X_NB_TWO_BS_NH_HS` | NHD (flashinfer) | `[NB, 2, BS, NH, HS]` |
-| `NL_X_TWO_NB_NH_BS_HS` | HND | `[2, NB, NH, BS, HS]` |
-| `NL_X_NB_TWO_NH_BS_HS` | HND (flashinfer) | `[NB, 2, NH, BS, HS]` |
-| `NL_X_NB_BS_HS` | MLA | `[NB, BS, HS]` |
-
-### 5.3 Block-level indexing
-
-Gather and scatter operate at **block granularity** (`tensor[block_ids]`)
-rather than per-token `index_select` / `index_copy_`. For HND layouts, a
-`permute(0, 2, 1, 3)` converts between head-major and token-major order.
-
-### 5.4 Utility functions
-
-- **`compute_kv_layout`** — extracts `(block_size, num_layers, hidden_dim_size, dtype_str, gpu_kv_format)` from live KV tensors.
-- **`gather_paged_kv_to_cpu`** — gathers paged blocks into CPU chunk tensors.
-- **`scatter_cpu_to_paged_kv`** — scatters CPU chunks back into device paged KV tensors. Respects `skip_first_n_tokens` for partial-prefix retrieval.
 
 ## Non-goals
 
