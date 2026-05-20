@@ -37,7 +37,7 @@ polymorphic `TransferContext` abstraction.
 | Transport | Copies | Data flow |
 |---|---|---|
 | CUDA IPC | 2 | GPU KV → GPU staging buffer → CPU memory obj |
-| Pickle | 4 | GPU KV → CPU chunk → pickle.dumps → pickle.loads → CPU memory obj |
+| Pickle | 3 | GPU KV → CPU chunk → pickle.dumps → (MQ send) → pickle.loads → CPU memory obj |
 | SHM (TODO) | 1 | GPU KV → CPU memory obj (SHM mapped) |
 
 **Retrieve (server storage → worker):**
@@ -45,7 +45,7 @@ polymorphic `TransferContext` abstraction.
 | Transport | Copies | Data flow |
 |---|---|---|
 | CUDA IPC | 2 | CPU memory obj → GPU staging buffer → GPU KV |
-| Pickle | 4 | CPU memory obj → pickle.dumps → pickle.loads → CPU chunk → GPU KV |
+| Pickle | 3 | CPU memory obj → (MQ send) → pickle.loads → CPU chunk → GPU KV |
 | SHM (TODO) | 1 | CPU memory obj (SHM mapped) → GPU KV |
 
 **Applicability:**
@@ -53,7 +53,7 @@ polymorphic `TransferContext` abstraction.
 | Transport | Platform requirement | Pros | Cons |
 |---|---|---|---|
 | CUDA IPC | NVIDIA CUDA devices only | Async GPU streams, mature path | CUDA-only |
-| Pickle | Any device, no dependencies | Generally available, zero setup | 4 copies + serialisation overhead |
+| Pickle | Any device, no dependencies | Generally available, zero setup | 3 copies + serialisation overhead, one-way data size = KV size |
 | SHM (TODO) | `/dev/shm` capacity ≥ L1 cache size | Fewest copies (1), no serialisation | Requires sufficient shared memory |
 
 ## 2. Architecture Overview
@@ -65,7 +65,7 @@ vllm_multi_process_adapter.py    ← Engine adapter, device-agnostic
   └── TransferContext             ← Worker-side transport abstraction (§3)
         ├── CudaTransferContext    ← CUDA IPC + MQ future path
         └── NonCudaTransferContext     ← Synchronous gather/scatter path
-              └── NonGpuContext        ← Serialisation abstraction (§4.2)
+              └── NonGpuContext        ← Serialisation abstraction (§4)
                     ├── NonGpuContextPickle   ← pickle.dumps/loads (§4.3)
                     └── NonGpuContextShm      ← shared memory (§4.4, TODO)
 ```
@@ -74,7 +74,7 @@ Two layers of abstraction serve different purposes:
 
 - **TransferContext** (§3) — decides **CUDA vs non-CUDA** routing at the
   worker adapter level.
-- **NonGpuContext** (§4.2) — decides **how** CPU chunk data is serialised and
+- **NonGpuContext** (§4) — decides **how** CPU chunk data is serialised and
   transported (pickle vs SHM). Only used inside `NonCudaTransferContext`.
 
 ### 2.2 State machine (worker ↔ server)
@@ -107,22 +107,19 @@ Two layers of abstraction serve different purposes:
                      |                                 |
                      v                                 v
            STORE (GPU → L1)            gather_paged_kv_to_cpu()
-           [async MQ future]           + _non_gpu_context.prepare_store()
-                     |                 + _non_gpu_context.commit_store() [sync]
-                     v                         _store_done[id] = ok
+           [async MQ future]           + prepare_store()  → PREPARE_STORE
+                                          + commit_store() → COMMIT_STORE (pickled bytes)
+                                          ✓ _store_done[id] = ok
                  [READY]                               |
                      +----------------+----------------+
                                       |
                                       v
-      transfer_ctx.submit_retrieve()  +  poll_finished()
-                                      |
-                     +----------------+----------------+
-                     |                                 |
-                     v                                 v
-          RETRIEVE (L1 → GPU)     _non_gpu_context.prepare_retrieve() [sync]
-          [async MQ future]       + scatter_cpu_to_paged_kv()
-                     |            + _non_gpu_context.commit_retrieve()
-                     v            _retrieve_done[id] = (ok, block_ids)
+      transfer_ctx.submit_retrieve()  + prepare_retrieve() → PREPARE_RETRIEVE
+                                      |    (server returns pickled bytes)
+                                      v    
+          RETRIEVE (L1 → GPU)          + scatter_cpu_to_paged_kv()
+          [async MQ future]                 + commit_retrieve() → COMMIT_RETRIEVE
+                                          ✓ _retrieve_done[id] = (ok, block_ids)
                      +----------------+----------------+
                                       |
                                       v
@@ -174,38 +171,76 @@ are **synchronous**: gather → prepare/commit, then record result in
 
 ## 4. Server-side: Non-GPU Context Protocol
 
-### 4.1 Why GPU context and non-GPU context need different protocols
+### 4.1 Five new protocol messages
 
-| | GPU context | non-GPU context |
-|---|---|---|
-| Registration | `REGISTER_KV_CACHE` — IPC handles | `REGISTER_KV_CACHE_NON_GPU_CONTEXT` — scalar fields |
-| Store | `STORE` — event handle + block IDs, server reads GPU directly | `STORE_CPU_CHUNKS` — serialised CPU tensors |
-| Retrieve | `RETRIEVE` — event handle + block IDs, server writes GPU directly | `RETRIEVE_CPU_CHUNKS` — key lookup, returns CPU tensors |
+The non-GPU context path introduces five new messages for two-phase store/retrieve:
 
-Registration uses **scalar fields** (`block_size`, `num_layers`,
-`hidden_dim_size`, `dtype_str`, `use_mla`) instead of pickled objects
-to avoid cross-process pickle security and compatibility concerns. The
-server reconstructs `MemoryLayoutDesc` from the scalars internally.
+| Message | Payload | Response | Description |
+|---------|---------|----------|-------------|
+| `REGISTER_KV_CACHE_NON_GPU_CONTEXT` | `RegisterNonGpuContextPayload` (scalar metadata) | None | Register with scalar fields instead of IPC handles |
+| `PREPARE_STORE` | `key, instance_id` | `PrepareStoreResponse(context: dict)` | Allocate resources, returns slot info |
+| `COMMIT_STORE` | `key, instance_id, cpu_data: bytes` ` | `bool` | Send serialised data |
+| `PREPARE_RETRIEVE` | `key, instance_id` | `PrepareRetrieveResponse(success, data: bytes, context: dict)` | Lookup key, return data |
+| `COMMIT_RETRIEVE` | `key, instance_id` | `bool` | Release locks/resources |
 
-### 4.2 `NonGpuContext` ABC: two-phase prepare/commit
+### 4.2 Why new messages needed
 
-The serialisation layer is abstracted behind `NonGpuContext` so that pickle
-and SHM can be swapped without touching `NonCudaTransferContext` or the server.
+| GPU context | non-GPU context |
+|---|---|
+| Uses `REGISTER_KV_CACHE` with IPC handles | Uses `REGISTER_KV_CACHE_NON_GPU_CONTEXT` with scalar fields |
+| Single `STORE` message with IPC handle | Two-phase: `PREPARE_STORE` + `COMMIT_STORE` |
+| Single `RETRIEVE` message with IPC handle | Two-phase: `PREPARE_RETRIEVE` + `COMMIT_RETRIEVE` |
 
-The ABC defines: `prepare_store`, `commit_store`, `prepare_retrieve`,
-`commit_retrieve`, `close`.
+Why scalar fields for registration? To avoid cross-process pickle security
+and compatibility concerns. The server reconstructs `MemoryLayoutDesc` from
+the scalars internally.
 
-Why two phases? Pickle can do everything in one step (prepare serialises,
-commit sends). SHM needs prepare to allocate a slot, then the worker writes
-into mapped memory, then commit tells the server "ready". The split
-accommodates both without forcing unnecessary round-trips on pickle.
+Two-phase design: Pickle can technically do everything in one step, but
+SHM needs prepare to allocate a slot, then worker writes to mapped memory,
+then commit tells server "ready". The split accommodates both without forcing
+unnecessary round-trips on pickle.
 
-| Phase | Pickle | SHM (TODO) |
-|---|---|---|
-| `prepare_store` | `pickle.dumps(chunks)` → opaque handle | MQ `PREPARE_STORE` → get SHM offset → `memcpy` into SHM |
-| `commit_store` | MQ `STORE_CPU_CHUNKS`, block for ack | MQ `COMMIT_STORE` → server reads from SHM |
-| `prepare_retrieve` | MQ `RETRIEVE_CPU_CHUNKS` → `pickle.loads` | MQ `PREPARE_RETRIEVE` → server writes to SHM → map tensor views |
-| `commit_retrieve` | no-op | MQ `FINISH_READ` → release SHM read lock |
+### 4.3 `NonGpuContext` ABC
+
+Abstract base class for serialisation implementations:
+
+```python
+class NonGpuContext(ABC):
+    def prepare_store(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+        """Send PREPARE_STORE, allocate resources. Returns pre-allocated buffers or None."""
+
+    def commit_store(self, key: Any, instance_id: int, chunks: list[torch.Tensor]) -> bool:
+        """Send COMMIT_STORE with serialised data. Returns success."""
+
+    def prepare_retrieve(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+        """Send PREPARE_RETRIEVE, deserialise response. Returns chunks or None."""
+
+    def commit_retrieve(self, key: Any, instance_id: int) -> bool:
+        """Send COMMIT_RETRIEVE for cleanup. Returns success."""
+
+    def allocate_store_buffers(self, size: int) -> list[torch.Tensor] | None:
+        """Allocate SHM buffers for store. Default: None (for pickle)."""
+
+    def allocate_retrieve_buffers(self, size: int) -> list[torch.Tensor] | None:
+        """Allocate SHM buffers for retrieve. Default: None (for pickle)."""
+
+    def close(self) -> None:
+        """Release resources."""
+```
+
+### 4.4 Implementation variants
+
+**Pickle (`NonGpuContextPickle`):**
+- `prepare_store`: sends `PREPARE_STORE`, returns `None` (no pre-allocated buffers)
+- `commit_store`: `pickle.dumps(chunks)` → sends via `COMMIT_STORE`
+- `prepare_retrieve`: sends `PREPARE_RETRIEVE`, `pickle.loads(response.data)`
+- `commit_retrieve`: sends `COMMIT_RETRIEVE` (no-op for pickle)
+
+**SHM (`NonGpuContextShm`) — TODO:**
+- `prepare_store`: allocate SHM slot, return slot info in context
+- `commit_store`: confirm write, server reads from SHM
+- `prepare_retrieve`: server writes to SHM, return slot info
+- `commit_retrieve`: release SHM read lock
 
 `create_non_gpu_context()` factory currently always returns `NonGpuContextPickle`.
 Future: probe `/dev/shm` availability and capacity, fall back to pickle if
@@ -241,92 +276,11 @@ rather than per-token `index_select` / `index_copy_`. For HND layouts, a
 - **`compute_kv_layout`** — extracts `(block_size, num_layers, hidden_dim_size, dtype_str, gpu_kv_format)` from live KV tensors.
 - **`gather_paged_kv_to_cpu`** — gathers paged blocks into CPU chunk tensors.
 - **`scatter_cpu_to_paged_kv`** — scatters CPU chunks back into device paged KV tensors. Respects `skip_first_n_tokens` for partial-prefix retrieval.
-
-## 5. Five New Protocol Messages
-
-The non-GPU context path introduces five new messages for two-phase store/retrieve:
-
-| Message | Direction | Payload | Response | Pickle Usage | SHM Usage (TODO) |
-|---------|-----------|---------|----------|--------------|------------------|
-| `REGISTER_KV_CACHE_NON_GPU_CONTEXT` | Worker→Server | `RegisterNonGpuContextPayload` (scalar metadata: block_size, num_layers, hidden_dim_size, dtype_str, use_mla) | None | Sends scalar metadata | Sends scalar metadata |
-| `PREPARE_STORE` | Worker→Server | `key, instance_id` | `PrepareStoreResponse(context={})` | Returns empty slots | Returns SHM slot info |
-| `COMMIT_STORE` | Worker→Server | `key, instance_id, cpu_data: bytes` | `bool` | `pickle.dumps(chunks)` → sends bytes | Confirms write, releases slot |
-| `PREPARE_RETRIEVE` | Worker→Server | `key, instance_id` | `PrepareRetrieveResponse(success, data: bytes, context)` | Server returns `pickle.dumps(chunks)` | Returns SHM slot info |
-| `COMMIT_RETRIEVE` | Worker→Server | `key, instance_id` | `bool` | No-op | Releases SHM read lock |
-
-### Message signatures
-
-```python
-# From protocols/engine.py
-PREPARE_STORE:   (KeyType, int) → PrepareStoreResponse(context: dict)
-COMMIT_STORE:    (KeyType, int, bytes) → bool
-PREPARE_RETRIEVE: (KeyType, int) → PrepareRetrieveResponse(success, data: bytes, context: dict)
-COMMIT_RETRIEVE: (KeyType, int) → bool
-```
-
-### Pickle path flow
-
-```
-Store:
-  worker: gather_paged_kv_to_cpu()
-  worker: prepare_store()    → PREPARE_STORE
-  worker: pickle.dumps(chunks) → COMMIT_STORE (payload: bytes)
-  server: pickle.loads() → write to memory
-
-Retrieve:
-  worker: prepare_retrieve() → PREPARE_RETRIEVE
-  server: pickle.dumps(chunks) → response.data
-  worker: pickle.loads() → chunks → scatter_cpu_to_paged_kv()
-  worker: commit_retrieve() → COMMIT_RETRIEVE (no-op)
-```
-
-### SHM path flow (TODO)
-
-```
-Store:
-  worker: prepare_store() → PREPARE_STORE
-  server: allocate SHM slot → return context={slot_id: xxx}
-  worker: memcpy to SHM (via mapped memory)
-  worker: commit_store() → COMMIT_STORE (confirmation)
-  server: read from SHM → free slot
-
-Retrieve:
-  worker: prepare_retrieve() → PREPARE_RETRIEVE
-  server: write data to SHM → return context={slot_id: xxx}
-  worker: read from SHM (via mapped memory) → scatter to GPU
-  worker: commit_retrieve() → COMMIT_RETRIEVE (release lock)
-```
+- **`gather_paged_kv_to_cpu(out=...)`** — writes directly into pre-allocated buffers (for SHM zero-copy).
 
 ## 6. SHM Implementation Details (TODO)
 
-### 6.1 NonGpuContext ABC extensions
-
-```python
-class NonGpuContext(ABC):
-    def prepare_store(self, key, instance_id) -> list[torch.Tensor] | None:
-        """Allocate store buffers. Returns pre-allocated buffers or None."""
-        ...
-
-    def allocate_store_buffers(self, size: int) -> list[torch.Tensor] | None:
-        """Allocate shared memory buffers for store. Default: None."""
-        return None
-
-    def commit_store(self, key, instance_id, chunks) -> bool:
-        ...
-
-    def prepare_retrieve(self, key, instance_id) -> list[torch.Tensor] | None:
-        """Get retrieve buffers. For SHM, returns data from shared memory."""
-        ...
-
-    def allocate_retrieve_buffers(self, size: int) -> list[torch.Tensor] | None:
-        """Allocate shared memory buffers for retrieve. Default: None."""
-        return None
-
-    def commit_retrieve(self, key, instance_id) -> bool:
-        ...
-```
-
-### 6.2 SHM fallback conditions
+### 6.1 SHM fallback conditions
 
 SHM is the **optimal** transport with only **1 copy**, but requires:
 
@@ -334,6 +288,27 @@ SHM is the **optimal** transport with only **1 copy**, but requires:
 - `/dev/shm` capacity ≥ L1 cache size (`worker_l1_cached_chunks * chunk_size_bytes`)
 
 If conditions are not met, automatically fall back to **Pickle** (3 copies).
+
+### 6.2 Zero-copy path with `out=` parameter
+
+The `gather_paged_kv_to_cpu` function accepts an optional `out` parameter:
+
+```python
+def gather_paged_kv_to_cpu(
+    kv_caches: dict[str, torch.Tensor],
+    layout: MemoryLayoutDesc,
+    block_ids: list[int],
+    out: list[torch.Tensor] | None = None,
+) -> list[torch.Tensor]:
+    if out is not None:
+        for chunk, buf in zip(chunks, out, strict=False):
+            buf.copy_(chunk, non_blocking=True)
+        return out
+    return chunks
+```
+
+This enables SHM implementations to pre-allocate shared memory buffers and
+write directly into them, avoiding an extra copy.
 
 ### 6.3 TODO items
 
