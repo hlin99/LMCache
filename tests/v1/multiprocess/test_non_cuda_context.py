@@ -477,6 +477,7 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
         "shm_name": "lmcache_test_pool",
         "pool_size": 1024,
     }
+    # Empty reserve_write indicates all object keys already exist in cache.
     mock_storage.reserve_write.return_value = {}
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h"]

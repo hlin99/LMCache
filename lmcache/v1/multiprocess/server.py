@@ -538,8 +538,10 @@ class MPCacheEngine:
         if cpu_data == b"" and self._is_shm_active():
             transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
             reserved_keys = self._pending_shm_writes.pop(transfer_key, None)
+            # Missing transfer key means COMMIT arrived without matching PREPARE.
             if reserved_keys is None:
                 return False
+            # Empty reservation is a valid no-op when all objects already exist.
             if reserved_keys:
                 self.storage_manager.finish_write(reserved_keys)
             return True
