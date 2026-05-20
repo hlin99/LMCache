@@ -37,7 +37,8 @@ Overall data flow:
 
 `TransferContext` is the worker-side transport abstraction with four methods:
 `register`, `submit_store`, `submit_retrieve`, and `close`.
-It intentionally does not expose `poll_finished` or `drain_all`.
+The current contract is intentionally minimal and does not include historical
+methods such as `poll_finished` or `drain_all`.
 
 - **HandleTransferContext** keeps the original CUDA IPC behavior:
   worker sends a handle and server performs direct GPU-side transfer.
@@ -56,6 +57,8 @@ Why three steps:
 
 `create_transfer_context()` selects the implementation once based on device type
 (CUDA → `HandleTransferContext`, otherwise → `DataTransferContext`).
+It also validates that all KV cache tensors share one device type and rejects
+mixed-device configurations.
 
 | Context | What is transferred | Who performs copy work | Completion style |
 |---|---|---|---|
