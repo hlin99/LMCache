@@ -459,3 +459,67 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     assert len(recovered_chunks) == 1
     assert torch.allclose(recovered_chunks[0], payload)
+
+
+def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure SHM commit succeeds when prepare_store reserves zero new objects."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        IPCCacheEngineKey,
+        RegisterNonGpuContextPayload,
+    )
+    from lmcache.v1.multiprocess.server import MPCacheEngine
+
+    mock_storage = MagicMock()
+    mock_storage.get_shm_pool_info.return_value = {
+        "shm_name": "lmcache_test_pool",
+        "pool_size": 1024,
+    }
+    mock_storage.reserve_write.return_value = {}
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+    with (
+        patch(
+            "lmcache.v1.multiprocess.server.StorageManager",
+            return_value=mock_storage,
+        ),
+        patch("lmcache.v1.multiprocess.server.TokenHasher"),
+        patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
+        patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch(
+            "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
+            return_value=["obj"],
+        ),
+    ):
+        session_cls.return_value.get_or_create.return_value = mock_session
+        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
+
+    engine.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=3,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+    key = IPCCacheEngineKey.from_token_ids(
+        "m",
+        1,
+        0,
+        [1] * 8,
+        start=0,
+        end=8,
+        request_id="req",
+    )
+    prepare_response = engine.prepare_store(key, 3)
+    assert prepare_response.context["slots"] == []
+
+    store_ok = engine.commit_store(key, 3, b"")
+    assert store_ok is True
+    mock_storage.finish_write.assert_not_called()

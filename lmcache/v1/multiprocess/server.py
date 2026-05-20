@@ -537,10 +537,11 @@ class MPCacheEngine:
         """
         if cpu_data == b"" and self._is_shm_active():
             transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
-            reserved_keys = self._pending_shm_writes.pop(transfer_key, [])
-            if not reserved_keys:
+            reserved_keys = self._pending_shm_writes.pop(transfer_key, None)
+            if reserved_keys is None:
                 return False
-            self.storage_manager.finish_write(reserved_keys)
+            if reserved_keys:
+                self.storage_manager.finish_write(reserved_keys)
             return True
 
         obj_keys = self._resolve_obj_keys(key)
