@@ -461,10 +461,16 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     assert torch.allclose(recovered_chunks[0], payload)
 
 
-def test_server_shm_store_idempotent_on_duplicate_key(
+def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_native_storage_ops: Any,
 ) -> None:
-    """Ensure SHM prepare/commit treats duplicate keys as idempotent success."""
+    """Regression: repeated prompt after worker restart should no-op-store cleanly.
+
+    When all object keys already exist in cache, SHM ``prepare_store`` reserves
+    no new objects and returns empty slots. ``commit_store`` must still succeed
+    as a valid no-op for that prepared transfer, but fail without a matching
+    prepare state.
+    """
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         IPCCacheEngineKey,
@@ -474,9 +480,10 @@ def test_server_shm_store_idempotent_on_duplicate_key(
 
     mock_storage = MagicMock()
     mock_storage.get_shm_pool_info.return_value = {
-        "shm_name": "lmcache_l1_pool_test",
-        "pool_size": 4096,
+        "shm_name": "lmcache_test_pool",
+        "pool_size": 1024,
     }
+    # Empty reserve_write indicates all object keys already exist in cache.
     mock_storage.reserve_write.return_value = {}
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h"]
@@ -518,9 +525,15 @@ def test_server_shm_store_idempotent_on_duplicate_key(
         end=8,
         request_id="req",
     )
-    response = engine.prepare_store(key, 3)
-    assert response.context == {}
-    assert engine.commit_store(key, 3, b"") is True
+    prepare_response = engine.prepare_store(key, 3)
+    assert prepare_response.context["slots"] == []
+
+    store_ok = engine.commit_store(key, 3, b"")
+    assert store_ok is True
+    mock_storage.finish_write.assert_not_called()
+
+    # A second commit without a matching prepare must fail.
+    assert engine.commit_store(key, 3, b"") is False
 
 
 def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
