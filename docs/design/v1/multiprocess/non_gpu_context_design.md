@@ -49,16 +49,17 @@ four lifecycle and transfer operations.
 - **submit_store**: `prepare_store` → `gather_paged_kv_to_cpu` → `commit_store`
 - **submit_retrieve**: `prepare_retrieve` → `scatter_cpu_to_paged_kv` → `commit_retrieve`
 
-Why three steps:
+Why `prepare → data operation → commit`:
 - `prepare_*`: set up transport state (for SHM this allocates/returns shared buffers;
   for pickle it is a protocol RPC that does not allocate transfer buffers).
-- gather/scatter: perform data movement between paged KV and contiguous CPU chunks.
+- gather/scatter: worker-local data movement between paged KV and contiguous
+  CPU chunks, performed between protocol phases.
 - `commit_*`: finalize and notify server to consume or release transfer state.
 
 `create_transfer_context()` selects the implementation once based on device type
 (CUDA → `HandleTransferContext`, otherwise → `DataTransferContext`).
 It also validates that all KV cache tensors share one device type and rejects
-mixed-device configurations.
+mixed-device configurations by raising an error.
 
 | Context | What is transferred | Who performs copy work | Completion style |
 |---|---|---|---|
@@ -69,9 +70,10 @@ mixed-device configurations.
 
 - **GPU Context (existing path):** server uses CUDA IPC handles to access worker
   device memory directly.
-- **Non-GPU Context:** server participates in a two-phase protocol exposed by
-  `NonGpuContext` (`prepare_store`, `commit_store`, `prepare_retrieve`,
-  `commit_retrieve`), plus lifecycle cleanup via `close`.
+- **Non-GPU Context:** server participates in two separate two-phase protocols
+  exposed by `NonGpuContext`: `prepare_store/commit_store` for store, and
+  `prepare_retrieve/commit_retrieve` for retrieve, plus lifecycle cleanup via
+  `close`.
 
 `NonGpuContext` implementations:
 - **NonGpuContextPickle**: serialize/deserialize chunk payloads with pickle.
@@ -106,9 +108,9 @@ behind one interface contract.
 
 ## 3. Protocol & Data Flow
 
-### 3.1 New MQ Request Types
+### 3.1 MQ Request Types Used by Non-GPU Path
 
-The non-GPU path introduces five request types:
+The non-GPU path uses five request types:
 
 1. `REGISTER_KV_CACHE_NON_GPU_CONTEXT`  
    Worker registers non-CUDA KV layout metadata so the server can reconstruct
