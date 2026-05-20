@@ -23,9 +23,9 @@ Worker adapter (vLLM MP adapter)
   └─ TransferContext
       ├─ HandleTransferContext  (CUDA IPC path)
       └─ DataTransferContext    (non-CUDA data path)
-           └─ NonGpuContext
-                ├─ NonGpuContextPickle
-                └─ NonGpuContextShm (TODO)
+          └─ NonGpuContext
+             ├─ NonGpuContextPickle
+             └─ NonGpuContextShm (TODO)
 ```
 
 Overall data flow:
@@ -37,8 +37,8 @@ Overall data flow:
 
 `TransferContext` is the worker-side transport abstraction with four methods:
 `register`, `submit_store`, `submit_retrieve`, and `close`.
-The current contract is intentionally minimal and does not include historical
-methods such as `poll_finished` or `drain_all`.
+The contract is intentionally minimal so worker adapters only depend on these
+four lifecycle and transfer operations.
 
 - **HandleTransferContext** keeps the original CUDA IPC behavior:
   worker sends a handle and server performs direct GPU-side transfer.
@@ -150,7 +150,8 @@ Server: deserialize -> storage write
 
 Retrieve (pickle)
 Worker: prepare_retrieve --> Server
-Server: read storage -> serialize bytes --> Worker
+Server: read storage -> serialize bytes
+Server: serialized bytes --> Worker
 Worker: deserialize -> scatter to paged KV
 Worker: commit_retrieve --> Server
 ```
