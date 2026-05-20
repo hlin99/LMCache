@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Shared-memory NonGpuContext implementation for multiprocess mode."""
+
+# Standard
+from typing import Any
+import mmap
+import os
+
+# Third Party
+import torch
+
+# First Party
+from lmcache.v1.multiprocess.non_gpu_context import (
+    NonGpuContext,
+    NonGpuContextMetadata,
+)
+from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+
+
+class NonGpuContextShm(NonGpuContext):
+    """Shared-memory implementation of :class:`NonGpuContext`."""
+
+    def __init__(
+        self,
+        metadata: NonGpuContextMetadata,
+        mq_client: Any,
+        mq_timeout: float,
+        shm_name: str,
+        pool_size: int,
+    ) -> None:
+        super().__init__(metadata, mq_client, mq_timeout)
+        if not shm_name or pool_size <= 0:
+            raise ValueError("shm_name must be non-empty and pool_size must be > 0")
+
+        self._shm_name = shm_name
+        self._pool_size = pool_size
+        shm_path = os.path.join("/dev/shm", shm_name.lstrip("/"))
+        self._shm_fd = os.open(shm_path, os.O_RDWR)
+        self._mmap_obj = mmap.mmap(
+            self._shm_fd, self._pool_size, access=mmap.ACCESS_WRITE
+        )
+
+    def _make_tensor_view(
+        self,
+        offset: int,
+        length: int,
+        shape: list[int],
+        dtype_str: str,
+    ) -> torch.Tensor:
+        """Create a tensor view over a SHM slot via ``torch.frombuffer``."""
+        dtype = getattr(torch, dtype_str)
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        if itemsize <= 0:
+            raise ValueError(f"Invalid dtype size for {dtype_str}")
+        count = length // itemsize
+        tensor_1d = torch.frombuffer(
+            self._mmap_obj, dtype=dtype, count=count, offset=offset
+        )
+        return tensor_1d.view(torch.Size(shape))
+
+    def _build_slot_tensors(self, slots: list[dict[str, Any]]) -> list[torch.Tensor]:
+        return [
+            self._make_tensor_view(
+                offset=int(slot["offset"]),
+                length=int(slot["length"]),
+                shape=list(slot["shape"]),
+                dtype_str=str(slot["dtype"]),
+            )
+            for slot in slots
+        ]
+
+    def prepare_store(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+        future = self.mq_client.submit_request(
+            RequestType.PREPARE_STORE,
+            [key, instance_id],
+            get_response_class(RequestType.PREPARE_STORE),
+        )
+        try:
+            response = future.result(timeout=self.mq_timeout)
+        except TimeoutError:
+            return None
+        slots = response.context.get("slots", [])
+        return self._build_slot_tensors(slots) if slots else None
+
+    def commit_store(
+        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
+    ) -> bool:
+        del chunks
+        future = self.mq_client.submit_request(
+            RequestType.COMMIT_STORE,
+            [key, instance_id, b""],
+            get_response_class(RequestType.COMMIT_STORE),
+        )
+        try:
+            return bool(future.result(timeout=self.mq_timeout))
+        except TimeoutError:
+            return False
+
+    def prepare_retrieve(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+        future = self.mq_client.submit_request(
+            RequestType.PREPARE_RETRIEVE,
+            [key, instance_id],
+            get_response_class(RequestType.PREPARE_RETRIEVE),
+        )
+        try:
+            response = future.result(timeout=self.mq_timeout)
+        except TimeoutError:
+            return None
+        if not response.success:
+            return None
+        slots = response.context.get("slots", [])
+        return self._build_slot_tensors(slots) if slots else None
+
+    def commit_retrieve(self, key: Any, instance_id: int) -> bool:
+        future = self.mq_client.submit_request(
+            RequestType.COMMIT_RETRIEVE,
+            [key, instance_id],
+            get_response_class(RequestType.COMMIT_RETRIEVE),
+        )
+        try:
+            return bool(future.result(timeout=self.mq_timeout))
+        except TimeoutError:
+            return False
+
+    def close(self) -> None:
+        try:
+            self._mmap_obj.close()
+        finally:
+            os.close(self._shm_fd)

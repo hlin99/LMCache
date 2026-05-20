@@ -25,6 +25,7 @@ from lmcache.v1.multiprocess.non_gpu_context import (
     scatter_cpu_to_paged_kv,
 )
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.protocols.engine import RegisterNonGpuContextResponse
 
 logger = init_logger(__name__)
 
@@ -291,14 +292,25 @@ class DataTransferContext(TransferContext):
                 )
             ],
         )
+        response = future.result(timeout=mq_timeout)
+        shm_name = ""
+        pool_size = 0
+        if isinstance(response, RegisterNonGpuContextResponse):
+            shm_name = response.shm_name
+            pool_size = response.pool_size
 
         metadata = NonGpuContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
         )
-        self._non_gpu_context = create_non_gpu_context(metadata, mq_client, mq_timeout)
-        future.result(timeout=mq_timeout)
+        self._non_gpu_context = create_non_gpu_context(
+            metadata,
+            mq_client,
+            mq_timeout,
+            shm_name=shm_name,
+            pool_size=pool_size,
+        )
 
     def submit_store(
         self,
