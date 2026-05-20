@@ -35,6 +35,9 @@ def _check_shm_capacity(required_bytes: int) -> bool:
 def _unlink_stale_shm(shm_name: str) -> None:
     """Remove a stale LMCache shm segment if it exists."""
     normalized = shm_name.lstrip("/")
+    if "/" in normalized or "\\" in normalized:
+        logger.warning("Refusing to unlink invalid shm name %s", shm_name)
+        return
     if not normalized.startswith("lmcache_l1_pool_"):
         return
     shm_path = os.path.join("/dev/shm", normalized)
@@ -77,8 +80,12 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         shm_name = config.shm_name
         if shm_name:
             try:
-                if not _check_shm_capacity(config.size_in_bytes):
-                    raise RuntimeError("insufficient /dev/shm capacity")
+                free_bytes = shutil.disk_usage("/dev/shm").free
+                if free_bytes < config.size_in_bytes:
+                    raise RuntimeError(
+                        "insufficient /dev/shm capacity: "
+                        f"need {config.size_in_bytes} bytes, have {free_bytes} bytes"
+                    )
                 _unlink_stale_shm(shm_name)
                 return MixedMemoryAllocator(
                     config.size_in_bytes,

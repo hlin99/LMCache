@@ -163,6 +163,11 @@ def batched_iteration(lst: list, batch_size: int) -> Generator[tuple, None, None
         yield batch
 
 
+def _dtype_to_name(dtype: torch.dtype) -> str:
+    """Return a stable torch dtype name without module prefix."""
+    return str(dtype).split(".")[-1]
+
+
 @dataclass
 class _PrefetchJob:
     handle: PrefetchHandle
@@ -402,6 +407,7 @@ class MPCacheEngine:
     def _make_non_gpu_transfer_key(
         key: IPCCacheEngineKey, instance_id: int
     ) -> tuple[object, ...]:
+        """Build a unique key for pending SHM write/read transfer tracking."""
         return (
             instance_id,
             key.model_name,
@@ -483,7 +489,7 @@ class MPCacheEngine:
                     "offset": memory_obj.shm_offset,
                     "length": memory_obj.shm_byte_length,
                     "shape": list(memory_obj.tensor.shape),
-                    "dtype": str(memory_obj.tensor.dtype).replace("torch.", ""),
+                    "dtype": _dtype_to_name(memory_obj.tensor.dtype),
                 }
             )
             reserved_keys.append(obj_key)
@@ -504,6 +510,8 @@ class MPCacheEngine:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
             cpu_data: Pickled list of CPU tensors produced by the worker.
+                In SHM mode, empty bytes (``b""``) indicate data is already
+                written to SHM and only lock finalization is required.
 
         Returns:
             ``True`` when all reserved objects are written, otherwise ``False``.
@@ -591,7 +599,7 @@ class MPCacheEngine:
                         "offset": memory_obj.shm_offset,
                         "length": memory_obj.shm_byte_length,
                         "shape": list(memory_obj.tensor.shape),
-                        "dtype": str(memory_obj.tensor.dtype).replace("torch.", ""),
+                        "dtype": _dtype_to_name(memory_obj.tensor.dtype),
                     }
                 )
             transfer_key = self._make_non_gpu_transfer_key(key, instance_id)

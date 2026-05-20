@@ -48,7 +48,9 @@ class NonGpuContextShm(NonGpuContext):
         dtype_str: str,
     ) -> torch.Tensor:
         """Create a tensor view over a SHM slot via ``torch.frombuffer``."""
-        dtype = getattr(torch, dtype_str)
+        dtype = getattr(torch, dtype_str, None)
+        if dtype is None or not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Invalid torch dtype string: {dtype_str}")
         itemsize = torch.empty((), dtype=dtype).element_size()
         if itemsize <= 0:
             raise ValueError(f"Invalid dtype size for {dtype_str}")
@@ -83,9 +85,8 @@ class NonGpuContextShm(NonGpuContext):
         return self._build_slot_tensors(slots) if slots else None
 
     def commit_store(
-        self, key: Any, instance_id: int, chunks: list[torch.Tensor]
+        self, key: Any, instance_id: int, _chunks: list[torch.Tensor]
     ) -> bool:
-        del chunks
         future = self.mq_client.submit_request(
             RequestType.COMMIT_STORE,
             [key, instance_id, b""],
