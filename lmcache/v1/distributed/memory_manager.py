@@ -20,18 +20,6 @@ from lmcache.v1.memory_management import (
 logger = init_logger(__name__)
 
 
-# HELPER FUNCTIONS
-def _check_shm_capacity(required_bytes: int) -> bool:
-    """Return whether ``/dev/shm`` has enough free space."""
-    if required_bytes <= 0:
-        return True
-    try:
-        free_bytes = shutil.disk_usage("/dev/shm").free
-    except OSError:
-        return False
-    return free_bytes >= required_bytes
-
-
 def _unlink_stale_shm(shm_name: str) -> None:
     """Remove a stale LMCache shm segment if it exists."""
     normalized = shm_name.lstrip("/")

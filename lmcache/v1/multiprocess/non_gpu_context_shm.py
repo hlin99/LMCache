@@ -35,13 +35,15 @@ class NonGpuContextShm(NonGpuContext):
         self._shm_name = shm_name
         self._pool_size = pool_size
         shm_path = os.path.join("/dev/shm", shm_name.lstrip("/"))
-        shm_fd = os.open(shm_path, os.O_RDWR)
+        self._shm_fd = os.open(shm_path, os.O_RDWR)
         try:
             self._mmap_obj = mmap.mmap(
-                shm_fd, self._pool_size, access=mmap.ACCESS_WRITE
+                self._shm_fd, self._pool_size, access=mmap.ACCESS_WRITE
             )
-        finally:
-            os.close(shm_fd)
+        except Exception:
+            os.close(self._shm_fd)
+            self._shm_fd = -1
+            raise
 
     def _make_tensor_view(
         self,
@@ -84,7 +86,12 @@ class NonGpuContextShm(NonGpuContext):
             response = future.result(timeout=self.mq_timeout)
         except TimeoutError:
             return None
-        slots = response.context.get("slots", [])
+        context = response.context if isinstance(response.context, dict) else {}
+        slots = context.get("slots")
+        if not slots:
+            return None
+        if not isinstance(slots, list):
+            return None
         return self._build_slot_tensors(slots) if slots else None
 
     def commit_store(
@@ -127,4 +134,11 @@ class NonGpuContextShm(NonGpuContext):
             return False
 
     def close(self) -> None:
-        self._mmap_obj.close()
+        if self._shm_fd < 0:
+            return
+        try:
+            self._mmap_obj.close()
+        finally:
+            fd = self._shm_fd
+            self._shm_fd = -1
+            os.close(fd)

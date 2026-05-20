@@ -6,6 +6,7 @@ import mmap
 import os
 
 # Third Party
+import pytest
 import torch
 
 # First Party
@@ -14,6 +15,8 @@ from lmcache.v1.distributed.config import L1MemoryManagerConfig
 from lmcache.v1.distributed.memory_manager import create_memory_allocator
 from lmcache.v1.memory_management import MixedMemoryAllocator
 from lmcache.v1.multiprocess.non_gpu_context import NonGpuContextMetadata
+from lmcache.v1.multiprocess.non_gpu_context import create_non_gpu_context
+from lmcache.v1.multiprocess.non_gpu_context_pickle import NonGpuContextPickle
 from lmcache.v1.multiprocess.non_gpu_context_shm import NonGpuContextShm
 from lmcache.v1.multiprocess.protocol import RequestType
 from lmcache.v1.multiprocess.protocols.engine import (
@@ -157,5 +160,66 @@ def test_non_gpu_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         assert context.commit_retrieve("k", 1)
     finally:
         context.close()
+        if os.path.exists(shm_path):
+            os.unlink(shm_path)
+
+
+def test_non_gpu_context_shm_init_raises_when_segment_missing() -> None:
+    with pytest.raises(FileNotFoundError):
+        NonGpuContextShm(
+            metadata=NonGpuContextMetadata(
+                layout_desc=MemoryLayoutDesc(
+                    shapes=[torch.Size([2, 2])],
+                    dtypes=[torch.float32],
+                ),
+                block_size=1,
+                use_mla=False,
+            ),
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            shm_name="lmcache_missing_shm_segment",
+            pool_size=4096,
+        )
+
+
+def test_create_non_gpu_context_falls_back_to_pickle_without_shm_info() -> None:
+    context = create_non_gpu_context(
+        metadata=NonGpuContextMetadata(
+            layout_desc=MemoryLayoutDesc(
+                shapes=[torch.Size([2, 2])],
+                dtypes=[torch.float32],
+            ),
+            block_size=1,
+            use_mla=False,
+        ),
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        shm_name="",
+        pool_size=0,
+    )
+    assert isinstance(context, NonGpuContextPickle)
+
+
+def test_non_gpu_context_shm_close_is_idempotent() -> None:
+    shm_name = f"lmcache_test_close_{os.getpid()}"
+    shm_path = _create_shm_file(shm_name, 4096)
+    try:
+        context = NonGpuContextShm(
+            metadata=NonGpuContextMetadata(
+                layout_desc=MemoryLayoutDesc(
+                    shapes=[torch.Size([2, 2])],
+                    dtypes=[torch.float32],
+                ),
+                block_size=1,
+                use_mla=False,
+            ),
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            shm_name=shm_name,
+            pool_size=4096,
+        )
+        context.close()
+        context.close()
+    finally:
         if os.path.exists(shm_path):
             os.unlink(shm_path)

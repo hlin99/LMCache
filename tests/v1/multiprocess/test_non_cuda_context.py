@@ -459,3 +459,142 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     assert len(recovered_chunks) == 1
     assert torch.allclose(recovered_chunks[0], payload)
+
+
+def test_server_shm_store_idempotent_on_duplicate_key(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure SHM prepare/commit treats duplicate keys as idempotent success."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        IPCCacheEngineKey,
+        RegisterNonGpuContextPayload,
+    )
+    from lmcache.v1.multiprocess.server import MPCacheEngine
+
+    mock_storage = MagicMock()
+    mock_storage.get_shm_pool_info.return_value = {
+        "shm_name": "lmcache_l1_pool_test",
+        "pool_size": 4096,
+    }
+    mock_storage.reserve_write.return_value = {}
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.server.StorageManager",
+            return_value=mock_storage,
+        ),
+        patch("lmcache.v1.multiprocess.server.TokenHasher"),
+        patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
+        patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch(
+            "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
+            return_value=["obj"],
+        ),
+    ):
+        session_cls.return_value.get_or_create.return_value = mock_session
+        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
+
+    engine.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=3,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+    key = IPCCacheEngineKey.from_token_ids(
+        "m",
+        1,
+        0,
+        [1] * 8,
+        start=0,
+        end=8,
+        request_id="req",
+    )
+    response = engine.prepare_store(key, 3)
+    assert response.context == {}
+    assert engine.commit_store(key, 3, b"") is True
+
+
+def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure unregister releases pending SHM read/write reservations."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        IPCCacheEngineKey,
+        RegisterNonGpuContextPayload,
+    )
+    from lmcache.v1.multiprocess.server import MPCacheEngine
+
+    mock_storage = MagicMock()
+    mock_storage.get_shm_pool_info.return_value = {
+        "shm_name": "lmcache_l1_pool_test",
+        "pool_size": 4096,
+    }
+    mock_memory_obj = MagicMock()
+    mock_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    mock_memory_obj.shm_offset = 0
+    mock_memory_obj.shm_byte_length = 2048
+    mock_storage.reserve_write.side_effect = (
+        lambda obj_keys, *_args, **_kwargs: {
+            obj_key: mock_memory_obj for obj_key in obj_keys
+        }
+    )
+    mock_storage.unsafe_read.side_effect = (
+        lambda obj_keys: (obj_keys, [mock_memory_obj for _ in obj_keys])
+    )
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.server.StorageManager",
+            return_value=mock_storage,
+        ),
+        patch("lmcache.v1.multiprocess.server.TokenHasher"),
+        patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
+        patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch(
+            "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
+            return_value=["obj"],
+        ),
+    ):
+        session_cls.return_value.get_or_create.return_value = mock_session
+        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
+
+    engine.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=4,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+    key = IPCCacheEngineKey.from_token_ids(
+        "m",
+        1,
+        0,
+        [1] * 8,
+        start=0,
+        end=8,
+        request_id="req",
+    )
+    assert engine.prepare_store(key, 4).context.get("slots")
+    assert engine.prepare_retrieve(key, 4).success is True
+
+    engine.unregister_kv_cache(4)
+
+    mock_storage.finish_write.assert_called_once()
+    mock_storage.finish_read_prefetched.assert_called_once()
