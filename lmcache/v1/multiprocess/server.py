@@ -397,11 +397,30 @@ class MPCacheEngine:
         )
         shm_pool_info = self.storage_manager.get_shm_pool_info()
         if not isinstance(shm_pool_info, dict):
+            logger.info(
+                "Instance %s non-GPU context using pickle transport "
+                "(no SHM pool info returned)",
+                payload.instance_id,
+            )
             return RegisterNonGpuContextResponse()
-        return RegisterNonGpuContextResponse(
+        response = RegisterNonGpuContextResponse(
             shm_name=str(shm_pool_info.get("shm_name", "")),
             pool_size=int(shm_pool_info.get("pool_size", 0)),
         )
+        if response.shm_name and response.pool_size > 0:
+            logger.info(
+                "Instance %s non-GPU context using SHM transport "
+                "(shm_name=%s, pool_size=%d)",
+                payload.instance_id,
+                response.shm_name,
+                response.pool_size,
+            )
+        else:
+            logger.info(
+                "Instance %s non-GPU context using pickle transport",
+                payload.instance_id,
+            )
+        return response
 
     @staticmethod
     def _make_non_gpu_transfer_key(

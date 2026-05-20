@@ -35,10 +35,14 @@ class NonGpuContextShm(NonGpuContext):
         self._shm_name = shm_name
         self._pool_size = pool_size
         shm_path = os.path.join("/dev/shm", shm_name.lstrip("/"))
-        self._shm_fd = os.open(shm_path, os.O_RDWR)
-        self._mmap_obj = mmap.mmap(
-            self._shm_fd, self._pool_size, access=mmap.ACCESS_WRITE
-        )
+        shm_fd = os.open(shm_path, os.O_RDWR)
+        try:
+            self._mmap_obj = mmap.mmap(
+                shm_fd, self._pool_size, access=mmap.ACCESS_WRITE
+            )
+        finally:
+            os.close(shm_fd)
+        self._buffer: Any = self._mmap_obj
 
     def _make_tensor_view(
         self,
@@ -56,7 +60,7 @@ class NonGpuContextShm(NonGpuContext):
             raise ValueError(f"Invalid dtype size for {dtype_str}")
         count = length // itemsize
         tensor_1d = torch.frombuffer(
-            self._mmap_obj, dtype=dtype, count=count, offset=offset
+            self._buffer, dtype=dtype, count=count, offset=offset
         )
         return tensor_1d.view(torch.Size(shape))
 
@@ -124,7 +128,5 @@ class NonGpuContextShm(NonGpuContext):
             return False
 
     def close(self) -> None:
-        try:
-            self._mmap_obj.close()
-        finally:
-            os.close(self._shm_fd)
+        self._buffer = None
+        self._mmap_obj.close()

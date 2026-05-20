@@ -21,8 +21,11 @@ from typing import Any, cast
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -122,11 +125,17 @@ def create_non_gpu_context(
         # Local
         from .non_gpu_context_shm import NonGpuContextShm
 
+        logger.info(
+            "Creating NonGpuContextShm (shm_name=%s, pool_size=%d)",
+            shm_name,
+            pool_size,
+        )
         return NonGpuContextShm(metadata, mq_client, mq_timeout, shm_name, pool_size)
 
     # Local
     from .non_gpu_context_pickle import NonGpuContextPickle
 
+    logger.info("Creating NonGpuContextPickle (pickle transport)")
     return NonGpuContextPickle(metadata, mq_client, mq_timeout)
 
 
