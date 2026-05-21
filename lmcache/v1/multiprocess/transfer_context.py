@@ -331,6 +331,11 @@ class DataTransferContext(TransferContext):
         torch_dev.synchronize()
         result = self._non_gpu_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
+        # All chunks already in cache — nothing to gather or commit.
+        if chunk_indices is not None and len(chunk_indices) == 0:
+            future: MessagingFuture[bool] = MessagingFuture()
+            future.set_result(True)
+            return future
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
             block_ids,
@@ -342,7 +347,7 @@ class DataTransferContext(TransferContext):
         )
         ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
 
-        future: MessagingFuture[bool] = MessagingFuture()
+        future = MessagingFuture()
         future.set_result(ok)
         return future
 

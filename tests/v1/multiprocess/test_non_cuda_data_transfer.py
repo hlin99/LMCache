@@ -467,9 +467,9 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     """Regression: repeated prompt after worker restart should no-op-store cleanly.
 
     When all object keys already exist in cache, SHM ``prepare_store`` reserves
-    no new objects and returns empty context (no "slots" key). The worker sees
-    no slots and does not call ``commit_store``, so no entry leaks in
-    ``_pending_shm_writes``.
+    no new objects and returns empty slots (``{"slots": [], "chunk_indices": []}``).
+    The worker sees an empty chunk_indices list, skips gather and commit entirely,
+    so no entry leaks in ``_pending_shm_writes`` and no spurious error is logged.
     """
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
@@ -526,8 +526,8 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
         request_id="req",
     )
     prepare_response = engine.prepare_store(key, 3)
-    # Empty context means no slots reserved — worker won't call commit_store.
-    assert prepare_response.context == {}
+    # Server signals all-cached via empty slots list (not missing "slots" key).
+    assert prepare_response.context == {"slots": [], "chunk_indices": []}
 
     # commit_store without a matching prepare must fail (no entry leaked).
     assert engine.commit_store(key, 3, b"") is False
@@ -598,7 +598,7 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
 
     prepare_response = engine.prepare_store(key, 5)
     assert isinstance(prepare_response, PrepareStoreResponse)
-    assert prepare_response.context == {}
+    assert prepare_response.context == {"slots": [], "chunk_indices": []}
     reserved_keys = mock_storage.reserve_write.call_args[0][0]
     mock_storage.finish_write.assert_called_once_with(reserved_keys)
 

@@ -562,7 +562,7 @@ class MPCacheEngine:
             if unused_keys:
                 self.storage_manager.finish_write(unused_keys)
         if not reserved_keys:
-            return PrepareStoreResponse(context={})
+            return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
         transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
         with self._pending_shm_lock:
             self._pending_shm_writes[transfer_key] = reserved_keys

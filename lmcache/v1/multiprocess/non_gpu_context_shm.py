@@ -93,8 +93,11 @@ class NonGpuContextShm(NonGpuContext):
             return None
         context = response.context if isinstance(response.context, dict) else {}
         slots = context.get("slots")
-        if not isinstance(slots, list) or not slots:
+        if not isinstance(slots, list):
             return None
+        if not slots:
+            # Server explicitly signals all chunks are already cached.
+            return [], []
         # chunk_indices is always present when the server has this fix applied.
         # The fallback to range(len(slots)) preserves correctness with an older
         # server: if all returned slots happen to be contiguous from index 0 the
