@@ -1380,7 +1380,8 @@ class LMCacheMPWorkerAdapter:
     def num_blocks_per_chunk(self) -> int:
         """
         Returns:
-            The number of vllm blocks in a LMCache data chunk
+            The number of vllm blocks in a LMCache data chunk, or 1 if
+            the chunk size has not been resolved yet (e.g. server unavailable).
         """
         return self.blocks_in_chunk if self.blocks_in_chunk is not None else 1
 

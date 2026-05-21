@@ -40,6 +40,11 @@ def _make_parallel_strategy() -> ParallelStrategy:
     )
 
 
+def _chunk_size_timeout(*args, **kwargs) -> int:
+    """Stub for ``get_lmcache_chunk_size`` that always raises TimeoutError."""
+    raise TimeoutError("server down")
+
+
 @pytest.fixture
 def fake_adapter(monkeypatch):
     """Build an adapter through its real ``__init__`` with the network
@@ -150,11 +155,7 @@ def test_register_kv_caches_skipped_when_server_unavailable(monkeypatch):
     """register_kv_caches is a no-op when the server never responds."""
     fake_client = MagicMock(name="mq_client")
     monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
-    monkeypatch.setattr(
-        adapter_mod,
-        "get_lmcache_chunk_size",
-        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("server down")),
-    )
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", _chunk_size_timeout)
     send_mock = MagicMock(name="send_lmcache_request")
     monkeypatch.setattr(adapter_mod, "send_lmcache_request", send_mock)
 
@@ -182,11 +183,7 @@ def test_submit_store_skipped_when_chunk_size_unavailable(monkeypatch):
     """submit_store_request is a no-op when the chunk-size fetch times out."""
     fake_client = MagicMock(name="mq_client")
     monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
-    monkeypatch.setattr(
-        adapter_mod,
-        "get_lmcache_chunk_size",
-        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("server down")),
-    )
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", _chunk_size_timeout)
     monkeypatch.setattr(adapter_mod, "send_lmcache_request", MagicMock())
 
     adapter = LMCacheMPWorkerAdapter(
@@ -208,11 +205,7 @@ def test_submit_retrieve_marks_error_blocks_when_chunk_size_unavailable(monkeypa
     """submit_retrieve_request adds block IDs to error set when server is down."""
     fake_client = MagicMock(name="mq_client")
     monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
-    monkeypatch.setattr(
-        adapter_mod,
-        "get_lmcache_chunk_size",
-        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("server down")),
-    )
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", _chunk_size_timeout)
     monkeypatch.setattr(adapter_mod, "send_lmcache_request", MagicMock())
 
     adapter = LMCacheMPWorkerAdapter(
