@@ -388,19 +388,10 @@ class MPCacheEngine:
         with self._contexts_lock:
             existing_context = self.contexts.get(payload.instance_id)
             if existing_context is not None:
-                logger.warning(
-                    "Instance %s's KV cache is already registered, "
-                    "skipping the new registration",
+                return self._build_existing_non_gpu_context_response(
                     payload.instance_id,
+                    existing_context,
                 )
-                if existing_context.shm_active:
-                    pool_info = self.storage_manager.get_shm_pool_info()
-                    if isinstance(pool_info, dict):
-                        return RegisterNonGpuContextResponse(
-                            shm_name=str(pool_info.get("shm_name", "")),
-                            pool_size=int(pool_info.get("pool_size", 0)),
-                        )
-                return RegisterNonGpuContextResponse()
 
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
@@ -451,19 +442,10 @@ class MPCacheEngine:
         with self._contexts_lock:
             existing_context = self.contexts.get(payload.instance_id)
             if existing_context is not None:
-                logger.warning(
-                    "Instance %s's KV cache is already registered, "
-                    "skipping the new registration",
+                return self._build_existing_non_gpu_context_response(
                     payload.instance_id,
+                    existing_context,
                 )
-                if existing_context.shm_active:
-                    pool_info = self.storage_manager.get_shm_pool_info()
-                    if isinstance(pool_info, dict):
-                        return RegisterNonGpuContextResponse(
-                            shm_name=str(pool_info.get("shm_name", "")),
-                            pool_size=int(pool_info.get("pool_size", 0)),
-                        )
-                return RegisterNonGpuContextResponse()
             self.contexts[payload.instance_id] = RegisteredContext(
                 model_name=payload.model_name,
                 world_size=payload.world_size,
@@ -475,6 +457,25 @@ class MPCacheEngine:
                 shm_active=shm_active,
             )
         return response
+
+    def _build_existing_non_gpu_context_response(
+        self,
+        instance_id: int,
+        existing_context: RegisteredContext,
+    ) -> RegisterNonGpuContextResponse:
+        logger.warning(
+            "Instance %s's KV cache is already registered, "
+            "skipping the new registration",
+            instance_id,
+        )
+        if existing_context.shm_active:
+            pool_info = self.storage_manager.get_shm_pool_info()
+            if isinstance(pool_info, dict):
+                return RegisterNonGpuContextResponse(
+                    shm_name=str(pool_info.get("shm_name", "")),
+                    pool_size=int(pool_info.get("pool_size", 0)),
+                )
+        return RegisterNonGpuContextResponse()
 
     @staticmethod
     def _make_non_gpu_transfer_key(

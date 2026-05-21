@@ -10,6 +10,7 @@ import os
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.non_gpu_context import (
     NonGpuContext,
     NonGpuContextMetadata,
@@ -17,6 +18,7 @@ from lmcache.v1.multiprocess.non_gpu_context import (
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 
 INVALID_SHM_FD = -1
+logger = init_logger(__name__)
 
 
 class NonGpuContextShm(NonGpuContext):
@@ -87,10 +89,16 @@ class NonGpuContextShm(NonGpuContext):
             [key, instance_id],
             get_response_class(RequestType.PREPARE_STORE),
         )
-        try:
-            response = future.result(timeout=self.mq_timeout)
-        except TimeoutError:
-            return None
+        while True:
+            try:
+                response = future.result(timeout=self.mq_timeout)
+                break
+            except TimeoutError:
+                logger.warning(
+                    "Timed out waiting for PREPARE_STORE response for "
+                    "instance_id=%s; continuing to wait",
+                    instance_id,
+                )
         context = response.context if isinstance(response.context, dict) else {}
         slots = context.get("slots")
         if not isinstance(slots, list):

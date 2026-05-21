@@ -127,6 +127,68 @@ def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
     assert isinstance(context, DataTransferContext)
 
 
+def test_submit_store_syncs_again_before_commit_with_shm_buffers() -> None:
+    """SHM store path should synchronize after async gather and before commit."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import DataTransferContext
+
+    context = DataTransferContext()
+    context._non_gpu_context = MagicMock()
+    context._non_gpu_context.prepare_store.return_value = ([torch.zeros(1)], [0])
+    context._non_gpu_context.commit_store.return_value = True
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.transfer_context.gather_paged_kv_to_cpu",
+            return_value=[torch.zeros(1)],
+        ),
+        patch("lmcache.v1.multiprocess.transfer_context.torch_dev.synchronize") as sync,
+    ):
+        future = context.submit_store(
+            _request_id="r",
+            key="k",
+            instance_id=1,
+            kv_caches={"layer_0": torch.zeros(1)},
+            block_ids=[0],
+            _event=MagicMock(),
+            blocks_in_chunk=1,
+        )
+
+    assert future.result(timeout=0.1) is True
+    assert sync.call_count == 2
+
+
+def test_submit_store_no_extra_sync_without_shm_buffers() -> None:
+    """Pickle/fallback store path should keep the original single sync."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import DataTransferContext
+
+    context = DataTransferContext()
+    context._non_gpu_context = MagicMock()
+    context._non_gpu_context.prepare_store.return_value = None
+    context._non_gpu_context.commit_store.return_value = True
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.transfer_context.gather_paged_kv_to_cpu",
+            return_value=[torch.zeros(1)],
+        ),
+        patch("lmcache.v1.multiprocess.transfer_context.torch_dev.synchronize") as sync,
+    ):
+        future = context.submit_store(
+            _request_id="r",
+            key="k",
+            instance_id=1,
+            kv_caches={"layer_0": torch.zeros(1)},
+            block_ids=[0],
+            _event=MagicMock(),
+            blocks_in_chunk=1,
+        )
+
+    assert future.result(timeout=0.1) is True
+    assert sync.call_count == 1
+
+
 def test_compute_kv_layout_and_gather_scatter_roundtrip() -> None:
     """Validate layout extraction and gather/scatter round-trip on CPU tensors."""
     # First Party
@@ -952,6 +1014,18 @@ class _CompletedFuture:
         return self._value
 
 
+class _TimeoutThenCompletedFuture:
+    def __init__(self, value):
+        self._value = value
+        self.calls = 0
+
+    def result(self, timeout=None):  # noqa: ARG002
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError()
+        return self._value
+
+
 def _create_shm_file(shm_name: str, size: int) -> str:
     path = os.path.join("/dev/shm", shm_name.lstrip("/"))
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -1066,6 +1140,56 @@ def test_non_gpu_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         context.close()
         if os.path.exists(shm_path):
             os.unlink(shm_path)
+
+
+def test_non_gpu_context_shm_prepare_store_retries_on_timeout() -> None:
+    """prepare_store should keep waiting on timeout instead of returning None."""
+    shm_name = f"lmcache_test_timeout_{os.getpid()}"
+    shm_path = _create_shm_file(shm_name, 4096)
+    slots = [
+        {
+            "offset": 0,
+            "length": 16,
+            "shape": [2, 2],
+            "dtype": "float32",
+        }
+    ]
+    future = _TimeoutThenCompletedFuture(
+        PrepareStoreResponse(context={"slots": slots, "chunk_indices": [0]})
+    )
+
+    mq_client = MagicMock()
+    mq_client.submit_request.return_value = future
+    context = NonGpuContextShm(
+        metadata=NonGpuContextMetadata(
+            layout_desc=MemoryLayoutDesc(
+                shapes=[torch.Size([2, 2])],
+                dtypes=[torch.float32],
+            ),
+            block_size=1,
+            use_mla=False,
+        ),
+        mq_client=mq_client,
+        mq_timeout=0.001,
+        shm_name=shm_name,
+        pool_size=4096,
+    )
+    try:
+        with patch(
+            "lmcache.v1.multiprocess.non_gpu_context_shm.logger.warning"
+        ) as warning:
+            result = context.prepare_store(key="k", instance_id=1)
+    finally:
+        context.close()
+        if os.path.exists(shm_path):
+            os.unlink(shm_path)
+
+    assert result is not None
+    tensors, chunk_indices = result
+    assert len(tensors) == 1
+    assert chunk_indices == [0]
+    assert future.calls == 2
+    warning.assert_called_once()
 
 
 def test_non_gpu_context_shm_init_raises_when_segment_missing() -> None:
