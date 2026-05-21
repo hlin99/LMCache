@@ -218,3 +218,44 @@ A larger L1 cache means fewer L2 round-trips.
 **Logging:**
 Use ``LMCACHE_LOG_LEVEL=DEBUG`` during initial setup to verify L2 store/load
 activity.  Switch to ``INFO`` (default) for production to reduce log volume.
+
+.. _non-gpu-transfer-mode:
+
+Non-GPU Transfer Mode
+---------------------
+
+For non-CUDA (XPU/CPU) deployments, LMCache workers exchange KV cache data
+through CPU memory rather than CUDA IPC handles.  By default, the server
+auto-allocates a POSIX shared-memory segment named
+``lmcache_l1_pool_<pid>`` and informs the worker of its name, enabling a
+zero-copy SHM transfer path.
+
+You can override this behavior with ``--shm-name``:
+
+.. code-block:: bash
+
+    # Default: auto-allocate a POSIX SHM segment (current behavior)
+    lmcache server --l1-size-gb 20
+
+    # Force pickle path — no SHM, workers use serialized transfer:
+    lmcache server --l1-size-gb 20 --shm-name ""
+
+    # Use a specific, predictable SHM segment name:
+    lmcache server --l1-size-gb 20 --shm-name "my_kv_pool"
+
+**When to use each mode:**
+
+- **Auto-allocate (default):** best for standard deployments where POSIX SHM
+  is available (Linux ``/dev/shm``).  Lowest copy count for non-CUDA workers.
+- **Force pickle (``--shm-name ""``):** use on platforms where POSIX SHM is
+  unavailable or restricted (e.g., certain XPU/cloud environments), or when
+  debugging transport issues.  Higher serialization overhead.
+- **Named segment (``--shm-name "my_kv_pool"``):** use when you need a
+  predictable segment name across server restarts or when multiple processes
+  must share the same SHM segment.
+
+.. note::
+   Worker-side code automatically picks pickle when it receives an empty
+   ``shm_name`` in the registration response, so no worker-side changes are
+   needed.
+

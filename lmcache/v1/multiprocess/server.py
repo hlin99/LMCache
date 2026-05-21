@@ -234,13 +234,31 @@ class MPCacheEngine:
         storage_manager_config: StorageManagerConfig,
         chunk_size: int = 256,
         hash_algorithm: str = "blake3",
+        shm_name_override: str | None = None,
     ):
+        """Initialize the cache engine.
+
+        Args:
+            storage_manager_config: Configuration for the storage manager.
+            chunk_size: Chunk size in tokens for KV cache operations.
+            hash_algorithm: Hash algorithm for token-based operations
+                (``builtin``, ``sha256_cbor``, or ``blake3``).
+            shm_name_override: Controls the POSIX SHM segment name used for
+                non-GPU (XPU/CPU) KV cache transfer.
+                ``None`` (default) auto-allocates a segment name.
+                ``""`` forces the pickle transport path (disables SHM).
+                Any other string uses that exact name for the SHM segment.
+        """
         # Worker instance ID -> registered context metadata
         self.contexts: dict[int, RegisteredContext] = {}
         self._contexts_lock = threading.Lock()
 
         # chunk size
         self.chunk_size = chunk_size
+
+        # SHM name override for non-GPU context registration.
+        # None -> auto-allocate (default), "" -> force pickle, other -> use given name.
+        self._shm_name_override = shm_name_override
 
         # Lock for clear() to avoid concurrent storage manager mutations
         self.lock = threading.Lock()
@@ -418,6 +436,39 @@ class MPCacheEngine:
             )
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+
+        # Apply shm_name override if configured.
+        # "" -> force pickle (return empty response, skip SHM pool query).
+        # non-empty string -> use specified name; storage manager was already
+        #   configured to create the SHM segment with this name in run_cache_server.
+        # None -> keep existing auto-allocate behavior.
+        if self._shm_name_override == "":
+            logger.info(
+                "Instance %s non-GPU context using pickle transport "
+                '(--shm-name "" forces pickle path)',
+                payload.instance_id,
+            )
+            with self._contexts_lock:
+                existing_context = self.contexts.get(payload.instance_id)
+                if existing_context is not None:
+                    logger.warning(
+                        "Instance %s's KV cache is already registered, "
+                        "skipping the new registration",
+                        payload.instance_id,
+                    )
+                    return RegisterNonGpuContextResponse()
+                self.contexts[payload.instance_id] = RegisteredContext(
+                    model_name=payload.model_name,
+                    world_size=payload.world_size,
+                    non_cuda_metadata=NonGpuContextMetadata(
+                        layout_desc=layout_desc,
+                        block_size=payload.block_size,
+                        use_mla=payload.use_mla,
+                    ),
+                    shm_active=False,
+                )
+            return RegisterNonGpuContextResponse()
+
         shm_pool_info = self.storage_manager.get_shm_pool_info()
         shm_active = False
         if not isinstance(shm_pool_info, dict):
@@ -428,7 +479,11 @@ class MPCacheEngine:
             )
             response = RegisterNonGpuContextResponse()
         else:
-            shm_name = str(shm_pool_info.get("shm_name", ""))
+            shm_name = (
+                self._shm_name_override
+                if self._shm_name_override is not None
+                else str(shm_pool_info.get("shm_name", ""))
+            )
             pool_size = int(shm_pool_info.get("pool_size", 0))
             shm_active = bool(shm_name) and pool_size > 0
             response = RegisterNonGpuContextResponse(
@@ -1624,11 +1679,22 @@ def run_cache_server(
     # storage-manager calls during engine init are captured too.
     maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
 
+    # Apply shm_name override from MP config to storage config before the
+    # StorageManager (and its SHM pool allocator) is created.
+    # None -> no change (auto-allocate).
+    # "" -> set empty name to disable SHM pool creation (force pickle path).
+    # non-empty -> use this exact name for the SHM pool segment.
+    if mp_config.shm_name is not None:
+        storage_manager_config.l1_manager_config.memory_config.shm_name = (
+            mp_config.shm_name
+        )
+
     # Initialize the engine (loggers self-register with the global controller)
     engine = MPCacheEngine(
         storage_manager_config=storage_manager_config,
         chunk_size=mp_config.chunk_size,
         hash_algorithm=mp_config.hash_algorithm,
+        shm_name_override=mp_config.shm_name,
     )
 
     # Initialize the message queue server

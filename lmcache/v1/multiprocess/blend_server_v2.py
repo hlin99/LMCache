@@ -370,9 +370,23 @@ class BlendEngineV2(MPCacheEngine):
         storage_manager_config: StorageManagerConfig,
         chunk_size: int = 256,
         hash_algorithm: str = "blake3",
+        shm_name_override: str | None = None,
     ):
+        """Initialize the blend cache engine.
+
+        Args:
+            storage_manager_config: Configuration for the storage manager.
+            chunk_size: Chunk size in tokens for KV cache operations.
+            hash_algorithm: Hash algorithm for token-based operations.
+            shm_name_override: Controls the POSIX SHM segment name used for
+                non-GPU KV cache transfer.  See :class:`MPCacheEngine` for
+                semantics.
+        """
         super().__init__(
-            storage_manager_config, chunk_size, hash_algorithm=hash_algorithm
+            storage_manager_config,
+            chunk_size,
+            hash_algorithm=hash_algorithm,
+            shm_name_override=shm_name_override,
         )
 
         self._cb_gpu_contexts: dict[int, PlainGPUCacheContext] = {}
@@ -1223,11 +1237,22 @@ def run_cache_server(
     # Wire up the trace recorder (no-op when --trace-level is unset).
     maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
 
+    # Apply shm_name override from MP config to storage config before the
+    # StorageManager (and its SHM pool allocator) is created.
+    # None -> no change (auto-allocate).
+    # "" -> set empty name to disable SHM pool creation (force pickle path).
+    # non-empty -> use this exact name for the SHM pool segment.
+    if mp_config.shm_name is not None:
+        storage_manager_config.l1_manager_config.memory_config.shm_name = (
+            mp_config.shm_name
+        )
+
     # Initialize the engine (loggers self-register with the global controller)
     engine = BlendEngineV2(
         storage_manager_config=storage_manager_config,
         chunk_size=mp_config.chunk_size,
         hash_algorithm=mp_config.hash_algorithm,
+        shm_name_override=mp_config.shm_name,
     )
 
     # Initialize the message queue server

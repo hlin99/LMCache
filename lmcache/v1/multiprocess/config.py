@@ -47,6 +47,17 @@ class MPServerConfig:
     )
     """Runtime plugin configuration (locations + extra config)."""
 
+    shm_name: str | None = None
+    """Shared memory segment name for non-GPU (XPU/CPU) KV cache transfer.
+
+    - ``None`` (default): auto-allocate a POSIX SHM segment (current behavior).
+    - ``""``: force pickle path — server returns an empty ``shm_name`` and
+      ``pool_size=0`` in ``RegisterNonGpuContextResponse``, causing the worker
+      to use ``NonGpuContextPickle`` instead of SHM.
+    - Any other string: use that exact name when creating or returning the
+      SHM pool (useful for predictable/shared segment names across restarts).
+    """
+
 
 @dataclass
 class RuntimePluginConfig:
@@ -167,6 +178,15 @@ def add_mp_server_args(
         'Example: \'{"plugin.frontend.heartbeat_url": '
         '"http://localhost:5000/heartbeat"}\'',
     )
+    mp_group.add_argument(
+        "--shm-name",
+        type=str,
+        default=None,
+        help="SHM segment name for non-GPU KV transfer. "
+        "Default (not specified): auto-allocate. "
+        'Set to "" to force pickle path (disable SHM). '
+        "Set to a name to use that specific SHM segment.",
+    )
     return parser
 
 
@@ -202,6 +222,7 @@ def parse_args_to_mp_server_config(
             locations=(args.runtime_plugin_locations or []),
             extra_config=plugin_extra,
         ),
+        shm_name=getattr(args, "shm_name", None),
     )
 
 

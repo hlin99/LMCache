@@ -63,6 +63,16 @@ Source: ``lmcache/v1/multiprocess/config.py``
      - JSON string of extra key-value config forwarded to runtime
        plugins via ``LMCACHE_RUNTIME_PLUGIN_EXTRA_CONFIG``. Example:
        ``'{"plugin.frontend.heartbeat_url": "http://localhost:5000/heartbeat"}'``.
+   * - ``--shm-name``
+     - ``None`` (auto-allocate)
+     - POSIX shared-memory segment name used for non-GPU (XPU/CPU) KV
+       cache transfer.  When not specified, the server auto-allocates a
+       segment named ``lmcache_l1_pool_<pid>`` (current behavior).
+       Set to ``""`` to force the pickle transport (disables SHM
+       entirely).  Set to a non-empty string to use that exact segment
+       name — useful for predictable names across restarts or when
+       sharing a segment between processes.
+       See :ref:`non-gpu-transfer-mode` for details.
 
 Lookup Hash Logging
 -------------------
