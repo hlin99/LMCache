@@ -240,6 +240,7 @@ def test_chunk_size_fetched_only_once(monkeypatch):
     monkeypatch.setattr(
         adapter_mod, "send_lmcache_request", MagicMock(return_value=future)
     )
+    # Stub layout helpers required by register_kv_caches (avoid CUDA IPC calls).
     monkeypatch.setattr(adapter_mod, "wrap_kv_caches", lambda kv: list(kv.values()))
     monkeypatch.setattr("lmcache.integration.vllm.utils.vllm_layout_hints", lambda: {})
 

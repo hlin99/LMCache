@@ -1383,6 +1383,7 @@ class LMCacheMPWorkerAdapter:
             The number of vllm blocks in a LMCache data chunk, or 1 if
             the chunk size has not been resolved yet (e.g. server unavailable).
         """
+        self._ensure_chunk_size()
         return self.blocks_in_chunk if self.blocks_in_chunk is not None else 1
 
     def get_block_ids_with_load_errors(self) -> set[int]:
