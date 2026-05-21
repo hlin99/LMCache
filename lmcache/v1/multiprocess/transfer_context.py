@@ -330,10 +330,7 @@ class DataTransferContext(TransferContext):
 
         torch_dev.synchronize()
         result = self._non_gpu_context.prepare_store(key, instance_id)
-        out_buffers: list[torch.Tensor] | None = None
-        chunk_indices: list[int] | None = None
-        if result is not None:
-            out_buffers, chunk_indices = result
+        out_buffers, chunk_indices = result if result is not None else (None, None)
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
             block_ids,

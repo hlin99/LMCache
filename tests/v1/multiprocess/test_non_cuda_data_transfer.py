@@ -815,8 +815,9 @@ def test_gather_paged_kv_with_chunk_indices_subset() -> None:
     # 3 chunks (6 blocks, 2 blocks per chunk), but we only want chunks 0 and 2
     source = _make_kv_caches(num_layers=2, num_blocks=6, block_size=4)
     blocks_per_chunk = 2
-    # Pre-allocate output buffers for chunks 0 and 2 only (2 tensors, not 3)
-    # Shape: [2, num_layers, chunk_tokens, hidden_dim] = [2, 2, 8, 16]
+    # Pre-allocate output buffers for chunks 0 and 2 only (2 tensors, not 3).
+    # Shape: [2, num_layers, chunk_tokens, hidden_dim] where
+    # chunk_tokens = blocks_per_chunk * block_size = 2 * 4 = 8.
     out0 = torch.zeros(2, 2, 8, 16)
     out2 = torch.zeros(2, 2, 8, 16)
     out_buffers = [out0, out2]
