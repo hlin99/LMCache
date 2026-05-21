@@ -33,10 +33,10 @@ class NonGpuContextShm(NonGpuContext):
 
         self._shm_name = shm_name
         self._pool_size = pool_size
-        self._shm: shared_memory.SharedMemory | None = shared_memory.SharedMemory(
-            name=shm_name.lstrip("/"), create=False
-        )
-        self._mmap_obj = self._shm.buf
+        self._shm: shared_memory.SharedMemory | None = None
+        self._shm_buffer: memoryview | None = None
+        self._shm = shared_memory.SharedMemory(name=shm_name.lstrip("/"), create=False)
+        self._shm_buffer = self._shm.buf
 
     def _make_tensor_view(
         self,
@@ -53,8 +53,10 @@ class NonGpuContextShm(NonGpuContext):
         if itemsize <= 0:
             raise ValueError(f"Invalid dtype size for {dtype_str}")
         count = length // itemsize
+        if self._shm_buffer is None:
+            raise RuntimeError("Shared memory buffer is not available")
         tensor_1d = torch.frombuffer(
-            self._mmap_obj, dtype=dtype, count=count, offset=offset
+            self._shm_buffer, dtype=dtype, count=count, offset=offset
         )
         return tensor_1d.view(torch.Size(shape))
 
@@ -146,3 +148,4 @@ class NonGpuContextShm(NonGpuContext):
             self._shm.close()
         finally:
             self._shm = None
+            self._shm_buffer = None
