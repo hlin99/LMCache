@@ -920,24 +920,23 @@ def test_server_prepare_store_includes_chunk_indices(
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-
-    engine.register_kv_cache_non_gpu_context(
-        RegisterNonGpuContextPayload(
-            instance_id=10,
-            model_name="m",
-            world_size=1,
-            block_size=4,
-            num_layers=2,
-            hidden_dim_size=16,
-            dtype_str="float32",
-            use_mla=False,
+        engine.register_kv_cache_non_gpu_context(
+            RegisterNonGpuContextPayload(
+                instance_id=10,
+                model_name="m",
+                world_size=1,
+                block_size=4,
+                num_layers=2,
+                hidden_dim_size=16,
+                dtype_str="float32",
+                use_mla=False,
+            )
         )
-    )
-    key = IPCCacheEngineKey.from_token_ids(
-        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req"
-    )
-    response = engine.prepare_store(key, 10)
-    ctx = response.context
+        key = IPCCacheEngineKey.from_token_ids(
+            "m", 1, 0, [1] * 16, start=0, end=16, request_id="req"
+        )
+        response = engine.prepare_store(key, 10)
+        ctx = response.context
 
     # slots should have 1 entry (only obj2 reserved)
     assert len(ctx.get("slots", [])) == 1
@@ -1048,8 +1047,9 @@ def test_non_gpu_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         pool_size=4096,
     )
     try:
-        store_views = context.prepare_store(key="k", instance_id=1)
-        assert store_views is not None
+        store_result = context.prepare_store(key="k", instance_id=1)
+        assert store_result is not None
+        store_views, _ = store_result
         store_views[0].copy_(
             torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
         )
