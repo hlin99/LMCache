@@ -234,7 +234,7 @@ You can override this behavior with ``--shm-name``:
 
 .. code-block:: bash
 
-    # Default: auto-allocate a POSIX SHM segment (current behavior)
+    # Default: auto-allocate a POSIX SHM segment
     lmcache server --l1-size-gb 20
 
     # Force pickle path — no SHM, workers use serialized transfer:

@@ -479,6 +479,11 @@ class MPCacheEngine:
             )
             response = RegisterNonGpuContextResponse()
         else:
+            # When shm_name_override is a non-empty string, the SHM pool was
+            # already created with that name (applied to storage_manager_config
+            # in run_cache_server before the StorageManager was constructed).
+            # We use the override name here to be explicit and consistent.
+            # When None, fall back to whatever name the storage manager allocated.
             shm_name = (
                 self._shm_name_override
                 if self._shm_name_override is not None
