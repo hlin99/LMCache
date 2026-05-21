@@ -682,6 +682,50 @@ def test_server_shm_transport_is_per_instance(stub_native_storage_ops: Any) -> N
     assert mock_storage.reserve_write.call_count == 1
 
 
+def test_server_non_gpu_reregister_returns_existing_shm_response(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure duplicate non-GPU registration returns existing SHM response."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
+    from lmcache.v1.multiprocess.server import MPCacheEngine
+
+    mock_storage = MagicMock()
+    mock_storage.get_shm_pool_info.return_value = {
+        "shm_name": "lmcache_test_pool",
+        "pool_size": 2048,
+    }
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.server.StorageManager",
+            return_value=mock_storage,
+        ),
+        patch("lmcache.v1.multiprocess.server.TokenHasher"),
+        patch("lmcache.v1.multiprocess.server.SessionManager"),
+        patch("lmcache.v1.multiprocess.server.get_event_bus"),
+    ):
+        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
+
+    payload = RegisterNonGpuContextPayload(
+        instance_id=8,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+    )
+    first_response = engine.register_kv_cache_non_gpu_context(payload)
+    second_response = engine.register_kv_cache_non_gpu_context(payload)
+
+    assert first_response.shm_name == "lmcache_test_pool"
+    assert first_response.pool_size == 2048
+    assert second_response.shm_name == "lmcache_test_pool"
+    assert second_response.pool_size == 2048
+
+
 def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
     stub_native_storage_ops: Any,
 ) -> None:

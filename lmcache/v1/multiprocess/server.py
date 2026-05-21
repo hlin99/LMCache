@@ -309,14 +309,13 @@ class MPCacheEngine:
             layout_hints: See :class:`LayoutHints`.  Forwarded to
                 :class:`GPUCacheContext` for GPU KV format detection.
         """
-        with self._contexts_lock:
-            if instance_id in self.contexts:
-                logger.warning(
-                    "Instance %s's KV cache is already registered, "
-                    "skipping the new registration",
-                    instance_id,
-                )
-                return
+        if instance_id in self.contexts:
+            logger.warning(
+                "Instance %s's KV cache is already registered, "
+                "skipping the new registration",
+                instance_id,
+            )
+            return
 
         gpu_context = GPUCacheContext(
             kv_caches,
@@ -324,19 +323,11 @@ class MPCacheEngine:
             layout_hints=layout_hints or None,
             engine_type=engine_type,
         )
-        with self._contexts_lock:
-            if instance_id in self.contexts:
-                logger.warning(
-                    "Instance %s's KV cache is already registered, "
-                    "skipping the new registration",
-                    instance_id,
-                )
-                return
-            self.contexts[instance_id] = RegisteredContext(
-                model_name=model_name,
-                world_size=world_size,
-                gpu_context=gpu_context,
-            )
+        self.contexts[instance_id] = RegisteredContext(
+            model_name=model_name,
+            world_size=world_size,
+            gpu_context=gpu_context,
+        )
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
             instance_id,
@@ -350,8 +341,7 @@ class MPCacheEngine:
         Args:
             instance_id (int): The GPU instance ID (such as PID).
         """
-        with self._contexts_lock:
-            context = self.contexts.pop(instance_id, None)
+        context = self.contexts.pop(instance_id, None)
         if context is None:
             logger.warning(
                 "No registered context found for instance ID %d", instance_id
@@ -396,12 +386,20 @@ class MPCacheEngine:
             ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
         """
         with self._contexts_lock:
-            if payload.instance_id in self.contexts:
+            existing_context = self.contexts.get(payload.instance_id)
+            if existing_context is not None:
                 logger.warning(
                     "Instance %s's KV cache is already registered, "
                     "skipping the new registration",
                     payload.instance_id,
                 )
+                if existing_context.shm_active:
+                    pool_info = self.storage_manager.get_shm_pool_info()
+                    if isinstance(pool_info, dict):
+                        return RegisterNonGpuContextResponse(
+                            shm_name=str(pool_info.get("shm_name", "")),
+                            pool_size=int(pool_info.get("pool_size", 0)),
+                        )
                 return RegisterNonGpuContextResponse()
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -451,12 +449,20 @@ class MPCacheEngine:
                     payload.instance_id,
                 )
         with self._contexts_lock:
-            if payload.instance_id in self.contexts:
+            existing_context = self.contexts.get(payload.instance_id)
+            if existing_context is not None:
                 logger.warning(
                     "Instance %s's KV cache is already registered, "
                     "skipping the new registration",
                     payload.instance_id,
                 )
+                if existing_context.shm_active:
+                    pool_info = self.storage_manager.get_shm_pool_info()
+                    if isinstance(pool_info, dict):
+                        return RegisterNonGpuContextResponse(
+                            shm_name=str(pool_info.get("shm_name", "")),
+                            pool_size=int(pool_info.get("pool_size", 0)),
+                        )
                 return RegisterNonGpuContextResponse()
             self.contexts[payload.instance_id] = RegisteredContext(
                 model_name=payload.model_name,
