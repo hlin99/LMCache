@@ -539,9 +539,10 @@ class MPCacheEngine:
             obj_keys, context.non_cuda_metadata.layout_desc, "new"
         )
         slots: list[dict] = []
+        chunk_indices: list[int] = []
         reserved_keys: list[ObjectKey] = []
         try:
-            for obj_key in obj_keys:
+            for idx, obj_key in enumerate(obj_keys):
                 memory_obj = reserved.get(obj_key)
                 if memory_obj is None or memory_obj.tensor is None:
                     continue
@@ -553,6 +554,7 @@ class MPCacheEngine:
                         "dtype": _dtype_to_name(memory_obj.tensor.dtype),
                     }
                 )
+                chunk_indices.append(idx)
                 reserved_keys.append(obj_key)
         finally:
             reserved_keys_set = set(reserved_keys)
@@ -564,7 +566,9 @@ class MPCacheEngine:
         transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
         with self._pending_shm_lock:
             self._pending_shm_writes[transfer_key] = reserved_keys
-        return PrepareStoreResponse(context={"slots": slots})
+        return PrepareStoreResponse(
+            context={"slots": slots, "chunk_indices": chunk_indices}
+        )
 
     @_lmcache_nvtx_annotate
     def commit_store(

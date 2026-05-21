@@ -800,3 +800,130 @@ def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
 
     mock_storage.finish_write.assert_called_once()
     mock_storage.finish_read_prefetched.assert_called_once()
+
+
+def test_gather_paged_kv_with_chunk_indices_subset() -> None:
+    """gather_paged_kv_to_cpu with chunk_indices only gathers the specified chunks.
+
+    This tests the fix for the IndexError that occurred when SHM prepare_store
+    returned fewer slots than total chunks because some chunks already existed
+    in cache.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.non_gpu_context import gather_paged_kv_to_cpu
+
+    # 3 chunks (6 blocks, 2 blocks per chunk), but we only want chunks 0 and 2
+    source = _make_kv_caches(num_layers=2, num_blocks=6, block_size=4)
+    blocks_per_chunk = 2
+    # Pre-allocate output buffers for chunks 0 and 2 only (2 tensors, not 3)
+    # Shape: [2, num_layers, chunk_tokens, hidden_dim] = [2, 2, 8, 16]
+    out0 = torch.zeros(2, 2, 8, 16)
+    out2 = torch.zeros(2, 2, 8, 16)
+    out_buffers = [out0, out2]
+
+    # With chunk_indices=[0, 2], gather only chunks at positions 0 and 2
+    # block_ids has 6 entries: [0,1] for chunk 0, [2,3] for chunk 1, [4,5] for chunk 2
+    result = gather_paged_kv_to_cpu(
+        source,
+        block_ids=[0, 1, 2, 3, 4, 5],
+        blocks_per_chunk=blocks_per_chunk,
+        out=out_buffers,
+        chunk_indices=[0, 2],
+    )
+
+    # Result should be the same list as out_buffers (in-place fill)
+    assert result is out_buffers
+
+    # out_buffers[0] should contain chunk 0 (blocks 0,1) data
+    # out_buffers[1] should contain chunk 2 (blocks 4,5) data
+    # Verify by independently gathering all chunks and comparing
+    all_chunks = gather_paged_kv_to_cpu(source, [0, 1, 2, 3, 4, 5], blocks_per_chunk)
+    assert torch.allclose(out_buffers[0], all_chunks[0])
+    assert torch.allclose(out_buffers[1], all_chunks[2])
+
+
+def test_gather_paged_kv_chunk_indices_none_is_backward_compatible() -> None:
+    """chunk_indices=None gathers all chunks, same as before the fix."""
+    # First Party
+    from lmcache.v1.multiprocess.non_gpu_context import gather_paged_kv_to_cpu
+
+    source = _make_kv_caches(num_layers=2, num_blocks=4, block_size=4)
+    out_all = gather_paged_kv_to_cpu(
+        source, [0, 1, 2, 3], blocks_per_chunk=2, chunk_indices=None
+    )
+    out_default = gather_paged_kv_to_cpu(source, [0, 1, 2, 3], blocks_per_chunk=2)
+    assert len(out_all) == len(out_default) == 2
+    for a, b in zip(out_all, out_default, strict=True):
+        assert torch.allclose(a, b)
+
+
+def test_server_prepare_store_includes_chunk_indices(
+    stub_native_storage_ops: Any,
+) -> None:
+    """prepare_store response context includes chunk_indices for SHM mode.
+
+    Regression test: the server must return the positional indices of the
+    reserved chunks so the client only gathers KV data for those chunks.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        IPCCacheEngineKey,
+        RegisterNonGpuContextPayload,
+    )
+    from lmcache.v1.multiprocess.server import MPCacheEngine
+
+    mock_storage = MagicMock()
+    mock_storage.get_shm_pool_info.return_value = {
+        "shm_name": "lmcache_test_pool",
+        "pool_size": 4096,
+    }
+    obj1 = "obj1"
+    obj2 = "obj2"
+    mock_memory_obj = MagicMock()
+    mock_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    mock_memory_obj.shm_offset = 0
+    mock_memory_obj.shm_byte_length = 2048
+    # Only obj2 (index 1) is reserved; obj1 (index 0) already exists in cache.
+    mock_storage.reserve_write.return_value = {obj2: mock_memory_obj}
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h1", b"h2"]
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.server.StorageManager",
+            return_value=mock_storage,
+        ),
+        patch("lmcache.v1.multiprocess.server.TokenHasher"),
+        patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
+        patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch(
+            "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
+            return_value=[obj1, obj2],
+        ),
+    ):
+        session_cls.return_value.get_or_create.return_value = mock_session
+        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
+
+    engine.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=10,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+    key = IPCCacheEngineKey.from_token_ids(
+        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req"
+    )
+    response = engine.prepare_store(key, 10)
+    ctx = response.context
+
+    # slots should have 1 entry (only obj2 reserved)
+    assert len(ctx.get("slots", [])) == 1
+    # chunk_indices should be [1] (position of obj2 in [obj1, obj2])
+    assert ctx.get("chunk_indices") == [1]
+

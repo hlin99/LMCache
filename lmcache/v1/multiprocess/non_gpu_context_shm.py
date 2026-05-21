@@ -79,7 +79,9 @@ class NonGpuContextShm(NonGpuContext):
             for slot in slots
         ]
 
-    def prepare_store(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
+    def prepare_store(
+        self, key: Any, instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int]] | None:
         future = self.mq_client.submit_request(
             RequestType.PREPARE_STORE,
             [key, instance_id],
@@ -93,7 +95,8 @@ class NonGpuContextShm(NonGpuContext):
         slots = context.get("slots")
         if not isinstance(slots, list) or not slots:
             return None
-        return self._build_slot_tensors(slots)
+        chunk_indices: list[int] = context.get("chunk_indices", list(range(len(slots))))
+        return self._build_slot_tensors(slots), chunk_indices
 
     def commit_store(
         self, key: Any, instance_id: int, _chunks: list[torch.Tensor]

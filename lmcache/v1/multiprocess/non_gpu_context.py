@@ -72,8 +72,18 @@ class NonGpuContext(ABC):
         return self.metadata.layout_desc
 
     @abstractmethod
-    def prepare_store(self, key: Any, instance_id: int) -> list[torch.Tensor] | None:
-        """Prepare store. Returns pre-allocated out buffers (shm) or None (pickle)."""
+    def prepare_store(
+        self, key: Any, instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int]] | None:
+        """Prepare store.
+
+        Returns a ``(tensors, chunk_indices)`` tuple for SHM mode or ``None``
+        for pickle mode / when no new chunks need writing.
+
+        The ``chunk_indices`` list contains the position of each reserved chunk
+        within the full chunk sequence so that the caller only gathers data for
+        chunks that were actually reserved (i.e. not already present in cache).
+        """
         ...
 
     @abstractmethod
@@ -190,6 +200,7 @@ def gather_paged_kv_to_cpu(
     layout_hints: Any | None = None,
     gpu_kv_format: Any | None = None,
     out: list[torch.Tensor] | None = None,
+    chunk_indices: list[int] | None = None,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
@@ -199,6 +210,14 @@ def gather_paged_kv_to_cpu(
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
+        out: Optional pre-allocated output tensors (one per entry in
+            ``chunk_indices`` when ``chunk_indices`` is given, or one per
+            chunk otherwise).
+        chunk_indices: Optional list of chunk positions (into the full
+            ``block_ids`` sequence) to gather.  When provided together with
+            ``out``, only those chunks are gathered and written into
+            ``out[i]`` in order.  When ``None``, all chunks are gathered
+            (backward-compatible behaviour).
 
     Returns:
         List of CPU tensors, one per chunk. For non-MLA each chunk has shape
@@ -234,7 +253,14 @@ def gather_paged_kv_to_cpu(
     layer_tensors = cast(list[torch.Tensor], normalized)
 
     chunks: list[torch.Tensor] = [] if out is None else out
-    for chunk_idx in range(num_chunks):
+
+    # When chunk_indices is given (SHM partial-reservation path), only
+    # process the specified subset.  The i-th entry in chunk_indices is the
+    # position of that chunk within the full block_ids sequence; the
+    # corresponding pre-allocated slot lives at out[i].
+    iter_indices = chunk_indices if chunk_indices is not None else range(num_chunks)
+
+    for out_idx, chunk_idx in enumerate(iter_indices):
         chunk_block_ids = block_ids[
             chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
         ]
@@ -250,7 +276,7 @@ def gather_paged_kv_to_cpu(
                 )
             chunk_tensor = torch.stack(mla_layers, dim=0)
             if out is not None:
-                out[chunk_idx].copy_(chunk_tensor, non_blocking=True)
+                out[out_idx].copy_(chunk_tensor, non_blocking=True)
             else:
                 chunks.append(chunk_tensor.cpu())
         else:
@@ -303,7 +329,7 @@ def gather_paged_kv_to_cpu(
             v_stacked = torch.stack(v_layers, dim=0)
             chunk_tensor = torch.stack([k_stacked, v_stacked], dim=0)
             if out is not None:
-                out[chunk_idx].copy_(chunk_tensor, non_blocking=True)
+                out[out_idx].copy_(chunk_tensor, non_blocking=True)
             else:
                 chunks.append(chunk_tensor.cpu())
     return chunks
