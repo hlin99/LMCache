@@ -3,6 +3,7 @@
 
 # Standard
 from multiprocessing import shared_memory
+from multiprocessing.resource_tracker import unregister
 from typing import Any
 
 # Third Party
@@ -39,6 +40,10 @@ class NonGpuContextShm(NonGpuContext):
             self._shm = shared_memory.SharedMemory(
                 name=shm_name.lstrip("/"), create=False
             )
+            # The SHM segment is owned by the server process. Unregister it
+            # from this worker's resource tracker so that Python does not
+            # unlink the segment when this worker exits.
+            unregister(f"/{self._shm.name}", "shared_memory")
             self._shm_buffer = self._shm.buf
         except Exception:
             self._shm = None
