@@ -387,6 +387,9 @@ class DataTransferContext(TransferContext):
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
+            # SHM path: ensure all device writes are complete before releasing
+            # the SHM slot (server may immediately reuse it after commit_retrieve).
+            torch_dev.synchronize()
         self._non_gpu_context.commit_retrieve(key, instance_id)
 
         future: MessagingFuture[bool] = MessagingFuture()

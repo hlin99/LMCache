@@ -20,29 +20,13 @@ from lmcache.v1.memory_management import (
 logger = init_logger(__name__)
 
 
-def _unlink_stale_shm(shm_name: str, configured_shm_name: str | None = None) -> None:
-    """Remove a stale LMCache shm segment if it exists.
-
-    Args:
-        shm_name: The name of the shm segment to remove.
-        configured_shm_name: An explicitly configured shm name (e.g. from
-            ``--shm-name``) that should also be allowed through the safety
-            check, even if it does not carry the default ``lmcache_l1_pool_``
-            prefix.
-    """
+def _unlink_stale_shm(shm_name: str) -> None:
+    """Remove a stale LMCache shm segment if it exists."""
     normalized = shm_name.lstrip("/")
     if "/" in normalized or "\\" in normalized:
         logger.warning("Refusing to unlink invalid shm name %s", shm_name)
         return
-    normalized_config = (
-        configured_shm_name.lstrip("/") if configured_shm_name is not None else ""
-    )
-    if "/" in normalized_config or "\\" in normalized_config:
-        normalized_config = ""
-    if not (
-        normalized.startswith("lmcache_l1_pool_")
-        or (normalized_config and normalized == normalized_config)
-    ):
+    if not normalized.startswith("lmcache_l1_pool_"):
         return
     shm_path = os.path.join("/dev/shm", normalized)
     try:
@@ -83,6 +67,11 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         )
         shm_name = config.shm_name
         if shm_name:
+            # Ensure the segment always carries the lmcache_l1_pool_ prefix so
+            # that _unlink_stale_shm can recognise user-supplied names too.
+            bare = shm_name.lstrip("/")
+            if not bare.startswith("lmcache_l1_pool_"):
+                shm_name = f"lmcache_l1_pool_{bare}"
             try:
                 free_bytes = shutil.disk_usage("/dev/shm").free
                 if free_bytes < config.size_in_bytes:
@@ -90,7 +79,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
                         "insufficient /dev/shm capacity: "
                         f"need {config.size_in_bytes} bytes, have {free_bytes} bytes"
                     )
-                _unlink_stale_shm(shm_name, configured_shm_name=config.shm_name)
+                _unlink_stale_shm(shm_name)
                 return MixedMemoryAllocator(
                     config.size_in_bytes,
                     align_bytes=config.align_bytes,
