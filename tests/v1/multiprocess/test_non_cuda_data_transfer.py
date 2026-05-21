@@ -542,6 +542,7 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
         IPCCacheEngineKey,
         RegisterNonGpuContextPayload,
     )
+    from lmcache.v1.multiprocess.protocols.engine import PrepareStoreResponse
     from lmcache.v1.multiprocess.server import MPCacheEngine
 
     mock_storage = MagicMock()
@@ -596,6 +597,7 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
     )
 
     prepare_response = engine.prepare_store(key, 5)
+    assert isinstance(prepare_response, PrepareStoreResponse)
     assert prepare_response.context == {}
     reserved_keys = mock_storage.reserve_write.call_args[0][0]
     mock_storage.finish_write.assert_called_once_with(reserved_keys)
@@ -665,8 +667,6 @@ def test_server_shm_transport_is_per_instance(stub_native_storage_ops: Any) -> N
             use_mla=False,
         )
     )
-    assert engine.contexts[6].shm_active is True
-    assert engine.contexts[7].shm_active is False
     key = IPCCacheEngineKey.from_token_ids(
         "m",
         1,

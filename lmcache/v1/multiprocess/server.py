@@ -549,7 +549,8 @@ class MPCacheEngine:
                 )
                 reserved_keys.append(obj_key)
         finally:
-            unused_keys = [k for k in reserved if k not in reserved_keys]
+            reserved_keys_set = set(reserved_keys)
+            unused_keys = [k for k in reserved if k not in reserved_keys_set]
             if unused_keys:
                 self.storage_manager.finish_write(unused_keys)
         if not reserved_keys:
