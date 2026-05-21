@@ -2,9 +2,8 @@
 """Shared-memory NonGpuContext implementation for multiprocess mode."""
 
 # Standard
+from multiprocessing import shared_memory
 from typing import Any
-import mmap
-import os
 
 # Third Party
 import torch
@@ -15,8 +14,6 @@ from lmcache.v1.multiprocess.non_gpu_context import (
     NonGpuContextMetadata,
 )
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
-
-INVALID_SHM_FD = -1
 
 
 class NonGpuContextShm(NonGpuContext):
@@ -36,17 +33,10 @@ class NonGpuContextShm(NonGpuContext):
 
         self._shm_name = shm_name
         self._pool_size = pool_size
-        self._shm_fd = INVALID_SHM_FD
-        shm_path = os.path.join("/dev/shm", shm_name.lstrip("/"))
-        self._shm_fd = os.open(shm_path, os.O_RDWR)
-        try:
-            self._mmap_obj = mmap.mmap(
-                self._shm_fd, self._pool_size, access=mmap.ACCESS_WRITE
-            )
-        except Exception:
-            os.close(self._shm_fd)
-            self._shm_fd = INVALID_SHM_FD
-            raise
+        self._shm: shared_memory.SharedMemory | None = shared_memory.SharedMemory(
+            name=shm_name.lstrip("/"), create=False
+        )
+        self._mmap_obj = self._shm.buf
 
     def _make_tensor_view(
         self,
@@ -150,11 +140,9 @@ class NonGpuContextShm(NonGpuContext):
             return False
 
     def close(self) -> None:
-        if self._shm_fd == INVALID_SHM_FD:
+        if self._shm is None:
             return
         try:
-            self._mmap_obj.close()
+            self._shm.close()
         finally:
-            fd = self._shm_fd
-            self._shm_fd = INVALID_SHM_FD
-            os.close(fd)
+            self._shm = None
