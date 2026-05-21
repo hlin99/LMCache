@@ -819,6 +819,8 @@ def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
 
 
 class _CompletedFuture:
+    """A mock Future that immediately returns a pre-set value for testing."""
+
     def __init__(self, value):
         self._value = value
 
@@ -827,6 +829,15 @@ class _CompletedFuture:
 
 
 def _create_shm_file(shm_name: str, size: int) -> str:
+    """Create a shared memory file in /dev/shm for testing.
+
+    Args:
+        shm_name: Name of the shared memory segment (leading slash stripped).
+        size: Size in bytes to allocate.
+
+    Returns:
+        Absolute path to the created file.
+    """
     path = os.path.join("/dev/shm", shm_name.lstrip("/"))
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     os.ftruncate(fd, size)
