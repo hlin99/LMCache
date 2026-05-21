@@ -29,11 +29,12 @@ def _unlink_stale_shm(
     if "/" in normalized or "\\" in normalized:
         logger.warning("Refusing to unlink invalid shm name %s", shm_name)
         return
-    configured_normalized = (
+    normalized_config = (
         configured_shm_name.lstrip("/") if configured_shm_name is not None else ""
     )
-    if not normalized.startswith("lmcache_l1_pool_") and (
-        not configured_normalized or normalized != configured_normalized
+    if not (
+        normalized.startswith("lmcache_l1_pool_")
+        or (normalized_config and normalized == normalized_config)
     ):
         return
     shm_path = os.path.join("/dev/shm", normalized)

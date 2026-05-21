@@ -346,6 +346,7 @@ class DataTransferContext(TransferContext):
             chunk_indices=chunk_indices,
         )
         if out_buffers is not None:
+            # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
         ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
 

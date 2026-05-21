@@ -127,7 +127,7 @@ def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
     assert isinstance(context, DataTransferContext)
 
 
-def test_submit_store_syncs_again_before_commit_with_shm_buffers() -> None:
+def test_submit_store_syncs_twice_with_shm_buffers() -> None:
     """SHM store path should synchronize after async gather and before commit."""
     # First Party
     from lmcache.v1.multiprocess.transfer_context import DataTransferContext

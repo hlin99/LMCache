@@ -89,15 +89,20 @@ class NonGpuContextShm(NonGpuContext):
             [key, instance_id],
             get_response_class(RequestType.PREPARE_STORE),
         )
+        retry_count = 0
+        # Intentionally wait until the reservation result is available:
+        # aborting on timeout can desynchronize SHM reservations and payload writes.
         while True:
             try:
                 response = future.result(timeout=self.mq_timeout)
                 break
             except TimeoutError:
+                retry_count += 1
                 logger.warning(
                     "Timed out waiting for PREPARE_STORE response for "
-                    "instance_id=%s; continuing to wait",
+                    "instance_id=%s (retry=%d); continuing to wait",
                     instance_id,
+                    retry_count,
                 )
         context = response.context if isinstance(response.context, dict) else {}
         slots = context.get("slots")
