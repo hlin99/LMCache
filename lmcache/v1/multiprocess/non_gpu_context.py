@@ -21,8 +21,11 @@ from typing import Any, cast
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -100,24 +103,39 @@ def create_non_gpu_context(
     metadata: NonGpuContextMetadata,
     mq_client: Any,
     mq_timeout: float,
+    shm_name: str = "",
+    pool_size: int = 0,
 ) -> NonGpuContext:
     """Factory that returns the appropriate :class:`NonGpuContext` implementation.
 
-    Currently always returns a pickle-based implementation
-    (``NonGpuContextPickle``). A future SHM-capable PR
-    may probe for shared-memory availability and fall back to pickle.
+    Returns SHM-based implementation when shared-memory pool information is
+    available; otherwise falls back to the pickle-based implementation.
 
     Args:
         metadata: Layout metadata for the non-GPU context.
         mq_client: Message-queue client for server communication.
         mq_timeout: Timeout in seconds for blocking MQ requests.
+        shm_name: Shared-memory segment name. Empty means pickle mode.
+        pool_size: Shared-memory pool size in bytes. Non-positive means pickle mode.
 
     Returns:
         A concrete :class:`NonGpuContext` instance.
     """
+    if shm_name and pool_size > 0:
+        # Local
+        from .non_gpu_context_shm import NonGpuContextShm
+
+        logger.info(
+            "Creating NonGpuContextShm (shm_name=%s, pool_size=%d)",
+            shm_name,
+            pool_size,
+        )
+        return NonGpuContextShm(metadata, mq_client, mq_timeout, shm_name, pool_size)
+
     # Local
     from .non_gpu_context_pickle import NonGpuContextPickle
 
+    logger.info("Creating NonGpuContextPickle (pickle transport)")
     return NonGpuContextPickle(metadata, mq_client, mq_timeout)
 
 

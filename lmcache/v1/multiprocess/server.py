@@ -72,6 +72,7 @@ from lmcache.v1.multiprocess.protocol import (
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
     PrepareStoreResponse,
+    RegisterNonGpuContextResponse,
 )
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -160,6 +161,11 @@ def batched_iteration(lst: list, batch_size: int) -> Generator[tuple, None, None
     it = iter(lst)
     while batch := tuple(islice(it, batch_size)):
         yield batch
+
+
+def _dtype_to_name(dtype: torch.dtype) -> str:
+    """Return a stable torch dtype name without module prefix."""
+    return str(dtype).split(".")[-1]
 
 
 @dataclass
@@ -254,6 +260,17 @@ class MPCacheEngine:
         # for crash resilience (e.g., client calls lookup but never queries)
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        # Pending SHM transfer tracking, keyed by (instance_id, IPC key).
+        # IPCCacheEngineKey is a frozen dataclass and hashable, so it is safe
+        # and efficient for dict lookups across pending transfer tracking.
+        self._pending_shm_writes: dict[
+            tuple[int, IPCCacheEngineKey], list[ObjectKey]
+        ] = {}
+        self._pending_shm_reads: dict[
+            tuple[int, IPCCacheEngineKey], list[ObjectKey]
+        ] = {}
+        self._pending_shm_lock = threading.Lock()
+        self._shm_active = False
 
         self._setup_metrics()
 
@@ -333,11 +350,28 @@ class MPCacheEngine:
             torch_dev.empty_cache()
         else:
             logger.info("Unregistered non-CUDA context for instance ID %d", instance_id)
+        with self._pending_shm_lock:
+            stale_writes = {
+                k: v for k, v in self._pending_shm_writes.items() if k[0] == instance_id
+            }
+            for transfer_key in stale_writes:
+                del self._pending_shm_writes[transfer_key]
+            stale_reads = {
+                k: v for k, v in self._pending_shm_reads.items() if k[0] == instance_id
+            }
+            for transfer_key in stale_reads:
+                del self._pending_shm_reads[transfer_key]
+        for reserved_keys in stale_writes.values():
+            if reserved_keys:
+                self.storage_manager.finish_write(reserved_keys)
+        for prefetched_keys in stale_reads.values():
+            if prefetched_keys:
+                self.storage_manager.finish_read_prefetched(prefetched_keys)
 
     def register_kv_cache_non_gpu_context(
         self,
         payload: RegisterNonGpuContextPayload,
-    ) -> None:
+    ) -> RegisterNonGpuContextResponse:
         """Register non-CUDA KV layout metadata for non-GPU context mode.
 
         Args:
@@ -354,7 +388,7 @@ class MPCacheEngine:
                 "skipping the new registration",
                 payload.instance_id,
             )
-            return
+            return RegisterNonGpuContextResponse()
 
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
@@ -381,6 +415,46 @@ class MPCacheEngine:
                 use_mla=payload.use_mla,
             ),
         )
+        shm_pool_info = self.storage_manager.get_shm_pool_info()
+        if not isinstance(shm_pool_info, dict):
+            self._shm_active = False
+            logger.info(
+                "Instance %s non-GPU context using pickle transport "
+                "(no SHM pool info returned)",
+                payload.instance_id,
+            )
+            return RegisterNonGpuContextResponse()
+        shm_name = str(shm_pool_info.get("shm_name", ""))
+        pool_size = int(shm_pool_info.get("pool_size", 0))
+        self._shm_active = bool(shm_name) and pool_size > 0
+        response = RegisterNonGpuContextResponse(
+            shm_name=shm_name,
+            pool_size=pool_size,
+        )
+        if self._shm_active:
+            logger.info(
+                "Instance %s non-GPU context using SHM transport "
+                "(shm_name=%s, pool_size=%d)",
+                payload.instance_id,
+                response.shm_name,
+                response.pool_size,
+            )
+        else:
+            logger.info(
+                "Instance %s non-GPU context using pickle transport",
+                payload.instance_id,
+            )
+        return response
+
+    @staticmethod
+    def _make_non_gpu_transfer_key(
+        key: IPCCacheEngineKey, instance_id: int
+    ) -> tuple[int, IPCCacheEngineKey]:
+        """Build a unique key for pending SHM write/read transfer tracking."""
+        return (instance_id, key)
+
+    def _is_shm_active(self) -> bool:
+        return self._shm_active
 
     def _resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
         """Resolve object keys from an IPC cache key.
@@ -419,7 +493,39 @@ class MPCacheEngine:
             PrepareStoreResponse with empty slots for pickle mode.
         """
 
-        return PrepareStoreResponse(context={})
+        if not self._is_shm_active():
+            return PrepareStoreResponse(context={})
+
+        obj_keys = self._resolve_obj_keys(key)
+        context = self.contexts.get(instance_id)
+        if context is None or context.non_cuda_metadata is None:
+            raise ValueError(
+                f"non-CUDA context not registered for instance ID {instance_id}"
+            )
+        reserved = self.storage_manager.reserve_write(
+            obj_keys, context.non_cuda_metadata.layout_desc, "new"
+        )
+        slots: list[dict] = []
+        reserved_keys: list[ObjectKey] = []
+        for obj_key in obj_keys:
+            memory_obj = reserved.get(obj_key)
+            if memory_obj is None or memory_obj.tensor is None:
+                continue
+            slots.append(
+                {
+                    "offset": memory_obj.shm_offset,
+                    "length": memory_obj.shm_byte_length,
+                    "shape": list(memory_obj.tensor.shape),
+                    "dtype": _dtype_to_name(memory_obj.tensor.dtype),
+                }
+            )
+            reserved_keys.append(obj_key)
+        if not reserved_keys:
+            return PrepareStoreResponse(context={})
+        transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
+        with self._pending_shm_lock:
+            self._pending_shm_writes[transfer_key] = reserved_keys
+        return PrepareStoreResponse(context={"slots": slots})
 
     @_lmcache_nvtx_annotate
     def commit_store(
@@ -434,10 +540,24 @@ class MPCacheEngine:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
             cpu_data: Pickled list of CPU tensors produced by the worker.
+                In SHM mode, empty bytes (``b""``) indicate data is already
+                written to SHM and only lock finalization is required.
 
         Returns:
             ``True`` when all reserved objects are written, otherwise ``False``.
         """
+        if cpu_data == b"" and self._is_shm_active():
+            transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
+            with self._pending_shm_lock:
+                reserved_keys = self._pending_shm_writes.pop(transfer_key, None)
+            # Missing transfer key means COMMIT arrived without matching PREPARE.
+            if reserved_keys is None:
+                return False
+            # Empty reservation is a valid no-op when all objects already exist.
+            if reserved_keys:
+                self.storage_manager.finish_write(reserved_keys)
+            return True
+
         obj_keys = self._resolve_obj_keys(key)
 
         context = self.contexts.get(instance_id)
@@ -495,14 +615,49 @@ class MPCacheEngine:
                 f"non-CUDA context not registered for instance ID {instance_id}"
             )
 
-        prefetched_keys: list[ObjectKey] = []
-        try:
-            with self.storage_manager.read_prefetched_results(obj_keys) as memory_objs:
-                if not memory_objs or len(memory_objs) != len(obj_keys):
+        if self._is_shm_active():
+            # Precondition: read locks for these keys were acquired during the
+            # lookup/prefetch phase before this retrieve call.
+            shm_prefetched_keys, shm_memory_objs = self.storage_manager.unsafe_read(
+                obj_keys
+            )
+            if (
+                not shm_memory_objs
+                or len(shm_prefetched_keys) != len(obj_keys)
+                or len(shm_memory_objs) != len(obj_keys)
+            ):
+                if shm_prefetched_keys:
+                    self.storage_manager.finish_read_prefetched(shm_prefetched_keys)
+                return PrepareRetrieveResponse(success=False, data=b"", context={})
+            slots: list[dict] = []
+            for memory_obj in shm_memory_objs:
+                if memory_obj.tensor is None:
+                    self.storage_manager.finish_read_prefetched(shm_prefetched_keys)
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
-                prefetched_keys = obj_keys[: len(memory_objs)]
+                slots.append(
+                    {
+                        "offset": memory_obj.shm_offset,
+                        "length": memory_obj.shm_byte_length,
+                        "shape": list(memory_obj.tensor.shape),
+                        "dtype": _dtype_to_name(memory_obj.tensor.dtype),
+                    }
+                )
+            transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
+            with self._pending_shm_lock:
+                self._pending_shm_reads[transfer_key] = shm_prefetched_keys
+            return PrepareRetrieveResponse(
+                success=True, data=b"", context={"slots": slots}
+            )
+
+        prefetched_keys_pickle: list[ObjectKey] = []
+        try:
+            read_ctx = self.storage_manager.read_prefetched_results(obj_keys)
+            with read_ctx as maybe_memory_objs:
+                if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
+                    return PrepareRetrieveResponse(success=False, data=b"", context={})
+                prefetched_keys_pickle = obj_keys[: len(maybe_memory_objs)]
                 chunks = []
-                for memory_obj in memory_objs:
+                for memory_obj in maybe_memory_objs:
                     if memory_obj.tensor is None:
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
@@ -512,8 +667,8 @@ class MPCacheEngine:
                     success=True, data=pickle.dumps(chunks), context={}
                 )
         finally:
-            if prefetched_keys:
-                self.storage_manager.finish_read_prefetched(prefetched_keys)
+            if prefetched_keys_pickle:
+                self.storage_manager.finish_read_prefetched(prefetched_keys_pickle)
 
     @_lmcache_nvtx_annotate
     def commit_retrieve(
@@ -530,6 +685,13 @@ class MPCacheEngine:
         Returns:
             Always ``True``.
         """
+        if self._is_shm_active():
+            transfer_key = self._make_non_gpu_transfer_key(key, instance_id)
+            with self._pending_shm_lock:
+                prefetched_keys = self._pending_shm_reads.pop(transfer_key, [])
+            if prefetched_keys:
+                self.storage_manager.finish_read_prefetched(prefetched_keys)
+            return True
         return True
 
     @_lmcache_nvtx_annotate
