@@ -1624,6 +1624,15 @@ def run_cache_server(
     # storage-manager calls during engine init are captured too.
     maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
 
+    # Apply shm_name override from MP config to storage config.
+    # None -> no change (auto-allocate).
+    # "" -> disable SHM pool creation (force pickle path).
+    # non-empty -> use this exact name for the SHM pool segment.
+    if mp_config.shm_name is not None:
+        storage_manager_config.l1_manager_config.memory_config.shm_name = (
+            mp_config.shm_name
+        )
+
     # Initialize the engine (loggers self-register with the global controller)
     engine = MPCacheEngine(
         storage_manager_config=storage_manager_config,
