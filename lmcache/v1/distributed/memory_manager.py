@@ -77,6 +77,8 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             if not bare.startswith("lmcache_l1_pool_"):
                 shm_name = f"lmcache_l1_pool_{bare}"
             try:
+                # /dev/shm capacity is only meaningful on Linux, where POSIX shm
+                # is backed by a tmpfs mount with a bounded free-space view.
                 if sys.platform.startswith("linux"):
                     free_bytes = shutil.disk_usage("/dev/shm").free
                     if free_bytes < config.size_in_bytes:
