@@ -581,6 +581,7 @@ class LMCacheMPSchedulerAdapter:
             # Skip if there is already a lookup request
             return
 
+        assert self.chunk_size is not None  # guaranteed by _ensure_chunk_size()
         aligned_end = (len(token_ids) // self.chunk_size) * self.chunk_size
 
         key = self._create_key(
@@ -989,6 +990,7 @@ class LMCacheMPWorkerAdapter:
         layout_hints["inference_engine_logical_block_size"] = (
             self.vllm_logical_block_size
         )
+        assert self.blocks_in_chunk is not None  # guaranteed by _ensure_chunk_size()
         try:
             self.transfer_ctx.register(
                 self.instance_id,
@@ -1139,6 +1141,7 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting store requests."
             )
+        assert self.blocks_in_chunk is not None  # guaranteed by _ensure_chunk_size()
         future = self.transfer_ctx.submit_store(
             request_id,
             key,
@@ -1191,6 +1194,7 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
+        assert self.blocks_in_chunk is not None  # guaranteed by _ensure_chunk_size()
         future = self.transfer_ctx.submit_retrieve(
             request_id,
             key,
