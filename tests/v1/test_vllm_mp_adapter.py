@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Public-API unit tests for ``LMCacheMPWorkerAdapter.register_kv_caches``.
+"""Public-API unit tests for ``LMCacheMPWorkerAdapter`` and
+``LMCacheMPSchedulerAdapter``.
 
 Behavioural coverage of the heartbeat-driven recovery path
 (``HeartbeatThread.register_recover_callback`` →
@@ -19,11 +20,24 @@ import torch
 # First Party
 from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
+    LMCacheMPSchedulerAdapter,
     LMCacheMPWorkerAdapter,
     LoadStoreOp,
     ParallelStrategy,
 )
 from lmcache.v1.multiprocess.protocol import RequestType
+
+
+def _make_parallel_strategy() -> ParallelStrategy:
+    return ParallelStrategy(
+        use_mla=False,
+        kv_world_size=1,
+        kv_worker_id=0,
+        actual_world_size=1,
+        actual_worker_id=0,
+        tp_size=1,
+        pp_size=1,
+    )
 
 
 @pytest.fixture
@@ -34,7 +48,7 @@ def fake_adapter(monkeypatch):
     is its return value (a ``MagicMock`` whose ``result()`` defaults to
     succeed; tests can attach ``side_effect`` to simulate failures).
     """
-    # Stub the MQ boundary so __init__'s chunk-size query and any later
+    # Stub the MQ boundary so chunk-size query and any later
     # send_lmcache_request call don't touch a real socket.
     fake_client = MagicMock(name="mq_client")
     monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
@@ -57,27 +71,207 @@ def fake_adapter(monkeypatch):
         lambda: {},
     )
 
-    parallel_strategy = ParallelStrategy(
-        use_mla=False,
-        kv_world_size=1,
-        kv_worker_id=0,
-        actual_world_size=1,
-        actual_worker_id=0,
-        tp_size=1,
-        pp_size=1,
-    )
     adapter = LMCacheMPWorkerAdapter(
         server_url="tcp://127.0.0.1:0",
         context=MagicMock(name="zmq_context"),
         model_name="test-model",
         vllm_block_size=16,
-        parallel_strategy=parallel_strategy,
+        parallel_strategy=_make_parallel_strategy(),
         mq_timeout=5.0,
     )
-    # __init__ issues exactly one MQ call (the chunk-size query). Reset
-    # so individual tests start with a clean call count.
-    send_mock.reset_mock()
+    # chunk_size is now fetched lazily (not in __init__), so send_mock starts
+    # clean with zero calls.
     return adapter, send_mock, future
+
+
+# ---------------------------------------------------------------------------
+# Lazy chunk-size initialisation tests
+# ---------------------------------------------------------------------------
+
+
+def test_worker_init_does_not_fetch_chunk_size(monkeypatch):
+    """__init__ must NOT block on the server: blocks_in_chunk is None after init."""
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+
+    chunk_size_calls = []
+
+    def _spy_chunk_size(*a, **kw):
+        chunk_size_calls.append(1)
+        return 256
+
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", _spy_chunk_size)
+
+    adapter = LMCacheMPWorkerAdapter(
+        server_url="tcp://127.0.0.1:0",
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=_make_parallel_strategy(),
+        mq_timeout=5.0,
+    )
+
+    assert chunk_size_calls == [], (
+        "get_lmcache_chunk_size must not be called in __init__"
+    )
+    assert adapter.blocks_in_chunk is None
+
+
+def test_scheduler_init_does_not_fetch_chunk_size(monkeypatch):
+    """LMCacheMPSchedulerAdapter.__init__ must not block on the server."""
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+
+    chunk_size_calls = []
+
+    def _spy_chunk_size(*a, **kw):
+        chunk_size_calls.append(1)
+        return 256
+
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", _spy_chunk_size)
+
+    adapter = LMCacheMPSchedulerAdapter(
+        server_url="tcp://127.0.0.1:0",
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=_make_parallel_strategy(),
+        mq_timeout=5.0,
+    )
+
+    assert chunk_size_calls == [], (
+        "get_lmcache_chunk_size must not be called in __init__"
+    )
+    assert adapter.chunk_size is None
+    assert adapter.blocks_in_chunk is None
+
+
+def test_register_kv_caches_skipped_when_server_unavailable(monkeypatch):
+    """register_kv_caches is a no-op when the server never responds."""
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(
+        adapter_mod,
+        "get_lmcache_chunk_size",
+        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("server down")),
+    )
+    send_mock = MagicMock(name="send_lmcache_request")
+    monkeypatch.setattr(adapter_mod, "send_lmcache_request", send_mock)
+
+    adapter = LMCacheMPWorkerAdapter(
+        server_url="tcp://127.0.0.1:0",
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=_make_parallel_strategy(),
+        mq_timeout=1.0,
+    )
+
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    # Should not raise and should be a no-op
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert not adapter.is_healthy
+    assert send_mock.call_count == 0
+    # kv_caches should remain empty because registration was skipped
+    assert adapter.kv_caches == {}
+
+
+def test_submit_store_skipped_when_chunk_size_unavailable(monkeypatch):
+    """submit_store_request is a no-op when the chunk-size fetch times out."""
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(
+        adapter_mod,
+        "get_lmcache_chunk_size",
+        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("server down")),
+    )
+    monkeypatch.setattr(adapter_mod, "send_lmcache_request", MagicMock())
+
+    adapter = LMCacheMPWorkerAdapter(
+        server_url="tcp://127.0.0.1:0",
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=_make_parallel_strategy(),
+        mq_timeout=1.0,
+    )
+
+    op = LoadStoreOp(token_ids=[1, 2, 3, 4], block_ids=[0], start=0, end=4)
+    adapter.submit_store_request("req-1", op, event=MagicMock())
+
+    assert "req-1" not in adapter.store_futures
+
+
+def test_submit_retrieve_marks_error_blocks_when_chunk_size_unavailable(monkeypatch):
+    """submit_retrieve_request adds block IDs to error set when server is down."""
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(
+        adapter_mod,
+        "get_lmcache_chunk_size",
+        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("server down")),
+    )
+    monkeypatch.setattr(adapter_mod, "send_lmcache_request", MagicMock())
+
+    adapter = LMCacheMPWorkerAdapter(
+        server_url="tcp://127.0.0.1:0",
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=_make_parallel_strategy(),
+        mq_timeout=1.0,
+    )
+
+    op = LoadStoreOp(token_ids=[1, 2, 3, 4], block_ids=[7, 8], start=0, end=4)
+    adapter.submit_retrieve_request("req-1", op, event=MagicMock())
+
+    assert {7, 8}.issubset(adapter.error_block_ids)
+
+
+def test_chunk_size_fetched_only_once(monkeypatch):
+    """get_lmcache_chunk_size is called exactly once across multiple operations."""
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+
+    call_count = []
+
+    def _counting_chunk_size(*a, **kw):
+        call_count.append(1)
+        return 256
+
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", _counting_chunk_size)
+    future = MagicMock()
+    future.result.return_value = None
+    monkeypatch.setattr(
+        adapter_mod, "send_lmcache_request", MagicMock(return_value=future)
+    )
+    monkeypatch.setattr(adapter_mod, "wrap_kv_caches", lambda kv: list(kv.values()))
+    monkeypatch.setattr("lmcache.integration.vllm.utils.vllm_layout_hints", lambda: {})
+
+    adapter = LMCacheMPWorkerAdapter(
+        server_url="tcp://127.0.0.1:0",
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=_make_parallel_strategy(),
+        mq_timeout=5.0,
+    )
+    assert len(call_count) == 0, "should not call chunk_size in __init__"
+
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+    assert len(call_count) == 1, "should call chunk_size exactly once on first use"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+    assert len(call_count) == 1, "should not call chunk_size again on second use"
+
+
+# ---------------------------------------------------------------------------
+# Existing register_kv_caches tests
+# ---------------------------------------------------------------------------
 
 
 def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):

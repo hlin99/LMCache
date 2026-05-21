@@ -445,21 +445,16 @@ class LMCacheMPSchedulerAdapter:
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
 
-        # Read chunk size from lmcache
-        try:
-            self.chunk_size = get_lmcache_chunk_size(
-                self.mq_client, timeout=self._mq_timeout
-            )
-        except TimeoutError:
-            self.mq_client.close()
-            raise ConnectionError(
-                f"LMCache server did not respond within {self._mq_timeout}s. "
-                "Is the server running?"
-            ) from None
-        assert self.chunk_size % vllm_block_size == 0, (
-            "LMCache chunk size should be a multiple of vLLM block size"
-        )
-        self.blocks_in_chunk = self.chunk_size // vllm_block_size
+        # Store vLLM block size for later use in the lazy chunk size computation.
+        self._vllm_block_size = vllm_block_size
+
+        # chunk_size and blocks_in_chunk are lazily fetched on first use.
+        # They are populated by _ensure_chunk_size() on the first lookup or
+        # num_blocks_per_chunk() call, so the vLLM process is not blocked
+        # during startup if the LMCache server is not yet running.
+        self.chunk_size: int | None = None
+        self.blocks_in_chunk: int | None = None
+        self._chunk_size_lock = threading.Lock()
 
         # Health state (shared with heartbeat thread)
         self._health_event = threading.Event()
@@ -501,6 +496,48 @@ class LMCacheMPSchedulerAdapter:
             )
             self._heartbeat.start()
 
+    def _ensure_chunk_size(self) -> bool:
+        """Fetch chunk_size from the server on the first call and cache it.
+
+        Uses double-checked locking so only one thread fetches the value
+        even when multiple threads call this concurrently.
+
+        Returns:
+            True if chunk_size is available (either already cached or
+            successfully fetched now); False if the server did not respond
+            within the timeout — the adapter remains in degraded mode and
+            the caller should skip its operation.
+        """
+        if self.chunk_size is not None:
+            return True
+        with self._chunk_size_lock:
+            if self.chunk_size is not None:
+                return True
+            try:
+                chunk_size = get_lmcache_chunk_size(
+                    self.mq_client, timeout=self._mq_timeout
+                )
+            except TimeoutError:
+                logger.warning(
+                    "LMCache server did not respond within %ss while fetching "
+                    "chunk size. Operating in degraded mode.",
+                    self._mq_timeout,
+                )
+                self._health_event.clear()
+                return False
+            if chunk_size % self._vllm_block_size != 0:
+                logger.warning(
+                    "LMCache chunk size %d is not a multiple of vLLM block "
+                    "size %d. Operating in degraded mode.",
+                    chunk_size,
+                    self._vllm_block_size,
+                )
+                self._health_event.clear()
+                return False
+            self.chunk_size = chunk_size
+            self.blocks_in_chunk = chunk_size // self._vllm_block_size
+            return True
+
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
         self,
@@ -532,6 +569,9 @@ class LMCacheMPSchedulerAdapter:
             In the meantime, this function will record the lookup request, and the
             status of the look up request can be checked by `check_lookup_result`.
         """
+        if not self._ensure_chunk_size():
+            return
+
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -623,9 +663,11 @@ class LMCacheMPSchedulerAdapter:
     def num_blocks_per_chunk(self) -> int:
         """
         Returns:
-            The number of vllm blocks in a LMCache data chunk
+            The number of vllm blocks in a LMCache data chunk, or 1 if the
+            chunk size has not been resolved yet (e.g. server unavailable).
         """
-        return self.blocks_in_chunk
+        self._ensure_chunk_size()
+        return self.blocks_in_chunk if self.blocks_in_chunk is not None else 1
 
     def cleanup_lookup_result(self, request_id: str) -> None:
         """
@@ -833,21 +875,6 @@ class LMCacheMPWorkerAdapter:
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
 
-        # Read chunk size from lmcache
-        try:
-            chunk_size = get_lmcache_chunk_size(
-                self.mq_client, timeout=self._mq_timeout
-            )
-        except TimeoutError:
-            self.mq_client.close()
-            raise ConnectionError(
-                f"LMCache server did not respond within {self._mq_timeout}s. "
-                "Is the server running?"
-            ) from None
-        assert chunk_size % vllm_block_size == 0, (
-            "LMCache chunk size should be a multiple of vLLM block size"
-        )
-        self.blocks_in_chunk = chunk_size // vllm_block_size
         # Retain the vLLM logical block size so we can ship it to the
         # LMCache server in ``register_kv_caches`` — the server uses it
         # (as ``layout_hints["inference_engine_logical_block_size"]``)
@@ -856,6 +883,13 @@ class LMCacheMPWorkerAdapter:
         # slot (``shape_desc.bs <
         # inference_engine_logical_block_size``).
         self.vllm_logical_block_size = vllm_block_size
+
+        # blocks_in_chunk is lazily fetched on first use.  It is populated by
+        # _ensure_chunk_size() on the first register/store/retrieve call, so
+        # the vLLM worker process is not blocked during startup if the
+        # LMCache server is not yet running.
+        self.blocks_in_chunk: int | None = None
+        self._chunk_size_lock = threading.Lock()
 
         # Health state (shared with heartbeat thread)
         self._health_event = threading.Event()
@@ -928,6 +962,8 @@ class LMCacheMPWorkerAdapter:
             ConnectionError: if the server does not respond within
                 mq_timeout.
         """
+        if not self._ensure_chunk_size():
+            return
         logger.info("Registering kv caches")
         self.kv_caches = kv_caches
         self._send_register_kv_caches_request(kv_caches)
@@ -989,6 +1025,47 @@ class LMCacheMPWorkerAdapter:
             )
             self._heartbeat.start()
 
+    def _ensure_chunk_size(self) -> bool:
+        """Fetch blocks_in_chunk from the server on the first call and cache it.
+
+        Uses double-checked locking so only one thread fetches the value
+        even when multiple threads call this concurrently.
+
+        Returns:
+            True if blocks_in_chunk is available (either already cached or
+            successfully fetched now); False if the server did not respond
+            within the timeout — the adapter remains in degraded mode and
+            the caller should skip its operation.
+        """
+        if self.blocks_in_chunk is not None:
+            return True
+        with self._chunk_size_lock:
+            if self.blocks_in_chunk is not None:
+                return True
+            try:
+                chunk_size = get_lmcache_chunk_size(
+                    self.mq_client, timeout=self._mq_timeout
+                )
+            except TimeoutError:
+                logger.warning(
+                    "LMCache server did not respond within %ss while fetching "
+                    "chunk size. Operating in degraded mode.",
+                    self._mq_timeout,
+                )
+                self._health_event.clear()
+                return False
+            if chunk_size % self.vllm_logical_block_size != 0:
+                logger.warning(
+                    "LMCache chunk size %d is not a multiple of vLLM block "
+                    "size %d. Operating in degraded mode.",
+                    chunk_size,
+                    self.vllm_logical_block_size,
+                )
+                self._health_event.clear()
+                return False
+            self.blocks_in_chunk = chunk_size // self.vllm_logical_block_size
+            return True
+
     def _reregister_kv_caches_callback(self) -> bool:
         """Heartbeat recover callback: re-register KV caches after the
         server returns. Runs on the heartbeat thread, before the health
@@ -1041,6 +1118,9 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        if not self._ensure_chunk_size():
+            return
+
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -1088,6 +1168,10 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        if not self._ensure_chunk_size():
+            self.error_block_ids.update(op.block_ids)
+            return
+
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -1298,7 +1382,7 @@ class LMCacheMPWorkerAdapter:
         Returns:
             The number of vllm blocks in a LMCache data chunk
         """
-        return self.blocks_in_chunk
+        return self.blocks_in_chunk if self.blocks_in_chunk is not None else 1
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
