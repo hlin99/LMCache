@@ -2,8 +2,6 @@
 
 # Standard
 from multiprocessing import shared_memory
-import shutil
-import sys
 
 # First Party
 from lmcache.logging import init_logger
@@ -77,34 +75,15 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         )
         shm_name = config.shm_name
         if shm_name:
-            # Ensure the segment always carries the lmcache_l1_pool_ prefix so
-            # that _unlink_stale_shm can recognise user-supplied names too.
             bare = shm_name.lstrip("/")
             if not bare.startswith("lmcache_l1_pool_"):
                 shm_name = f"lmcache_l1_pool_{bare}"
-            try:
-                # /dev/shm capacity is only meaningful on Linux, where POSIX shm
-                # is backed by a tmpfs mount with a bounded free-space view.
-                if sys.platform.startswith("linux"):
-                    free_bytes = shutil.disk_usage("/dev/shm").free
-                    if free_bytes < config.size_in_bytes:
-                        raise RuntimeError(
-                            "insufficient /dev/shm capacity: "
-                            f"need {config.size_in_bytes} bytes, "
-                            f"have {free_bytes} bytes"
-                        )
-                _unlink_stale_shm(shm_name)
-                return MixedMemoryAllocator(
-                    config.size_in_bytes,
-                    align_bytes=config.align_bytes,
-                    shm_name=shm_name,
-                )
-            except (RuntimeError, OSError, ValueError):
-                logger.warning(
-                    "Failed to initialize SHM pool (%s), falling back to pickle path",
-                    shm_name,
-                    exc_info=True,
-                )
+            _unlink_stale_shm(shm_name)
+            return MixedMemoryAllocator(
+                config.size_in_bytes,
+                align_bytes=config.align_bytes,
+                shm_name=shm_name,
+            )
         return MixedMemoryAllocator(
             config.size_in_bytes,
             align_bytes=config.align_bytes,

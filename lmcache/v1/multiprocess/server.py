@@ -6,6 +6,8 @@ from itertools import islice
 from typing import Generator
 import argparse
 import pickle
+import shutil
+import sys
 import threading
 import time
 
@@ -246,8 +248,9 @@ class MPCacheEngine:
         self.lock = threading.Lock()
 
         # storage manager
-        self.storage_manager = StorageManager(storage_manager_config)
         self._storage_manager_config = storage_manager_config
+        self._resolve_shm_config(self._storage_manager_config)
+        self.storage_manager = StorageManager(self._storage_manager_config)
         self._shm_pool_info = self._compute_shm_pool_info(self._storage_manager_config)
 
         # Token hasher and session manager for token-based operations
@@ -488,6 +491,31 @@ class MPCacheEngine:
     def get_shm_pool_info(self) -> dict:
         """Return shared-memory pool metadata for non-GPU SHM transport."""
         return dict(self._shm_pool_info)
+
+    @staticmethod
+    def _resolve_shm_config(config: StorageManagerConfig) -> None:
+        """Pre-check /dev/shm capacity and disable SHM transport when needed."""
+        mem_cfg = config.l1_manager_config.memory_config
+        if not mem_cfg.shm_name or mem_cfg.use_lazy:
+            return
+
+        if sys.platform.startswith("linux"):
+            try:
+                free_bytes = shutil.disk_usage("/dev/shm").free
+                if free_bytes < mem_cfg.size_in_bytes:
+                    logger.warning(
+                        "Insufficient /dev/shm capacity: need %d bytes, have %d bytes. "
+                        "Falling back to pickle transport.",
+                        mem_cfg.size_in_bytes,
+                        free_bytes,
+                    )
+                    mem_cfg.shm_name = ""
+            except OSError:
+                logger.warning(
+                    "Cannot check /dev/shm capacity, disabling SHM transport.",
+                    exc_info=True,
+                )
+                mem_cfg.shm_name = ""
 
     @staticmethod
     def _compute_shm_pool_info(config: StorageManagerConfig) -> dict:
