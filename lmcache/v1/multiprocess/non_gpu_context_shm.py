@@ -76,6 +76,7 @@ class NonGpuContextShm(NonGpuContext):
         return tensor_1d.view(torch.Size(shape))
 
     def _build_slot_tensors(self, slots: list[dict[str, Any]]) -> list[torch.Tensor]:
+        descriptors = [ShmSlotDescriptor.from_dict(slot) for slot in slots]
         return [
             self._make_tensor_view(
                 offset=descriptor.offset,
@@ -83,9 +84,7 @@ class NonGpuContextShm(NonGpuContext):
                 shape=descriptor.shape,
                 dtype_str=descriptor.dtype,
             )
-            for descriptor in (
-                ShmSlotDescriptor.from_dict(slot) for slot in slots
-            )
+            for descriptor in descriptors
         ]
 
     def prepare_store(

@@ -48,7 +48,7 @@ class ShmSlotDescriptor:
 
         Raises:
             KeyError: If any required field is missing.
-            TypeError: If ``shape`` is not iterable.
+            TypeError: If ``shape`` cannot be converted with ``list(...)``.
             ValueError: If numeric fields cannot be coerced to integers.
         """
         return cls(
