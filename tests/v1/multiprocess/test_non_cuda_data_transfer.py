@@ -487,6 +487,80 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     assert torch.allclose(recovered_chunks[0], payload)
 
 
+def test_server_register_non_gpu_context_uses_pickle_transfer_strategy(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure pickle mode registration installs PickleTransferStrategy."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
+    from lmcache.v1.multiprocess.server import MPCacheEngine
+    from lmcache.v1.multiprocess.transfer_strategy import PickleTransferStrategy
+
+    with (
+        patch("lmcache.v1.multiprocess.server.StorageManager"),
+        patch("lmcache.v1.multiprocess.server.TokenHasher"),
+        patch("lmcache.v1.multiprocess.server.SessionManager"),
+        patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={"shm_name": "", "pool_size": 0},
+        ),
+    ):
+        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=16)
+
+    engine.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=11,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+    assert isinstance(engine._strategies[11], PickleTransferStrategy)
+
+
+def test_server_register_non_gpu_context_uses_shm_transfer_strategy(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure SHM mode registration installs ShmTransferStrategy."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
+    from lmcache.v1.multiprocess.server import MPCacheEngine
+    from lmcache.v1.multiprocess.transfer_strategy import ShmTransferStrategy
+
+    with (
+        patch("lmcache.v1.multiprocess.server.StorageManager"),
+        patch("lmcache.v1.multiprocess.server.TokenHasher"),
+        patch("lmcache.v1.multiprocess.server.SessionManager"),
+        patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={"shm_name": "lmcache_l1_pool_test", "pool_size": 4096},
+        ),
+    ):
+        engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=16)
+
+    engine.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=12,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+    assert isinstance(engine._strategies[12], ShmTransferStrategy)
+
+
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_native_storage_ops: Any,
 ) -> None:
