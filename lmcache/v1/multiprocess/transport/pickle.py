@@ -9,7 +9,7 @@ import pickle
 import torch
 
 # First Party
-from lmcache.v1.multiprocess.non_gpu_context import (
+from lmcache.v1.multiprocess.transport.base import (
     NonGpuContext,
     NonGpuContextMetadata,
 )

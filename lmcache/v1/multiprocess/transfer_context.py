@@ -16,7 +16,7 @@ from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
 from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.mq import MessageQueueClient
-from lmcache.v1.multiprocess.non_gpu_context import (
+from lmcache.v1.multiprocess.transport.base import (
     NonGpuContext,
     NonGpuContextMetadata,
     compute_kv_layout,
