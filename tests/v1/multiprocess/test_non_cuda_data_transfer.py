@@ -108,7 +108,7 @@ def _make_hnd_flashinfer_kv_caches(
 def _make_storage_manager_config(
     shm_name: str = "",
     pool_size: int = 1024,
-    use_lazy: bool = True,
+    use_lazy: bool = False,
 ) -> StorageManagerConfig:
     """Build a StorageManagerConfig for MPCacheEngine tests."""
     memory_config = L1MemoryManagerConfig(
@@ -118,6 +118,8 @@ def _make_storage_manager_config(
         align_bytes=0x1000,
         shm_name=shm_name,
     )
+    # __post_init__ can auto-disable lazy mode on CPU-only environments, so force
+    # the requested value for deterministic engine-level SHM info tests.
     memory_config.use_lazy = use_lazy
     return StorageManagerConfig(
         l1_manager_config=L1ManagerConfig(memory_config=memory_config),
@@ -657,8 +659,10 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
     mock_storage.finish_write.assert_called_once_with(reserved_keys)
 
 
-def test_server_shm_transport_is_per_instance(stub_native_storage_ops: Any) -> None:
-    """Ensure SHM transport activation follows engine-level config."""
+def test_server_shm_transport_is_consistent_across_instances(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure one engine-level SHM config applies consistently to all instances."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         IPCCacheEngineKey,
@@ -735,6 +739,7 @@ def test_server_shm_transport_is_per_instance(stub_native_storage_ops: Any) -> N
     )
 
     assert engine.prepare_store(key, 6).context.get("slots")
+    # SHM mode is resolved once from engine config, so instance 7 also uses SHM.
     assert engine.prepare_store(key, 7).context.get("slots")
     assert mock_storage.reserve_write.call_count == 2
 

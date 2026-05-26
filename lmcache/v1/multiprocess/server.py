@@ -248,7 +248,7 @@ class MPCacheEngine:
         # storage manager
         self.storage_manager = StorageManager(storage_manager_config)
         self._storage_manager_config = storage_manager_config
-        self._shm_pool_info = self._compute_shm_pool_info(storage_manager_config)
+        self._shm_pool_info = self._compute_shm_pool_info(self._storage_manager_config)
 
         # Token hasher and session manager for token-based operations
         self.token_hasher = TokenHasher(
@@ -491,15 +491,25 @@ class MPCacheEngine:
 
     @staticmethod
     def _compute_shm_pool_info(config: StorageManagerConfig) -> dict:
-        """Compute effective SHM pool metadata from storage manager config."""
+        """Compute effective SHM pool metadata from storage manager config.
+
+        Returns:
+            A dict with:
+            - ``shm_name`` (str): Effective SHM segment name, normalized to include
+              ``lmcache_l1_pool_`` prefix when non-empty.
+            - ``pool_size`` (int): SHM pool size in bytes.
+
+            Returns ``{"shm_name": "", "pool_size": 0}`` when lazy allocation is
+            enabled or SHM is disabled.
+        """
         mem_cfg = config.l1_manager_config.memory_config
         shm_name = mem_cfg.shm_name or ""
         if not shm_name or mem_cfg.use_lazy:
             return {"shm_name": "", "pool_size": 0}
 
-        bare = shm_name.lstrip("/")
-        if not bare.startswith("lmcache_l1_pool_"):
-            shm_name = f"lmcache_l1_pool_{bare}"
+        stripped_name = shm_name.lstrip("/")
+        if not stripped_name.startswith("lmcache_l1_pool_"):
+            shm_name = f"lmcache_l1_pool_{stripped_name}"
 
         return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
 
