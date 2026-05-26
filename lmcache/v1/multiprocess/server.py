@@ -596,6 +596,14 @@ class MPCacheEngine:
         return (instance_id, key)
 
     def _get_non_gpu_context_metadata(self, instance_id: int) -> NonGpuContextMetadata:
+        """Return non-GPU context metadata for a registered instance.
+
+        Args:
+            instance_id: Worker instance identifier.
+
+        Raises:
+            ValueError: If the non-GPU context is not registered.
+        """
         with self._contexts_lock:
             context = self.contexts.get(instance_id)
         if context is None or context.non_cuda_metadata is None:
@@ -604,7 +612,26 @@ class MPCacheEngine:
             )
         return context.non_cuda_metadata
 
+    def _validate_non_gpu_context_exists(self, instance_id: int) -> None:
+        """Validate that a non-GPU context exists for a worker instance.
+
+        Args:
+            instance_id: Worker instance identifier.
+
+        Raises:
+            ValueError: If the non-GPU context is not registered.
+        """
+        self._get_non_gpu_context_metadata(instance_id)
+
     def _get_transfer_strategy(self, instance_id: int) -> TransferStrategy:
+        """Return the registered transfer strategy for a worker instance.
+
+        Args:
+            instance_id: Worker instance identifier.
+
+        Raises:
+            ValueError: If no transfer strategy is registered for the instance.
+        """
         strategy = self._strategies.get(instance_id)
         if strategy is None:
             raise ValueError(
@@ -750,7 +777,7 @@ class MPCacheEngine:
         """
 
         strategy = self._get_transfer_strategy(instance_id)
-        self._get_non_gpu_context_metadata(instance_id)
+        self._validate_non_gpu_context_exists(instance_id)
         return strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
@@ -783,7 +810,7 @@ class MPCacheEngine:
             Always ``True``.
         """
         strategy = self._get_transfer_strategy(instance_id)
-        self._get_non_gpu_context_metadata(instance_id)
+        self._validate_non_gpu_context_exists(instance_id)
         return strategy.commit_retrieve(key=key, instance_id=instance_id)
 
     @_lmcache_nvtx_annotate
