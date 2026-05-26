@@ -75,6 +75,8 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         )
         shm_name = config.shm_name
         if shm_name:
+            # Keep the lmcache_l1_pool_ prefix in normalized SHM names so
+            # stale-segment cleanup can recognize and unlink user-provided names.
             bare = shm_name.lstrip("/")
             if not bare.startswith("lmcache_l1_pool_"):
                 shm_name = f"lmcache_l1_pool_{bare}"

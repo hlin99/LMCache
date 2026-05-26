@@ -494,7 +494,18 @@ class MPCacheEngine:
 
     @staticmethod
     def _resolve_shm_config(config: StorageManagerConfig) -> None:
-        """Pre-check /dev/shm capacity and disable SHM transport when needed."""
+        """Resolve SHM configuration in place before storage-manager creation.
+
+        Args:
+            config: Storage-manager config to mutate in place.
+
+        Notes:
+            Clears ``config.l1_manager_config.memory_config.shm_name`` when SHM
+            transport should be disabled:
+            - lazy allocation is enabled
+            - /dev/shm free space is insufficient on Linux
+            - /dev/shm capacity cannot be queried on Linux
+        """
         mem_cfg = config.l1_manager_config.memory_config
         if not mem_cfg.shm_name or mem_cfg.use_lazy:
             return
@@ -505,17 +516,23 @@ class MPCacheEngine:
                 if free_bytes < mem_cfg.size_in_bytes:
                     logger.warning(
                         "Insufficient /dev/shm capacity: need %d bytes, have %d bytes. "
-                        "Falling back to pickle transport.",
+                        "Disabling SHM transport.",
                         mem_cfg.size_in_bytes,
                         free_bytes,
                     )
                     mem_cfg.shm_name = ""
             except OSError:
                 logger.warning(
-                    "Cannot check /dev/shm capacity, disabling SHM transport.",
+                    "Cannot verify /dev/shm capacity required for SHM transport; "
+                    "disabling SHM mode.",
                     exc_info=True,
                 )
                 mem_cfg.shm_name = ""
+        else:
+            logger.debug(
+                "Skipping /dev/shm capacity pre-check on non-Linux platform %s",
+                sys.platform,
+            )
 
     @staticmethod
     def _compute_shm_pool_info(config: StorageManagerConfig) -> dict:

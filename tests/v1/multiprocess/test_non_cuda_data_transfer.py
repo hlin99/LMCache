@@ -380,9 +380,13 @@ def test_server_register_and_find_non_cuda_context_layout(
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager"),
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={"shm_name": "", "pool_size": 0},
+        ),
     ):
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=16)
-    engine._shm_pool_info = {"shm_name": "", "pool_size": 0}
     engine.register_kv_cache_non_gpu_context(
         RegisterNonGpuContextPayload(
             instance_id=1,
@@ -431,6 +435,11 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={"shm_name": "", "pool_size": 0},
+        ),
         patch(
             "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
             return_value=["obj"],
@@ -438,7 +447,6 @@ def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> N
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-    engine._shm_pool_info = {"shm_name": "", "pool_size": 0}
 
     engine.register_kv_cache_non_gpu_context(
         RegisterNonGpuContextPayload(
@@ -510,6 +518,14 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={
+                "shm_name": "lmcache_l1_pool_lmcache_test_pool",
+                "pool_size": 1024,
+            },
+        ),
         patch(
             "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
             return_value=["obj"],
@@ -517,7 +533,6 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-    engine._shm_pool_info = {"shm_name": "lmcache_test_pool", "pool_size": 1024}
 
     engine.register_kv_cache_non_gpu_context(
         RegisterNonGpuContextPayload(
@@ -577,6 +592,14 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={
+                "shm_name": "lmcache_l1_pool_lmcache_test_pool",
+                "pool_size": 1024,
+            },
+        ),
         patch(
             "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
             return_value=["obj"],
@@ -584,7 +607,6 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-    engine._shm_pool_info = {"shm_name": "lmcache_test_pool", "pool_size": 1024}
 
     engine.register_kv_cache_non_gpu_context(
         RegisterNonGpuContextPayload(
@@ -615,8 +637,10 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
     mock_storage.finish_write.assert_called_once_with(reserved_keys)
 
 
-def test_server_shm_transport_is_per_instance(stub_native_storage_ops: Any) -> None:
-    """Ensure SHM transport activation is tracked per registered instance."""
+def test_server_shm_transport_uses_engine_level_config(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure all instances share the same engine-level SHM transport setting."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         IPCCacheEngineKey,
@@ -643,6 +667,14 @@ def test_server_shm_transport_is_per_instance(stub_native_storage_ops: Any) -> N
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={
+                "shm_name": "lmcache_l1_pool_lmcache_test_pool",
+                "pool_size": 1024,
+            },
+        ),
         patch(
             "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
             return_value=["obj"],
@@ -650,7 +682,6 @@ def test_server_shm_transport_is_per_instance(stub_native_storage_ops: Any) -> N
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-    engine._shm_pool_info = {"shm_name": "lmcache_test_pool", "pool_size": 1024}
 
     engine.register_kv_cache_non_gpu_context(
         RegisterNonGpuContextPayload(
@@ -709,9 +740,16 @@ def test_server_non_gpu_reregister_returns_existing_shm_response(
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager"),
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={
+                "shm_name": "lmcache_l1_pool_lmcache_test_pool",
+                "pool_size": 2048,
+            },
+        ),
     ):
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-    engine._shm_pool_info = {"shm_name": "lmcache_test_pool", "pool_size": 2048}
 
     payload = RegisterNonGpuContextPayload(
         instance_id=8,
@@ -726,9 +764,9 @@ def test_server_non_gpu_reregister_returns_existing_shm_response(
     first_response = engine.register_kv_cache_non_gpu_context(payload)
     second_response = engine.register_kv_cache_non_gpu_context(payload)
 
-    assert first_response.shm_name == "lmcache_test_pool"
+    assert first_response.shm_name == "lmcache_l1_pool_lmcache_test_pool"
     assert first_response.pool_size == 2048
-    assert second_response.shm_name == "lmcache_test_pool"
+    assert second_response.shm_name == "lmcache_l1_pool_lmcache_test_pool"
     assert second_response.pool_size == 2048
 
 
@@ -766,6 +804,11 @@ def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={"shm_name": "lmcache_l1_pool_test", "pool_size": 4096},
+        ),
         patch(
             "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
             return_value=["obj"],
@@ -773,7 +816,6 @@ def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-    engine._shm_pool_info = {"shm_name": "lmcache_l1_pool_test", "pool_size": 4096}
 
     engine.register_kv_cache_non_gpu_context(
         RegisterNonGpuContextPayload(
@@ -896,6 +938,14 @@ def test_server_prepare_store_includes_chunk_indices(
         patch("lmcache.v1.multiprocess.server.TokenHasher"),
         patch("lmcache.v1.multiprocess.server.SessionManager") as session_cls,
         patch("lmcache.v1.multiprocess.server.get_event_bus"),
+        patch.object(
+            MPCacheEngine,
+            "_compute_shm_pool_info",
+            return_value={
+                "shm_name": "lmcache_l1_pool_lmcache_test_pool",
+                "pool_size": 4096,
+            },
+        ),
         patch(
             "lmcache.v1.multiprocess.server.ipc_key_to_object_keys",
             return_value=[obj1, obj2],
@@ -903,7 +953,6 @@ def test_server_prepare_store_includes_chunk_indices(
     ):
         session_cls.return_value.get_or_create.return_value = mock_session
         engine = MPCacheEngine(storage_manager_config=MagicMock(), chunk_size=8)
-        engine._shm_pool_info = {"shm_name": "lmcache_test_pool", "pool_size": 4096}
         engine.register_kv_cache_non_gpu_context(
             RegisterNonGpuContextPayload(
                 instance_id=10,
