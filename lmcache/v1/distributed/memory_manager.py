@@ -51,6 +51,12 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
     Returns:
         MemoryAllocatorInterface: An instance of a memory allocator.
     """
+    if config.shm_name and config.use_lazy:
+        raise ValueError(
+            "Shared memory mode (shm_name) is incompatible with lazy allocation "
+            "(--l1-use-lazy). Please pass --no-l1-use-lazy when using shm_name."
+        )
+
     if config.use_lazy:
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
@@ -119,13 +125,6 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
-        self._shm_pool_info = {"shm_name": "", "pool_size": 0}
-        if isinstance(self._allocator, MixedMemoryAllocator):
-            if self._allocator.shm_name:
-                self._shm_pool_info = {
-                    "shm_name": self._allocator.shm_name,
-                    "pool_size": self._size_in_bytes,
-                }
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -234,10 +233,6 @@ class L1MemoryManager:
         Close the memory manager and release all resources.
         """
         self._allocator.close()
-
-    def get_shm_pool_info(self) -> dict:
-        """Return SHM pool metadata for non-GPU SHM transport."""
-        return dict(self._shm_pool_info)
 
     # Debugging APIs
     def memcheck(self):
