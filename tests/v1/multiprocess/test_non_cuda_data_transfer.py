@@ -404,6 +404,94 @@ def test_server_register_and_find_non_cuda_context_layout(
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
+def test_build_modules_passes_empty_shm_override_to_non_gpu_module(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure MP-level empty shm override disables SHM in non-GPU mode."""
+    # First Party
+    from lmcache.v1.multiprocess.config import MPServerConfig
+    from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
+    from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
+    from lmcache.v1.multiprocess.server import _build_modules
+
+    storage_manager_config = MagicMock()
+    storage_manager_config.l1_manager_config.memory_config.shm_name = "storage_default"
+    storage_manager_config.l1_manager_config.memory_config.use_lazy = False
+    storage_manager_config.l1_manager_config.memory_config.size_in_bytes = 4096
+
+    with (
+        patch("lmcache.v1.multiprocess.engine_context.StorageManager"),
+        patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
+        patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+        patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+    ):
+        ctx = MPCacheEngineContext(
+            storage_manager_config=storage_manager_config, chunk_size=16
+        )
+
+    modules = _build_modules(ctx, MPServerConfig(transfer_mode="non_gpu", shm_name=""))
+    module = next(m for m in modules if isinstance(m, NonGPUTransferModule))
+    response = module.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=3,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+
+    assert response.shm_name == ""
+    assert response.pool_size == 0
+
+
+def test_non_gpu_transfer_module_uses_mp_config_shm_name_override(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Ensure MP-level shm override is normalized and returned to workers."""
+    # First Party
+    from lmcache.v1.multiprocess.config import MPServerConfig
+    from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
+    from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
+
+    storage_manager_config = MagicMock()
+    storage_manager_config.l1_manager_config.memory_config.shm_name = None
+    storage_manager_config.l1_manager_config.memory_config.use_lazy = True
+    storage_manager_config.l1_manager_config.memory_config.size_in_bytes = 8192
+
+    with (
+        patch("lmcache.v1.multiprocess.engine_context.StorageManager"),
+        patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
+        patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+        patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+    ):
+        ctx = MPCacheEngineContext(
+            storage_manager_config=storage_manager_config, chunk_size=16
+        )
+
+    module = NonGPUTransferModule(ctx, MPServerConfig(shm_name="worker_pool"))
+    response = module.register_kv_cache_non_gpu_context(
+        RegisterNonGpuContextPayload(
+            instance_id=4,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+        )
+    )
+
+    assert response.shm_name == "lmcache_l1_pool_worker_pool"
+    assert response.pool_size == 8192
+
+
 def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> None:
     """Validate mocked server-side CPU chunk store and retrieve behavior."""
     # First Party

@@ -145,7 +145,7 @@ def _build_modules(
     if mp_config.transfer_mode == "gpu":
         modules.append(GPUTransferModule(ctx))
     else:
-        modules.append(NonGPUTransferModule(ctx))
+        modules.append(NonGPUTransferModule(ctx, mp_config))
 
     if mp_config.engine_type == "blend":
         if mp_config.transfer_mode != "gpu":

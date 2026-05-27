@@ -16,6 +16,7 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.multiprocess.config import MPServerConfig
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
     RegisterNonGpuContextPayload,
@@ -72,10 +73,16 @@ class NonGPUTransferModule:
 
     Args:
         ctx: The shared engine context.
+        mp_config: Optional MP server config carrying non-GPU SHM overrides.
     """
 
-    def __init__(self, ctx: MPCacheEngineContext) -> None:
+    def __init__(
+        self,
+        ctx: MPCacheEngineContext,
+        mp_config: MPServerConfig | None = None,
+    ) -> None:
         self._ctx = ctx
+        self._shm_name_override = mp_config.shm_name if mp_config else None
         self._non_gpu_contexts: dict[int, NonGPUContextEntry] = {}
         self._strategies: dict[int, TransferStrategy] = {}
         self._pending_shm_writes: dict[
@@ -162,6 +169,17 @@ class NonGPUTransferModule:
 
     def _compute_shm_pool_info(self) -> ShmPoolInfo:
         """Compute SHM pool info from storage manager config."""
+        if self._shm_name_override is not None:
+            shm_name = self._shm_name_override
+            if not shm_name:
+                return {"shm_name": "", "pool_size": 0}
+            sm_config = self._ctx.storage_manager_config
+            mem_cfg = sm_config.l1_manager_config.memory_config
+            bare = shm_name.lstrip("/")
+            if not bare.startswith("lmcache_l1_pool_"):
+                shm_name = f"lmcache_l1_pool_{bare}"
+            return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
+
         sm_config = self._ctx.storage_manager_config
         mem_cfg = sm_config.l1_manager_config.memory_config
         shm_name = mem_cfg.shm_name or ""
