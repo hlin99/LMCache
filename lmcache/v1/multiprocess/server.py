@@ -191,6 +191,14 @@ def run_cache_server(
 
     maybe_initialize_trace_recorder(event_bus, obs_config, storage_manager_config)
 
+    # Apply shm_name override from MP config so the allocator creates the
+    # segment with the user-specified name (must happen before StorageManager
+    # is instantiated inside MPCacheEngineContext).
+    if mp_config.shm_name is not None:
+        storage_manager_config.l1_manager_config.memory_config.shm_name = (
+            mp_config.shm_name
+        )
+
     ctx = MPCacheEngineContext(
         storage_manager_config=storage_manager_config,
         chunk_size=mp_config.chunk_size,
