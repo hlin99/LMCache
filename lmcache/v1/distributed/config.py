@@ -173,7 +173,8 @@ def add_storage_manager_args(
         type=str,
         default=None,
         help='SHM segment name for non-GPU KV transfer. '
-        'Default: auto-allocate. "" to force pickle.',
+        'Default: auto-allocate. "" to force pickle. '
+        "Custom name: use that specific SHM segment.",
     )
 
     # L1 Manager Config (TTL settings)
@@ -327,7 +328,7 @@ def parse_args_to_config(
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
     )
-    if getattr(args, "shm_name", None) is not None:
+    if args.shm_name is not None:
         config.l1_manager_config.memory_config.shm_name = args.shm_name
     return config
 

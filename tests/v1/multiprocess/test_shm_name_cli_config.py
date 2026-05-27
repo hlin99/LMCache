@@ -5,6 +5,9 @@ import argparse
 import sys
 import types
 
+# Third Party
+import pytest
+
 
 def _install_config_import_stubs() -> None:
     l2_pkg = types.ModuleType("lmcache.v1.distributed.l2_adapters")
@@ -56,7 +59,9 @@ from lmcache.v1.distributed.config import add_storage_manager_args, parse_args_t
 from lmcache.v1.multiprocess.config import add_mp_server_args, parse_args_to_mp_server_config
 
 
-def test_shm_name_moves_to_storage_manager_config() -> None:
+@pytest.mark.parametrize("shm_name", ["", "custom_name"])
+def test_shm_name_moves_to_storage_manager_config(shm_name: str) -> None:
+    """Verify explicit --shm-name values populate storage config only."""
     parser = argparse.ArgumentParser()
     add_mp_server_args(parser)
     add_storage_manager_args(parser)
@@ -68,7 +73,7 @@ def test_shm_name_moves_to_storage_manager_config() -> None:
             "--eviction-policy",
             "LRU",
             "--shm-name",
-            "",
+            shm_name,
         ]
     )
 
@@ -76,16 +81,36 @@ def test_shm_name_moves_to_storage_manager_config() -> None:
     storage_config = parse_args_to_config(args)
 
     assert not hasattr(mp_config, "shm_name")
-    assert storage_config.l1_manager_config.memory_config.shm_name == ""
+    assert storage_config.l1_manager_config.memory_config.shm_name == shm_name
+
+
+def test_storage_manager_parser_keeps_default_shm_name_when_flag_omitted() -> None:
+    """Verify omitting --shm-name preserves the L1 memory config default."""
+    parser = argparse.ArgumentParser()
+    add_mp_server_args(parser)
+    add_storage_manager_args(parser)
+
+    args = parser.parse_args(
+        [
+            "--l1-size-gb",
+            "1",
+            "--eviction-policy",
+            "LRU",
+        ]
+    )
+
+    storage_config = parse_args_to_config(args)
+
+    assert storage_config.l1_manager_config.memory_config.shm_name.startswith(
+        "lmcache_l1_pool_"
+    )
 
 
 def test_mp_server_parser_rejects_shm_name_argument() -> None:
+    """Verify the MP-only parser rejects --shm-name as an unknown argument."""
     parser = argparse.ArgumentParser()
     add_mp_server_args(parser)
 
-    try:
+    with pytest.raises(SystemExit) as exc_info:
         parser.parse_args(["--shm-name", "custom"])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("--shm-name should not be accepted by MP parser")
+    assert exc_info.value.code == 2
