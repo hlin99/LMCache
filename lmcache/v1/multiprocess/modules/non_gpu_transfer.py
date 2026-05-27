@@ -29,6 +29,7 @@ from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
     PrepareStoreResponse,
+    RegisterNonGpuContextResponse,
 )
 
 logger = init_logger(__name__)
@@ -140,7 +141,7 @@ class NonGPUTransferModule:
     def register_kv_cache_non_gpu_context(
         self,
         payload: RegisterNonGpuContextPayload,
-    ) -> None:
+    ) -> RegisterNonGpuContextResponse:
         """Register non-CUDA KV layout metadata for non-GPU context mode.
 
         Args:
@@ -157,7 +158,7 @@ class NonGPUTransferModule:
                 "skipping the new registration",
                 payload.instance_id,
             )
-            return
+            return RegisterNonGpuContextResponse()
 
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
@@ -191,6 +192,7 @@ class NonGPUTransferModule:
         self._ctx.layout_desc_registry.register(
             payload.model_name, payload.world_size, layout_desc
         )
+        return RegisterNonGpuContextResponse()
 
     def unregister_kv_cache(self, instance_id: int) -> None:
         """Unregister a non-GPU KV cache context for the given instance ID.

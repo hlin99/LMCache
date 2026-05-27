@@ -384,7 +384,7 @@ def test_server_register_and_find_non_cuda_context_layout(
     ):
         ctx = MPCacheEngineContext(storage_manager_config=MagicMock(), chunk_size=16)
     module = NonGPUTransferModule(ctx)
-    module.register_kv_cache_non_gpu_context(
+    response = module.register_kv_cache_non_gpu_context(
         RegisterNonGpuContextPayload(
             instance_id=1,
             model_name="m",
@@ -396,6 +396,8 @@ def test_server_register_and_find_non_cuda_context_layout(
             use_mla=False,
         )
     )
+    assert response.shm_name == ""
+    assert response.pool_size == 0
 
     layout = ctx.layout_desc_registry.find("m", 1)
     assert layout is not None
