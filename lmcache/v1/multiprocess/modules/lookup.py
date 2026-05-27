@@ -57,7 +57,7 @@ class LookupModule:
         ]
 
     def report_status(self) -> dict:
-        return {"active_prefetch_jobs": self._active_prefetch_count()}
+        return {}
 
     def close(self) -> None:
         pass
@@ -297,3 +297,7 @@ class LookupModule:
         """Return the number of active prefetch jobs (thread-safe)."""
         with self._prefetch_job_lock:
             return len(self._prefetch_jobs)
+
+    def active_prefetch_count(self) -> int:
+        """Return the number of active prefetch jobs (public interface)."""
+        return self._active_prefetch_count()

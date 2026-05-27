@@ -52,15 +52,10 @@ from lmcache.v1.multiprocess.custom_types import (
     KVCache,
     RegisterNonGpuContextPayload,
 )
-from lmcache.v1.multiprocess.engine_context import (
-    MPCacheEngineContext,
-    RegisteredContext,
-    _PrefetchJob,
-)
+from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
 from lmcache.v1.multiprocess.engine_module import (
     EngineModule,
     HandlerSpec,
-    ThreadPoolType,
 )
 from lmcache.v1.multiprocess.gpu_context import GPUCacheContext
 from lmcache.v1.multiprocess.modules.gpu_transfer import GPUTransferModule
@@ -88,13 +83,27 @@ def _build_modules(
 ) -> tuple[GPUTransferModule, NonGPUTransferModule, LookupModule, ManagementModule]:
     """Build and return the set of engine modules.
 
+    When ``mp_config.transfer_mode`` is ``"non_gpu"``, the
+    :class:`~lmcache.v1.multiprocess.modules.gpu_transfer.GPUTransferModule`
+    is still created but effectively unused; all store/retrieve traffic goes
+    through :class:`~lmcache.v1.multiprocess.modules.non_gpu_transfer.NonGPUTransferModule`.
+    When ``transfer_mode`` is ``"gpu"`` (the default), the GPU module handles
+    store/retrieve and the non-GPU module handles registration of CPU-only workers.
+
     Args:
         context: Shared engine state context.
-        mp_config: MP server configuration.
+        mp_config: MP server configuration.  The relevant fields are:
+            - ``transfer_mode``: ``"gpu"`` (default) or ``"non_gpu"``
+            - ``shm_name``: Optional SHM segment override for the non-GPU path.
 
     Returns:
         Tuple of (gpu_module, non_gpu_module, lookup_module, management_module).
     """
+    if mp_config.transfer_mode not in ("gpu", "non_gpu"):
+        logger.warning(
+            "Unknown transfer_mode '%s'; defaulting to 'gpu'.",
+            mp_config.transfer_mode,
+        )
     gpu_module = GPUTransferModule(context)
     non_gpu_module = NonGPUTransferModule(context, shm_name=mp_config.shm_name)
     lookup_module = LookupModule(context)
@@ -359,20 +368,6 @@ class MPCacheEngine:
         return self._context.find_layout_desc(model_name, world_size)
 
     # ------------------------------------------------------------------
-    # Static methods (backward compat for tests)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _resolve_shm_config(config: StorageManagerConfig) -> None:
-        """Delegate to MPCacheEngineContext._resolve_shm_config."""
-        MPCacheEngineContext._resolve_shm_config(config)
-
-    @staticmethod
-    def _compute_shm_pool_info(config: StorageManagerConfig) -> dict:
-        """Delegate to MPCacheEngineContext._compute_shm_pool_info."""
-        return MPCacheEngineContext._compute_shm_pool_info(config)
-
-    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -385,7 +380,7 @@ class MPCacheEngine:
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""
-        return self._lookup_module._active_prefetch_count()
+        return self._lookup_module.active_prefetch_count()
 
     def _setup_metrics(self) -> None:
         """Register OTel observable gauges for MP engine metrics."""

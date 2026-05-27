@@ -154,16 +154,7 @@ class NonGPUTransferModule:
         Raises:
             ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
         """
-        with self._ctx._contexts_lock:
-            existing_context = self._ctx.contexts.get(payload.instance_id)
-            if existing_context is not None:
-                logger.warning(
-                    "Instance %s's KV cache is already registered, "
-                    "skipping the new registration",
-                    payload.instance_id,
-                )
-                return self._build_existing_non_gpu_context_response(existing_context)
-
+        # Validate dtype before acquiring the lock (raises on bad input).
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
             raise ValueError(

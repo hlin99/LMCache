@@ -60,7 +60,7 @@ class ManagementModule:
         sm = self._ctx.storage_manager.report_status()
         active_prefetch = 0
         if self._lookup_module is not None:
-            active_prefetch = self._lookup_module._active_prefetch_count()
+            active_prefetch = self._lookup_module.active_prefetch_count()
         return {
             "is_healthy": sm["is_healthy"],
             "chunk_size": self._ctx.chunk_size,

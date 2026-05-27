@@ -167,8 +167,6 @@ class MPCacheEngineContext:
         )
         self._device_host_func_dispatcher.start()
 
-        self._setup_metrics()
-
     def resolve_obj_keys(self, key: IPCCacheEngineKey) -> list[ObjectKey]:
         """Resolve object keys from an IPC cache key.
 
@@ -288,7 +286,3 @@ class MPCacheEngineContext:
 
         with self._contexts_lock:
             self.contexts.clear()
-
-    def _setup_metrics(self) -> None:
-        """Register OTel observable gauges for MP engine metrics."""
-        pass
