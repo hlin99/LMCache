@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import Counter
 from typing import Any, Union
 import ctypes
 import os
+import threading
 import unittest.mock
 
 # Third Party
@@ -1867,3 +1869,54 @@ def test_alloc_pinned_ptr_is_page_aligned(size: int) -> None:
             assert buf[i] == ((i & 0xFF) ^ 0xA5)
     finally:
         _py_ops.free_pinned_ptr(ptr)
+
+
+def test_record_and_drain_recorded_completions_cpu_fallback() -> None:
+    """Verify sequential record/drain behavior and post-drain emptiness."""
+    _py_ops.drain_recorded_completions()
+
+    expected = [
+        ("finish_write", b"payload-0"),
+        ("finish_write", b"\x00\xff\x10"),
+        ("finish_read", b"payload-2"),
+    ]
+    for kind, payload in expected:
+        _py_ops.record_completion_on_stream(0, kind, payload)
+
+    assert _py_ops.drain_recorded_completions() == expected
+    assert _py_ops.drain_recorded_completions() == []
+
+
+def test_record_completion_on_stream_thread_safety() -> None:
+    """Verify concurrent recording preserves all completions without loss."""
+    _py_ops.drain_recorded_completions()
+
+    N_THREADS = 8
+    ITEMS_PER_THREAD = 100
+    # Keep explicit expected tuples so Counter checks exact membership.
+    expected = [
+        (f"kind-{thread_id}", f"{thread_id}-{idx}".encode())
+        for thread_id in range(N_THREADS)
+        for idx in range(ITEMS_PER_THREAD)
+    ]
+
+    def _worker(thread_id: int) -> None:
+        for idx in range(ITEMS_PER_THREAD):
+            _py_ops.record_completion_on_stream(
+                0,
+                f"kind-{thread_id}",
+                f"{thread_id}-{idx}".encode(),
+            )
+
+    threads = [
+        threading.Thread(target=_worker, args=(tid,)) for tid in range(N_THREADS)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    drained = _py_ops.drain_recorded_completions()
+    assert len(drained) == N_THREADS * ITEMS_PER_THREAD
+    assert Counter(drained) == Counter(expected)
+    assert _py_ops.drain_recorded_completions() == []

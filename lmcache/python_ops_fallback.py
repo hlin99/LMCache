@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 import ctypes
 import ctypes.util
 import os
+import threading
 import warnings
 
 # Third Party
@@ -26,6 +27,8 @@ from lmcache import torch_dev
 _tensor_registry: dict[int, torch.Tensor] = {}
 _shm_registry: dict[int, shared_memory.SharedMemory] = {}
 _buf_registry: dict[int, ctypes.Array] = {}
+_recorded_completions: list[tuple[str, bytes]] = []
+_recorded_completions_lock = threading.Lock()
 
 # Cached copy library for lmcache_memcpy_async (lazy-initialized)
 _copy_lib_NOT_LOADED = object()
@@ -1515,3 +1518,37 @@ def get_gpu_pci_bus_id(device_id: int = 0) -> str | None:
         pass
 
     return None
+
+
+def record_completion_on_stream(stream_ptr: int, kind: str, encoded: bytes) -> None:
+    """Record one completion in CPU fallback mode.
+
+    Args:
+        stream_ptr: Opaque stream handle from native caller. Kept for API
+            compatibility with the CUDA implementation, and intentionally
+            ignored on CPU fallback.
+        kind: Completion kind string (for example ``"finish_write"``)
+            consumed by ``DeviceHostFuncDispatcher.register`` handlers.
+        encoded: Serialized payload bytes for the completion event.
+
+    Returns:
+        None.
+    """
+    del stream_ptr
+    with _recorded_completions_lock:
+        _recorded_completions.append((kind, encoded))
+
+
+def drain_recorded_completions() -> list[tuple[str, bytes]]:
+    """Drain all recorded completions in CPU fallback mode.
+
+    Draining means retrieving all currently buffered completion tuples and
+    clearing the shared buffer in one lock-protected critical section.
+
+    Returns:
+        A list of ``(kind, encoded)`` tuples recorded so far.
+    """
+    with _recorded_completions_lock:
+        drained = list(_recorded_completions)
+        _recorded_completions.clear()
+    return drained
