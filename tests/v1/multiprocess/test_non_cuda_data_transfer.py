@@ -404,6 +404,137 @@ def test_server_register_and_find_non_cuda_context_layout(
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
+def test_server_shm_pool_info_disables_shm_when_dev_shm_too_small(
+    stub_native_storage_ops: Any,
+) -> None:
+    """_compute_shm_pool_info disables SHM when /dev/shm has insufficient space."""
+    # First Party
+    from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
+
+    sm_cfg = MagicMock()
+    sm_cfg.l1_manager_config.memory_config = MagicMock(
+        shm_name="test_pool",
+        use_lazy=False,
+        size_in_bytes=4096,
+    )
+
+    with (
+        patch("lmcache.v1.multiprocess.engine_context.StorageManager"),
+        patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
+        patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+        patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+    ):
+        ctx = MPCacheEngineContext(storage_manager_config=sm_cfg, chunk_size=16)
+    module = NonGPUTransferModule(ctx)
+
+    with (
+        patch("lmcache.v1.multiprocess.modules.non_gpu_transfer.sys.platform", "linux"),
+        patch(
+            "lmcache.v1.multiprocess.modules.non_gpu_transfer.shutil.disk_usage",
+            return_value=MagicMock(free=1024),
+        ),
+        patch(
+            "lmcache.v1.multiprocess.modules.non_gpu_transfer.logger.warning"
+        ) as warn,
+    ):
+        shm_pool_info = module._compute_shm_pool_info()
+
+    assert shm_pool_info == {"shm_name": "", "pool_size": 0}
+    warn.assert_called_once_with(
+        "Insufficient /dev/shm capacity: need %d bytes, have %d bytes. "
+        "Disabling SHM transport.",
+        4096,
+        1024,
+    )
+
+
+def test_server_register_logs_pickle_transport_selection(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Register logs when pickle transport is selected."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
+    from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
+
+    with (
+        patch("lmcache.v1.multiprocess.engine_context.StorageManager"),
+        patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
+        patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+        patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+    ):
+        ctx = MPCacheEngineContext(storage_manager_config=MagicMock(), chunk_size=16)
+    module = NonGPUTransferModule(ctx)
+
+    with patch("lmcache.v1.multiprocess.modules.non_gpu_transfer.logger.info") as info:
+        module.register_kv_cache_non_gpu_context(
+            RegisterNonGpuContextPayload(
+                instance_id=11,
+                model_name="m",
+                world_size=1,
+                block_size=4,
+                num_layers=2,
+                hidden_dim_size=16,
+                dtype_str="float32",
+                use_mla=False,
+            )
+        )
+
+    info.assert_called_with("Instance %s non-GPU context using pickle transport", 11)
+
+
+def test_server_register_logs_shm_transport_selection(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Register logs when SHM transport is selected."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
+    from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
+
+    with (
+        patch("lmcache.v1.multiprocess.engine_context.StorageManager"),
+        patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
+        patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+        patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+    ):
+        ctx = MPCacheEngineContext(storage_manager_config=MagicMock(), chunk_size=16)
+        module = NonGPUTransferModule(ctx)
+
+    with (
+        patch.object(
+            NonGPUTransferModule,
+            "_compute_shm_pool_info",
+            return_value={
+                "shm_name": "lmcache_l1_pool_lmcache_test_pool",
+                "pool_size": 1024,
+            },
+        ),
+        patch("lmcache.v1.multiprocess.modules.non_gpu_transfer.logger.info") as info,
+    ):
+        module.register_kv_cache_non_gpu_context(
+            RegisterNonGpuContextPayload(
+                instance_id=12,
+                model_name="m",
+                world_size=1,
+                block_size=4,
+                num_layers=2,
+                hidden_dim_size=16,
+                dtype_str="float32",
+                use_mla=False,
+            )
+        )
+
+    info.assert_called_with(
+        "Instance %s non-GPU context using SHM transport "
+        "(shm_name=%s, pool_size=%d)",
+        12,
+        "lmcache_l1_pool_lmcache_test_pool",
+        1024,
+    )
+
+
 def test_server_store_and_retrieve_cpu_chunks(stub_native_storage_ops: Any) -> None:
     """Validate mocked server-side CPU chunk store and retrieve behavior."""
     # First Party

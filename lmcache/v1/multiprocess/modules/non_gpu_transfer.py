@@ -4,6 +4,8 @@
 # Standard
 from dataclasses import dataclass
 from typing import TypedDict
+import shutil
+import sys
 import threading
 
 # Third Party
@@ -170,7 +172,26 @@ class NonGPUTransferModule:
         bare = shm_name.lstrip("/")
         if not bare.startswith("lmcache_l1_pool_"):
             shm_name = f"lmcache_l1_pool_{bare}"
-        return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
+        pool_size = mem_cfg.size_in_bytes
+        if pool_size > 0 and sys.platform.startswith("linux"):
+            try:
+                free_bytes = shutil.disk_usage("/dev/shm").free
+                if free_bytes < pool_size:
+                    logger.warning(
+                        "Insufficient /dev/shm capacity: need %d bytes, have %d bytes. "
+                        "Disabling SHM transport.",
+                        pool_size,
+                        free_bytes,
+                    )
+                    return {"shm_name": "", "pool_size": 0}
+            except OSError:
+                logger.warning(
+                    "Cannot verify /dev/shm capacity required for SHM transport; "
+                    "disabling SHM mode.",
+                    exc_info=True,
+                )
+                return {"shm_name": "", "pool_size": 0}
+        return {"shm_name": shm_name, "pool_size": pool_size}
 
     @staticmethod
     def _make_transfer_key(
@@ -233,6 +254,7 @@ class NonGPUTransferModule:
             world_size=payload.world_size,
         )
         strategy: TransferStrategy = PickleTransferStrategy(self._ctx.storage_manager)
+        shm_active = False
         if shm_name and pool_size > 0:
             strategy = ShmTransferStrategy(
                 storage_manager=self._ctx.storage_manager,
@@ -241,6 +263,20 @@ class NonGPUTransferModule:
                 pending_lock=self._pending_shm_lock,
                 transfer_key_factory=self._make_transfer_key,
                 fallback_strategy=PickleTransferStrategy(self._ctx.storage_manager),
+            )
+            shm_active = True
+        if shm_active:
+            logger.info(
+                "Instance %s non-GPU context using SHM transport "
+                "(shm_name=%s, pool_size=%d)",
+                payload.instance_id,
+                shm_name,
+                pool_size,
+            )
+        else:
+            logger.info(
+                "Instance %s non-GPU context using pickle transport",
+                payload.instance_id,
             )
         self._strategies[payload.instance_id] = strategy
 
