@@ -14,7 +14,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
     RegisterNonGpuContextPayload,
@@ -179,8 +179,6 @@ class NonGPUTransferModule:
                 [2, payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
             )
         )
-        from lmcache.v1.distributed.api import MemoryLayoutDesc
-
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
         shm_pool_info = self.get_shm_pool_info()
         shm_active = False

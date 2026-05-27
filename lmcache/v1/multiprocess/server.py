@@ -26,6 +26,7 @@ import zmq
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
+from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.config import (
     StorageManagerConfig,
     add_storage_manager_args,
@@ -353,7 +354,7 @@ class MPCacheEngine:
             status.update(module.report_status())
         return status
 
-    def _find_layout_desc(self, model_name: str, world_size: int):
+    def _find_layout_desc(self, model_name: str, world_size: int) -> MemoryLayoutDesc | None:
         """Find layout desc from a matching context (backward compat)."""
         return self._context.find_layout_desc(model_name, world_size)
 

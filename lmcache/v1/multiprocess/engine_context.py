@@ -89,9 +89,19 @@ class RegisteredContext:
             ValueError: If no GPU context or non-CUDA metadata is configured.
         """
         if self.gpu_context is not None:
-            from lmcache.v1.multiprocess.modules.gpu_transfer import get_layout_desc
-
-            return get_layout_desc(self.gpu_context, chunk_size)
+            # Inline the layout computation to avoid a circular import with
+            # modules.gpu_transfer (which itself imports engine_context).
+            gpu_context = self.gpu_context
+            num_groups = gpu_context.kv_layer_groups_manager.num_groups
+            shapes = [
+                gpu_context.get_kv_buffer_shape(chunk_size, group_idx)
+                for group_idx in range(num_groups)
+            ]
+            dtypes = [
+                gpu_context.kv_layer_groups_manager.kv_layer_groups[group_idx].dtype
+                for group_idx in range(num_groups)
+            ]
+            return MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
         if self.non_cuda_metadata is None:
             raise ValueError(
                 "Invalid RegisteredContext: no GPU or non-CUDA metadata configured"
