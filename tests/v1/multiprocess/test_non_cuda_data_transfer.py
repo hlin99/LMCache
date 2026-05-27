@@ -449,6 +449,44 @@ def test_server_shm_pool_info_disables_shm_when_dev_shm_too_small(
     )
 
 
+def test_server_shm_pool_info_skips_dev_shm_check_on_non_linux(
+    stub_native_storage_ops: Any,
+) -> None:
+    """_compute_shm_pool_info should not probe /dev/shm on non-Linux platforms."""
+    # First Party
+    from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
+
+    sm_cfg = MagicMock()
+    sm_cfg.l1_manager_config.memory_config = MagicMock(
+        shm_name="test_pool",
+        use_lazy=False,
+        size_in_bytes=4096,
+    )
+
+    with (
+        patch("lmcache.v1.multiprocess.engine_context.StorageManager"),
+        patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
+        patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+        patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+    ):
+        ctx = MPCacheEngineContext(storage_manager_config=sm_cfg, chunk_size=16)
+    module = NonGPUTransferModule(ctx)
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.modules.non_gpu_transfer.sys.platform", "darwin"
+        ),
+        patch(
+            "lmcache.v1.multiprocess.modules.non_gpu_transfer.shutil.disk_usage"
+        ) as disk_usage,
+    ):
+        shm_pool_info = module._compute_shm_pool_info()
+
+    assert shm_pool_info == {"shm_name": "lmcache_l1_pool_test_pool", "pool_size": 4096}
+    disk_usage.assert_not_called()
+
+
 def test_server_register_logs_pickle_transport_selection(
     stub_native_storage_ops: Any,
 ) -> None:
