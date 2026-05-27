@@ -5,7 +5,6 @@ from functools import partial
 from itertools import islice
 from typing import Generator
 import argparse
-import pickle
 import threading
 import time
 
@@ -1480,10 +1479,10 @@ class MPCacheEngine:
             )
         )
         if session is None:
-            logger.warning("Session %s not found, skipping touch", request_id)
+            logger.debug("Session %s not found, skipping touch", request_id)
             return
         if session.lookup_ipc_key is None:
-            logger.warning("Session %s has no lookup ipc key, skipping touch", request_id)
+            logger.debug("Session %s has no lookup ipc key, skipping touch", request_id)
             return
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
