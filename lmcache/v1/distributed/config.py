@@ -168,6 +168,13 @@ def add_storage_manager_args(
         default=4096,
         help="The alignment size in bytes. Default is 4KB (4096 bytes).",
     )
+    memory_group.add_argument(
+        "--shm-name",
+        type=str,
+        default=None,
+        help='SHM segment name for non-GPU KV transfer. '
+        'Default: auto-allocate. "" to force pickle.',
+    )
 
     # L1 Manager Config (TTL settings)
     ttl_group = parser.add_argument_group(
@@ -312,7 +319,7 @@ def parse_args_to_config(
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)
 
-    return StorageManagerConfig(
+    config = StorageManagerConfig(
         l1_manager_config=l1_manager_config,
         eviction_config=eviction_config,
         l2_adapter_config=l2_adapter_config,
@@ -320,6 +327,9 @@ def parse_args_to_config(
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
     )
+    if getattr(args, "shm_name", None) is not None:
+        config.l1_manager_config.memory_config.shm_name = args.shm_name
+    return config
 
 
 def parse_args(args: list[str] | None = None) -> StorageManagerConfig:
