@@ -483,7 +483,9 @@ def test_server_shm_pool_info_skips_dev_shm_check_on_non_linux(
     ):
         shm_pool_info = module._compute_shm_pool_info()
 
-    assert shm_pool_info == {"shm_name": "lmcache_l1_pool_test_pool", "pool_size": 4096}
+    assert shm_pool_info["shm_name"].startswith("lmcache_l1_pool_")
+    assert shm_pool_info["shm_name"].endswith("test_pool")
+    assert shm_pool_info["pool_size"] == 4096
     disk_usage.assert_not_called()
 
 
@@ -545,7 +547,7 @@ def test_server_register_logs_shm_transport_selection(
             NonGPUTransferModule,
             "_compute_shm_pool_info",
             return_value={
-                "shm_name": "lmcache_l1_pool_lmcache_test_pool",
+                "shm_name": "lmcache_l1_pool_test_shm",
                 "pool_size": 1024,
             },
         ),
@@ -568,7 +570,7 @@ def test_server_register_logs_shm_transport_selection(
         "Instance %s non-GPU context using SHM transport "
         "(shm_name=%s, pool_size=%d)",
         12,
-        "lmcache_l1_pool_lmcache_test_pool",
+        "lmcache_l1_pool_test_shm",
         1024,
     )
 

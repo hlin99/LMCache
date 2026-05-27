@@ -254,7 +254,6 @@ class NonGPUTransferModule:
             world_size=payload.world_size,
         )
         strategy: TransferStrategy = PickleTransferStrategy(self._ctx.storage_manager)
-        shm_active = False
         if shm_name and pool_size > 0:
             strategy = ShmTransferStrategy(
                 storage_manager=self._ctx.storage_manager,
@@ -264,8 +263,7 @@ class NonGPUTransferModule:
                 transfer_key_factory=self._make_transfer_key,
                 fallback_strategy=PickleTransferStrategy(self._ctx.storage_manager),
             )
-            shm_active = True
-        if shm_active:
+        if isinstance(strategy, ShmTransferStrategy):
             logger.info(
                 "Instance %s non-GPU context using SHM transport "
                 "(shm_name=%s, pool_size=%d)",
