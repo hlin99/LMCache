@@ -966,12 +966,12 @@ def test_server_prepare_store_includes_chunk_indices(
             "m", 1, 0, [1] * 16, start=0, end=16, request_id="req"
         )
         response = module.prepare_store(key, 10)
-        ctx = response.context
+        response_context = response.context
 
         # slots should have 1 entry (only obj2 reserved)
-        assert len(ctx.get("slots", [])) == 1
+        assert len(response_context.get("slots", [])) == 1
         # chunk_indices should be [1] (position of obj2 in [obj1, obj2])
-        assert ctx.get("chunk_indices") == [1]
+        assert response_context.get("chunk_indices") == [1]
 
 
 class _CompletedFuture:

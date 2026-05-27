@@ -4,6 +4,7 @@
 # Standard
 from dataclasses import dataclass
 import threading
+from typing import TypedDict
 
 # Third Party
 import torch
@@ -38,6 +39,13 @@ from lmcache.v1.multiprocess.server_transfer import (
 from lmcache.v1.multiprocess.worker_transfer.base import NonGpuContextMetadata
 
 logger = init_logger(__name__)
+
+
+class ShmPoolInfo(TypedDict):
+    """Shared-memory pool metadata returned during registration."""
+
+    shm_name: str
+    pool_size: int
 
 
 @dataclass
@@ -152,7 +160,7 @@ class NonGPUTransferModule:
         self._non_gpu_contexts.clear()
         self._strategies.clear()
 
-    def _compute_shm_pool_info(self) -> dict:
+    def _compute_shm_pool_info(self) -> ShmPoolInfo:
         """Compute SHM pool info from storage manager config."""
         sm_config = self._ctx.storage_manager_config
         mem_cfg = sm_config.l1_manager_config.memory_config
@@ -185,8 +193,8 @@ class NonGPUTransferModule:
             ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
         """
         shm_pool_info = self._compute_shm_pool_info()
-        shm_name = str(shm_pool_info.get("shm_name", ""))
-        pool_size = int(shm_pool_info.get("pool_size", 0))
+        shm_name = shm_pool_info["shm_name"]
+        pool_size = shm_pool_info["pool_size"]
 
         if payload.instance_id in self._non_gpu_contexts:
             logger.warning(
@@ -258,20 +266,22 @@ class NonGPUTransferModule:
         self._strategies.pop(instance_id, None)
 
         with self._pending_shm_lock:
-            stale_writes = [
-                key
-                for key in self._pending_shm_writes
-                if key[0] == instance_id
-            ]
-            stale_reads = [
-                key
-                for key in self._pending_shm_reads
-                if key[0] == instance_id
-            ]
-            write_obj_keys = [
-                self._pending_shm_writes.pop(key) for key in stale_writes
-            ]
-            read_obj_keys = [self._pending_shm_reads.pop(key) for key in stale_reads]
+            stale_writes = []
+            stale_reads = []
+            for transfer_key in self._pending_shm_writes:
+                if transfer_key[0] == instance_id:
+                    stale_writes.append(transfer_key)
+            for transfer_key in self._pending_shm_reads:
+                if transfer_key[0] == instance_id:
+                    stale_reads.append(transfer_key)
+
+            write_obj_keys = []
+            for transfer_key in stale_writes:
+                write_obj_keys.append(self._pending_shm_writes.pop(transfer_key))
+
+            read_obj_keys = []
+            for transfer_key in stale_reads:
+                read_obj_keys.append(self._pending_shm_reads.pop(transfer_key))
 
         for obj_keys in write_obj_keys:
             if obj_keys:
