@@ -120,7 +120,6 @@ class MessageQueueClient:
         self.ctx = context
         self.socket = self.ctx.socket(zmq.DEALER)
         self.socket.connect(server_url)
-        logger.info("MessageQueueClient connected to %s", server_url)
 
         # Input queue
         self.task_notifier, self.task_waiter = prepare_internal_push_pull_sockets(
