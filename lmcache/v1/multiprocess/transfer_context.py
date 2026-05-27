@@ -18,7 +18,7 @@ from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType
 from lmcache.v1.multiprocess.protocols.engine import RegisterNonGpuContextResponse
-from lmcache.v1.multiprocess.worker_transfer.base import (
+from lmcache.v1.multiprocess.non_gpu_context import (
     NonGpuContext,
     NonGpuContextMetadata,
     compute_kv_layout,
