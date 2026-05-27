@@ -168,6 +168,15 @@ def add_storage_manager_args(
         default=4096,
         help="The alignment size in bytes. Default is 4KB (4096 bytes).",
     )
+    memory_group.add_argument(
+        "--shm-name",
+        type=str,
+        default=None,
+        help="POSIX shared-memory segment name for L1 pool. "
+        "Default (not specified): auto-allocate pid-based name. "
+        'Set to "" to disable SHM. '
+        "Set to a name to use that specific SHM segment.",
+    )
 
     # L1 Manager Config (TTL settings)
     ttl_group = parser.add_argument_group(
@@ -291,11 +300,13 @@ def parse_args_to_config(
     Returns:
         StorageManagerConfig: The configuration object.
     """
+    shm_name = getattr(args, "shm_name", None)
     memory_config = L1MemoryManagerConfig(
         size_in_bytes=int(args.l1_size_gb * (1 << 30)),
         use_lazy=args.l1_use_lazy,
         init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
         align_bytes=args.l1_align_bytes,
+        **({"shm_name": shm_name} if shm_name is not None else {}),
     )
 
     l1_manager_config = L1ManagerConfig(
