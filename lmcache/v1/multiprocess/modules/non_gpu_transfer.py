@@ -82,7 +82,9 @@ class NonGPUTransferModule:
         mp_config: MPServerConfig | None = None,
     ) -> None:
         self._ctx = ctx
-        self._shm_name_override = mp_config.shm_name if mp_config else None
+        self._shm_name_override = (
+            mp_config.shm_name if mp_config is not None else None
+        )
         self._non_gpu_contexts: dict[int, NonGPUContextEntry] = {}
         self._strategies: dict[int, TransferStrategy] = {}
         self._pending_shm_writes: dict[
