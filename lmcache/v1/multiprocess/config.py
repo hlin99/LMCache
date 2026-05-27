@@ -51,6 +51,12 @@ class MPServerConfig:
     """SHM segment name for non-GPU KV transfer.
     None: auto-allocate (default). "": force pickle. Other: use that name."""
 
+    transfer_mode: str = "gpu"
+    """Transfer mode for the cache server.
+    'gpu': GPU CUDA IPC transfer (default).
+    'non_gpu': Non-GPU transfer via SHM or pickle based on shm_name.
+    """
+
 
 @dataclass
 class RuntimePluginConfig:
@@ -180,6 +186,15 @@ def add_mp_server_args(
         'Set to "" to force pickle path (disable SHM). '
         "Set to a name to use that specific SHM segment.",
     )
+    mp_group.add_argument(
+        "--transfer-mode",
+        type=str,
+        default="gpu",
+        choices=["gpu", "non_gpu"],
+        help="Transfer mode for the cache server. "
+        "'gpu': GPU CUDA IPC transfer (default). "
+        "'non_gpu': Non-GPU transfer via SHM or pickle based on --shm-name.",
+    )
     return parser
 
 
@@ -216,6 +231,7 @@ def parse_args_to_mp_server_config(
             extra_config=plugin_extra,
         ),
         shm_name=args.shm_name,
+        transfer_mode=args.transfer_mode,
     )
 
 
