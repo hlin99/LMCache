@@ -243,6 +243,13 @@ class NonGPUTransferModule:
                 fallback_strategy=PickleTransferStrategy(self._ctx.storage_manager),
             )
         self._strategies[payload.instance_id] = strategy
+        transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
+        logger.info(
+            "Server non-GPU transfer context registered "
+            "(instance_id=%d, mode=%s)",
+            payload.instance_id,
+            transfer_mode,
+        )
 
         self._ctx.layout_desc_registry.register(
             payload.model_name, payload.world_size, layout_desc
