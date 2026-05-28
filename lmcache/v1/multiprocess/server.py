@@ -3,6 +3,8 @@
 
 # Standard
 import argparse
+import shutil
+import sys
 import time
 
 # Third Party
@@ -193,9 +195,6 @@ def run_cache_server(
 
     # For non-GPU transfer: apply shm_name from mp_config and verify capacity
     if mp_config.transfer_mode == "non_gpu" and mp_config.shm_name is not None:
-        import shutil
-        import sys
-
         mem_cfg = storage_manager_config.l1_manager_config.memory_config
         mem_cfg.shm_name = mp_config.shm_name
         if mem_cfg.shm_name and sys.platform.startswith("linux"):
