@@ -14,8 +14,15 @@ import pytest
 # First Party
 from lmcache.v1.multiprocess.config import add_mp_server_args
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-SERVER_FILE = REPO_ROOT / "lmcache/v1/multiprocess/server.py"
+
+def _find_repo_root() -> Path:
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    raise RuntimeError("Could not find repository root from test file path")
+
+
+SERVER_FILE = _find_repo_root() / "lmcache/v1/multiprocess/server.py"
 
 
 def _make_module(name: str, **attrs) -> ModuleType:
@@ -26,6 +33,8 @@ def _make_module(name: str, **attrs) -> ModuleType:
 
 @pytest.fixture
 def server_module(monkeypatch):
+    zmq_context = object()
+
     class _BaseModule:
         def __init__(self, ctx):
             self.ctx = ctx
@@ -57,7 +66,7 @@ def server_module(monkeypatch):
         NORMAL = "normal"
 
     stubs = {
-        "zmq": _make_module("zmq", Context=SimpleNamespace(instance=lambda: object())),
+        "zmq": _make_module("zmq", Context=SimpleNamespace(instance=lambda: zmq_context)),
         "lmcache.v1.distributed.config": _make_module(
             "lmcache.v1.distributed.config",
             StorageManagerConfig=object,
@@ -181,7 +190,7 @@ def test_build_modules_allows_blend_with_auto_mode(server_module):
 def test_build_modules_rejects_blend_with_non_gpu_mode(server_module):
     with pytest.raises(
         ValueError,
-        match="Blend engine requires transfer_mode in \\{'gpu', 'auto'\\}",
+        match="Blend engine requires transfer_mode to be 'gpu' or 'auto'",
     ):
         server_module._build_modules(
             object(),
