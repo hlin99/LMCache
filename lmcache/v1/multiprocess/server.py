@@ -135,7 +135,7 @@ def _build_modules(
         List of initialized engine modules.
 
     Raises:
-        ValueError: If blend engine is requested with non-GPU transfer mode.
+        ValueError: If blend engine is requested with non-GPU-only transfer mode.
     """
     modules: list[EngineModule] = [
         LookupModule(ctx),
@@ -144,13 +144,16 @@ def _build_modules(
 
     if mp_config.transfer_mode == "gpu":
         modules.append(GPUTransferModule(ctx))
+    elif mp_config.transfer_mode == "non_gpu":
+        modules.append(NonGPUTransferModule(ctx))
     else:
+        modules.append(GPUTransferModule(ctx))
         modules.append(NonGPUTransferModule(ctx))
 
     if mp_config.engine_type == "blend":
-        if mp_config.transfer_mode != "gpu":
+        if mp_config.transfer_mode == "non_gpu":
             raise ValueError(
-                "Blend engine requires transfer_mode='gpu', "
+                "Blend engine requires transfer_mode in {'gpu', 'auto'}, "
                 f"got '{mp_config.transfer_mode}'"
             )
         # First Party
