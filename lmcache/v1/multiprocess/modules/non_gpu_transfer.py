@@ -30,7 +30,7 @@ from lmcache.v1.multiprocess.protocols.engine import (
     PrepareStoreResponse,
     RegisterNonGpuContextResponse,
 )
-from lmcache.v1.multiprocess.worker_transfer.base import NonGpuContextMetadata
+from lmcache.v1.multiprocess.adapter_connector.base import NonGpuContextMetadata
 
 # Local
 from .server_transfer import (
