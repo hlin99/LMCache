@@ -507,25 +507,28 @@ def server_module_factory(
         # resolve_obj_keys (which traverses SessionManager → TokenHasher →
         # ipc_key_to_object_keys) works when strategies call it after the
         # factory returns.
+        session_patcher = patch(
+            "lmcache.v1.multiprocess.engine_context.SessionManager"
+        )
         patchers = [
             patch(
                 "lmcache.v1.multiprocess.engine_context.StorageManager",
                 return_value=mock_storage,
             ),
             patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
-            patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
+            session_patcher,
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
             patch(
                 "lmcache.v1.multiprocess.engine_context.ipc_key_to_object_keys",
                 return_value=resolved_obj_keys,
             ),
         ]
-        mocks = [p.start() for p in patchers]
+        started: dict[object, MagicMock] = {}
         for p in patchers:
+            started[p] = p.start()
             request.addfinalizer(p.stop)
 
-        # mocks[2] is the SessionManager class mock.
-        session_cls = mocks[2]
+        session_cls = started[session_patcher]
         session_cls.return_value.get_or_create.return_value = mock_session
 
         ctx = MPCacheEngineContext(
