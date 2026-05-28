@@ -171,7 +171,12 @@ class MPCacheEngineContext:
     def _compute_shm_pool_info(
         storage_manager_config: StorageManagerConfig,
     ) -> ShmPoolInfo:
-        """Compute SHM pool info from storage manager config."""
+        """Compute normalized SHM pool metadata from storage config.
+
+        Returns an empty pool (disabled SHM transport) when ``shm_name`` is
+        empty or lazy memory mode is enabled. Otherwise strips any leading ``/``
+        and ensures the name starts with ``lmcache_l1_pool_``.
+        """
         mem_cfg = storage_manager_config.l1_manager_config.memory_config
         shm_name = mem_cfg.shm_name or ""
         if not shm_name or mem_cfg.use_lazy:
