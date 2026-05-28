@@ -503,26 +503,36 @@ def server_module_factory(
             mock_session = MagicMock()
             mock_session.get_hashes.return_value = [b"h"]
 
-        with (
+        # All patches are kept active via start()/addfinalizer so that
+        # resolve_obj_keys (which traverses SessionManager → TokenHasher →
+        # ipc_key_to_object_keys) works when strategies call it after the
+        # factory returns.
+        patchers = [
             patch(
                 "lmcache.v1.multiprocess.engine_context.StorageManager",
                 return_value=mock_storage,
             ),
             patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
-            patch("lmcache.v1.multiprocess.engine_context.SessionManager") as session_cls,
+            patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
-        ):
-            session_cls.return_value.get_or_create.return_value = mock_session
-            ctx = MPCacheEngineContext(
-                storage_manager_config=storage_manager_config or MagicMock(),
-                chunk_size=chunk_size,
-            )
-            patcher = patch.object(
-                ctx, "resolve_obj_keys", MagicMock(return_value=resolved_obj_keys)
-            )
-            patcher.start()
-            request.addfinalizer(patcher.stop)
-            module = NonGPUTransferModule(ctx)
+            patch(
+                "lmcache.v1.multiprocess.engine_context.ipc_key_to_object_keys",
+                return_value=resolved_obj_keys,
+            ),
+        ]
+        mocks = [p.start() for p in patchers]
+        for p in patchers:
+            request.addfinalizer(p.stop)
+
+        # mocks[2] is the SessionManager class mock.
+        session_cls = mocks[2]
+        session_cls.return_value.get_or_create.return_value = mock_session
+
+        ctx = MPCacheEngineContext(
+            storage_manager_config=storage_manager_config or MagicMock(),
+            chunk_size=chunk_size,
+        )
+        module = NonGPUTransferModule(ctx)
 
         return module, mock_storage, mock_session, ctx
 
