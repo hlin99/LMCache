@@ -176,13 +176,12 @@ It also computes `shm_pool_info` once from `StorageManagerConfig`:
 
 ### 2.5 Current File Layout (Key Components)
 
-- `lmcache/v1/multiprocess/engine_context.py`: `MPCacheEngineContext`, `LayoutDescRegistry`, `ShmPoolInfo`
 - `lmcache/v1/multiprocess/modules/non_gpu_transfer.py`: `NonGPUTransferModule`
 - `lmcache/v1/multiprocess/modules/server_transfer.py`: `TransferStrategy`, `PickleTransferStrategy`, `ShmTransferStrategy`
+- `lmcache/v1/multiprocess/worker_transfer/transfer_context.py`: `DataTransferContext`, `HandleTransferContext`
 - `lmcache/v1/multiprocess/worker_transfer/base.py`: `NonGpuContext`, `gather_paged_kv_to_cpu`, `scatter_cpu_to_paged_kv`, `compute_kv_layout`
 - `lmcache/v1/multiprocess/worker_transfer/pickle.py`: `NonGpuContextPickle`
 - `lmcache/v1/multiprocess/worker_transfer/shm.py`: `NonGpuContextShm`
-- `lmcache/v1/multiprocess/worker_transfer/transfer_context.py`: `DataTransferContext`, `HandleTransferContext`
 
 ## 3. Protocol & Data Flow
 
