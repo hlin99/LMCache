@@ -471,6 +471,7 @@ def stub_native_storage_ops() -> Any:
 @pytest.fixture
 def server_module_factory(
     stub_native_storage_ops: Any,
+    request: pytest.FixtureRequest,
 ) -> ServerModuleFactory:
     """Create a patched server module/context with configurable mocks."""
     # First Party
@@ -516,8 +517,12 @@ def server_module_factory(
                 storage_manager_config=storage_manager_config or MagicMock(),
                 chunk_size=chunk_size,
             )
+            patcher = patch.object(
+                ctx, "resolve_obj_keys", MagicMock(return_value=resolved_obj_keys)
+            )
+            patcher.start()
+            request.addfinalizer(patcher.stop)
             module = NonGPUTransferModule(ctx)
-        ctx.resolve_obj_keys = MagicMock(return_value=resolved_obj_keys)  # type: ignore[method-assign]
 
         return module, mock_storage, mock_session, ctx
 
