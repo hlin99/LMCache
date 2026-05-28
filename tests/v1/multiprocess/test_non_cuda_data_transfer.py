@@ -497,6 +497,7 @@ def server_module_factory(
         Returns ``(module, mock_storage, mock_session, ctx)``.
         """
         mock_storage = mock_storage or MagicMock()
+        resolved_obj_keys = object_keys or ["obj"]
         if mock_session is None:
             mock_session = MagicMock()
             mock_session.get_hashes.return_value = [b"h"]
@@ -509,10 +510,6 @@ def server_module_factory(
             patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
             patch("lmcache.v1.multiprocess.engine_context.SessionManager") as session_cls,
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
-            patch(
-                "lmcache.v1.multiprocess.engine_context.ipc_key_to_object_keys",
-                return_value=object_keys or ["obj"],
-            ),
         ):
             session_cls.return_value.get_or_create.return_value = mock_session
             ctx = MPCacheEngineContext(
@@ -520,6 +517,7 @@ def server_module_factory(
                 chunk_size=chunk_size,
             )
             module = NonGPUTransferModule(ctx)
+        ctx.resolve_obj_keys = MagicMock(return_value=resolved_obj_keys)  # type: ignore[method-assign]
 
         return module, mock_storage, mock_session, ctx
 
