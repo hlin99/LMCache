@@ -14,7 +14,8 @@ import pytest
 # First Party
 from lmcache.v1.multiprocess.config import add_mp_server_args
 
-SERVER_FILE = Path(__file__).resolve().parents[3] / "lmcache/v1/multiprocess/server.py"
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+SERVER_FILE = REPO_ROOT / "lmcache/v1/multiprocess/server.py"
 
 
 def _make_module(name: str, **attrs) -> ModuleType:
@@ -185,4 +186,12 @@ def test_build_modules_rejects_blend_with_non_gpu_mode(server_module):
         server_module._build_modules(
             object(),
             SimpleNamespace(transfer_mode="non_gpu", engine_type="blend"),
+        )
+
+
+def test_build_modules_rejects_unknown_transfer_mode(server_module):
+    with pytest.raises(ValueError, match="Unsupported transfer_mode 'invalid'"):
+        server_module._build_modules(
+            object(),
+            SimpleNamespace(transfer_mode="invalid", engine_type="default"),
         )

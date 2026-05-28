@@ -146,9 +146,11 @@ def _build_modules(
         modules.append(GPUTransferModule(ctx))
     elif mp_config.transfer_mode == "non_gpu":
         modules.append(NonGPUTransferModule(ctx))
-    else:
+    elif mp_config.transfer_mode == "auto":
         modules.append(GPUTransferModule(ctx))
         modules.append(NonGPUTransferModule(ctx))
+    else:
+        raise ValueError(f"Unsupported transfer_mode '{mp_config.transfer_mode}'")
 
     if mp_config.engine_type == "blend":
         if mp_config.transfer_mode == "non_gpu":
