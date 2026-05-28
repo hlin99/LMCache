@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 from unittest.mock import MagicMock, patch
 import mmap
 import os
@@ -25,6 +25,42 @@ from lmcache.v1.multiprocess.worker_transfer.base import (
 )
 from lmcache.v1.multiprocess.worker_transfer.pickle import NonGpuContextPickle
 from lmcache.v1.multiprocess.worker_transfer.shm import NonGpuContextShm
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.config import StorageManagerConfig
+    from lmcache.v1.multiprocess.custom_types import (
+        IPCCacheEngineKey,
+        RegisterNonGpuContextPayload,
+    )
+    from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
+
+
+class ServerModuleFactory(Protocol):
+    """Typed callable contract for creating patched server test modules.
+
+    Args:
+        storage_manager_config: Optional engine storage config override.
+        chunk_size: Engine chunk size used to initialize the context.
+        object_keys: Object keys returned by ``ipc_key_to_object_keys``.
+        mock_storage: Optional storage mock; defaults to a new ``MagicMock``.
+        mock_session: Optional session mock; defaults to a new ``MagicMock``.
+
+    Returns a tuple of
+    ``(NonGPUTransferModule, storage MagicMock, session MagicMock, MPCacheEngineContext)``.
+    """
+
+    def __call__(
+        self,
+        *,
+        storage_manager_config: "StorageManagerConfig | None" = None,
+        chunk_size: int = 8,
+        object_keys: list[str] | None = None,
+        mock_storage: MagicMock | None = None,
+        mock_session: MagicMock | None = None,
+    ) -> tuple["NonGPUTransferModule", MagicMock, MagicMock, "MPCacheEngineContext"]:
+        ...
 
 
 def _make_kv_caches(
@@ -126,7 +162,16 @@ def _make_storage_manager_config(
     )
 
 
-def _default_register_payload(instance_id: int = 1) -> Any:
+def _default_register_payload(instance_id: int = 1) -> "RegisterNonGpuContextPayload":
+    """Build a default non-GPU registration payload for server-side tests.
+
+    Args:
+        instance_id: Worker instance id to register. Defaults to ``1``.
+
+    Uses fixed values ``model_name="m"``, ``world_size=1``, ``block_size=4``,
+    ``num_layers=2``, ``hidden_dim_size=16``, ``dtype_str="float32"``, and
+    ``use_mla=False`` for a compact baseline scenario used by most tests.
+    """
     # First Party
     from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
 
@@ -142,7 +187,16 @@ def _default_register_payload(instance_id: int = 1) -> Any:
     )
 
 
-def _default_key(tokens: int = 8) -> Any:
+def _default_key(tokens: int = 8) -> "IPCCacheEngineKey":
+    """Build a default IPC cache key with ``tokens`` contiguous token IDs.
+
+    Args:
+        tokens: Total token count and key end offset. Defaults to ``8``.
+
+    Uses fixed values ``model_name="m"``, ``world_size=1``, ``rank=0``,
+    token IDs of ``[1] * tokens``, ``start=0``, ``end=tokens``,
+    and ``request_id="req"``.
+    """
     # First Party
     from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
 
@@ -417,7 +471,7 @@ def stub_native_storage_ops() -> Any:
 @pytest.fixture
 def server_module_factory(
     stub_native_storage_ops: Any,
-) -> Callable[..., tuple[Any, MagicMock, MagicMock, Any]]:
+) -> ServerModuleFactory:
     """Create a patched server module/context with configurable mocks."""
     # First Party
     from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
@@ -425,17 +479,26 @@ def server_module_factory(
 
     def _create(
         *,
-        storage_manager_config: Any | None = None,
+        storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
         object_keys: list[str] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
-    ) -> tuple[Any, MagicMock, MagicMock, Any]:
+    ) -> tuple["NonGPUTransferModule", MagicMock, MagicMock, "MPCacheEngineContext"]:
+        """Create a patched module/context plus storage/session mocks.
+
+        Args:
+            storage_manager_config: Optional engine storage config override.
+            chunk_size: Engine chunk size passed to context construction.
+            object_keys: Keys returned from ``ipc_key_to_object_keys`` patch.
+            mock_storage: Optional storage mock instance to inject.
+            mock_session: Optional session mock instance to inject.
+
+        Returns ``(module, mock_storage, mock_session, ctx)``.
+        """
         mock_storage = mock_storage or MagicMock()
-        mock_session = mock_session or MagicMock()
-        if mock_session is not None and not isinstance(
-            mock_session.get_hashes.return_value, list
-        ):
+        if mock_session is None:
+            mock_session = MagicMock()
             mock_session.get_hashes.return_value = [b"h"]
 
         with (
@@ -510,7 +573,7 @@ def test_engine_context_shm_pool_info(
 
 def test_server_register_and_find_non_cuda_context_layout(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure non-CUDA registration stores metadata and lookup finds layout."""
     module, _, _, ctx = server_module_factory(chunk_size=16)
@@ -527,7 +590,7 @@ def test_server_register_and_find_non_cuda_context_layout(
 
 def test_server_store_and_retrieve_cpu_chunks(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """Validate mocked server-side CPU chunk store and retrieve behavior."""
     mock_storage = MagicMock()
@@ -566,7 +629,7 @@ def test_server_store_and_retrieve_cpu_chunks(
 
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """Regression: repeated prompt after worker restart should no-op-store cleanly.
 
@@ -600,7 +663,7 @@ def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
 
 def test_server_prepare_store_releases_unused_reserved_write_locks(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure SHM prepare_store releases reserved keys that have no writable tensor."""
     # First Party
@@ -633,7 +696,7 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
 
 def test_server_shm_transport_uses_engine_level_config(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure all instances share the same engine-level SHM transport setting."""
     mock_storage = MagicMock()
@@ -664,7 +727,7 @@ def test_server_shm_transport_uses_engine_level_config(
 
 def test_server_non_gpu_reregister_returns_existing_shm_response(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure duplicate non-GPU registration returns existing SHM response."""
     module, _, _, _ = server_module_factory(
@@ -684,7 +747,7 @@ def test_server_non_gpu_reregister_returns_existing_shm_response(
 
 def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure unregister releases pending SHM read/write reservations."""
     mock_storage = MagicMock()
@@ -763,7 +826,7 @@ def test_gather_paged_kv_with_chunk_indices_subset() -> None:
 
 def test_server_prepare_store_includes_chunk_indices(
     stub_native_storage_ops: Any,
-    server_module_factory: Callable[..., tuple[Any, MagicMock, MagicMock, Any]],
+    server_module_factory: ServerModuleFactory,
 ) -> None:
     """prepare_store response context includes chunk_indices for SHM mode.
 
