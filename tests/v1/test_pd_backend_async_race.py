@@ -40,7 +40,7 @@ def _make_key(chunk_hash: int, worker_id: int = 0) -> CacheEngineKey:
     )
 
 
-def _make_memory_obj(address: int):
+def _make_memory_obj(address: int) -> MagicMock:
     """Create a lightweight mock MemoryObj with a distinguishable address."""
     meta = MagicMock()
     meta.address = address
@@ -82,7 +82,7 @@ def _make_pd_backend_data_dict():
             self.data: dict[CacheEngineKey, MagicMock] = {}
             self.data_lock = threading.Lock()
 
-        def put(self, key: CacheEngineKey, mem_obj) -> None:
+        def put(self, key: CacheEngineKey, mem_obj: MagicMock) -> None:
             with self.data_lock:
                 if key in self.data:
                     mem_obj.ref_count_down()

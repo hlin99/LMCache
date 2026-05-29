@@ -1341,6 +1341,8 @@ class PDBackendAsync(AllocatorBackendInterface):
                 key = CacheEngineKey.from_string(key_str)
                 with self.data_lock:
                     if key in self.data:
+                        # Pin existing object so concurrent remove() cannot
+                        # delete it before the deduped consumer retrieves it.
                         self.data[key].ref_count_up()
                         already_sent_indexes.append(idx)
                         continue
@@ -1490,7 +1492,7 @@ class PDBackendAsync(AllocatorBackendInterface):
             mem_obj = self.data.get(key, None)
             if mem_obj is not None:
                 mem_obj.ref_count_down()
-                removed = False
+                deleted = False
                 if mem_obj.get_ref_count() == 0:
                     del self.data[key]
                     logger.debug(
@@ -1502,15 +1504,14 @@ class PDBackendAsync(AllocatorBackendInterface):
                         len(self.data),
                         self._get_free_chunks(),
                     )
-                    mem_obj.ref_count_down()
-                    removed = True
+                    deleted = True
                 # Notify any coroutines blocked waiting for free memory.
                 # _alloc_freed_condition and _recv_loop only exist on the
                 # receiver; remove() is also called on the sender, so the
                 # hasattr guards are intentional.  run_coroutine_threadsafe is
                 # used because remove() may be called from any OS thread while
                 # the receiver event loop runs on a dedicated thread.
-                if removed and hasattr(self, "_alloc_freed_condition") and hasattr(
+                if deleted and hasattr(self, "_alloc_freed_condition") and hasattr(
                     self, "_recv_loop"
                 ):
                     loop = self._recv_loop
