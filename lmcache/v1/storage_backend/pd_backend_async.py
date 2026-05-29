@@ -1353,13 +1353,9 @@ class PDBackendAsync(AllocatorBackendInterface):
         try:
             for idx, key_str in enumerate(alloc_request.keys):
                 key = CacheEngineKey.from_string(key_str)
-                with self.data_lock:
-                    if key in self.data:
-                        # Pin existing object so concurrent remove() cannot
-                        # delete it before the deduped consumer retrieves it.
-                        self.data[key].ref_count_up()
-                        already_sent_indexes.append(idx)
-                        continue
+                if self.contains(key, pin=True):
+                    already_sent_indexes.append(idx)
+                    continue
 
                 if idx == total_allocs - 1:
                     token_dim = fmt.token_dim()
