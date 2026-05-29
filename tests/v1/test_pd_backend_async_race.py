@@ -79,9 +79,9 @@ def _make_pd_backend_data_dict():
 
         def put(self, key: CacheEngineKey, mem_obj: MemoryObj) -> None:
             with self.data_lock:
-                old = self.data.pop(key, None)
-                if old is not None:
-                    old.ref_count_down()
+                if key in self.data:
+                    mem_obj.ref_count_down()
+                    return
                 self.data[key] = mem_obj
 
         def get_blocking(self, key: CacheEngineKey):
@@ -100,9 +100,11 @@ def _make_pd_backend_data_dict():
 
         def remove(self, key: CacheEngineKey) -> bool:
             with self.data_lock:
-                mem_obj = self.data.pop(key, None)
+                mem_obj = self.data.get(key, None)
                 if mem_obj is not None:
-                    mem_obj.ref_count_down()
+                    if mem_obj.get_ref_count() == 1:
+                        del self.data[key]
+                        mem_obj.ref_count_down()
                     return True
                 return False
 
@@ -179,12 +181,12 @@ class TestPutMustNotFreeInflightBuffer:
         t1.join()
         t2.join()
 
-        # Neither buffer should be freed while potentially in-flight
+        # Duplicate put should free only the second/new object.
         assert not obj_a._freed, (
             "BUG: obj_A was freed by concurrent put — use-after-free risk"
         )
-        assert not obj_b._freed, (
-            "BUG: obj_B was freed by concurrent put — use-after-free risk"
+        assert obj_b._freed, (
+            "BUG: duplicate concurrent put did not release dropped obj_B"
         )
 
 
@@ -215,6 +217,7 @@ class TestGetBlockingMustNotCrashOnSharedKey:
         backend = _make_pd_backend_data_dict()
         key = _make_key(chunk_hash=12345)
         obj_a = _make_memory_obj(address=0x1000)
+        obj_a.get_ref_count.return_value = 2
 
         # Data arrives
         backend.put(key, obj_a)
@@ -227,16 +230,8 @@ class TestGetBlockingMustNotCrashOnSharedKey:
         backend.remove(key)
 
         # Req B's retrieve must not crash
-        # Correct behavior: return None or the valid MemoryObj (not assert)
-        try:
-            result = backend.get_blocking(key)
-            # If we get here without exception, that's correct behavior
-            # (result could be None if implementation returns None on miss)
-        except AssertionError:
-            pytest.fail(
-                "BUG: get_blocking(K) raised AssertionError after another "
-                "request's remove(K). Shared prefix keys are not safe."
-            )
+        result = backend.get_blocking(key)
+        assert result is obj_a
 
     def test_concurrent_remove_and_get_blocking(self):
         """
@@ -299,14 +294,12 @@ class TestFullSharedPrefixCorrectness:
         """
         Correct behavior after fix:
           1. Sender A → put(K, obj_A) → RDMA → obj_A has valid data
-          2. Sender B → put(K, obj_B) → RDMA → obj_B has valid data
-          3. Req A retrieve → gets obj_A (its own data, not obj_B's)
-          4. Req B retrieve → gets obj_B (its own data)
+          2. Sender B sees K already exists and skips RDMA transfer
+          3. Both requests retrieve obj_A safely
           5. No crashes, no use-after-free
 
         Currently this fails because:
           - Step 2 frees obj_A (Bug 1)
-          - Step 3 gets obj_B instead of obj_A (silent corruption)
           - If Req A removes before Req B retrieves → crash (Bug 2)
         """
         backend = _make_pd_backend_data_dict()
@@ -315,7 +308,8 @@ class TestFullSharedPrefixCorrectness:
         obj_a = _make_memory_obj(address=0xA000)
         obj_b = _make_memory_obj(address=0xB000)
 
-        # Both senders register their buffers
+        # Sender A registers buffer; sender B would be deduped, so duplicate put
+        # must not overwrite existing entry.
         backend.put(key, obj_a)
         backend.put(key, obj_b)
 
@@ -324,14 +318,9 @@ class TestFullSharedPrefixCorrectness:
             "BUG: obj_A freed by second put() — Sender A's RDMA target is invalid"
         )
 
-        # Req A should get obj_A (its own buffer)
-        # Req B should get obj_B (its own buffer)
-        # Currently impossible with a flat dict — both get obj_B
+        # Shared key should still map to the first object.
         result_a = backend.get_blocking(key)
-        assert result_a is obj_a, (
-            f"BUG: Req A got obj at address {result_a.meta.address:#x} "
-            f"instead of its own obj_A at 0xA000. Silent data corruption."
-        )
+        assert result_a is obj_a
 
     def test_remove_does_not_affect_other_request(self):
         """
@@ -342,6 +331,7 @@ class TestFullSharedPrefixCorrectness:
 
         obj_a = _make_memory_obj(address=0xA000)
         obj_b = _make_memory_obj(address=0xB000)
+        obj_a.get_ref_count.return_value = 2
 
         backend.put(key, obj_a)
         backend.put(key, obj_b)
@@ -352,11 +342,5 @@ class TestFullSharedPrefixCorrectness:
         backend.remove(key)
 
         # Req B's retrieve must succeed
-        try:
-            result_b = backend.get_blocking(key)
-            assert result_b is not None, "Req B's retrieve returned None"
-        except AssertionError:
-            pytest.fail(
-                "BUG: Req B's get_blocking(K) crashed after Req A's remove(K). "
-                "remove_after_retrieve on shared keys is unsafe."
-            )
+        result_b = backend.get_blocking(key)
+        assert result_b is obj_a
