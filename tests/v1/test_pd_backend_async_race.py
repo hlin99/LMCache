@@ -1,22 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests reproducing PDBackendAsync race conditions with shared prefix keys.
+Unit tests for PDBackendAsync shared-prefix race conditions.
 
-These tests directly exercise the PDBackendAsync.put(), get_blocking(), and
-remove() methods to demonstrate two critical bugs:
+These tests verify correctness of put(), get_blocking(), and remove()
+when multiple requests share the same CacheEngineKey (shared prefix).
 
-Bug 1 (put overwrite releases in-flight buffer):
-    When two requests share the same CacheEngineKey, the second put(K, obj_B)
-    releases obj_A via ref_count_down(). If Sender A is still writing to
-    obj_A.meta.address via RDMA, this is a use-after-free.
+Expected behavior (after fix):
+  - put(K, obj_B) should NOT free obj_A if obj_A is still in-flight (RDMA)
+  - get_blocking(K) should never raise AssertionError; it should either
+    return the correct MemoryObj or handle the miss gracefully
+  - remove(K) by one request should not break another request's retrieve
 
-Bug 2 (remove_after_retrieve deletes another request's data):
-    After Req A retrieves and removes key K, Req B's subsequent
-    get_blocking(K) fails with AssertionError because the data dict
-    no longer contains K.
-
-No GPU, RDMA, or ZMQ required — we mock the allocator and directly
-call the data-path methods.
+Currently these tests FAIL, demonstrating the bugs exist.
+After the fix, they should PASS.
 """
 
 import threading
@@ -58,7 +54,6 @@ def _make_memory_obj(address: int) -> MemoryObj:
     obj.meta = meta
     obj.get_ref_count.return_value = 1
     obj.get_size.return_value = 131072
-    # Track ref_count_down calls
     obj._freed = False
 
     def _ref_down():
@@ -71,9 +66,8 @@ def _make_memory_obj(address: int) -> MemoryObj:
 def _make_pd_backend_data_dict():
     """
     Create a minimal stand-in for PDBackendAsync's data dict and lock,
-    along with the put/get_blocking/remove/contains methods copied from
-    the real implementation. This avoids needing to instantiate the full
-    PDBackendAsync (which requires ZMQ, transfer channels, etc).
+    with put/get_blocking/remove/contains methods copied from the real
+    implementation. Avoids instantiating full PDBackendAsync.
     """
 
     class FakePDBackendDataPath:
@@ -84,7 +78,6 @@ def _make_pd_backend_data_dict():
             self.data_lock = threading.Lock()
 
         def put(self, key: CacheEngineKey, mem_obj: MemoryObj) -> None:
-            # Exact copy from pd_backend_async.py:1417-1440
             with self.data_lock:
                 old = self.data.pop(key, None)
                 if old is not None:
@@ -92,14 +85,12 @@ def _make_pd_backend_data_dict():
                 self.data[key] = mem_obj
 
         def get_blocking(self, key: CacheEngineKey):
-            # Exact copy from pd_backend_async.py:1442-1458
             with self.data_lock:
                 mem_obj = self.data.get(key, None)
                 assert mem_obj is not None, f"Key {key} not found in local data."
                 return mem_obj
 
         def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-            # Exact copy from pd_backend_async.py:632-648
             with self.data_lock:
                 if mem_obj := self.data.get(key, None):
                     if pin:
@@ -108,7 +99,6 @@ def _make_pd_backend_data_dict():
                 return False
 
         def remove(self, key: CacheEngineKey) -> bool:
-            # Exact copy from pd_backend_async.py:1460-1502 (simplified)
             with self.data_lock:
                 mem_obj = self.data.pop(key, None)
                 if mem_obj is not None:
@@ -120,26 +110,27 @@ def _make_pd_backend_data_dict():
 
 
 # ---------------------------------------------------------------------------
-# Bug 1: put() overwrites in-flight buffer (use-after-free)
+# Test: put() must not free an in-flight MemoryObj
 # ---------------------------------------------------------------------------
 
 
-class TestPutOverwriteReleasesInflightBuffer:
+class TestPutMustNotFreeInflightBuffer:
     """
-    Demonstrates that when two AllocRequests produce the same key K,
-    the second put(K, obj_B) frees obj_A's buffer while the first sender
-    may still be writing to it via RDMA.
+    When two AllocRequests produce the same key K, put(K, obj_B) must NOT
+    release obj_A if obj_A's RDMA write may still be in progress.
+
+    Correct behavior: obj_A should remain valid until its RDMA completes.
     """
 
-    def test_put_overwrites_and_frees_old_obj(self):
+    def test_second_put_must_not_free_first_obj(self):
         """
         Scenario:
-          1. Receiver allocates obj_A for Req A → put(K, obj_A)
-          2. Receiver allocates obj_B for Req B → put(K, obj_B)
-          3. obj_A.ref_count_down() is called → buffer freed
-          4. Sender A is still doing RDMA to obj_A.meta.address → UAF!
+          1. Receiver: put(K, obj_A) — Sender A will RDMA to obj_A.address
+          2. Receiver: put(K, obj_B) — Sender B will RDMA to obj_B.address
+          3. obj_A must NOT be freed (Sender A's RDMA is still in-flight)
 
-        This test verifies that put(K, obj_B) does indeed free obj_A.
+        After fix: put() should either reject duplicate keys, use refcount,
+        or maintain multiple entries per key.
         """
         backend = _make_pd_backend_data_dict()
         key = _make_key(chunk_hash=12345)
@@ -147,29 +138,22 @@ class TestPutOverwriteReleasesInflightBuffer:
         obj_a = _make_memory_obj(address=0x1000)
         obj_b = _make_memory_obj(address=0x2000)
 
-        # Step 1: Receiver handles AllocRequest for Req A
+        # Receiver handles AllocRequest for Req A
         backend.put(key, obj_a)
-        assert backend.contains(key)
-        assert not obj_a._freed, "obj_A should NOT be freed yet"
 
-        # Step 2: Receiver handles AllocRequest for Req B (same key!)
+        # Receiver handles AllocRequest for Req B (same key)
         backend.put(key, obj_b)
 
-        # Step 3: Verify obj_A was freed (use-after-free!)
-        assert obj_a._freed, (
-            "BUG: obj_A was freed by put() even though Sender A's RDMA "
-            "may still be writing to obj_A.meta.address (0x1000). "
-            "This is a use-after-free."
+        # CORRECTNESS CHECK: obj_A must NOT be freed while RDMA is in-flight
+        assert not obj_a._freed, (
+            "BUG: put(K, obj_B) freed obj_A while Sender A's RDMA may still "
+            "be writing to address 0x1000. This is use-after-free."
         )
 
-        # The data dict now points to obj_B
-        result = backend.get_blocking(key)
-        assert result is obj_b
-
-    def test_concurrent_put_from_two_threads(self):
+    def test_concurrent_put_must_not_free_either(self):
         """
-        Simulate two AllocRequest handlers running concurrently for the
-        same key (as would happen with shared prefix in xP1D topology).
+        Two concurrent AllocRequest handlers for the same key must not
+        free each other's buffers.
         """
         backend = _make_pd_backend_data_dict()
         key = _make_key(chunk_hash=99999)
@@ -185,7 +169,6 @@ class TestPutOverwriteReleasesInflightBuffer:
 
         def put_b():
             barrier.wait()
-            # Small delay to increase chance of interleaving
             time.sleep(0.001)
             backend.put(key, obj_b)
 
@@ -196,96 +179,96 @@ class TestPutOverwriteReleasesInflightBuffer:
         t1.join()
         t2.join()
 
-        # One of them was freed; this demonstrates the race
-        freed_count = sum([obj_a._freed, obj_b._freed])
-        # At least one object was freed (the loser of the race)
-        # In practice obj_a is freed since obj_b's put() comes second
-        assert freed_count >= 1, (
-            "Expected at least one MemoryObj to be freed due to overwrite"
+        # Neither buffer should be freed while potentially in-flight
+        assert not obj_a._freed, (
+            "BUG: obj_A was freed by concurrent put — use-after-free risk"
+        )
+        assert not obj_b._freed, (
+            "BUG: obj_B was freed by concurrent put — use-after-free risk"
         )
 
 
 # ---------------------------------------------------------------------------
-# Bug 2: remove_after_retrieve causes get_blocking AssertionError
+# Test: get_blocking() must not crash when key was removed by another request
 # ---------------------------------------------------------------------------
 
 
-class TestRemoveAfterRetrieveCausesGetBlockingFailure:
+class TestGetBlockingMustNotCrashOnSharedKey:
     """
-    Demonstrates the crash: Req A's remove(K) after retrieve deletes the
-    entry that Req B needs for its get_blocking(K).
-
-    This is the exact scenario from the bug report:
-      AssertionError: Key CacheEngineKey(...) not found in local data.
+    When Req A removes key K after retrieve, Req B's get_blocking(K) must
+    not crash. The system should handle this gracefully (e.g., return None
+    and trigger re-prefill, or use refcounting to keep the entry alive).
     """
 
-    def test_remove_then_get_blocking_asserts(self):
+    def test_get_blocking_after_remove_must_not_assert(self):
         """
-        Scenario (single-threaded, deterministic):
-          1. put(K, obj_A) — Req A's data arrives
-          2. contains(K) → True — Req B's lookup sees the key
-          3. get_blocking(K) → obj_A — Req A's retrieve succeeds
-          4. remove(K) — Req A's remove_after_retrieve
-          5. get_blocking(K) → AssertionError! — Req B's retrieve fails
+        Scenario:
+          1. put(K, obj_A) — data arrives
+          2. Req B: contains(K) → True (lookup succeeds)
+          3. Req A: get_blocking(K) → obj_A (retrieve succeeds)
+          4. Req A: remove(K) (remove_after_retrieve)
+          5. Req B: get_blocking(K) — must NOT crash
 
-        Steps 2-5 happen on the decoder side. The key point is that
-        Req B's lookup (step 2) happened before Req A's remove (step 4),
-        but Req B's get_blocking (step 5) happens after.
+        After fix: either get_blocking returns None (graceful miss),
+        or the remove is deferred until all consumers are done.
         """
         backend = _make_pd_backend_data_dict()
         key = _make_key(chunk_hash=12345)
-
         obj_a = _make_memory_obj(address=0x1000)
 
-        # Step 1: Data arrives for Req A
+        # Data arrives
         backend.put(key, obj_a)
 
-        # Step 2: Req B's lookup — sees the key exists
-        assert backend.contains(key), "Req B's lookup should see key K"
+        # Req B's lookup succeeds
+        assert backend.contains(key)
 
-        # Step 3: Req A's retrieve
-        result = backend.get_blocking(key)
-        assert result is obj_a
-
-        # Step 4: Req A's remove_after_retrieve
+        # Req A retrieves and removes
+        backend.get_blocking(key)
         backend.remove(key)
 
-        # Step 5: Req B's retrieve — CRASH
-        with pytest.raises(AssertionError, match="not found in local data"):
-            backend.get_blocking(key)
+        # Req B's retrieve must not crash
+        # Correct behavior: return None or the valid MemoryObj (not assert)
+        try:
+            result = backend.get_blocking(key)
+            # If we get here without exception, that's correct behavior
+            # (result could be None if implementation returns None on miss)
+        except AssertionError:
+            pytest.fail(
+                "BUG: get_blocking(K) raised AssertionError after another "
+                "request's remove(K). Shared prefix keys are not safe."
+            )
 
-    def test_concurrent_retrieve_and_remove(self):
+    def test_concurrent_remove_and_get_blocking(self):
         """
-        More realistic: two threads racing — one removes while the other
-        tries get_blocking. The assertion failure is non-deterministic but
-        this test maximizes the chance of hitting it.
+        Stress test: one thread does put/get/remove, another does
+        contains/get_blocking. get_blocking must never assert.
         """
         backend = _make_pd_backend_data_dict()
         key = _make_key(chunk_hash=55555)
 
-        errors: list[Exception] = []
-        N_ITERATIONS = 200
+        crash_count = 0
+        crash_lock = threading.Lock()
+        N_ITERATIONS = 500
 
         def retrieve_and_remove():
-            """Simulates Req A: get_blocking then remove."""
             for _ in range(N_ITERATIONS):
                 obj = _make_memory_obj(address=0xAAAA)
                 backend.put(key, obj)
-                time.sleep(0.0001)
                 try:
                     backend.get_blocking(key)
                 except AssertionError:
-                    pass  # Expected in race
+                    pass
                 backend.remove(key)
 
         def lookup_and_retrieve():
-            """Simulates Req B: contains check then get_blocking."""
+            nonlocal crash_count
             for _ in range(N_ITERATIONS):
                 if backend.contains(key):
                     try:
                         backend.get_blocking(key)
-                    except AssertionError as e:
-                        errors.append(e)
+                    except AssertionError:
+                        with crash_lock:
+                            crash_count += 1
 
         t1 = threading.Thread(target=retrieve_and_remove)
         t2 = threading.Thread(target=lookup_and_retrieve)
@@ -294,40 +277,37 @@ class TestRemoveAfterRetrieveCausesGetBlockingFailure:
         t1.join()
         t2.join()
 
-        # We expect at least some assertion errors from the race
-        # If the code were correct, this list would be empty
-        assert len(errors) > 0, (
-            "Expected AssertionError from get_blocking() due to race between "
-            "remove_after_retrieve and concurrent get_blocking on shared key. "
-            "The race was not triggered in this run — try increasing N_ITERATIONS."
+        assert crash_count == 0, (
+            f"BUG: get_blocking() crashed {crash_count} times due to race "
+            f"between remove_after_retrieve and shared-key get_blocking. "
+            f"contains() returned True but get_blocking() found key missing."
         )
 
 
 # ---------------------------------------------------------------------------
-# Bug 1+2 combined: full scenario
+# Test: full shared prefix scenario — correctness
 # ---------------------------------------------------------------------------
 
 
-class TestFullSharedPrefixScenario:
+class TestFullSharedPrefixCorrectness:
     """
-    End-to-end simulation of the shared prefix race condition:
-    Two requests with the same prefix → same CacheEngineKey.
+    End-to-end: two requests with same prefix → same CacheEngineKey.
+    Both must be able to retrieve their data without corruption or crash.
     """
 
-    def test_full_race_scenario(self):
+    def test_both_requests_retrieve_successfully(self):
         """
-        Timeline:
-          1. Sender A → AllocRequest → receiver put(K, obj_A)
-          2. Sender A RDMA completes → ProxyNotif
-          3. Decoder: Req A lookup(K) → hit
-          4. Sender B → AllocRequest → receiver put(K, obj_B)
-             → obj_A freed! (but Req A already got_blocking it, so OK this time)
-          5. Decoder: Req A retrieve → get_blocking(K) → gets obj_B (WRONG DATA!)
-          6. Decoder: Req A remove(K)
-          7. Decoder: Req B lookup(K) was True earlier
-          8. Decoder: Req B retrieve → get_blocking(K) → ASSERT FAIL
+        Correct behavior after fix:
+          1. Sender A → put(K, obj_A) → RDMA → obj_A has valid data
+          2. Sender B → put(K, obj_B) → RDMA → obj_B has valid data
+          3. Req A retrieve → gets obj_A (its own data, not obj_B's)
+          4. Req B retrieve → gets obj_B (its own data)
+          5. No crashes, no use-after-free
 
-        This demonstrates both bugs in sequence.
+        Currently this fails because:
+          - Step 2 frees obj_A (Bug 1)
+          - Step 3 gets obj_B instead of obj_A (silent corruption)
+          - If Req A removes before Req B retrieves → crash (Bug 2)
         """
         backend = _make_pd_backend_data_dict()
         key = _make_key(chunk_hash=67890)
@@ -335,29 +315,48 @@ class TestFullSharedPrefixScenario:
         obj_a = _make_memory_obj(address=0xA000)
         obj_b = _make_memory_obj(address=0xB000)
 
-        # Step 1: Receiver allocates for Req A
+        # Both senders register their buffers
         backend.put(key, obj_a)
-
-        # Step 3: Req A's lookup succeeds
-        assert backend.contains(key)
-
-        # Step 4: Receiver allocates for Req B (same key)
-        # This frees obj_A — Bug 1!
         backend.put(key, obj_b)
-        assert obj_a._freed, "Bug 1: obj_A freed while potentially still in RDMA"
 
-        # Step 5: Req A's retrieve — gets obj_B instead of obj_A!
-        # This is silent data corruption: Req A reads Req B's (possibly
-        # incomplete) buffer instead of its own.
-        result = backend.get_blocking(key)
-        assert result is obj_b, (
-            "Req A gets obj_B (wrong data!) because put() overwrote obj_A"
+        # Bug 1 check: obj_A must still be valid
+        assert not obj_a._freed, (
+            "BUG: obj_A freed by second put() — Sender A's RDMA target is invalid"
         )
-        assert result is not obj_a, "Req A should have gotten obj_A but got obj_B"
 
-        # Step 6: Req A's remove_after_retrieve
+        # Req A should get obj_A (its own buffer)
+        # Req B should get obj_B (its own buffer)
+        # Currently impossible with a flat dict — both get obj_B
+        result_a = backend.get_blocking(key)
+        assert result_a is obj_a, (
+            f"BUG: Req A got obj at address {result_a.meta.address:#x} "
+            f"instead of its own obj_A at 0xA000. Silent data corruption."
+        )
+
+    def test_remove_does_not_affect_other_request(self):
+        """
+        After Req A retrieves and removes, Req B must still succeed.
+        """
+        backend = _make_pd_backend_data_dict()
+        key = _make_key(chunk_hash=67890)
+
+        obj_a = _make_memory_obj(address=0xA000)
+        obj_b = _make_memory_obj(address=0xB000)
+
+        backend.put(key, obj_a)
+        backend.put(key, obj_b)
+
+        # Req A retrieves (should get obj_A) and removes its entry
+        # Req B should still be able to retrieve obj_B
+        backend.get_blocking(key)
         backend.remove(key)
 
-        # Step 7-8: Req B tries to retrieve — CRASH (Bug 2)
-        with pytest.raises(AssertionError, match="not found in local data"):
-            backend.get_blocking(key)
+        # Req B's retrieve must succeed
+        try:
+            result_b = backend.get_blocking(key)
+            assert result_b is not None, "Req B's retrieve returned None"
+        except AssertionError:
+            pytest.fail(
+                "BUG: Req B's get_blocking(K) crashed after Req A's remove(K). "
+                "remove_after_retrieve on shared keys is unsafe."
+            )
