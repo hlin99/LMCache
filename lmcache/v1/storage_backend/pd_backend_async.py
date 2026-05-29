@@ -912,10 +912,10 @@ class PDBackendAsync(AllocatorBackendInterface):
                     "remote_indexes": remote_indexes,
                 }
 
-                # Track sent keys for abort cleanup.
+                # Track all keys (including deduped) for abort cleanup.
                 if req_id:
                     sent = self._sent_keys.setdefault(req_id, [])
-                    sent.extend(k.to_string() for k in keys_to_send)
+                    sent.extend(k.to_string() for k in keys)
 
                 await self.transfer_channel.async_batched_write(
                     objects=mem_objs_to_send,
