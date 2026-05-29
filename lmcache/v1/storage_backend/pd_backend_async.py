@@ -1339,9 +1339,11 @@ class PDBackendAsync(AllocatorBackendInterface):
         try:
             for idx, key_str in enumerate(alloc_request.keys):
                 key = CacheEngineKey.from_string(key_str)
-                if self.contains(key, pin=False):
-                    already_sent_indexes.append(idx)
-                    continue
+                with self.data_lock:
+                    if key in self.data:
+                        self.data[key].ref_count_up()
+                        already_sent_indexes.append(idx)
+                        continue
 
                 if idx == total_allocs - 1:
                     token_dim = fmt.token_dim()
@@ -1487,8 +1489,9 @@ class PDBackendAsync(AllocatorBackendInterface):
         with self.data_lock:
             mem_obj = self.data.get(key, None)
             if mem_obj is not None:
+                mem_obj.ref_count_down()
                 removed = False
-                if mem_obj.get_ref_count() == 1:
+                if mem_obj.get_ref_count() == 0:
                     del self.data[key]
                     logger.debug(
                         "[PD-FREE] remove key=%s, addr=%d, ref_count=%d, "
