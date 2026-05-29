@@ -856,6 +856,27 @@ class PDBackendAsync(AllocatorBackendInterface):
             already_sent_indexes = set(alloc_response.already_sent_indexes)
             remote_indexes = alloc_response.remote_indexes
 
+            num_keys = len(keys)
+            if already_sent_indexes:
+                if (
+                    min(already_sent_indexes) < 0
+                    or max(already_sent_indexes) >= num_keys
+                ):
+                    raise RuntimeError(
+                        f"Invalid already_sent_indexes from receiver: "
+                        f"{alloc_response.already_sent_indexes}, "
+                        f"valid range [0, {num_keys})"
+                    )
+
+            expected_send_count = num_keys - len(already_sent_indexes)
+            if len(remote_indexes) != expected_send_count:
+                raise RuntimeError(
+                    f"AllocResponse inconsistency: total_keys={num_keys}, "
+                    f"already_sent={len(already_sent_indexes)}, "
+                    f"remote_indexes={len(remote_indexes)}, "
+                    f"expected={expected_send_count}"
+                )
+
             mem_objs_to_send: list[MemoryObj] = []
             keys_to_send: list[CacheEngineKey] = []
             for idx, (key, mem_obj) in enumerate(zip(keys, memory_objs, strict=True)):
@@ -865,13 +886,6 @@ class PDBackendAsync(AllocatorBackendInterface):
                 else:
                     mem_objs_to_send.append(mem_obj)
                     keys_to_send.append(key)
-
-            if len(remote_indexes) != len(mem_objs_to_send):
-                raise RuntimeError(
-                    "Receiver alloc response mismatch: "
-                    f"remote_indexes={len(remote_indexes)}, "
-                    f"to_send={len(mem_objs_to_send)}"
-                )
 
             # Abort if any remote slot failed to allocate.
             for idx, (mem_obj, remote_addr) in enumerate(
@@ -1451,7 +1465,7 @@ class PDBackendAsync(AllocatorBackendInterface):
         """Store a memory object in the local data dictionary."""
         with self.data_lock:
             if key in self.data:
-                logger.debug(
+                logger.info(
                     "Duplicate put for key %s in PDBackendAsync.put(); "
                     "dropping new object.",
                     key,
@@ -1491,16 +1505,17 @@ class PDBackendAsync(AllocatorBackendInterface):
         with self.data_lock:
             mem_obj = self.data.get(key, None)
             if mem_obj is not None:
+                before_rc = mem_obj.get_ref_count()
                 mem_obj.ref_count_down()
                 deleted = False
                 if mem_obj.get_ref_count() == 0:
                     del self.data[key]
                     logger.debug(
-                        "[PD-FREE] remove key=%s, addr=%d, ref_count=%d, "
+                        "[PD-FREE] remove key=%s, addr=%d, ref_count_before=%d, "
                         "data_size=%d, free_chunks_before=%d",
                         key,
                         mem_obj.meta.address,
-                        mem_obj.get_ref_count(),
+                        before_rc,
                         len(self.data),
                         self._get_free_chunks(),
                     )
