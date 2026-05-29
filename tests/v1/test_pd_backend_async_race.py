@@ -21,7 +21,7 @@ call the data-path methods.
 
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -38,11 +38,11 @@ from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetad
 def _make_key(chunk_hash: int, worker_id: int = 0) -> CacheEngineKey:
     """Create a CacheEngineKey with a specific chunk_hash."""
     return CacheEngineKey(
-        chunk_hash=chunk_hash,
-        fmt="fake_fmt",
+        model_name="test_model",
         world_size=1,
         worker_id=worker_id,
-        lora_id="",
+        chunk_hash=chunk_hash,
+        dtype=torch.float16,
     )
 
 
