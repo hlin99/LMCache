@@ -47,19 +47,30 @@ def _make_memory_obj(address: int) -> MemoryObj:
     meta = MagicMock(spec=MemoryObjMetadata)
     meta.address = address
     meta.fmt = MemoryFormat.KV_2LTD
-    meta.shape = torch.Size([2, 1, 256, 128])
+    meta.shape = torch.Size([1, 2, 3])
     meta.dtype = torch.float16
 
     obj = MagicMock(spec=MemoryObj)
     obj.meta = meta
-    obj.get_ref_count.return_value = 1
-    obj.get_size.return_value = 131072
+    obj.get_size.return_value = 12
+    obj._ref_count = 1
     obj._freed = False
 
-    def _ref_down():
-        obj._freed = True
+    def _ref_up():
+        obj._ref_count += 1
 
+    def _ref_down():
+        assert obj._ref_count > 0
+        obj._ref_count -= 1
+        if obj._ref_count == 0:
+            obj._freed = True
+
+    def _get_ref_count():
+        return obj._ref_count
+
+    obj.ref_count_up.side_effect = _ref_up
     obj.ref_count_down.side_effect = _ref_down
+    obj.get_ref_count.side_effect = _get_ref_count
     return obj
 
 
@@ -102,9 +113,9 @@ def _make_pd_backend_data_dict():
             with self.data_lock:
                 mem_obj = self.data.get(key, None)
                 if mem_obj is not None:
-                    if mem_obj.get_ref_count() == 1:
+                    mem_obj.ref_count_down()
+                    if mem_obj.get_ref_count() == 0:
                         del self.data[key]
-                        mem_obj.ref_count_down()
                     return True
                 return False
 
@@ -217,7 +228,7 @@ class TestGetBlockingMustNotCrashOnSharedKey:
         backend = _make_pd_backend_data_dict()
         key = _make_key(chunk_hash=12345)
         obj_a = _make_memory_obj(address=0x1000)
-        obj_a.get_ref_count.return_value = 2
+        obj_a._ref_count = 2
 
         # Data arrives
         backend.put(key, obj_a)
@@ -232,6 +243,7 @@ class TestGetBlockingMustNotCrashOnSharedKey:
         # Req B's retrieve must not crash
         result = backend.get_blocking(key)
         assert result is obj_a
+        assert obj_a.get_ref_count() == 1
 
     def test_concurrent_remove_and_get_blocking(self):
         """
@@ -331,7 +343,7 @@ class TestFullSharedPrefixCorrectness:
 
         obj_a = _make_memory_obj(address=0xA000)
         obj_b = _make_memory_obj(address=0xB000)
-        obj_a.get_ref_count.return_value = 2
+        obj_a._ref_count = 2
 
         backend.put(key, obj_a)
         backend.put(key, obj_b)
@@ -340,7 +352,12 @@ class TestFullSharedPrefixCorrectness:
         # Req B should still be able to retrieve obj_B
         backend.get_blocking(key)
         backend.remove(key)
+        assert key in backend.data
+        assert obj_a.get_ref_count() == 1
 
         # Req B's retrieve must succeed
         result_b = backend.get_blocking(key)
         assert result_b is obj_a
+        backend.remove(key)
+        assert key not in backend.data
+        assert obj_a.get_ref_count() == 0
