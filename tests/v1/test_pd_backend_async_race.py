@@ -19,9 +19,11 @@ import threading
 import time
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +42,17 @@ def _make_key(chunk_hash: int, worker_id: int = 0) -> CacheEngineKey:
     )
 
 
-def _make_memory_obj(address: int) -> MagicMock:
+def _make_memory_obj(address: int) -> MemoryObj:
     """Create a lightweight mock MemoryObj with a distinguishable address."""
-    meta = MagicMock()
+    meta = MagicMock(spec=MemoryObjMetadata)
     meta.address = address
+    meta.fmt = MemoryFormat.KV_2LTD
+    meta.shape = torch.Size([1, 2, 3])
+    meta.dtype = torch.float16
 
-    obj = MagicMock()
+    obj = MagicMock(spec=MemoryObj)
     obj.meta = meta
+    obj.get_size.return_value = 12
     obj._ref_count = 1
     obj._freed = False
 
@@ -79,10 +85,10 @@ def _make_pd_backend_data_dict():
         """Mimics PDBackendAsync data-path methods exactly."""
 
         def __init__(self):
-            self.data: dict[CacheEngineKey, MagicMock] = {}
+            self.data: dict[CacheEngineKey, MemoryObj] = {}
             self.data_lock = threading.Lock()
 
-        def put(self, key: CacheEngineKey, mem_obj: MagicMock) -> None:
+        def put(self, key: CacheEngineKey, mem_obj: MemoryObj) -> None:
             with self.data_lock:
                 if key in self.data:
                     mem_obj.ref_count_down()
