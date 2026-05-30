@@ -15,7 +15,7 @@ This module provides:
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import Any, cast
 
 # Third Party
 import torch
@@ -27,10 +27,6 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
-
-if TYPE_CHECKING:
-    # First Party
-    import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
@@ -185,7 +181,7 @@ def create_non_gpu_context(
 def compute_kv_layout(
     kv_caches: dict[str, torch.Tensor],
     layout_hints: LayoutHints | None = None,
-) -> tuple[int, int, int, str, "lmc_ops.GPUKVFormat"]:
+) -> tuple[int, int, int, str, Any]:
     """Compute KV layout metadata from KV tensors.
 
     Args:
@@ -226,7 +222,7 @@ def gather_paged_kv_to_cpu(
     block_ids: list[int],
     blocks_per_chunk: int,
     layout_hints: LayoutHints | None = None,
-    gpu_kv_format: "lmc_ops.GPUKVFormat" | None = None,
+    gpu_kv_format: Any | None = None,
     out: list[torch.Tensor] | None = None,
     chunk_indices: list[int] | None = None,
 ) -> list[torch.Tensor]:
@@ -370,7 +366,7 @@ def scatter_cpu_to_paged_kv(
     blocks_per_chunk: int,
     skip_first_n_tokens: int = 0,
     layout_hints: LayoutHints | None = None,
-    gpu_kv_format: "lmc_ops.GPUKVFormat" | None = None,
+    gpu_kv_format: Any | None = None,
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
