@@ -982,21 +982,22 @@ def test_non_gpu_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         pool_size=4096,
     )
     try:
-        store_result = context.prepare_store(key="k", instance_id=1)
+        key = _default_key()
+        store_result = context.prepare_store(key=key, instance_id=1)
         assert store_result is not None
         store_views, _ = store_result
         store_views[0].copy_(
             torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
         )
-        assert context.commit_store("k", 1, store_views)
+        assert context.commit_store(key, 1, store_views)
 
-        retrieve_views = context.prepare_retrieve(key="k", instance_id=1)
+        retrieve_views = context.prepare_retrieve(key=key, instance_id=1)
         assert retrieve_views is not None
         assert torch.equal(
             retrieve_views[0],
             torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
         )
-        assert context.commit_retrieve("k", 1)
+        assert context.commit_retrieve(key, 1)
     finally:
         context.close()
         if os.path.exists(shm_path):
