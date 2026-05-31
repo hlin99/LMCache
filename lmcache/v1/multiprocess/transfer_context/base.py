@@ -159,30 +159,24 @@ def create_non_gpu_context(
     if not shm_name or pool_size <= 0:
         force_pickle = True
 
-    if force_pickle:
+    if not force_pickle:
         # Local
-        from .pickle import NonGpuContextPickle
+        from .shm import NonGpuContextShm
 
-        logger.info("Creating NonGpuContextPickle (pickle transport)")
-        return NonGpuContextPickle(metadata, mq_client, mq_timeout)
-
-    # Local
-    from .shm import NonGpuContextShm
-
-    try:
-        logger.info(
-            "Creating NonGpuContextShm (shm_name=%s, pool_size=%d)",
-            shm_name,
-            pool_size,
-        )
-        return NonGpuContextShm(metadata, mq_client, mq_timeout, shm_name, pool_size)
-    except Exception:
-        logger.warning(
-            "Failed to initialize SHM context (shm_name=%s), "
-            "falling back to pickle transport",
-            shm_name,
-            exc_info=True,
-        )
+        try:
+            logger.info(
+                "Creating NonGpuContextShm (shm_name=%s, pool_size=%d)",
+                shm_name,
+                pool_size,
+            )
+            return NonGpuContextShm(metadata, mq_client, mq_timeout, shm_name, pool_size)
+        except Exception:
+            logger.warning(
+                "Failed to initialize SHM context (shm_name=%s), "
+                "falling back to pickle transport",
+                shm_name,
+                exc_info=True,
+            )
 
     # Local
     from .pickle import NonGpuContextPickle
