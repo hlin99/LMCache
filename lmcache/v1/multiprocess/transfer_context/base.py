@@ -151,7 +151,8 @@ def create_non_gpu_context(
         shm_name: Shared-memory segment name. Empty values force pickle mode.
         pool_size: Shared-memory pool size in bytes. Non-positive values force
             pickle mode.
-        use_pickle: Force pickle transport even when SHM info is available.
+        use_pickle: Explicitly use pickle transport even when SHM info is
+            available.
 
     Returns:
         A concrete :class:`NonGpuContext` instance.
