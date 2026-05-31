@@ -135,7 +135,7 @@ def create_non_gpu_context(
     shm_name: str,
     pool_size: int,
     *,
-    force_pickle: bool = False,
+    use_pickle: bool = False,
 ) -> NonGpuContext:
     """Factory that returns the appropriate :class:`NonGpuContext` implementation.
 
@@ -151,15 +151,15 @@ def create_non_gpu_context(
         shm_name: Shared-memory segment name. Empty values force pickle mode.
         pool_size: Shared-memory pool size in bytes. Non-positive values force
             pickle mode.
-        force_pickle: Force pickle transport even when SHM info is available.
+        use_pickle: Force pickle transport even when SHM info is available.
 
     Returns:
         A concrete :class:`NonGpuContext` instance.
     """
     if not shm_name or pool_size <= 0:
-        force_pickle = True
+        use_pickle = True
 
-    if not force_pickle:
+    if not use_pickle:
         # Local
         from .shm import NonGpuContextShm
 
@@ -169,7 +169,9 @@ def create_non_gpu_context(
                 shm_name,
                 pool_size,
             )
-            return NonGpuContextShm(metadata, mq_client, mq_timeout, shm_name, pool_size)
+            return NonGpuContextShm(
+                metadata, mq_client, mq_timeout, shm_name, pool_size
+            )
         except Exception:
             logger.warning(
                 "Failed to initialize SHM context (shm_name=%s), "

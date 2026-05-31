@@ -1043,7 +1043,7 @@ def test_create_non_gpu_context_falls_back_to_pickle_without_shm_info() -> None:
     assert isinstance(context, NonGpuContextPickle)
 
 
-def test_create_non_gpu_context_force_pickle_ignores_valid_shm_info() -> None:
+def test_create_non_gpu_context_use_pickle_ignores_valid_shm_info() -> None:
     context = create_non_gpu_context(
         metadata=NonGpuContextMetadata(
             layout_desc=MemoryLayoutDesc(
@@ -1057,7 +1057,7 @@ def test_create_non_gpu_context_force_pickle_ignores_valid_shm_info() -> None:
         mq_timeout=1.0,
         shm_name="lmcache_valid_shm",
         pool_size=4096,
-        force_pickle=True,
+        use_pickle=True,
     )
     assert isinstance(context, NonGpuContextPickle)
 
