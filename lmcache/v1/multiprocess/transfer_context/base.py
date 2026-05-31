@@ -148,8 +148,9 @@ def create_non_gpu_context(
         metadata: Layout metadata for the non-GPU context.
         mq_client: Message-queue client for server communication.
         mq_timeout: Timeout in seconds for blocking MQ requests.
-        shm_name: Shared-memory segment name.
-        pool_size: Shared-memory pool size in bytes.
+        shm_name: Shared-memory segment name. Empty values force pickle mode.
+        pool_size: Shared-memory pool size in bytes. Non-positive values force
+            pickle mode.
         force_pickle: Force pickle transport even when SHM info is available.
 
     Returns:
@@ -186,6 +187,7 @@ def create_non_gpu_context(
     # Local
     from .pickle import NonGpuContextPickle
 
+    logger.info("Creating NonGpuContextPickle (pickle transport)")
     return NonGpuContextPickle(metadata, mq_client, mq_timeout)
 
 
