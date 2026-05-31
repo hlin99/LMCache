@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 # First Party
-from lmcache.v1.multiprocess.adapter_connector.base import (
+from lmcache.v1.multiprocess.transfer_context.base import (
     NonGpuContext,
     NonGpuContextMetadata,
 )

@@ -13,7 +13,7 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
-from lmcache.v1.multiprocess.adapter_connector.base import (
+from lmcache.v1.multiprocess.transfer_context.base import (
     NonGpuContext,
     NonGpuContextMetadata,
     compute_kv_layout,

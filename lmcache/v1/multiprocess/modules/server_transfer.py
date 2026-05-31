@@ -14,8 +14,8 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.multiprocess.adapter_connector.base import NonGpuContextMetadata
-from lmcache.v1.multiprocess.adapter_connector.shm import ShmSlotDescriptor
+from lmcache.v1.multiprocess.transfer_context.base import NonGpuContextMetadata
+from lmcache.v1.multiprocess.transfer_context.shm import ShmSlotDescriptor
 from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
