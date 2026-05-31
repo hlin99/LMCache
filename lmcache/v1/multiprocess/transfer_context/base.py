@@ -132,8 +132,10 @@ def create_non_gpu_context(
     metadata: NonGpuContextMetadata,
     mq_client: MessageQueueClient,
     mq_timeout: float,
-    shm_name: str = "",
-    pool_size: int = 0,
+    shm_name: str,
+    pool_size: int,
+    *,
+    force_pickle: bool = False,
 ) -> NonGpuContext:
     """Factory that returns the appropriate :class:`NonGpuContext` implementation.
 
@@ -146,37 +148,44 @@ def create_non_gpu_context(
         metadata: Layout metadata for the non-GPU context.
         mq_client: Message-queue client for server communication.
         mq_timeout: Timeout in seconds for blocking MQ requests.
-        shm_name: Shared-memory segment name. Empty means pickle mode.
-        pool_size: Shared-memory pool size in bytes. Non-positive means pickle mode.
+        shm_name: Shared-memory segment name.
+        pool_size: Shared-memory pool size in bytes.
+        force_pickle: Force pickle transport even when SHM info is available.
 
     Returns:
         A concrete :class:`NonGpuContext` instance.
     """
-    if shm_name and pool_size > 0:
-        # Local
-        from .shm import NonGpuContextShm
+    if not shm_name or pool_size <= 0:
+        force_pickle = True
 
-        try:
-            logger.info(
-                "Creating NonGpuContextShm (shm_name=%s, pool_size=%d)",
-                shm_name,
-                pool_size,
-            )
-            return NonGpuContextShm(
-                metadata, mq_client, mq_timeout, shm_name, pool_size
-            )
-        except Exception:
-            logger.warning(
-                "Failed to initialize SHM context (shm_name=%s), "
-                "falling back to pickle transport",
-                shm_name,
-                exc_info=True,
-            )
+    if force_pickle:
+        # Local
+        from .pickle import NonGpuContextPickle
+
+        logger.info("Creating NonGpuContextPickle (pickle transport)")
+        return NonGpuContextPickle(metadata, mq_client, mq_timeout)
+
+    # Local
+    from .shm import NonGpuContextShm
+
+    try:
+        logger.info(
+            "Creating NonGpuContextShm (shm_name=%s, pool_size=%d)",
+            shm_name,
+            pool_size,
+        )
+        return NonGpuContextShm(metadata, mq_client, mq_timeout, shm_name, pool_size)
+    except Exception:
+        logger.warning(
+            "Failed to initialize SHM context (shm_name=%s), "
+            "falling back to pickle transport",
+            shm_name,
+            exc_info=True,
+        )
 
     # Local
     from .pickle import NonGpuContextPickle
 
-    logger.info("Creating NonGpuContextPickle (pickle transport)")
     return NonGpuContextPickle(metadata, mq_client, mq_timeout)
 
 
