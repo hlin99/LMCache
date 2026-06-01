@@ -1,13 +1,18 @@
-#!/usr/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
 SERVER_PID=""
+SERVER_READY_TIMEOUT=180
+RESPONSE_FILE=""
 
 cleanup() {
     if [[ -n "${SERVER_PID}" ]]; then
-        command kill "${SERVER_PID}" 2>/dev/null || true
+        kill "${SERVER_PID}" 2>/dev/null || true
         wait "${SERVER_PID}" 2>/dev/null || true
+    fi
+    if [[ -n "${RESPONSE_FILE}" ]]; then
+        rm -f "${RESPONSE_FILE}"
     fi
 }
 
@@ -29,15 +34,15 @@ python -m vllm.entrypoints.openai.api_server \
 SERVER_PID=$!
 
 echo "Waiting for vLLM server readiness..."
-if ! timeout 180 bash -c 'until curl -s http://localhost:8000/v1/models | grep -q "opt-125m"; do sleep 2; done'; then
+if ! timeout "${SERVER_READY_TIMEOUT}" bash -c 'until curl -s http://localhost:8000/v1/models | grep -q "opt-125m"; do sleep 2; done'; then
     echo "Timed out waiting for server readiness"
     exit 1
 fi
 
 echo "Server is ready"
 
-response_file="/tmp/lmcache_cpu_e2e_response.json"
-http_code=$(curl -s -o "${response_file}" -w "%{http_code}" \
+RESPONSE_FILE=$(mktemp /tmp/lmcache_cpu_e2e_response.XXXXXX.json)
+http_code=$(curl -s -o "${RESPONSE_FILE}" -w "%{http_code}" \
     http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
@@ -48,7 +53,7 @@ http_code=$(curl -s -o "${response_file}" -w "%{http_code}" \
     }')
 
 echo "Response:"
-cat "${response_file}"
+cat "${RESPONSE_FILE}"
 
 if [[ "${http_code}" != "200" ]]; then
     echo
