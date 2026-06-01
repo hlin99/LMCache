@@ -1,0 +1,7 @@
+steps:
+  - label: ":cpu: CPU vLLM + LMCache E2E"
+    key: "cpu_e2e"
+    timeout_in_minutes: 20
+    command: |
+      chmod +x .buildkite/scripts/cpu-e2e-test.sh
+      .buildkite/scripts/cpu-e2e-test.sh
