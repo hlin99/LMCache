@@ -191,6 +191,7 @@ VLLM_TARGET_DEVICE=cpu vllm serve facebook/opt-125m \
   --dtype bfloat16 \
   --disable-hybrid-kv-cache-manager \
   --no-enable-prefix-caching \
+  --gpu-memory-utilization 0.5 \
   --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}' \
   >"${VLLM_LOG}" 2>&1 &
 VLLM_PID=$!
