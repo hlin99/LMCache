@@ -298,15 +298,15 @@ echo "✅ LMCache server is healthy"
 # Verify transport mode matches expectation
 echo "[Phase 2 / Step 3.5] Verifying transport mode: expecting '${EXPECTED_TRANSPORT}'"
 if [ "${EXPECTED_TRANSPORT}" = "shm" ]; then
-  if grep -qi "pickle" "${LMCACHE_LOG}" 2>/dev/null && ! grep -qi "shm\|shared.memory" "${LMCACHE_LOG}" 2>/dev/null; then
-    echo "❌ Expected shm transport but log suggests pickle"
+  if ! grep -q "Using shm" "${LMCACHE_LOG}" 2>/dev/null; then
+    echo "❌ Expected shm transport but 'Using shm' not found in log"
     tail -50 "${LMCACHE_LOG}"
     false
   fi
   echo "✅ Transport mode confirmed: shm"
 elif [ "${EXPECTED_TRANSPORT}" = "pickle" ]; then
-  if grep -qi "shm\|shared.memory" "${LMCACHE_LOG}" 2>/dev/null && ! grep -qi "pickle" "${LMCACHE_LOG}" 2>/dev/null; then
-    echo "❌ Expected pickle transport but log suggests shm"
+  if ! grep -q "Using pickle" "${LMCACHE_LOG}" 2>/dev/null; then
+    echo "❌ Expected pickle transport but 'Using pickle' not found in log"
     tail -50 "${LMCACHE_LOG}"
     false
   fi
