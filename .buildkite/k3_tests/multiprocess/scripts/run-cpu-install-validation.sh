@@ -184,6 +184,7 @@ echo "✅ LMCache server is healthy"
 
 echo "[Phase 2 / Step 4] Starting vLLM server"
 echo "vLLM log: ${VLLM_LOG}"
+export VLLM_TARGET_DEVICE=cpu
 VLLM_TARGET_DEVICE=cpu vllm serve facebook/opt-125m \
   --port "${VLLM_PORT}" \
   --dtype bfloat16 \
