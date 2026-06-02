@@ -107,6 +107,13 @@ steps:
                   - name: container-0
                     image: lmcache/ci-base:latest
                     imagePullPolicy: Never
+                    resources:
+                      requests:
+                        cpu: "4"
+                        memory: "16Gi"
+                      limits:
+                        cpu: "4"
+                        memory: "16Gi"
                     volumeMounts:
                       - { name: hf-cache, mountPath: /root/.cache/huggingface }
                       - { name: dshm, mountPath: /dev/shm }
@@ -128,6 +135,13 @@ steps:
                   - name: container-0
                     image: lmcache/ci-base:latest
                     imagePullPolicy: Never
+                    resources:
+                      requests:
+                        cpu: "4"
+                        memory: "16Gi"
+                      limits:
+                        cpu: "4"
+                        memory: "16Gi"
                     volumeMounts:
                       - { name: hf-cache, mountPath: /root/.cache/huggingface }
                       - { name: dshm, mountPath: /dev/shm }
