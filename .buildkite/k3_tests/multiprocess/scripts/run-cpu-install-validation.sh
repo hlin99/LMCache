@@ -11,7 +11,7 @@ LMCACHE_LOG="/tmp/build_${BUILD_ID}_lmcache_cpu_validation.log"
 VLLM_LOG="/tmp/build_${BUILD_ID}_vllm_cpu_validation.log"
 LMCACHE_PID=""
 VLLM_PID=""
-LMCACHE_PORT="${LMCACHE_PORT:-8080}"
+LMCACHE_HTTP_PORT="${LMCACHE_HTTP_PORT:-8080}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-2}"
 LMCACHE_EVICTION_POLICY="${LMCACHE_EVICTION_POLICY:-LRU}"
@@ -73,8 +73,6 @@ cleanup_processes() {
     kill "${LMCACHE_PID}" 2>/dev/null || true
     wait "${LMCACHE_PID}" 2>/dev/null || true
   fi
-  fuser -k "${VLLM_PORT}/tcp" 2>/dev/null || true
-  fuser -k "${LMCACHE_PORT}/tcp" 2>/dev/null || true
   set -e
 }
 
@@ -169,7 +167,6 @@ lmcache server \
   --l1-size-gb "${LMCACHE_L1_SIZE_GB}" \
   --eviction-policy "${LMCACHE_EVICTION_POLICY}" \
   --chunk-size "${LMCACHE_CHUNK_SIZE}" \
-  --port "${LMCACHE_PORT}" \
   >"${LMCACHE_LOG}" 2>&1 &
 LMCACHE_PID=$!
 echo "LMCache server started (PID=${LMCACHE_PID})"
@@ -179,8 +176,8 @@ if ! kill -0 "${LMCACHE_PID}" 2>/dev/null; then
   false
 fi
 
-echo "Waiting for LMCache healthcheck at http://localhost:${LMCACHE_PORT}/healthcheck (timeout: ${LMCACHE_HEALTHCHECK_TIMEOUT}s)"
-if ! wait_for_endpoint_contains "http://localhost:${LMCACHE_PORT}/healthcheck" "${LMCACHE_HEALTHCHECK_TIMEOUT}" "" "LMCache server"; then
+echo "Waiting for LMCache healthcheck at http://localhost:${LMCACHE_HTTP_PORT}/healthcheck (timeout: ${LMCACHE_HEALTHCHECK_TIMEOUT}s)"
+if ! wait_for_endpoint_contains "http://localhost:${LMCACHE_HTTP_PORT}/healthcheck" "${LMCACHE_HEALTHCHECK_TIMEOUT}" "" "LMCache server"; then
   false
 fi
 echo "✅ LMCache server is healthy"
