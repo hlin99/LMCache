@@ -96,7 +96,7 @@ steps:
   - group: ":compression: Multiprocess (CPU-only)"
     steps:
       - label: ":compression: cpu_install_validation (shm)"
-        command: bash .buildkite/k3_tests/multiprocess/scripts/run-cpu-install-validation.sh
+        command: bash .buildkite/k3_tests/multiprocess/scripts/run-cpu-e2e-validation.sh
         timeout_in_minutes: 30
         agents: { queue: "k8s" }
         plugins:
@@ -114,7 +114,7 @@ steps:
                   - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 4Gi } }
 
       - label: ":compression: cpu_install_validation (pickle)"
-        command: bash .buildkite/k3_tests/multiprocess/scripts/run-cpu-install-validation.sh
+        command: bash .buildkite/k3_tests/multiprocess/scripts/run-cpu-e2e-validation.sh
         env:
           LMCACHE_SHM_NAME: ""
         timeout_in_minutes: 30
