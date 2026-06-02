@@ -492,8 +492,8 @@ def test_block_kv_transfer_python_fallback_matches_gather_scatter() -> None:
     )
     chunk_tokens = blocks_per_chunk * block_size
 
-    expected = gather_paged_kv_to_cpu(source, block_ids, blocks_per_chunk)
-    out = [torch.empty_like(chunk) for chunk in expected]
+    source_chunks = gather_paged_kv_to_cpu(source, block_ids, blocks_per_chunk)
+    out = [torch.empty_like(chunk) for chunk in source_chunks]
     multi_layer_block_kv_transfer(
         normalized,
         out,
@@ -505,12 +505,12 @@ def test_block_kv_transfer_python_fallback_matches_gather_scatter() -> None:
         fmt,
         backend="python",
     )
-    for got, exp in zip(out, expected, strict=False):
+    for got, exp in zip(out, source_chunks, strict=True):
         assert torch.allclose(got, exp)
 
     dest_expected = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
     dest_facade = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
-    scatter_cpu_to_paged_kv(dest_expected, [4, 5, 6, 7], expected, blocks_per_chunk)
+    scatter_cpu_to_paged_kv(dest_expected, [4, 5, 6, 7], source_chunks, blocks_per_chunk)
     fmt2, normalized2 = normalize_kv_and_discover_format(
         list(dest_facade.values()), EngineType.VLLM
     )
@@ -524,7 +524,7 @@ def test_block_kv_transfer_python_fallback_matches_gather_scatter() -> None:
     )
     multi_layer_block_kv_transfer(
         normalized2,
-        expected,
+        source_chunks,
         [4, 5, 6, 7],
         list(dest_facade.values())[0].device,
         lmc_ops.TransferDirection.H2D,

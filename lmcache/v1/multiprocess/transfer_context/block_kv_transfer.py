@@ -173,7 +173,7 @@ def _python_fallback_transfer(
         obj_device = obj.to(layer_tensors[0].device)
         if use_mla:
             eff_idx = torch.tensor(effective_block_ids, dtype=torch.long)
-            for layer in layer_tensors:
+            for layer_idx, layer in enumerate(layer_tensors):
                 src = obj_device[layer_idx, skip_tokens:]
                 hidden_size = layer.shape[-1]
                 layer[eff_idx] = src.reshape(len(effective_block_ids), block_size, hidden_size)
@@ -182,6 +182,7 @@ def _python_fallback_transfer(
         for layer_idx, layer in enumerate(layer_tensors):
             k_src = obj_device[0, layer_idx, skip_tokens:]
             v_src = obj_device[1, layer_idx, skip_tokens:]
+            eff_idx = torch.tensor(effective_block_ids, dtype=torch.long)
             if use_hnd:
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
                     k_t = layer[0]
@@ -196,8 +197,8 @@ def _python_fallback_transfer(
                 v_blocks = v_src.reshape(
                     len(effective_block_ids), block_size, nh, hs
                 ).permute(0, 2, 1, 3)
-                k_t[effective_block_ids] = k_blocks
-                v_t[effective_block_ids] = v_blocks
+                k_t[eff_idx] = k_blocks
+                v_t[eff_idx] = v_blocks
             else:
                 if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
                     k_t = layer[0]
@@ -206,10 +207,10 @@ def _python_fallback_transfer(
                     k_t = layer[:, 0]
                     v_t = layer[:, 1]
                 _nb, _bs, nh, hs = k_t.shape
-                k_t[effective_block_ids] = k_src.reshape(
+                k_t[eff_idx] = k_src.reshape(
                     len(effective_block_ids), block_size, nh, hs
                 )
-                v_t[effective_block_ids] = v_src.reshape(
+                v_t[eff_idx] = v_src.reshape(
                     len(effective_block_ids), block_size, nh, hs
                 )
 
@@ -294,6 +295,22 @@ def multi_layer_block_kv_transfer(
     The facade accepts tensor-form or ptr-form arguments and dispatches to the
     CUDA kernel when available, otherwise it falls back to Python tensor
     indexing/copy implementation.
+
+    Args:
+        paged_buffer: Normalized paged KV tensors or an int64 pointer tensor.
+        lmcache_objects: LMCache chunk tensors or LMCache object pointers.
+        block_ids: Flattened block ids as a Python list or tensor.
+        device: Target backend device.
+        direction: Transfer direction enum (D2H or H2D).
+        shape_desc: Page buffer shape descriptor for transfer kernels.
+        lmcache_chunk_size: Tokens per LMCache object.
+        gpu_kv_format: KV format enum describing paged buffer layout.
+        skip_prefix_n_blocks: Number of leading destination blocks to skip.
+        backend: Optional backend override (``\"cuda\"`` or ``\"python\"``).
+
+    Raises:
+        ValueError: If arguments are invalid.
+        TypeError: If tensor-only fallback receives pointer-form inputs.
     """
     default_device = (
         paged_buffer.device
