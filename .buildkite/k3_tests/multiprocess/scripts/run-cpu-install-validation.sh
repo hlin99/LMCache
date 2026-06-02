@@ -342,7 +342,7 @@ start_vllm
 # Request A (first time) → should trigger store
 echo "[Phase 3 / Step 3] Request A (first) — expecting LMCache store"
 L1_WRITE_BEFORE=$(scrape_metric "lmcache_mp_l1_write_chunks_total")
-OUTPUT_1=$(send_completion "${PROMPT_FILE}" 50)
+OUTPUT_1=$(send_completion "${PROMPT_FILE}" 200)
 echo "Output 1: ${OUTPUT_1}"
 sleep 2  # allow async store to complete
 L1_WRITE_AFTER=$(scrape_metric "lmcache_mp_l1_write_chunks_total")
@@ -357,7 +357,7 @@ echo "✅ LMCache store verified (${STORE_DELTA} chunks written)"
 # Request A (second time, same vLLM instance) → should trigger read/hit
 echo "[Phase 3 / Step 4] Request A (second) — expecting LMCache hit"
 L1_READ_BEFORE=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
-OUTPUT_2=$(send_completion "${PROMPT_FILE}" 50)
+OUTPUT_2=$(send_completion "${PROMPT_FILE}" 200)
 echo "Output 2: ${OUTPUT_2}"
 sleep 2
 L1_READ_AFTER=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
@@ -378,7 +378,7 @@ start_vllm
 # Request A (third time, new vLLM instance) → should trigger read/hit from LMCache
 echo "[Phase 3 / Step 6] Request A (third) — expecting LMCache hit after vLLM restart"
 L1_READ_BEFORE=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
-OUTPUT_3=$(send_completion "${PROMPT_FILE}" 50)
+OUTPUT_3=$(send_completion "${PROMPT_FILE}" 200)
 echo "Output 3: ${OUTPUT_3}"
 sleep 2
 L1_READ_AFTER=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
@@ -415,7 +415,7 @@ story_b = '''In the year 2147, humanity established its first permanent colony o
 print(story_b, end='')
 " > "${PROMPT_FILE_B}"
 L1_READ_BEFORE=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
-OUTPUT_B=$(send_completion "${PROMPT_FILE_B}" 50)
+OUTPUT_B=$(send_completion "${PROMPT_FILE_B}" 200)
 echo "Output B: ${OUTPUT_B}"
 wait_for_metric_change "lmcache_mp_l1_read_chunks_total" "${L1_READ_BEFORE}" 5 || true
 L1_READ_AFTER=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
