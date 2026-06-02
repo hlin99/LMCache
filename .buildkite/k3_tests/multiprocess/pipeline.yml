@@ -92,3 +92,22 @@ steps:
         agents: { queue: "k8s" }
         plugins: [{ kubernetes: { podSpec: *pod-1gpu } }]
         artifact_paths: ["*.log"]
+
+  - group: ":compression: Multiprocess (CPU-only)"
+    steps:
+      - label: ":compression: cpu_install_validation"
+        command: bash .buildkite/k3_tests/multiprocess/scripts/run-cpu-install-validation.sh
+        timeout_in_minutes: 30
+        agents: { queue: "k8s" }
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - name: container-0
+                    image: lmcache/ci-base:latest
+                    imagePullPolicy: Never
+                    volumeMounts:
+                      - { name: hf-cache, mountPath: /root/.cache/huggingface }
+                volumes:
+                  - { name: hf-cache, hostPath: { path: /data/huggingface, type: DirectoryOrCreate } }
+        artifact_paths: ["*.log"]
