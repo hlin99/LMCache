@@ -15,6 +15,7 @@ from .base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from .block_kv_transfer import multi_layer_block_kv_transfer
 from .pickle import NonGpuContextPickle
 from .shm import NonGpuContextShm, ShmSlotDescriptor
 from .worker_transfer import (
@@ -37,5 +38,6 @@ __all__ = [
     "create_non_gpu_context",
     "create_transfer_context",
     "gather_paged_kv_to_cpu",
+    "multi_layer_block_kv_transfer",
     "scatter_cpu_to_paged_kv",
 ]
