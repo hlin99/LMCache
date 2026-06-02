@@ -56,4 +56,16 @@ steps:
     artifact_paths:
       - "durations/test.html"
       - "coverage-test.xml"
-      - "coverage-test/**/*"      
+      - "coverage-test/**/*"
+
+  - label: "CPU Install Validation (Phase 1)"
+    key: "cpu_install_validation"
+    timeout_in_minutes: 30
+    command: |
+      chmod +x .buildkite/scripts/cpu-integration-tests.sh
+      .buildkite/scripts/cpu-integration-tests.sh
+
+      export TARGET="$PWD"
+      echo "Deleting current workspace $TARGET"
+      cd /
+      sudo rm -rf "$TARGET"
