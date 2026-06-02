@@ -18,6 +18,8 @@ LMCACHE_EVICTION_POLICY="${LMCACHE_EVICTION_POLICY:-LRU}"
 LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-128}"
 LMCACHE_HEALTHCHECK_TIMEOUT="${LMCACHE_HEALTHCHECK_TIMEOUT:-30}"
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-120}"
+# Set LMCACHE_SHM_NAME="" to use pickle transport; unset/default uses shm transport
+LMCACHE_SHM_NAME="${LMCACHE_SHM_NAME-__default__}"
 
 # Directory to collect artifacts before workspace is deleted
 ARTIFACT_DIR="/tmp/build_${BUILD_ID}_artifacts"
@@ -262,10 +264,22 @@ echo "✅ Model download/check complete"
 
 echo "[Phase 2 / Step 3] Starting LMCache server"
 echo "LMCache log: ${LMCACHE_LOG}"
-lmcache server \
-  --l1-size-gb "${LMCACHE_L1_SIZE_GB}" \
-  --eviction-policy "${LMCACHE_EVICTION_POLICY}" \
-  --chunk-size "${LMCACHE_CHUNK_SIZE}" \
+# Build lmcache server args
+LMCACHE_ARGS=(
+  --l1-size-gb "${LMCACHE_L1_SIZE_GB}"
+  --eviction-policy "${LMCACHE_EVICTION_POLICY}"
+  --chunk-size "${LMCACHE_CHUNK_SIZE}"
+)
+if [ "${LMCACHE_SHM_NAME}" = "__default__" ]; then
+  echo "Transport mode: shared memory (shm)"
+  EXPECTED_TRANSPORT="shm"
+else
+  echo "Transport mode: pickle (--shm-name '${LMCACHE_SHM_NAME}')"
+  LMCACHE_ARGS+=(--shm-name "${LMCACHE_SHM_NAME}")
+  EXPECTED_TRANSPORT="pickle"
+fi
+
+lmcache server "${LMCACHE_ARGS[@]}" \
   >"${LMCACHE_LOG}" 2>&1 &
 LMCACHE_PID=$!
 echo "LMCache server started (PID=${LMCACHE_PID})"
@@ -280,6 +294,24 @@ if ! wait_for_endpoint_contains "http://localhost:${LMCACHE_HTTP_PORT}/healthche
   false
 fi
 echo "✅ LMCache server is healthy"
+
+# Verify transport mode matches expectation
+echo "[Phase 2 / Step 3.5] Verifying transport mode: expecting '${EXPECTED_TRANSPORT}'"
+if [ "${EXPECTED_TRANSPORT}" = "shm" ]; then
+  if grep -qi "pickle" "${LMCACHE_LOG}" 2>/dev/null && ! grep -qi "shm\|shared.memory" "${LMCACHE_LOG}" 2>/dev/null; then
+    echo "❌ Expected shm transport but log suggests pickle"
+    tail -50 "${LMCACHE_LOG}"
+    false
+  fi
+  echo "✅ Transport mode confirmed: shm"
+elif [ "${EXPECTED_TRANSPORT}" = "pickle" ]; then
+  if grep -qi "shm\|shared.memory" "${LMCACHE_LOG}" 2>/dev/null && ! grep -qi "pickle" "${LMCACHE_LOG}" 2>/dev/null; then
+    echo "❌ Expected pickle transport but log suggests shm"
+    tail -50 "${LMCACHE_LOG}"
+    false
+  fi
+  echo "✅ Transport mode confirmed: pickle"
+fi
 
 echo "[Phase 2 / Step 4] Installing libnuma and starting vLLM server"
 apt-get update && apt-get install -y --no-install-recommends libnuma1

@@ -95,8 +95,28 @@ steps:
 
   - group: ":compression: Multiprocess (CPU-only)"
     steps:
-      - label: ":compression: cpu_install_validation"
+      - label: ":compression: cpu_install_validation (shm)"
         command: bash .buildkite/k3_tests/multiprocess/scripts/run-cpu-install-validation.sh
+        timeout_in_minutes: 30
+        agents: { queue: "k8s" }
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - name: container-0
+                    image: lmcache/ci-base:latest
+                    imagePullPolicy: Never
+                    volumeMounts:
+                      - { name: hf-cache, mountPath: /root/.cache/huggingface }
+                      - { name: dshm, mountPath: /dev/shm }
+                volumes:
+                  - { name: hf-cache, hostPath: { path: /data/huggingface, type: DirectoryOrCreate } }
+                  - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 4Gi } }
+
+      - label: ":compression: cpu_install_validation (pickle)"
+        command: bash .buildkite/k3_tests/multiprocess/scripts/run-cpu-install-validation.sh
+        env:
+          LMCACHE_SHM_NAME: ""
         timeout_in_minutes: 30
         agents: { queue: "k8s" }
         plugins:
