@@ -7,16 +7,37 @@ VENV_DIR=".venv-${BUILD_ID}"
 cleanup_workspace() {
   if [ -n "${BUILDKITE_BUILD_ID:-}" ]; then
     export TARGET="$PWD"
+    case "$TARGET" in
+      ""|"/"|"/usr"|"/var"|"/etc"|"/bin"|"/sbin"|"/opt"|"/home"|"/tmp")
+        echo "❌ Refusing to delete unsafe workspace path: ${TARGET:-<empty>}"
+        return 1
+        ;;
+    esac
+    if [ "$TARGET" = "$HOME" ]; then
+      echo "❌ Refusing to delete unsafe workspace path: ${TARGET:-<empty>}"
+      return 1
+    fi
+    if [ ! -d "$TARGET/.git" ] || [ ! -f "$TARGET/pyproject.toml" ]; then
+      echo "❌ Refusing to delete unexpected workspace path: $TARGET"
+      return 1
+    fi
     echo "Deleting current workspace $TARGET"
     cd /
-    sudo rm -rf "$TARGET"
+    if command -v sudo >/dev/null 2>&1; then
+      sudo rm -rf "$TARGET"
+    else
+      rm -rf "$TARGET"
+    fi
   fi
 }
 
 on_error() {
   local exit_code=$?
+  trap - ERR
   echo "❌ CPU install validation failed (exit code: ${exit_code})"
-  cleanup_workspace
+  set +e
+  cleanup_workspace || echo "❌ Workspace cleanup failed"
+  set -e
   exit "$exit_code"
 }
 
