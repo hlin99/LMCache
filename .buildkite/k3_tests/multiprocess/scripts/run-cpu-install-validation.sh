@@ -406,7 +406,28 @@ if [ "${OUTPUT_1}" != "${OUTPUT_3}" ]; then
 fi
 echo "✅ All three outputs are identical — cache does not alter inference results"
 
-echo "[Phase 3 / Step 8] Cleaning up"
+# Negative test: a completely different prompt should NOT hit the cache
+echo "[Phase 3 / Step 8] Request B (different prompt) — expecting cache MISS"
+PROMPT_FILE_B="/tmp/build_${BUILD_ID}_phase3_prompt_b.txt"
+python3 -c "
+# A completely different prompt that shares no prefix with prompt A
+story_b = '''In the year 2147, humanity established its first permanent colony on Mars. The settlement, named Arcadia, housed three thousand researchers and engineers working to terraform the red planet. Chief botanist Dr. Yuki Tanaka spent her days in the greenhouse domes, cultivating genetically modified crops that could thrive in Martian soil. The atmospheric processors hummed day and night, slowly converting carbon dioxide into breathable oxygen. It was tedious work measured in decades, but the colonists were patient. Every morning, Dr. Tanaka checked her instruments and recorded the oxygen levels in her logbook. Today the readings showed'''
+print(story_b, end='')
+" > "${PROMPT_FILE_B}"
+L1_READ_BEFORE=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
+OUTPUT_B=$(send_completion "${PROMPT_FILE_B}" 50)
+echo "Output B: ${OUTPUT_B}"
+wait_for_metric_change "lmcache_mp_l1_read_chunks_total" "${L1_READ_BEFORE}" 5 || true
+L1_READ_AFTER=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
+READ_DELTA=$((L1_READ_AFTER - L1_READ_BEFORE))
+echo "L1 read chunks delta for new prompt: ${READ_DELTA}"
+if [ "${READ_DELTA}" -gt 0 ]; then
+  echo "❌ Unexpected cache hit on a completely different prompt — metrics may be unreliable"
+  false
+fi
+echo "✅ Cache miss confirmed for different prompt — metrics are trustworthy"
+
+echo "[Phase 3 / Step 9] Cleaning up"
 stop_vllm
 cleanup_processes
 echo "✅ Phase 3 cleanup completed"
