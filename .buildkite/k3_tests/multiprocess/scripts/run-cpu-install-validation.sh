@@ -110,6 +110,90 @@ wait_for_endpoint_contains() {
   return 1
 }
 
+# Scrape a Prometheus counter value from LMCache /metrics endpoint
+scrape_metric() {
+  local metric_name="$1"
+  python3 - <<EOF
+import sys, urllib.request
+url = "http://localhost:${LMCACHE_HTTP_PORT}/metrics"
+try:
+    body = urllib.request.urlopen(url, timeout=10).read().decode()
+except Exception as e:
+    print(f"ERROR fetching {url}: {e}", file=sys.stderr)
+    print("0")
+    sys.exit(0)
+total = 0.0
+for line in body.splitlines():
+    if line.startswith("#"):
+        continue
+    if not line.startswith("${metric_name}"):
+        continue
+    parts = line.rsplit(" ", 1)
+    if len(parts) != 2:
+        continue
+    try:
+        total += float(parts[1])
+    except ValueError:
+        continue
+print(int(total))
+EOF
+}
+
+# Send a completion request and print the text output
+send_completion() {
+  local prompt_file="$1"
+  local max_tokens="${2:-50}"
+  local prompt
+  prompt="$(cat "${prompt_file}")"
+  local response
+  response="$(curl -fsS "http://localhost:${VLLM_PORT}/v1/completions" \
+    -H "Content-Type: application/json" \
+    -d "$(python3 -c "
+import json, sys
+prompt = open('${prompt_file}').read()
+print(json.dumps({
+    'model': 'facebook/opt-125m',
+    'prompt': prompt,
+    'max_tokens': ${max_tokens},
+    'temperature': 0
+}))
+")")"
+  echo "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])"
+}
+
+start_vllm() {
+  echo "Starting vLLM server..."
+  VLLM_TARGET_DEVICE=cpu vllm serve facebook/opt-125m \
+    --port "${VLLM_PORT}" \
+    --dtype bfloat16 \
+    --disable-hybrid-kv-cache-manager \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.5 \
+    --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}' \
+    >"${VLLM_LOG}" 2>&1 &
+  VLLM_PID=$!
+  echo "vLLM server started (PID=${VLLM_PID})"
+  sleep 1
+  if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
+    echo "❌ vLLM server exited immediately after startup. See ${VLLM_LOG} for details"
+    return 1
+  fi
+  echo "Waiting for vLLM readiness at http://localhost:${VLLM_PORT}/v1/models (timeout: ${VLLM_READY_TIMEOUT}s)"
+  if ! wait_for_endpoint_contains "http://localhost:${VLLM_PORT}/v1/models" "${VLLM_READY_TIMEOUT}" "facebook/opt-125m" "vLLM server"; then
+    return 1
+  fi
+  echo "✅ vLLM server is ready"
+}
+
+stop_vllm() {
+  if [ -n "${VLLM_PID}" ] && kill -0 "${VLLM_PID}" 2>/dev/null; then
+    echo "Stopping vLLM (PID=${VLLM_PID})"
+    kill "${VLLM_PID}" 2>/dev/null || true
+    wait "${VLLM_PID}" 2>/dev/null || true
+    VLLM_PID=""
+  fi
+}
+
 on_error() {
   local exit_code=$?
   trap - ERR
@@ -197,31 +281,10 @@ if ! wait_for_endpoint_contains "http://localhost:${LMCACHE_HTTP_PORT}/healthche
 fi
 echo "✅ LMCache server is healthy"
 
-echo "[Phase 2 / Step 4] Starting vLLM server"
-echo "vLLM log: ${VLLM_LOG}"
+echo "[Phase 2 / Step 4] Installing libnuma and starting vLLM server"
 apt-get update && apt-get install -y --no-install-recommends libnuma1
 export VLLM_TARGET_DEVICE=cpu
-VLLM_TARGET_DEVICE=cpu vllm serve facebook/opt-125m \
-  --port "${VLLM_PORT}" \
-  --dtype bfloat16 \
-  --disable-hybrid-kv-cache-manager \
-  --no-enable-prefix-caching \
-  --gpu-memory-utilization 0.5 \
-  --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}' \
-  >"${VLLM_LOG}" 2>&1 &
-VLLM_PID=$!
-echo "vLLM server started (PID=${VLLM_PID})"
-sleep 1
-if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
-  echo "❌ vLLM server exited immediately after startup. See ${VLLM_LOG} for details"
-  false
-fi
-
-echo "Waiting for vLLM readiness at http://localhost:${VLLM_PORT}/v1/models (timeout: ${VLLM_READY_TIMEOUT}s)"
-if ! wait_for_endpoint_contains "http://localhost:${VLLM_PORT}/v1/models" "${VLLM_READY_TIMEOUT}" "facebook/opt-125m" "vLLM server"; then
-  false
-fi
-echo "✅ vLLM server is ready"
+start_vllm
 
 echo "[Phase 2 / Step 5] Sending E2E test request"
 completion_response="$(curl -fsS "http://localhost:${VLLM_PORT}/v1/completions" \
@@ -238,11 +301,120 @@ if ! echo "${completion_response}" | grep -q "facebook/opt-125m"; then
 fi
 echo "✅ E2E request validation passed"
 
-echo "[Phase 2 / Step 6] Cleaning up LMCache and vLLM processes"
-cleanup_processes
+echo "[Phase 2 / Step 6] Cleaning up Phase 2 vLLM"
+stop_vllm
 echo "✅ Phase 2 cleanup completed"
 
 echo "✅ CPU E2E validation passed"
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3: Cache Hit Validation
+# ═══════════════════════════════════════════════════════════════════
+# Scenario:
+#   - LMCache server stays running the entire time
+#   - vLLM instance 1: request A → LMCache store; request A again → LMCache hit
+#   - vLLM restart (instance 2): request A → LMCache hit (cross-instance)
+#   - All three outputs must be identical (bit-exact with temperature=0)
+# ═══════════════════════════════════════════════════════════════════
+
+echo "=== Cache Hit Validation (Phase 3) ==="
+
+# Generate a fixed ~1000 token prompt
+PROMPT_FILE="/tmp/build_${BUILD_ID}_phase3_prompt.txt"
+python3 -c "
+words = 'The quick brown fox jumps over the lazy dog near the river bank. '
+# opt-125m tokenizer: ~1.3 tokens/word, 750 words ≈ 1000 tokens
+prompt = (words * 75).strip()
+prompt += ' Summary of the above text:'
+print(prompt, end='')
+" > "${PROMPT_FILE}"
+echo "Generated prompt file: ${PROMPT_FILE} ($(wc -c < "${PROMPT_FILE}") bytes)"
+
+# Reset metrics to have a clean baseline
+echo "[Phase 3 / Step 1] Resetting LMCache metrics"
+curl -fsS -X POST "http://localhost:${LMCACHE_HTTP_PORT}/metrics/reset" >/dev/null
+echo "✅ Metrics reset"
+
+# Start vLLM instance 1
+echo "[Phase 3 / Step 2] Starting vLLM (instance 1)"
+start_vllm
+
+# Request A (first time) → should trigger store
+echo "[Phase 3 / Step 3] Request A (first) — expecting LMCache store"
+L1_WRITE_BEFORE=$(scrape_metric "lmcache_mp_l1_write_chunks_total")
+OUTPUT_1=$(send_completion "${PROMPT_FILE}" 50)
+echo "Output 1: ${OUTPUT_1}"
+sleep 2  # allow async store to complete
+L1_WRITE_AFTER=$(scrape_metric "lmcache_mp_l1_write_chunks_total")
+STORE_DELTA=$((L1_WRITE_AFTER - L1_WRITE_BEFORE))
+echo "L1 write chunks delta: ${STORE_DELTA}"
+if [ "${STORE_DELTA}" -lt 1 ]; then
+  echo "❌ No L1 write activity after first request (expected store)"
+  false
+fi
+echo "✅ LMCache store verified (${STORE_DELTA} chunks written)"
+
+# Request A (second time, same vLLM instance) → should trigger read/hit
+echo "[Phase 3 / Step 4] Request A (second) — expecting LMCache hit"
+L1_READ_BEFORE=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
+OUTPUT_2=$(send_completion "${PROMPT_FILE}" 50)
+echo "Output 2: ${OUTPUT_2}"
+sleep 2
+L1_READ_AFTER=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
+READ_DELTA=$((L1_READ_AFTER - L1_READ_BEFORE))
+echo "L1 read chunks delta: ${READ_DELTA}"
+if [ "${READ_DELTA}" -lt 1 ]; then
+  echo "❌ No L1 read activity on second request (expected cache hit)"
+  false
+fi
+echo "✅ LMCache hit verified on same instance (${READ_DELTA} chunks read)"
+
+# Restart vLLM
+echo "[Phase 3 / Step 5] Restarting vLLM (instance 2)"
+stop_vllm
+sleep 2
+start_vllm
+
+# Request A (third time, new vLLM instance) → should trigger read/hit from LMCache
+echo "[Phase 3 / Step 6] Request A (third) — expecting LMCache hit after vLLM restart"
+L1_READ_BEFORE=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
+OUTPUT_3=$(send_completion "${PROMPT_FILE}" 50)
+echo "Output 3: ${OUTPUT_3}"
+sleep 2
+L1_READ_AFTER=$(scrape_metric "lmcache_mp_l1_read_chunks_total")
+READ_DELTA=$((L1_READ_AFTER - L1_READ_BEFORE))
+echo "L1 read chunks delta: ${READ_DELTA}"
+if [ "${READ_DELTA}" -lt 1 ]; then
+  echo "❌ No L1 read activity after vLLM restart (expected cross-instance cache hit)"
+  false
+fi
+echo "✅ LMCache cross-instance hit verified (${READ_DELTA} chunks read)"
+
+# Verify all three outputs are identical
+echo "[Phase 3 / Step 7] Verifying output consistency"
+if [ "${OUTPUT_1}" != "${OUTPUT_2}" ]; then
+  echo "❌ Output mismatch between request 1 and request 2"
+  echo "  Output 1: ${OUTPUT_1}"
+  echo "  Output 2: ${OUTPUT_2}"
+  false
+fi
+if [ "${OUTPUT_1}" != "${OUTPUT_3}" ]; then
+  echo "❌ Output mismatch between request 1 and request 3 (after vLLM restart)"
+  echo "  Output 1: ${OUTPUT_1}"
+  echo "  Output 3: ${OUTPUT_3}"
+  false
+fi
+echo "✅ All three outputs are identical — cache does not alter inference results"
+
+echo "[Phase 3 / Step 8] Cleaning up"
+stop_vllm
+cleanup_processes
+echo "✅ Phase 3 cleanup completed"
+
+echo ""
+echo "=========================================="
+echo "✅ All phases passed (Phase 1 + 2 + 3)"
+echo "=========================================="
 
 # Upload artifacts BEFORE deleting the workspace
 upload_artifacts
