@@ -1,0 +1,9 @@
+env:
+  PATH: "$HOME/.local/bin:$PATH"
+
+steps:
+  - label: "CPU Install Validation (Phase 1)"
+    timeout_in_minutes: 30
+    command: |
+      chmod +x .buildkite/scripts/cpu-integration-tests.sh
+      .buildkite/scripts/cpu-integration-tests.sh
