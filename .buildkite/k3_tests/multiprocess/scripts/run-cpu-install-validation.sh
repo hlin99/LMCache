@@ -322,11 +322,11 @@ echo "=== Cache Hit Validation (Phase 3) ==="
 # Generate a fixed ~1000 token prompt
 PROMPT_FILE="/tmp/build_${BUILD_ID}_phase3_prompt.txt"
 python3 -c "
-words = 'The quick brown fox jumps over the lazy dog near the river bank. '
-# opt-125m tokenizer: ~1.3 tokens/word, 750 words ≈ 1000 tokens
-prompt = (words * 75).strip()
-prompt += ' Summary of the above text:'
-print(prompt, end='')
+# A diverse, non-repetitive story prompt (~1000 tokens for opt-125m).
+# The model will continue the narrative; correctness doesn't matter,
+# only that all three runs produce identical output (cache consistency).
+story = '''Once upon a time in a small coastal village, there lived an old lighthouse keeper named Thomas. Every evening, he climbed the one hundred and thirty-seven steps to the top of the lighthouse to light the great lamp. The sea was unpredictable in those parts. Ships from distant lands carried spices, silk, and stories of places Thomas had never seen. One stormy night in November, a merchant vessel called the Silver Heron appeared on the horizon, listing dangerously to starboard. Thomas watched through his brass telescope as the waves crashed against its hull. He knew that if the ship did not change course within the next ten minutes, it would strike the jagged rocks known locally as the Devil's Teeth. He grabbed the emergency flare gun from the wooden cabinet and fired three red flares into the sky. The captain of the Silver Heron saw the warning and ordered hard to port. The ship groaned as it turned, barely clearing the outermost rock by twenty meters. The next morning, the captain rowed ashore to thank Thomas personally. He brought a gift: a small wooden box containing a compass that always pointed not north, but toward home. Thomas kept it on his desk for the rest of his days. Years later, when Thomas retired, he passed the compass to his granddaughter Elena, who had inherited his love of the sea. Elena became a marine biologist studying the migration patterns of humpback whales along the Pacific coast. She traveled from Alaska to Mexico following the whale pods, documenting their songs and social behaviors. Her research revealed that whale families maintained bonds across thousands of miles, communicating through low-frequency calls that could travel entire ocean basins. One afternoon while diving near a coral reef off the coast of Baja California, Elena discovered something extraordinary beneath a rocky overhang:'''
+print(story, end='')
 " > "${PROMPT_FILE}"
 echo "Generated prompt file: ${PROMPT_FILE} ($(wc -c < "${PROMPT_FILE}") bytes)"
 
