@@ -84,4 +84,3 @@ python -c "import vllm; print('vllm:', vllm.__version__)"
 python -c "import lmcache; print('lmcache:', lmcache.__version__)"
 
 echo "✅ CPU install validation passed"
-cleanup_workspace
