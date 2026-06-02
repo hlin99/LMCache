@@ -19,6 +19,20 @@ LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-128}"
 LMCACHE_HEALTHCHECK_TIMEOUT="${LMCACHE_HEALTHCHECK_TIMEOUT:-30}"
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-120}"
 
+# Directory to collect artifacts before workspace is deleted
+ARTIFACT_DIR="/tmp/build_${BUILD_ID}_artifacts"
+mkdir -p "${ARTIFACT_DIR}"
+
+upload_artifacts() {
+  # Copy logs to artifact dir (which survives workspace deletion)
+  cp -f "${LMCACHE_LOG}" "${ARTIFACT_DIR}/lmcache_cpu_validation.log" 2>/dev/null || true
+  cp -f "${VLLM_LOG}" "${ARTIFACT_DIR}/vllm_cpu_validation.log" 2>/dev/null || true
+
+  if [ -n "${BUILDKITE_BUILD_ID:-}" ] && command -v buildkite-agent >/dev/null 2>&1; then
+    buildkite-agent artifact upload "${ARTIFACT_DIR}/*.log" || true
+  fi
+}
+
 cleanup_workspace() {
   if [ -n "${BUILDKITE_BUILD_ID:-}" ]; then
     export TARGET="$PWD"
@@ -103,6 +117,7 @@ on_error() {
   set +e
   print_failure_logs
   cleanup_processes
+  upload_artifacts
   cleanup_workspace || echo "❌ Workspace cleanup failed"
   set -e
   exit "$exit_code"
@@ -228,4 +243,7 @@ cleanup_processes
 echo "✅ Phase 2 cleanup completed"
 
 echo "✅ CPU E2E validation passed"
+
+# Upload artifacts BEFORE deleting the workspace
+upload_artifacts
 cleanup_workspace
