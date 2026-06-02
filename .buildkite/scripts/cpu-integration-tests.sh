@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -e
 
+echo "Build ID: ${BUILDKITE_BUILD_ID:-local}"
+echo "Python: $(python3 --version 2>&1 || true)"
+echo "uv: $(uv --version 2>&1 || true)"
+
 BUILD_ID="${BUILDKITE_BUILD_ID:-local_$$}"
 VENV_DIR=".venv-${BUILD_ID}"
 
@@ -49,6 +53,10 @@ uv venv --python 3.12 "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 echo "✅ Virtual environment ready"
 
+echo "Upgrading pip/setuptools/wheel"
+uv pip install --upgrade pip setuptools wheel
+echo "✅ Upgraded pip/setuptools/wheel"
+
 echo "Installing build dependencies from requirements/build.txt"
 uv pip install -r requirements/build.txt
 echo "✅ Installed requirements/build.txt"
@@ -58,12 +66,15 @@ uv pip install -r requirements/common.txt
 echo "✅ Installed requirements/common.txt"
 
 echo "Installing vLLM CPU build"
-uv pip install vllm --extra-index-url https://download.pytorch.org/whl/cpu
+uv pip install vllm --extra-index-url https://download.pytorch.org/whl/cpu --prerelease=allow
 echo "✅ vLLM CPU install completed"
 
 echo "Installing LMCache in editable mode with NO_GPU_EXT=1"
 NO_GPU_EXT=1 uv pip install -e . --no-build-isolation
 echo "✅ LMCache install completed"
+
+echo "Freezing installed package versions"
+uv pip freeze
 
 echo "Validating imports"
 python -c "import lmcache; import vllm; print('✅ Imports OK')"
