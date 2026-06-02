@@ -295,24 +295,6 @@ if ! wait_for_endpoint_contains "http://localhost:${LMCACHE_HTTP_PORT}/healthche
 fi
 echo "✅ LMCache server is healthy"
 
-# Verify transport mode matches expectation
-echo "[Phase 2 / Step 3.5] Verifying transport mode: expecting '${EXPECTED_TRANSPORT}'"
-if [ "${EXPECTED_TRANSPORT}" = "shm" ]; then
-  if ! grep -q "Using shm" "${LMCACHE_LOG}" 2>/dev/null; then
-    echo "❌ Expected shm transport but 'Using shm' not found in log"
-    tail -50 "${LMCACHE_LOG}"
-    false
-  fi
-  echo "✅ Transport mode confirmed: shm"
-elif [ "${EXPECTED_TRANSPORT}" = "pickle" ]; then
-  if ! grep -q "Using pickle" "${LMCACHE_LOG}" 2>/dev/null; then
-    echo "❌ Expected pickle transport but 'Using pickle' not found in log"
-    tail -50 "${LMCACHE_LOG}"
-    false
-  fi
-  echo "✅ Transport mode confirmed: pickle"
-fi
-
 echo "[Phase 2 / Step 4] Installing libnuma and starting vLLM server"
 apt-get update && apt-get install -y --no-install-recommends libnuma1
 export VLLM_TARGET_DEVICE=cpu
@@ -332,6 +314,24 @@ if ! echo "${completion_response}" | grep -q "facebook/opt-125m"; then
   false
 fi
 echo "✅ E2E request validation passed"
+
+# Verify transport mode (logged after vLLM connects to LMCache server)
+echo "[Phase 2 / Step 5.5] Verifying transport mode: expecting '${EXPECTED_TRANSPORT}'"
+if [ "${EXPECTED_TRANSPORT}" = "shm" ]; then
+  if ! grep -q "Using shm" "${LMCACHE_LOG}" 2>/dev/null; then
+    echo "❌ Expected shm transport but 'Using shm' not found in log"
+    tail -50 "${LMCACHE_LOG}"
+    false
+  fi
+  echo "✅ Transport mode confirmed: shm"
+elif [ "${EXPECTED_TRANSPORT}" = "pickle" ]; then
+  if ! grep -q "Using pickle" "${LMCACHE_LOG}" 2>/dev/null; then
+    echo "❌ Expected pickle transport but 'Using pickle' not found in log"
+    tail -50 "${LMCACHE_LOG}"
+    false
+  fi
+  echo "✅ Transport mode confirmed: pickle"
+fi
 
 echo "[Phase 2 / Step 6] Cleaning up Phase 2 vLLM"
 stop_vllm
