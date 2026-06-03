@@ -914,7 +914,7 @@ def multi_layer_block_kv_transfer(
         obj_dtype,
     )
     block_id_list = _to_block_id_list(block_ids)
-    # Simplify skip: slice block_ids at entry, then process from chunk 0.
+    # Simplify skip: slice block_ids at entry, then process sequentially.
     if skip_prefix_n_blocks > 0:
         block_id_list = block_id_list[skip_prefix_n_blocks:]
     blocks_per_object = lmcache_chunk_size // int(shape_desc.bs)
@@ -922,7 +922,12 @@ def multi_layer_block_kv_transfer(
     use_mla = _is_mla_format(gpu_kv_format)
     use_hnd = _is_hnd_format(gpu_kv_format)
 
-    # Layer-major loop: outer layer_id, inner object_idx.
+    # For H2D, pre-transfer objects to layer device once.
+    if is_h2d and layer_tensors:
+        target_device = layer_tensors[0].device
+        objs_on_device = [obj.to(target_device) for obj in object_tensors]
+
+    # Layer-major loop: outer layer_idx, inner object_idx.
     for layer_idx, layer in enumerate(layer_tensors):
         for object_idx, obj in enumerate(object_tensors):
             obj_block_start = object_idx * blocks_per_object
@@ -980,7 +985,7 @@ def multi_layer_block_kv_transfer(
                     )
             else:
                 # H2D scatter using index_copy_
-                obj_device = obj.to(layer.device)
+                obj_device = objs_on_device[object_idx]
                 if use_mla:
                     src = obj_device[layer_idx, :n_tokens]
                     hidden_size = layer.shape[-1]
