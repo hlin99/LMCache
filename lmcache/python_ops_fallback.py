@@ -795,6 +795,10 @@ def _normalize_paged_layers(
             if all(
                 isinstance(t, torch.Tensor) for t in paged_buffer_ptrs_tensor
             ):
+                if len(paged_buffer_ptrs_tensor) % 2 != 0:
+                    raise ValueError(
+                        "Flat SGLang MHA list must have even length (2*NL)"
+                    )
                 nl = len(paged_buffer_ptrs_tensor) // 2
                 return [
                     paged_buffer_ptrs_tensor[:nl],
