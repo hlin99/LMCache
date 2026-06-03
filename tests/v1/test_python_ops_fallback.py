@@ -1845,6 +1845,7 @@ def scenario_multi_layer_block_kv_transfer(
     shape_desc.nh = num_heads
     shape_desc.hs = head_size
     shape_desc.element_size = dtype.itemsize
+    shape_desc.kv_size = 2
 
     gpu_kv_format = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
     num_chunks = num_blocks // blocks_per_chunk
@@ -2013,6 +2014,7 @@ def scenario_multi_layer_block_kv_transfer(
     shape_desc_mla.nh = 1
     shape_desc_mla.hs = mla_hidden
     shape_desc_mla.element_size = dtype.itemsize
+    shape_desc.kv_size = 1
     gpu_kv_format_mla = ops.GPUKVFormat.NL_X_NB_BS_HS
     d2h_chunks_mla = [
         torch.zeros(num_layers, chunk_tokens, mla_hidden, dtype=dtype)
@@ -2358,6 +2360,7 @@ def scenario_multi_layer_block_kv_transfer(
     shape_desc_mc.nh = num_heads
     shape_desc_mc.hs = head_size
     shape_desc_mc.element_size = dtype.itemsize
+    shape_desc_mc.kv_size = 2
     num_chunks_mc = num_blocks_mc // blocks_per_chunk  # 3 chunks
     d2h_chunks_mc = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
