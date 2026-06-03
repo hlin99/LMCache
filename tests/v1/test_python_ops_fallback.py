@@ -1820,8 +1820,9 @@ def scenario_multi_layer_block_kv_transfer(
 
     # C++ bindings (cuda_c_ops, xpu_sycl_ops) expect uint64 pointer tensors for
     # paged_buffer_ptrs_tensor and list[int] for lmcache_objects_ptrs.
-    # The Python fallback (cpu_py_ops, cuda_py_ops) expects tensor objects directly.
-    use_tensor_list = (ops is _py_ops) or device not in ("cpu", "cuda", "xpu")
+    # The Python fallback also supports both modes on cpu/cuda (pointer inputs
+    # are reconstructed internally via _tensor_from_ptr).
+    use_tensor_list = device not in ("cpu", "cuda")
 
     # --- NHD per-layer ---
     torch.manual_seed(123)
@@ -1843,6 +1844,7 @@ def scenario_multi_layer_block_kv_transfer(
     shape_desc.bs = block_size
     shape_desc.nh = num_heads
     shape_desc.hs = head_size
+    shape_desc.element_size = dtype.itemsize
 
     gpu_kv_format = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
     num_chunks = num_blocks // blocks_per_chunk
@@ -2010,6 +2012,7 @@ def scenario_multi_layer_block_kv_transfer(
     shape_desc_mla.bs = block_size
     shape_desc_mla.nh = 1
     shape_desc_mla.hs = mla_hidden
+    shape_desc_mla.element_size = dtype.itemsize
     gpu_kv_format_mla = ops.GPUKVFormat.NL_X_NB_BS_HS
     d2h_chunks_mla = [
         torch.zeros(num_layers, chunk_tokens, mla_hidden, dtype=dtype)
@@ -2354,6 +2357,7 @@ def scenario_multi_layer_block_kv_transfer(
     shape_desc_mc.bs = block_size
     shape_desc_mc.nh = num_heads
     shape_desc_mc.hs = head_size
+    shape_desc_mc.element_size = dtype.itemsize
     num_chunks_mc = num_blocks_mc // blocks_per_chunk  # 3 chunks
     d2h_chunks_mc = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)

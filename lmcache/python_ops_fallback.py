@@ -757,28 +757,132 @@ def _is_mla_format(gpu_kv_format: GPUKVFormat) -> bool:
     )
 
 
+_ELEMENT_SIZE_TO_DTYPE: dict[int, torch.dtype] = {
+    1: torch.uint8,
+    2: torch.float16,
+    4: torch.float32,
+}
+
+
+def _is_ptr_tensor(x: object) -> bool:
+    """Return True when *x* is a 1-D pointer tensor (int64 or uint64)."""
+    return (
+        isinstance(x, torch.Tensor)
+        and x.dtype in (torch.int64, torch.uint64)
+        and x.ndim == 1
+    )
+
+
+def _per_layer_paged_shape(
+    gpu_kv_format: GPUKVFormat,
+    nb: int,
+    bs: int,
+    nh: int,
+    hs: int,
+) -> tuple[int, ...]:
+    """Return the logical shape of a single per-layer paged buffer tensor."""
+    fmt = int(gpu_kv_format)
+    if fmt == int(GPUKVFormat.NL_X_NBBS_ONE_HS):
+        return (nb * bs, 1, hs)
+    if fmt == int(GPUKVFormat.NL_X_NB_BS_HS):
+        return (nb, bs, hs)
+    if fmt == int(GPUKVFormat.NL_X_TWO_NB_NH_BS_HS):
+        return (2, nb, nh, bs, hs)
+    if fmt == int(GPUKVFormat.NL_X_NB_TWO_NH_BS_HS):
+        return (nb, 2, nh, bs, hs)
+    if fmt == int(GPUKVFormat.NL_X_TWO_NB_BS_NH_HS):
+        return (2, nb, bs, nh, hs)
+    # Covers NL_X_NB_TWO_BS_NH_HS and any future NHD variants.
+    return (nb, 2, bs, nh, hs)
+
+
+def _infer_kv_dtype(
+    paged_buffer_ptrs_tensor: object,
+    lmcache_objects_ptrs: object,
+    shape_desc: "PageBufferShapeDesc",
+) -> torch.dtype:
+    """Infer the KV element dtype from whichever inputs carry it."""
+    if isinstance(paged_buffer_ptrs_tensor, list) and paged_buffer_ptrs_tensor:
+        first = paged_buffer_ptrs_tensor[0]
+        if isinstance(first, list) and first and isinstance(first[0], torch.Tensor):
+            return first[0].dtype
+        if isinstance(first, torch.Tensor):
+            return first.dtype
+    if isinstance(paged_buffer_ptrs_tensor, torch.Tensor) and not _is_ptr_tensor(
+        paged_buffer_ptrs_tensor
+    ):
+        return paged_buffer_ptrs_tensor.dtype
+    if isinstance(lmcache_objects_ptrs, list) and lmcache_objects_ptrs:
+        if isinstance(lmcache_objects_ptrs[0], torch.Tensor):
+            return lmcache_objects_ptrs[0].dtype
+    if shape_desc is not None and shape_desc.element_size > 0:
+        return _ELEMENT_SIZE_TO_DTYPE.get(shape_desc.element_size, torch.float16)
+    return torch.float16
+
+
 def _normalize_paged_layers(
     paged_buffer_ptrs_tensor: "torch.Tensor | list",
     gpu_kv_format: GPUKVFormat,
+    shape_desc: "PageBufferShapeDesc | None" = None,
+    device: "torch.device | str | None" = None,
+    dtype: "torch.dtype | None" = None,
 ) -> "torch.Tensor | list[torch.Tensor] | list[list[torch.Tensor]]":
     """Normalize paged buffer input based on GPU KV format.
+
+    Accepts either tensor-form inputs (list / Tensor) or a 1-D pointer tensor
+    (int64 / uint64).  When a pointer tensor is provided *shape_desc*, *device*,
+    and *dtype* must be supplied so the tensors can be reconstructed via
+    :func:`_tensor_from_ptr`.
 
     Returns:
         - Single ``torch.Tensor`` for cross-layer formats.
         - ``list[list[torch.Tensor]]`` (2 x NL) for SGLang MHA formats.
         - ``list[torch.Tensor]`` (per-layer) for all other formats.
-
-    Python fallback only accepts tensor-form inputs.
-    Pointer inputs are not supported and will raise TypeError.
     """
     if _is_cross_layer_format(gpu_kv_format):
         if isinstance(paged_buffer_ptrs_tensor, torch.Tensor):
+            if _is_ptr_tensor(paged_buffer_ptrs_tensor):
+                # 1-D pointer tensor with a single entry → reconstruct full tensor.
+                assert shape_desc is not None and device is not None and dtype is not None
+                nb = int(shape_desc.nb)
+                nl = int(shape_desc.nl)
+                bs = int(shape_desc.bs)
+                nh = int(shape_desc.nh)
+                hs = int(shape_desc.hs)
+                if int(gpu_kv_format) == int(GPUKVFormat.NB_NL_TWO_NH_BS_HS):
+                    shape: tuple[int, ...] = (nb, nl, 2, nh, bs, hs)
+                else:
+                    shape = (nb, nl, 2, bs, nh, hs)
+                ptr = int(paged_buffer_ptrs_tensor[0].item())
+                return _tensor_from_ptr(ptr, shape, dtype, device)
             return paged_buffer_ptrs_tensor
         raise TypeError(
             "Cross-layer formats require a single torch.Tensor input; "
-            "pointer-based inputs are not supported by the Python fallback"
+            "got: " + type(paged_buffer_ptrs_tensor).__name__
         )
     if _is_sglang_mha_format(gpu_kv_format):
+        if _is_ptr_tensor(paged_buffer_ptrs_tensor):
+            # 1-D pointer tensor [K_L0,...,K_LN-1, V_L0,...,V_LN-1] → nested list.
+            assert shape_desc is not None and device is not None and dtype is not None
+            nb = int(shape_desc.nb)
+            nl = int(shape_desc.nl)
+            bs = int(shape_desc.bs)
+            nh = int(shape_desc.nh)
+            hs = int(shape_desc.hs)
+            is_flat = int(gpu_kv_format) == int(GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS)
+            per_layer_shape: tuple[int, ...] = (
+                (nb * bs, nh, hs) if is_flat else (nb, bs, nh, hs)
+            )
+            ptrs = [int(p.item()) for p in paged_buffer_ptrs_tensor]
+            k_tensors = [
+                _tensor_from_ptr(ptrs[i], per_layer_shape, dtype, device)
+                for i in range(nl)
+            ]
+            v_tensors = [
+                _tensor_from_ptr(ptrs[nl + i], per_layer_shape, dtype, device)
+                for i in range(nl)
+            ]
+            return [k_tensors, v_tensors]
         if isinstance(paged_buffer_ptrs_tensor, list):
             # Already nested [[K tensors], [V tensors]]
             if (
@@ -799,17 +903,29 @@ def _normalize_paged_layers(
                     raise ValueError(
                         "Flat SGLang MHA list must have even length (2*NL)"
                     )
-                nl = len(paged_buffer_ptrs_tensor) // 2
+                nl_list = len(paged_buffer_ptrs_tensor) // 2
                 return [
-                    paged_buffer_ptrs_tensor[:nl],
-                    paged_buffer_ptrs_tensor[nl:],
+                    paged_buffer_ptrs_tensor[:nl_list],
+                    paged_buffer_ptrs_tensor[nl_list:],
                 ]
         raise TypeError(
-            "SGLang MHA formats require a list[list[torch.Tensor]] or flat "
-            "list[torch.Tensor] (2*NL entries) input; "
-            "pointer-based inputs are not supported by the Python fallback"
+            "SGLang MHA formats require a list[list[torch.Tensor]], a flat "
+            "list[torch.Tensor] (2*NL entries), or a 1-D pointer tensor; "
+            "got: " + type(paged_buffer_ptrs_tensor).__name__
         )
     # Per-layer formats
+    if _is_ptr_tensor(paged_buffer_ptrs_tensor):
+        # 1-D pointer tensor [ptr_L0, ..., ptr_LN-1] → list of per-layer tensors.
+        assert shape_desc is not None and device is not None and dtype is not None
+        nb = int(shape_desc.nb)
+        bs = int(shape_desc.bs)
+        nh = int(shape_desc.nh)
+        hs = int(shape_desc.hs)
+        per_shape = _per_layer_paged_shape(gpu_kv_format, nb, bs, nh, hs)
+        return [
+            _tensor_from_ptr(int(p.item()), per_shape, dtype, device)
+            for p in paged_buffer_ptrs_tensor
+        ]
     if isinstance(paged_buffer_ptrs_tensor, list):
         if not all(isinstance(t, torch.Tensor) for t in paged_buffer_ptrs_tensor):
             raise TypeError(
@@ -817,26 +933,61 @@ def _normalize_paged_layers(
             )
         return paged_buffer_ptrs_tensor
     raise TypeError(
-        "paged_buffer_ptrs_tensor must be a list[torch.Tensor]; "
-        "pointer-based inputs are not supported by the Python fallback"
+        "paged_buffer_ptrs_tensor must be a list[torch.Tensor] or 1-D pointer tensor; "
+        "got: " + type(paged_buffer_ptrs_tensor).__name__
     )
 
 
 def _normalize_lmcache_objects(
-    lmcache_objects_ptrs: list[int] | list[torch.Tensor],
+    lmcache_objects_ptrs: "list[int] | list[torch.Tensor]",
+    shape_desc: "PageBufferShapeDesc | None" = None,
+    lmcache_chunk_size: "int | None" = None,
+    gpu_kv_format: "GPUKVFormat | None" = None,
+    dtype: "torch.dtype | None" = None,
 ) -> list[torch.Tensor]:
     """Normalize LMCache object inputs to chunk tensors.
 
-    Python fallback only accepts tensor-form inputs (list of chunk tensors).
-    Pointer inputs are not supported and will raise TypeError.
+    Accepts either a list of chunk tensors or a ``list[int]`` of raw CPU pointers.
+    When a pointer list is provided *shape_desc*, *lmcache_chunk_size*,
+    *gpu_kv_format*, and *dtype* must be supplied so the tensors can be
+    reconstructed via :func:`_tensor_from_ptr` on the CPU.
     """
-    if isinstance(lmcache_objects_ptrs, list) and all(
-        isinstance(t, torch.Tensor) for t in lmcache_objects_ptrs
-    ):
-        return lmcache_objects_ptrs
+    if not isinstance(lmcache_objects_ptrs, list):
+        raise TypeError(
+            "lmcache_objects_ptrs must be a list[torch.Tensor] or list[int]; "
+            "got: " + type(lmcache_objects_ptrs).__name__
+        )
+    if not lmcache_objects_ptrs:
+        return []
+    if isinstance(lmcache_objects_ptrs[0], torch.Tensor):
+        return lmcache_objects_ptrs  # type: ignore[return-value]
+    if isinstance(lmcache_objects_ptrs[0], int):
+        # Pointer mode: reconstruct chunk tensors (always on CPU).
+        assert (
+            shape_desc is not None
+            and lmcache_chunk_size is not None
+            and gpu_kv_format is not None
+            and dtype is not None
+        ), (
+            "_normalize_lmcache_objects: shape_desc, lmcache_chunk_size, "
+            "gpu_kv_format, and dtype are required when lmcache_objects_ptrs "
+            "contains raw int pointers"
+        )
+        nl = int(shape_desc.nl)
+        nh = int(shape_desc.nh)
+        hs = int(shape_desc.hs)
+        chunk_tokens = lmcache_chunk_size
+        if _is_mla_format(gpu_kv_format):
+            chunk_shape: tuple[int, ...] = (nl, chunk_tokens, hs)
+        else:
+            chunk_shape = (2, nl, chunk_tokens, nh * hs)
+        return [
+            _tensor_from_ptr(ptr, chunk_shape, dtype, "cpu")
+            for ptr in lmcache_objects_ptrs
+        ]
     raise TypeError(
-        "lmcache_objects_ptrs must be a list[torch.Tensor]; "
-        "pointer-based inputs are not supported by the Python fallback"
+        "lmcache_objects_ptrs must be a list[torch.Tensor] or list[int]; "
+        "got list containing: " + type(lmcache_objects_ptrs[0]).__name__
     )
 
 
@@ -880,8 +1031,21 @@ def multi_layer_block_kv_transfer(
     if not (is_d2h or is_h2d):
         raise ValueError(f"Unsupported transfer direction: {direction!r}")
 
-    normalized = _normalize_paged_layers(paged_buffer_ptrs_tensor, gpu_kv_format)
-    object_tensors = _normalize_lmcache_objects(lmcache_objects_ptrs)
+    kv_dtype = _infer_kv_dtype(paged_buffer_ptrs_tensor, lmcache_objects_ptrs, shape_desc)
+    normalized = _normalize_paged_layers(
+        paged_buffer_ptrs_tensor,
+        gpu_kv_format,
+        shape_desc=shape_desc,
+        device=device,
+        dtype=kv_dtype,
+    )
+    object_tensors = _normalize_lmcache_objects(
+        lmcache_objects_ptrs,
+        shape_desc=shape_desc,
+        lmcache_chunk_size=lmcache_chunk_size,
+        gpu_kv_format=gpu_kv_format,
+        dtype=kv_dtype,
+    )
     block_id_list = _to_block_id_list(block_ids)
     blocks_per_object = lmcache_chunk_size // int(shape_desc.bs)
     block_size = int(shape_desc.bs)
