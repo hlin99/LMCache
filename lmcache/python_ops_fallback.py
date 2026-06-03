@@ -757,7 +757,8 @@ def _normalize_paged_layers(
             )
         return paged_buffer_ptrs_tensor
     raise TypeError(
-        "Python fallback does not support pointer inputs"
+        "paged_buffer_ptrs_tensor must be a list[torch.Tensor]; "
+        "pointer-based inputs are not supported by the Python fallback"
     )
 
 
@@ -774,7 +775,8 @@ def _normalize_lmcache_objects(
     ):
         return lmcache_objects_ptrs
     raise TypeError(
-        "Python fallback does not support pointer inputs"
+        "lmcache_objects_ptrs must be a list[torch.Tensor]; "
+        "pointer-based inputs are not supported by the Python fallback"
     )
 
 
