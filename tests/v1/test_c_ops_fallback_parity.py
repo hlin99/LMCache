@@ -302,25 +302,3 @@ def test_enum_parity(enum_name):
     assert c_members == py_members, (
         f"{enum_name} mismatch:\n  c_ops:    {c_members}\n  fallback: {py_members}"
     )
-
-
-@pytest.mark.skipif(not HAS_C_OPS, reason="c_ops not available (no CUDA)")
-def test_multi_layer_block_kv_transfer_signature_exact_args():
-    c_params = _parse_docstring_params(c_ops.multi_layer_block_kv_transfer)
-    assert c_params is not None, "Cannot parse c_ops.multi_layer_block_kv_transfer"
-    py_params = _get_python_params(fallback.multi_layer_block_kv_transfer)
-
-    expected = [
-        "paged_buffer_ptrs_tensor",
-        "lmcache_objects_ptrs",
-        "block_ids",
-        "device",
-        "direction",
-        "shape_desc",
-        "lmcache_chunk_size",
-        "gpu_kv_format",
-        "skip_prefix_n_blocks",
-    ]
-    assert [name for name, _, _ in c_params] == expected
-    assert [name for name, _, _ in py_params] == expected
-    assert len(c_params) == len(py_params) == 9

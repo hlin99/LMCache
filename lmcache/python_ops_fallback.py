@@ -742,37 +742,13 @@ def _is_mla_format(gpu_kv_format: GPUKVFormat) -> bool:
     )
 
 
-def _get_layer_shape(
-    shape_desc: PageBufferShapeDesc,
-    gpu_kv_format: GPUKVFormat,
-) -> Tuple[int, ...]:
-    """Build one-layer paged buffer tensor shape for the given KV layout."""
-    nb = int(shape_desc.nb)
-    bs = int(shape_desc.bs)
-    nh = int(shape_desc.nh)
-    hs = int(shape_desc.hs)
-    if _is_mla_format(gpu_kv_format):
-        return (nb, bs, hs)
-    if _is_hnd_format(gpu_kv_format):
-        if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_NH_BS_HS):
-            return (2, nb, nh, bs, hs)
-        return (nb, 2, nh, bs, hs)
-    if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_BS_NH_HS):
-        return (2, nb, bs, nh, hs)
-    return (nb, 2, bs, nh, hs)
-
-
 def _normalize_paged_layers(
     paged_buffer_ptrs_tensor: torch.Tensor | list[torch.Tensor],
-    shape_desc: PageBufferShapeDesc,
-    gpu_kv_format: GPUKVFormat,
-    device: torch.device,
-    dtype: torch.dtype,
 ) -> list[torch.Tensor]:
     """Normalize paged buffer input to per-layer tensors.
 
-    Accepts either a list of layer tensors or an int64 pointer tensor and
-    returns a list of tensor views matching one-layer paged buffer layout.
+    Python fallback only accepts tensor-form inputs (list of per-layer tensors).
+    Pointer inputs are not supported and will raise TypeError.
     """
     if isinstance(paged_buffer_ptrs_tensor, list):
         if not all(isinstance(t, torch.Tensor) for t in paged_buffer_ptrs_tensor):
@@ -780,62 +756,26 @@ def _normalize_paged_layers(
                 "paged_buffer_ptrs_tensor list must contain torch.Tensor entries"
             )
         return paged_buffer_ptrs_tensor
-    if not isinstance(paged_buffer_ptrs_tensor, torch.Tensor):
-        raise TypeError(
-            "paged_buffer_ptrs_tensor must be a torch.Tensor or list[torch.Tensor]"
-        )
-    if paged_buffer_ptrs_tensor.dtype != torch.int64:
-        raise TypeError("paged_buffer_ptrs_tensor pointer tensor must have dtype int64")
-
-    nl = int(shape_desc.nl)
-    if paged_buffer_ptrs_tensor.numel() < nl:
-        raise ValueError(
-            f"paged_buffer_ptrs_tensor has {paged_buffer_ptrs_tensor.numel()} entries, "
-            f"but shape_desc.nl is {nl}"
-        )
-
-    layer_shape = _get_layer_shape(shape_desc, gpu_kv_format)
-    layer_ptrs = paged_buffer_ptrs_tensor.reshape(-1)[:nl]
-    return [
-        _tensor_from_ptr(int(ptr.item()), layer_shape, dtype, device)
-        for ptr in layer_ptrs
-    ]
+    raise TypeError(
+        "Python fallback does not support pointer inputs"
+    )
 
 
 def _normalize_lmcache_objects(
     lmcache_objects_ptrs: list[int] | list[torch.Tensor],
-    shape_desc: PageBufferShapeDesc,
-    lmcache_chunk_size: int,
-    gpu_kv_format: GPUKVFormat,
-    dtype: torch.dtype,
 ) -> list[torch.Tensor]:
     """Normalize LMCache object inputs to chunk tensors.
 
-    Accepts either a list of chunk tensors or a list of raw pointers and
-    returns one tensor per LMCache object with fallback-compatible shape.
+    Python fallback only accepts tensor-form inputs (list of chunk tensors).
+    Pointer inputs are not supported and will raise TypeError.
     """
     if isinstance(lmcache_objects_ptrs, list) and all(
         isinstance(t, torch.Tensor) for t in lmcache_objects_ptrs
     ):
         return lmcache_objects_ptrs
-    if not (
-        isinstance(lmcache_objects_ptrs, list)
-        and all(isinstance(ptr, int) for ptr in lmcache_objects_ptrs)
-    ):
-        raise TypeError(
-            "lmcache_objects_ptrs must be list[int] or list[torch.Tensor]"
-        )
-
-    nl = int(shape_desc.nl)
-    hidden_dim = int(shape_desc.nh) * int(shape_desc.hs)
-    if _is_mla_format(gpu_kv_format):
-        object_shape = (nl, int(lmcache_chunk_size), hidden_dim)
-    else:
-        object_shape = (2, nl, int(lmcache_chunk_size), hidden_dim)
-    return [
-        _tensor_from_ptr(int(ptr), object_shape, dtype, torch.device("cpu"))
-        for ptr in lmcache_objects_ptrs
-    ]
+    raise TypeError(
+        "Python fallback does not support pointer inputs"
+    )
 
 
 def _to_block_id_list(block_ids: torch.Tensor | list[int]) -> list[int]:
@@ -873,45 +813,16 @@ def multi_layer_block_kv_transfer(
     if skip_prefix_n_blocks < 0:
         raise ValueError("skip_prefix_n_blocks must be >= 0")
 
-    resolved_device = (
-        device if isinstance(device, torch.device) else torch.device(device)
-    )
     is_d2h = int(direction) == int(TransferDirection.D2H)
     is_h2d = int(direction) == int(TransferDirection.H2D)
     if not (is_d2h or is_h2d):
         raise ValueError(f"Unsupported transfer direction: {direction!r}")
 
-    if (
-        isinstance(lmcache_objects_ptrs, list)
-        and lmcache_objects_ptrs
-        and isinstance(lmcache_objects_ptrs[0], torch.Tensor)
-    ):
-        obj_dtype = lmcache_objects_ptrs[0].dtype
-    elif (
-        isinstance(paged_buffer_ptrs_tensor, list)
-        and paged_buffer_ptrs_tensor
-        and isinstance(paged_buffer_ptrs_tensor[0], torch.Tensor)
-    ):
-        obj_dtype = paged_buffer_ptrs_tensor[0].dtype
-    else:
-        raise TypeError(
-            "Unable to infer dtype for fallback transfer. Provide tensor-form "
-            "inputs for either paged_buffer_ptrs_tensor or lmcache_objects_ptrs."
-        )
-
     layer_tensors = _normalize_paged_layers(
         paged_buffer_ptrs_tensor,
-        shape_desc,
-        gpu_kv_format,
-        resolved_device,
-        obj_dtype,
     )
     object_tensors = _normalize_lmcache_objects(
         lmcache_objects_ptrs,
-        shape_desc,
-        lmcache_chunk_size,
-        gpu_kv_format,
-        obj_dtype,
     )
     block_id_list = _to_block_id_list(block_ids)
     # Simplify skip: slice block_ids at entry, then process sequentially.
@@ -923,7 +834,7 @@ def multi_layer_block_kv_transfer(
     use_hnd = _is_hnd_format(gpu_kv_format)
 
     # For H2D, pre-transfer objects to layer device once.
-    if is_h2d and layer_tensors:
+    if is_h2d and layer_tensors and object_tensors:
         target_device = layer_tensors[0].device
         objs_on_device = [obj.to(target_device) for obj in object_tensors]
 
@@ -945,7 +856,7 @@ def multi_layer_block_kv_transfer(
 
             if is_d2h:
                 if use_mla:
-                    layer_blocks = layer[eff_idx]
+                    layer_blocks = layer.index_select(0, eff_idx)
                     flat = layer_blocks.reshape(n_tokens, layer.shape[-1])
                     obj[layer_idx, :n_tokens].copy_(flat, non_blocking=True)
                 else:
@@ -958,12 +869,12 @@ def multi_layer_block_kv_transfer(
                             k_t, v_t = layer[:, 0], layer[:, 1]
                         _nb, nh, _bs, hs = k_t.shape
                         k_blocks = (
-                            k_t[eff_idx]
+                            k_t.index_select(0, eff_idx)
                             .permute(0, 2, 1, 3)
                             .reshape(n_tokens, nh * hs)
                         )
                         v_blocks = (
-                            v_t[eff_idx]
+                            v_t.index_select(0, eff_idx)
                             .permute(0, 2, 1, 3)
                             .reshape(n_tokens, nh * hs)
                         )
@@ -975,8 +886,12 @@ def multi_layer_block_kv_transfer(
                         else:
                             k_t, v_t = layer[:, 0], layer[:, 1]
                         _nb, _bs, nh, hs = k_t.shape
-                        k_blocks = k_t[eff_idx].reshape(n_tokens, nh * hs)
-                        v_blocks = v_t[eff_idx].reshape(n_tokens, nh * hs)
+                        k_blocks = k_t.index_select(0, eff_idx).reshape(
+                            n_tokens, nh * hs
+                        )
+                        v_blocks = v_t.index_select(0, eff_idx).reshape(
+                            n_tokens, nh * hs
+                        )
                     obj[0, layer_idx, :n_tokens].copy_(
                         k_blocks, non_blocking=True
                     )

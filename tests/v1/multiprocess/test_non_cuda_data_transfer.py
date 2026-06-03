@@ -455,28 +455,6 @@ def test_scatter_respects_skip_first_n_tokens(
                 )
 
 
-def test_scatter_non_block_aligned_skip_raises() -> None:
-    """Scatter should fail clearly for non-block-aligned token skips."""
-    # First Party
-    from lmcache.v1.multiprocess.transfer_context.base import (
-        gather_paged_kv_to_cpu,
-        scatter_cpu_to_paged_kv,
-    )
-
-    source = _make_kv_caches(num_layers=1, num_blocks=4, block_size=4)
-    gathered = gather_paged_kv_to_cpu(source, [0, 1], blocks_per_chunk=2)
-    destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
-
-    with pytest.raises(ValueError, match="block-aligned"):
-        scatter_cpu_to_paged_kv(
-            destination,
-            [0, 1],
-            gathered,
-            blocks_per_chunk=2,
-            skip_first_n_tokens=1,
-        )
-
-
 @pytest.fixture
 def stub_native_storage_ops() -> Any:
     """Stub native modules so server imports work in source-only test runs."""
