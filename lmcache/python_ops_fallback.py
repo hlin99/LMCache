@@ -913,6 +913,23 @@ def multi_layer_block_kv_transfer(
         )
 
 
+def _valid_block_range(
+    object_idx: int,
+    block_id_list: list[int],
+    blocks_per_object: int,
+    block_size: int,
+    skip_prefix_n_blocks: int,
+) -> tuple[list[int], int] | None:
+    """Return valid engine block ids and token offset for one LMCache object."""
+    object_flat_start = object_idx * blocks_per_object
+    valid_flat_start = max(object_flat_start, skip_prefix_n_blocks)
+    valid_flat_end = min(object_flat_start + blocks_per_object, len(block_id_list))
+    if valid_flat_start >= valid_flat_end:
+        return None
+    offset_in_object = (valid_flat_start - object_flat_start) * block_size
+    return block_id_list[valid_flat_start:valid_flat_end], offset_in_object
+
+
 def _transfer_cross_layer(
     paged_tensor: torch.Tensor,
     object_tensors: list[torch.Tensor],
@@ -942,49 +959,51 @@ def _transfer_cross_layer(
         objs_on_device = [obj.to(paged_tensor.device) for obj in object_tensors]
 
     for object_idx, obj in enumerate(object_tensors):
-        for local_block_idx in range(blocks_per_object):
-            flat_block_idx = object_idx * blocks_per_object + local_block_idx
-            if flat_block_idx >= len(block_id_list):
-                break
-            if flat_block_idx < skip_prefix_n_blocks:
-                continue
-            engine_block_id = block_id_list[flat_block_idx]
-            offset_in_object = local_block_idx * block_size
+        valid = _valid_block_range(
+            object_idx, block_id_list, blocks_per_object, block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        engine_block_ids, offset_in_object = valid
+        n_valid = len(engine_block_ids)
+        token_end = offset_in_object + n_valid * block_size
+        eff_idx = torch.tensor(
+            engine_block_ids, dtype=torch.long, device=paged_tensor.device
+        )
 
-            eff_idx = torch.tensor(
-                [engine_block_id], dtype=torch.long, device=paged_tensor.device
-            )
-            selected = paged_tensor.index_select(0, eff_idx)  # [1, NL, 2, ...]
+        if is_d2h:
+            selected = paged_tensor.index_select(0, eff_idx)
 
-            for layer_idx in range(num_layers):
-                for kv in range(2):
-                    if is_d2h:
-                        slice_t = selected[:, layer_idx, kv]
-                        if is_hnd:
-                            # [1, NH, BS, HS] → [BS, NH*HS]
-                            flat = slice_t.permute(0, 2, 1, 3).reshape(
-                                block_size, nh * hs
-                            )
-                        else:
-                            # [1, BS, NH, HS] → [BS, NH*HS]
-                            flat = slice_t.reshape(block_size, nh * hs)
-                        obj[kv, layer_idx, offset_in_object:offset_in_object + block_size].copy_(
-                            flat, non_blocking=True
+        for layer_idx in range(num_layers):
+            for kv in range(2):
+                if is_d2h:
+                    slice_t = selected[:, layer_idx, kv]
+                    if is_hnd:
+                        # [N, NH, BS, HS] → [N*BS, NH*HS]
+                        flat = slice_t.permute(0, 2, 1, 3).reshape(
+                            n_valid * block_size, nh * hs
                         )
                     else:
-                        obj_device = objs_on_device[object_idx]
-                        src = obj_device[kv, layer_idx, offset_in_object:offset_in_object + block_size]
-                        if is_hnd:
-                            # [BS, NH*HS] → [1, NH, BS, HS]
-                            src_blocks = src.reshape(
-                                1, block_size, nh, hs
-                            ).permute(0, 2, 1, 3)
-                        else:
-                            # [BS, NH*HS] → [1, BS, NH, HS]
-                            src_blocks = src.reshape(1, block_size, nh, hs)
-                        paged_tensor[:, layer_idx, kv].index_copy_(
-                            0, eff_idx, src_blocks
-                        )
+                        # [N, BS, NH, HS] → [N*BS, NH*HS]
+                        flat = slice_t.reshape(n_valid * block_size, nh * hs)
+                    obj[kv, layer_idx, offset_in_object:token_end].copy_(
+                        flat, non_blocking=True
+                    )
+                else:
+                    obj_device = objs_on_device[object_idx]
+                    src = obj_device[kv, layer_idx, offset_in_object:token_end]
+                    if is_hnd:
+                        # [N*BS, NH*HS] → [N, NH, BS, HS]
+                        src_blocks = src.reshape(
+                            n_valid, block_size, nh, hs
+                        ).permute(0, 2, 1, 3)
+                    else:
+                        # [N*BS, NH*HS] → [N, BS, NH, HS]
+                        src_blocks = src.reshape(n_valid, block_size, nh, hs)
+                    paged_tensor[:, layer_idx, kv].index_copy_(
+                        0, eff_idx, src_blocks
+                    )
 
 
 def _transfer_sglang_mha(
@@ -1011,60 +1030,54 @@ def _transfer_sglang_mha(
         objs_on_device = [obj.to(target_device) for obj in object_tensors]
 
     for object_idx, obj in enumerate(object_tensors):
-        for local_block_idx in range(blocks_per_object):
-            flat_block_idx = object_idx * blocks_per_object + local_block_idx
-            if flat_block_idx >= len(block_id_list):
-                break
-            if flat_block_idx < skip_prefix_n_blocks:
-                continue
-            engine_block_id = block_id_list[flat_block_idx]
-            offset_in_object = local_block_idx * block_size
+        valid = _valid_block_range(
+            object_idx, block_id_list, blocks_per_object, block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        engine_block_ids, offset_in_object = valid
+        n_valid = len(engine_block_ids)
+        token_end = offset_in_object + n_valid * block_size
+        eff_idx = torch.tensor(engine_block_ids, dtype=torch.long, device=target_device)
+        if is_flat:
+            token_indices = (
+                eff_idx[:, None] * block_size
+                + torch.arange(block_size, dtype=torch.long, device=target_device)
+            ).reshape(-1)
 
-            for layer_idx in range(num_layers):
-                for kv in range(2):
-                    layer_t = paged_tensors[kv][layer_idx]
-                    nh = layer_t.shape[-2]
-                    hs = layer_t.shape[-1]
+        for layer_idx in range(num_layers):
+            for kv in range(2):
+                layer_t = paged_tensors[kv][layer_idx]
+                nh = layer_t.shape[-2]
+                hs = layer_t.shape[-1]
 
-                    if is_d2h:
-                        if is_flat:
-                            # [NB*BS, NH, HS] — slice by token range
-                            start = engine_block_id * block_size
-                            end = start + block_size
-                            gathered = layer_t[start:end]
-                        else:
-                            # [NB, BS, NH, HS] — index_select on dim 0
-                            eff_idx = torch.tensor(
-                                [engine_block_id], dtype=torch.long,
-                                device=layer_t.device,
-                            )
-                            gathered = layer_t.index_select(0, eff_idx).reshape(
-                                block_size, nh, hs
-                            )
-                        flat = gathered.reshape(block_size, nh * hs)
-                        obj[kv, layer_idx, offset_in_object:offset_in_object + block_size].copy_(
-                            flat, non_blocking=True
-                        )
+                if is_d2h:
+                    if is_flat:
+                        # [NB*BS, NH, HS]
+                        gathered = layer_t.index_select(0, token_indices)
                     else:
-                        obj_device = objs_on_device[object_idx]
-                        src = obj_device[kv, layer_idx, offset_in_object:offset_in_object + block_size]
-                        if is_flat:
-                            # scatter into [NB*BS, NH, HS]
-                            src_shaped = src.reshape(block_size, nh, hs)
-                            start = engine_block_id * block_size
-                            token_indices = torch.arange(
-                                start, start + block_size,
-                                dtype=torch.long, device=layer_t.device,
-                            )
-                            layer_t.index_copy_(0, token_indices, src_shaped)
-                        else:
-                            # [BS, NH*HS] → [1, BS, NH, HS]
-                            eff_idx = torch.tensor(
-                                [engine_block_id], dtype=torch.long,
-                                device=layer_t.device,
-                            )
-                            src_blocks = src.reshape(1, block_size, nh, hs)
-                            layer_t.index_copy_(0, eff_idx, src_blocks)
+                        # [NB, BS, NH, HS]
+                        gathered = layer_t.index_select(0, eff_idx).reshape(
+                            n_valid * block_size, nh, hs
+                        )
+                    flat = gathered.reshape(n_valid * block_size, nh * hs)
+                    obj[kv, layer_idx, offset_in_object:token_end].copy_(
+                        flat, non_blocking=True
+                    )
+                else:
+                    obj_device = objs_on_device[object_idx]
+                    src = obj_device[kv, layer_idx, offset_in_object:token_end]
+                    src_shaped = src.reshape(n_valid * block_size, nh, hs)
+                    if is_flat:
+                        # scatter into [NB*BS, NH, HS]
+                        layer_t.index_copy_(0, token_indices, src_shaped)
+                    else:
+                        # [N*BS, NH*HS] → [N, BS, NH, HS]
+                        src_blocks = src_shaped.reshape(
+                            n_valid, block_size, nh, hs
+                        )
+                        layer_t.index_copy_(0, eff_idx, src_blocks)
 
 
 def _transfer_per_layer_mla(
@@ -1083,31 +1096,31 @@ def _transfer_per_layer_mla(
 
     for layer_idx, layer in enumerate(layer_tensors):
         for object_idx, obj in enumerate(object_tensors):
-            for local_block_idx in range(blocks_per_object):
-                flat_block_idx = object_idx * blocks_per_object + local_block_idx
-                if flat_block_idx >= len(block_id_list):
-                    break
-                if flat_block_idx < skip_prefix_n_blocks:
-                    continue
-                engine_block_id = block_id_list[flat_block_idx]
-                offset_in_object = local_block_idx * block_size
+            valid = _valid_block_range(
+                object_idx, block_id_list, blocks_per_object, block_size,
+                skip_prefix_n_blocks,
+            )
+            if valid is None:
+                continue
+            engine_block_ids, offset_in_object = valid
+            n_valid = len(engine_block_ids)
+            token_end = offset_in_object + n_valid * block_size
+            eff_idx = torch.tensor(
+                engine_block_ids, dtype=torch.long, device=layer.device
+            )
 
-                eff_idx = torch.tensor(
-                    [engine_block_id], dtype=torch.long, device=layer.device
+            if is_d2h:
+                layer_blocks = layer.index_select(0, eff_idx)
+                flat = layer_blocks.reshape(n_valid * block_size, layer.shape[-1])
+                obj[layer_idx, offset_in_object:token_end].copy_(
+                    flat, non_blocking=True
                 )
-
-                if is_d2h:
-                    layer_blocks = layer.index_select(0, eff_idx)
-                    flat = layer_blocks.reshape(block_size, layer.shape[-1])
-                    obj[layer_idx, offset_in_object:offset_in_object + block_size].copy_(
-                        flat, non_blocking=True
-                    )
-                else:
-                    obj_device = objs_on_device[object_idx]
-                    src = obj_device[layer_idx, offset_in_object:offset_in_object + block_size]
-                    hidden_size = layer.shape[-1]
-                    src_blocks = src.reshape(1, block_size, hidden_size)
-                    layer.index_copy_(0, eff_idx, src_blocks)
+            else:
+                obj_device = objs_on_device[object_idx]
+                src = obj_device[layer_idx, offset_in_object:token_end]
+                hidden_size = layer.shape[-1]
+                src_blocks = src.reshape(n_valid, block_size, hidden_size)
+                layer.index_copy_(0, eff_idx, src_blocks)
 
 
 def _transfer_per_layer_hnd(
@@ -1134,48 +1147,48 @@ def _transfer_per_layer_hnd(
         _nb, nh, _bs, hs = k_t.shape
 
         for object_idx, obj in enumerate(object_tensors):
-            for local_block_idx in range(blocks_per_object):
-                flat_block_idx = object_idx * blocks_per_object + local_block_idx
-                if flat_block_idx >= len(block_id_list):
-                    break
-                if flat_block_idx < skip_prefix_n_blocks:
-                    continue
-                engine_block_id = block_id_list[flat_block_idx]
-                offset_in_object = local_block_idx * block_size
+            valid = _valid_block_range(
+                object_idx, block_id_list, blocks_per_object, block_size,
+                skip_prefix_n_blocks,
+            )
+            if valid is None:
+                continue
+            engine_block_ids, offset_in_object = valid
+            n_valid = len(engine_block_ids)
+            token_end = offset_in_object + n_valid * block_size
+            eff_idx = torch.tensor(
+                engine_block_ids, dtype=torch.long, device=layer.device
+            )
 
-                eff_idx = torch.tensor(
-                    [engine_block_id], dtype=torch.long, device=layer.device
+            if is_d2h:
+                k_blocks = (
+                    k_t.index_select(0, eff_idx)
+                    .permute(0, 2, 1, 3)
+                    .reshape(n_valid * block_size, nh * hs)
                 )
-
-                if is_d2h:
-                    k_blocks = (
-                        k_t.index_select(0, eff_idx)
-                        .permute(0, 2, 1, 3)
-                        .reshape(block_size, nh * hs)
-                    )
-                    v_blocks = (
-                        v_t.index_select(0, eff_idx)
-                        .permute(0, 2, 1, 3)
-                        .reshape(block_size, nh * hs)
-                    )
-                    obj[0, layer_idx, offset_in_object:offset_in_object + block_size].copy_(
-                        k_blocks, non_blocking=True
-                    )
-                    obj[1, layer_idx, offset_in_object:offset_in_object + block_size].copy_(
-                        v_blocks, non_blocking=True
-                    )
-                else:
-                    obj_device = objs_on_device[object_idx]
-                    k_src = obj_device[0, layer_idx, offset_in_object:offset_in_object + block_size]
-                    v_src = obj_device[1, layer_idx, offset_in_object:offset_in_object + block_size]
-                    k_blocks = k_src.reshape(
-                        1, block_size, nh, hs
-                    ).permute(0, 2, 1, 3)
-                    v_blocks = v_src.reshape(
-                        1, block_size, nh, hs
-                    ).permute(0, 2, 1, 3)
-                    k_t.index_copy_(0, eff_idx, k_blocks)
-                    v_t.index_copy_(0, eff_idx, v_blocks)
+                v_blocks = (
+                    v_t.index_select(0, eff_idx)
+                    .permute(0, 2, 1, 3)
+                    .reshape(n_valid * block_size, nh * hs)
+                )
+                obj[0, layer_idx, offset_in_object:token_end].copy_(
+                    k_blocks, non_blocking=True
+                )
+                obj[1, layer_idx, offset_in_object:token_end].copy_(
+                    v_blocks, non_blocking=True
+                )
+            else:
+                obj_device = objs_on_device[object_idx]
+                k_src = obj_device[0, layer_idx, offset_in_object:token_end]
+                v_src = obj_device[1, layer_idx, offset_in_object:token_end]
+                k_blocks = k_src.reshape(
+                    n_valid, block_size, nh, hs
+                ).permute(0, 2, 1, 3)
+                v_blocks = v_src.reshape(
+                    n_valid, block_size, nh, hs
+                ).permute(0, 2, 1, 3)
+                k_t.index_copy_(0, eff_idx, k_blocks)
+                v_t.index_copy_(0, eff_idx, v_blocks)
 
 
 def _transfer_per_layer_nhd(
@@ -1202,46 +1215,46 @@ def _transfer_per_layer_nhd(
         _nb, _bs, nh, hs = k_t.shape
 
         for object_idx, obj in enumerate(object_tensors):
-            for local_block_idx in range(blocks_per_object):
-                flat_block_idx = object_idx * blocks_per_object + local_block_idx
-                if flat_block_idx >= len(block_id_list):
-                    break
-                if flat_block_idx < skip_prefix_n_blocks:
-                    continue
-                engine_block_id = block_id_list[flat_block_idx]
-                offset_in_object = local_block_idx * block_size
+            valid = _valid_block_range(
+                object_idx, block_id_list, blocks_per_object, block_size,
+                skip_prefix_n_blocks,
+            )
+            if valid is None:
+                continue
+            engine_block_ids, offset_in_object = valid
+            n_valid = len(engine_block_ids)
+            token_end = offset_in_object + n_valid * block_size
+            eff_idx = torch.tensor(
+                engine_block_ids, dtype=torch.long, device=layer.device
+            )
 
-                eff_idx = torch.tensor(
-                    [engine_block_id], dtype=torch.long, device=layer.device
+            if is_d2h:
+                k_blocks = k_t.index_select(0, eff_idx).reshape(
+                    n_valid * block_size, nh * hs
                 )
-
-                if is_d2h:
-                    k_blocks = k_t.index_select(0, eff_idx).reshape(
-                        block_size, nh * hs
-                    )
-                    v_blocks = v_t.index_select(0, eff_idx).reshape(
-                        block_size, nh * hs
-                    )
-                    obj[0, layer_idx, offset_in_object:offset_in_object + block_size].copy_(
-                        k_blocks, non_blocking=True
-                    )
-                    obj[1, layer_idx, offset_in_object:offset_in_object + block_size].copy_(
-                        v_blocks, non_blocking=True
-                    )
-                else:
-                    obj_device = objs_on_device[object_idx]
-                    k_src = obj_device[0, layer_idx, offset_in_object:offset_in_object + block_size]
-                    v_src = obj_device[1, layer_idx, offset_in_object:offset_in_object + block_size]
-                    k_t.index_copy_(
-                        0,
-                        eff_idx,
-                        k_src.reshape(1, block_size, nh, hs),
-                    )
-                    v_t.index_copy_(
-                        0,
-                        eff_idx,
-                        v_src.reshape(1, block_size, nh, hs),
-                    )
+                v_blocks = v_t.index_select(0, eff_idx).reshape(
+                    n_valid * block_size, nh * hs
+                )
+                obj[0, layer_idx, offset_in_object:token_end].copy_(
+                    k_blocks, non_blocking=True
+                )
+                obj[1, layer_idx, offset_in_object:token_end].copy_(
+                    v_blocks, non_blocking=True
+                )
+            else:
+                obj_device = objs_on_device[object_idx]
+                k_src = obj_device[0, layer_idx, offset_in_object:token_end]
+                v_src = obj_device[1, layer_idx, offset_in_object:token_end]
+                k_t.index_copy_(
+                    0,
+                    eff_idx,
+                    k_src.reshape(n_valid, block_size, nh, hs),
+                )
+                v_t.index_copy_(
+                    0,
+                    eff_idx,
+                    v_src.reshape(n_valid, block_size, nh, hs),
+                )
 
 
 def single_layer_kv_transfer(
