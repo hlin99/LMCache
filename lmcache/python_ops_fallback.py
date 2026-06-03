@@ -758,6 +758,11 @@ def _is_mla_format(gpu_kv_format: GPUKVFormat) -> bool:
 
 
 _ELEMENT_SIZE_TO_DTYPE: dict[int, torch.dtype] = {
+    # Maps the byte width of a KV-cache element to a representative torch dtype.
+    # Only widths that commonly appear in KV caches are listed; 1-byte entries
+    # are treated as uint8 (raw bytes), 2-byte as float16, 4-byte as float32.
+    # Note: bfloat16 also has element_size == 2 but cannot be distinguished here;
+    # callers that need exact dtype should supply it explicitly.
     1: torch.uint8,
     2: torch.float16,
     4: torch.float32,
@@ -780,7 +785,19 @@ def _per_layer_paged_shape(
     nh: int,
     hs: int,
 ) -> tuple[int, ...]:
-    """Return the logical shape of a single per-layer paged buffer tensor."""
+    """Return the logical shape of a single per-layer paged buffer tensor.
+
+    Args:
+        gpu_kv_format: The format enum that describes how K/V tokens are laid out.
+        nb: Number of blocks in the paged buffer (``shape_desc.nb``).
+        bs: Tokens per block / block size (``shape_desc.bs``).
+        nh: Number of attention heads (``shape_desc.nh``).
+        hs: Per-head hidden size (``shape_desc.hs``).
+
+    Returns:
+        A tuple representing the shape needed to reconstruct one layer's tensor
+        from a raw pointer via :func:`_tensor_from_ptr`.
+    """
     fmt = int(gpu_kv_format)
     if fmt == int(GPUKVFormat.NL_X_NBBS_ONE_HS):
         return (nb * bs, 1, hs)
@@ -801,7 +818,17 @@ def _infer_kv_dtype(
     lmcache_objects_ptrs: object,
     shape_desc: "PageBufferShapeDesc",
 ) -> torch.dtype:
-    """Infer the KV element dtype from whichever inputs carry it."""
+    """Infer the KV element dtype from whichever inputs carry it.
+
+    Inference order (first match wins):
+    1. ``paged_buffer_ptrs_tensor`` — if it is a non-pointer tensor or a list
+       of tensors (including nested SGLang MHA lists), the dtype of the first
+       tensor is used.
+    2. ``lmcache_objects_ptrs`` — if it is a list of tensors, the dtype of the
+       first chunk tensor is used.
+    3. ``shape_desc.element_size`` — looked up in :data:`_ELEMENT_SIZE_TO_DTYPE`.
+    4. ``torch.float16`` — silent default when no other source is available.
+    """
     if isinstance(paged_buffer_ptrs_tensor, list) and paged_buffer_ptrs_tensor:
         first = paged_buffer_ptrs_tensor[0]
         if isinstance(first, list) and first and isinstance(first[0], torch.Tensor):
@@ -816,7 +843,14 @@ def _infer_kv_dtype(
         if isinstance(lmcache_objects_ptrs[0], torch.Tensor):
             return lmcache_objects_ptrs[0].dtype
     if shape_desc is not None and shape_desc.element_size > 0:
-        return _ELEMENT_SIZE_TO_DTYPE.get(shape_desc.element_size, torch.float16)
+        dtype = _ELEMENT_SIZE_TO_DTYPE.get(shape_desc.element_size)
+        if dtype is None:
+            raise ValueError(
+                f"Unsupported element_size {shape_desc.element_size!r} in "
+                "shape_desc; cannot infer KV dtype. "
+                f"Supported sizes: {sorted(_ELEMENT_SIZE_TO_DTYPE)}"
+            )
+        return dtype
     return torch.float16
 
 
@@ -843,7 +877,11 @@ def _normalize_paged_layers(
         if isinstance(paged_buffer_ptrs_tensor, torch.Tensor):
             if _is_ptr_tensor(paged_buffer_ptrs_tensor):
                 # 1-D pointer tensor with a single entry → reconstruct full tensor.
-                assert shape_desc is not None and device is not None and dtype is not None
+                if shape_desc is None or device is None or dtype is None:
+                    raise ValueError(
+                        "_normalize_paged_layers: shape_desc, device, and dtype are "
+                        "required when paged_buffer_ptrs_tensor is a pointer tensor"
+                    )
                 nb = int(shape_desc.nb)
                 nl = int(shape_desc.nl)
                 bs = int(shape_desc.bs)
@@ -863,7 +901,11 @@ def _normalize_paged_layers(
     if _is_sglang_mha_format(gpu_kv_format):
         if _is_ptr_tensor(paged_buffer_ptrs_tensor):
             # 1-D pointer tensor [K_L0,...,K_LN-1, V_L0,...,V_LN-1] → nested list.
-            assert shape_desc is not None and device is not None and dtype is not None
+            if shape_desc is None or device is None or dtype is None:
+                raise ValueError(
+                    "_normalize_paged_layers: shape_desc, device, and dtype are "
+                    "required when paged_buffer_ptrs_tensor is a pointer tensor"
+                )
             nb = int(shape_desc.nb)
             nl = int(shape_desc.nl)
             bs = int(shape_desc.bs)
@@ -903,10 +945,10 @@ def _normalize_paged_layers(
                     raise ValueError(
                         "Flat SGLang MHA list must have even length (2*NL)"
                     )
-                nl_list = len(paged_buffer_ptrs_tensor) // 2
+                half = len(paged_buffer_ptrs_tensor) // 2
                 return [
-                    paged_buffer_ptrs_tensor[:nl_list],
-                    paged_buffer_ptrs_tensor[nl_list:],
+                    paged_buffer_ptrs_tensor[:half],
+                    paged_buffer_ptrs_tensor[half:],
                 ]
         raise TypeError(
             "SGLang MHA formats require a list[list[torch.Tensor]], a flat "
@@ -916,7 +958,11 @@ def _normalize_paged_layers(
     # Per-layer formats
     if _is_ptr_tensor(paged_buffer_ptrs_tensor):
         # 1-D pointer tensor [ptr_L0, ..., ptr_LN-1] → list of per-layer tensors.
-        assert shape_desc is not None and device is not None and dtype is not None
+        if shape_desc is None or device is None or dtype is None:
+            raise ValueError(
+                "_normalize_paged_layers: shape_desc, device, and dtype are "
+                "required when paged_buffer_ptrs_tensor is a pointer tensor"
+            )
         nb = int(shape_desc.nb)
         bs = int(shape_desc.bs)
         nh = int(shape_desc.nh)
@@ -963,16 +1009,17 @@ def _normalize_lmcache_objects(
         return lmcache_objects_ptrs  # type: ignore[return-value]
     if isinstance(lmcache_objects_ptrs[0], int):
         # Pointer mode: reconstruct chunk tensors (always on CPU).
-        assert (
-            shape_desc is not None
-            and lmcache_chunk_size is not None
-            and gpu_kv_format is not None
-            and dtype is not None
-        ), (
-            "_normalize_lmcache_objects: shape_desc, lmcache_chunk_size, "
-            "gpu_kv_format, and dtype are required when lmcache_objects_ptrs "
-            "contains raw int pointers"
-        )
+        if (
+            shape_desc is None
+            or lmcache_chunk_size is None
+            or gpu_kv_format is None
+            or dtype is None
+        ):
+            raise ValueError(
+                "_normalize_lmcache_objects: shape_desc, lmcache_chunk_size, "
+                "gpu_kv_format, and dtype are required when lmcache_objects_ptrs "
+                "contains raw int pointers"
+            )
         nl = int(shape_desc.nl)
         nh = int(shape_desc.nh)
         hs = int(shape_desc.hs)
