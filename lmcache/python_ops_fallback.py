@@ -920,7 +920,20 @@ def _valid_block_range(
     block_size: int,
     skip_prefix_n_blocks: int,
 ) -> tuple[list[int], int] | None:
-    """Return valid engine block ids and token offset for one LMCache object."""
+    """Return valid engine blocks and their starting token offset.
+
+    Args:
+        object_idx: Index of the LMCache object/chunk being processed.
+        block_id_list: Full ordered engine block ids for the transfer.
+        blocks_per_object: Number of blocks represented by one LMCache object.
+        block_size: Number of tokens per block.
+        skip_prefix_n_blocks: Number of leading flat block positions to skip.
+
+    Returns:
+        ``None`` if this object has no valid blocks after skip handling.
+        Otherwise, a tuple of valid engine block ids and the token offset
+        within this LMCache object where those blocks start.
+    """
     object_flat_start = object_idx * blocks_per_object
     valid_flat_start = max(object_flat_start, skip_prefix_n_blocks)
     valid_flat_end = min(object_flat_start + blocks_per_object, len(block_id_list))
@@ -980,7 +993,7 @@ def _transfer_cross_layer(
                 if is_d2h:
                     slice_t = selected[:, layer_idx, kv]
                     if is_hnd:
-                        # [N, NH, BS, HS] → [N*BS, NH*HS]
+                        # [N, NH, BS, HS] → [N, BS, NH, HS] → [N*BS, NH*HS]
                         flat = slice_t.permute(0, 2, 1, 3).reshape(
                             n_valid * block_size, nh * hs
                         )
@@ -1041,6 +1054,7 @@ def _transfer_sglang_mha(
         token_end = offset_in_object + n_valid * block_size
         eff_idx = torch.tensor(engine_block_ids, dtype=torch.long, device=target_device)
         if is_flat:
+            # Reuse the same token indices for every layer/KV tensor in this object.
             token_indices = (
                 eff_idx[:, None] * block_size
                 + torch.arange(block_size, dtype=torch.long, device=target_device)
@@ -1073,7 +1087,7 @@ def _transfer_sglang_mha(
                         # scatter into [NB*BS, NH, HS]
                         layer_t.index_copy_(0, token_indices, src_shaped)
                     else:
-                        # [N*BS, NH*HS] → [N, BS, NH, HS]
+                        # [N*BS, NH, HS] → [N, BS, NH, HS]
                         src_blocks = src_shaped.reshape(
                             n_valid, block_size, nh, hs
                         )
