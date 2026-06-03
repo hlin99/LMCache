@@ -726,6 +726,7 @@ def multi_layer_kv_transfer_unilateral(
 
 
 def _is_hnd_format(gpu_kv_format: GPUKVFormat) -> bool:
+    """Return True when a KV format stores heads before block tokens (HND)."""
     return int(gpu_kv_format) in (
         int(GPUKVFormat.NL_X_TWO_NB_NH_BS_HS),
         int(GPUKVFormat.NL_X_NB_TWO_NH_BS_HS),
@@ -734,6 +735,7 @@ def _is_hnd_format(gpu_kv_format: GPUKVFormat) -> bool:
 
 
 def _is_mla_format(gpu_kv_format: GPUKVFormat) -> bool:
+    """Return True when a KV format uses MLA paged layout."""
     return int(gpu_kv_format) in (
         int(GPUKVFormat.NL_X_NB_BS_HS),
         int(GPUKVFormat.NL_X_NBBS_ONE_HS),
@@ -744,6 +746,7 @@ def _get_layer_shape(
     shape_desc: PageBufferShapeDesc,
     gpu_kv_format: GPUKVFormat,
 ) -> Tuple[int, ...]:
+    """Build one-layer paged buffer tensor shape for the given KV layout."""
     nb = int(shape_desc.nb)
     bs = int(shape_desc.bs)
     nh = int(shape_desc.nh)
@@ -766,6 +769,11 @@ def _normalize_paged_layers(
     device: torch.device,
     dtype: torch.dtype,
 ) -> list[torch.Tensor]:
+    """Normalize paged buffer input to per-layer tensors.
+
+    Accepts either a list of layer tensors or an int64 pointer tensor and
+    returns a list of tensor views matching one-layer paged buffer layout.
+    """
     if isinstance(paged_buffer_ptrs_tensor, list):
         if not all(isinstance(t, torch.Tensor) for t in paged_buffer_ptrs_tensor):
             raise TypeError(
@@ -801,6 +809,11 @@ def _normalize_lmcache_objects(
     gpu_kv_format: GPUKVFormat,
     dtype: torch.dtype,
 ) -> list[torch.Tensor]:
+    """Normalize LMCache object inputs to chunk tensors.
+
+    Accepts either a list of chunk tensors or a list of raw pointers and
+    returns one tensor per LMCache object with fallback-compatible shape.
+    """
     if isinstance(lmcache_objects_ptrs, list) and all(
         isinstance(t, torch.Tensor) for t in lmcache_objects_ptrs
     ):
@@ -826,6 +839,7 @@ def _normalize_lmcache_objects(
 
 
 def _to_block_id_list(block_ids: torch.Tensor | list[int]) -> list[int]:
+    """Convert block IDs from tensor/list form into a Python ``list[int]``."""
     if isinstance(block_ids, torch.Tensor):
         return [int(x) for x in block_ids.to(dtype=torch.int64).cpu().tolist()]
     if isinstance(block_ids, list) and all(isinstance(x, int) for x in block_ids):
@@ -844,6 +858,12 @@ def multi_layer_block_kv_transfer(
     gpu_kv_format: GPUKVFormat,
     skip_prefix_n_blocks: int,
 ) -> None:
+    """Python fallback implementation of block-based multi-layer KV transfer.
+
+    Signature intentionally mirrors the C++ binding so callers can invoke
+    ``lmcache.c_ops.multi_layer_block_kv_transfer`` uniformly on native and
+    fallback backends.
+    """
     if lmcache_chunk_size <= 0:
         raise ValueError("lmcache_chunk_size must be positive")
     if int(shape_desc.bs) <= 0 or lmcache_chunk_size % int(shape_desc.bs) != 0:
@@ -875,8 +895,8 @@ def multi_layer_block_kv_transfer(
         obj_dtype = paged_buffer_ptrs_tensor[0].dtype
     else:
         raise TypeError(
-            "Unable to infer dtype for fallback transfer. "
-            "Pass list[torch.Tensor] inputs."
+            "Unable to infer dtype for fallback transfer. Provide tensor-form "
+            "inputs for either paged_buffer_ptrs_tensor or lmcache_objects_ptrs."
         )
 
     layer_tensors = _normalize_paged_layers(

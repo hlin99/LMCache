@@ -1965,6 +1965,7 @@ def _make_block_kv_caches(
     num_heads: int = 2,
     head_size: int = 8,
 ) -> dict[str, torch.Tensor]:
+    """Create random NHD paged KV tensors for block transfer tests."""
     return {
         f"layer_{idx}": torch.randn(2, num_blocks, block_size, num_heads, head_size)
         for idx in range(num_layers)
