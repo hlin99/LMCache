@@ -1116,6 +1116,10 @@ def _transfer_per_layer_mla(
 
     for layer_idx, layer in enumerate(layer_tensors):
         is_flat = int(gpu_kv_format) == int(GPUKVFormat.NL_X_NBBS_ONE_HS)
+        if is_flat:
+            token_offsets = torch.arange(
+                block_size, dtype=torch.long, device=layer.device
+            )
         for object_idx, obj in enumerate(object_tensors):
             valid = _valid_block_range(
                 object_idx, block_id_list, blocks_per_object, block_size,
@@ -1130,9 +1134,6 @@ def _transfer_per_layer_mla(
                 engine_block_ids, dtype=torch.long, device=layer.device
             )
             if is_flat:
-                token_offsets = torch.arange(
-                    block_size, dtype=torch.long, device=layer.device
-                )
                 token_indices = (
                     eff_idx[:, None] * block_size + token_offsets[None, :]
                 ).reshape(-1)
