@@ -920,7 +920,7 @@ def _valid_block_range(
     block_size: int,
     skip_prefix_n_blocks: int,
 ) -> tuple[list[int], int] | None:
-    """Return valid engine blocks and their starting token offset.
+    """Return valid engine block IDs and their LMCache object token offset.
 
     Args:
         object_idx: Index of the LMCache object/chunk being processed.
@@ -993,7 +993,8 @@ def _transfer_cross_layer(
                 if is_d2h:
                     slice_t = selected[:, layer_idx, kv]
                     if is_hnd:
-                        # [N, NH, BS, HS] → [N, BS, NH, HS] → [N*BS, NH*HS]
+                        # N=n_valid, BS=block_size:
+                        # [N, NH, BS, HS] -> [N, BS, NH, HS] -> [N*BS, NH*HS]
                         flat = slice_t.permute(0, 2, 1, 3).reshape(
                             n_valid * block_size, nh * hs
                         )
@@ -1007,12 +1008,14 @@ def _transfer_cross_layer(
                     obj_device = objs_on_device[object_idx]
                     src = obj_device[kv, layer_idx, offset_in_object:token_end]
                     if is_hnd:
-                        # [N*BS, NH*HS] → [N, NH, BS, HS]
+                        # N=n_valid, BS=block_size:
+                        # [N*BS, NH*HS] -> [N, BS, NH, HS] -> [N, NH, BS, HS]
                         src_blocks = src.reshape(
                             n_valid, block_size, nh, hs
                         ).permute(0, 2, 1, 3)
                     else:
-                        # [N*BS, NH*HS] → [N, BS, NH, HS]
+                        # N=n_valid, BS=block_size:
+                        # [N*BS, NH*HS] -> [N, BS, NH, HS]
                         src_blocks = src.reshape(n_valid, block_size, nh, hs)
                     paged_tensor[:, layer_idx, kv].index_copy_(
                         0, eff_idx, src_blocks
@@ -1054,7 +1057,8 @@ def _transfer_sglang_mha(
         token_end = offset_in_object + n_valid * block_size
         eff_idx = torch.tensor(engine_block_ids, dtype=torch.long, device=target_device)
         if is_flat:
-            # Reuse the same token indices for every layer/KV tensor in this object.
+            # Flat token positions for all valid blocks:
+            # block_id * block_size + token offset. Reused across layer/KV pairs.
             token_indices = (
                 eff_idx[:, None] * block_size
                 + torch.arange(block_size, dtype=torch.long, device=target_device)
@@ -1087,7 +1091,8 @@ def _transfer_sglang_mha(
                         # scatter into [NB*BS, NH, HS]
                         layer_t.index_copy_(0, token_indices, src_shaped)
                     else:
-                        # [N*BS, NH, HS] → [N, BS, NH, HS]
+                        # N=n_valid, BS=block_size:
+                        # [N*BS, NH, HS] -> [N, BS, NH, HS]
                         src_blocks = src_shaped.reshape(
                             n_valid, block_size, nh, hs
                         )
