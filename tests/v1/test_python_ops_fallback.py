@@ -1799,32 +1799,35 @@ def scenario_dispatcher_integration(ops: Any, device: str) -> dict[str, torch.Te
 def scenario_multi_layer_block_kv_transfer(
     ops: Any, device: str
 ) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with NHD format (D2H and H2D).
+    """Test multi_layer_block_kv_transfer across all GPU KV formats.
 
-    Exercises the block-based transfer path:
-    - D2H: gather blocks from paged buffers into LMCache chunk tensors
-    - H2D: scatter chunks back into paged buffers using index_copy_
-    Verifies round-trip consistency.
+    Exercises the block-based transfer path for:
+    - NHD per-layer format (D2H and H2D round-trip)
+    - HND per-layer format (with permute)
+    - MLA per-layer format (no K/V split)
+    - Cross-layer NHD (single tensor [NB, NL, 2, BS, NH, HS])
+    - Cross-layer HND (single tensor [NB, NL, 2, NH, BS, HS])
+    - SGLang MHA flat (2*NL tensors [NB*BS, NH, HS])
+    - SGLang MHA block (2*NL tensors [NB, BS, NH, HS])
+    - skip_prefix_n_blocks > 0
+    - num_blocks > blocks_per_chunk (multi-chunk)
     """
-    torch.manual_seed(123)
+    results = {}
 
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    num_heads = 2
-    head_size = 8
+    # --- NHD per-layer ---
+    torch.manual_seed(123)
+    num_layers, num_blocks, block_size = 2, 8, 4
+    num_heads, head_size = 2, 8
     blocks_per_chunk = 4
     chunk_tokens = blocks_per_chunk * block_size
+    hidden_dim = num_heads * head_size
     dtype = torch.float32
 
-    # Build paged buffers (NHD: [2, num_blocks, block_size, num_heads, head_size])
     paged_layers = [
         torch.randn(2, num_blocks, block_size, num_heads, head_size,
                      dtype=dtype, device=device)
         for _ in range(num_layers)
     ]
-
-    # Shape descriptor
     shape_desc = ops.PageBufferShapeDesc()
     shape_desc.nl = num_layers
     shape_desc.nb = num_blocks
@@ -1833,395 +1836,206 @@ def scenario_multi_layer_block_kv_transfer(
     shape_desc.hs = head_size
 
     gpu_kv_format = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
-    hidden_dim = num_heads * head_size
-
-    # Allocate output chunks for D2H
     num_chunks = num_blocks // blocks_per_chunk
     d2h_chunks = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
         for _ in range(num_chunks)
     ]
-
     block_ids = list(range(num_blocks))
 
-    # D2H gather
     ops.multi_layer_block_kv_transfer(
-        paged_layers,
-        d2h_chunks,
+        paged_layers, d2h_chunks,
         torch.tensor(block_ids, dtype=torch.int64),
-        torch.device(device),
-        ops.TransferDirection.D2H,
-        shape_desc,
-        chunk_tokens,
-        gpu_kv_format,
-        0,
+        torch.device(device), ops.TransferDirection.D2H,
+        shape_desc, chunk_tokens, gpu_kv_format, 0,
     )
-
-    # H2D scatter into fresh paged buffers
-    paged_layers_h2d = [
-        torch.zeros_like(layer) for layer in paged_layers
-    ]
-
+    paged_h2d = [torch.zeros_like(l) for l in paged_layers]
     ops.multi_layer_block_kv_transfer(
-        paged_layers_h2d,
-        d2h_chunks,
+        paged_h2d, d2h_chunks,
         torch.tensor(block_ids, dtype=torch.int64),
-        torch.device(device),
-        ops.TransferDirection.H2D,
-        shape_desc,
-        chunk_tokens,
-        gpu_kv_format,
-        0,
+        torch.device(device), ops.TransferDirection.H2D,
+        shape_desc, chunk_tokens, gpu_kv_format, 0,
     )
-
-    # Verify round-trip: original paged == reconstructed paged
-    results = {}
-    for layer_idx in range(num_layers):
-        orig = paged_layers[layer_idx].cpu()
-        recon = paged_layers_h2d[layer_idx].cpu()
-        results[f"block_kv_transfer_roundtrip_layer{layer_idx}"] = (
-            torch.stack([orig, recon])
-        )
+    for i in range(num_layers):
+        orig = paged_layers[i].cpu()
+        recon = paged_h2d[i].cpu()
+        results[f"nhd_layer{i}"] = torch.stack([orig, recon])
         assert torch.allclose(orig, recon, atol=1e-6), (
-            f"Layer {layer_idx} round-trip mismatch"
+            f"NHD Layer {i} round-trip mismatch"
         )
 
-    return results
-
-
-def scenario_multi_layer_block_kv_transfer_hnd(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with HND format (permute path)."""
+    # --- HND per-layer ---
     torch.manual_seed(456)
-
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    num_heads = 2
-    head_size = 8
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    hidden_dim = num_heads * head_size
-    dtype = torch.float32
-
-    # HND: [2, NB, NH, BS, HS]
-    paged_layers = [
+    paged_layers_hnd = [
         torch.randn(2, num_blocks, num_heads, block_size, head_size,
                      dtype=dtype, device=device)
         for _ in range(num_layers)
     ]
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = num_heads
-    shape_desc.hs = head_size
-
-    gpu_kv_format = ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS
-    num_chunks = num_blocks // blocks_per_chunk
-    d2h_chunks = [
+    gpu_kv_format_hnd = ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS
+    d2h_chunks_hnd = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
         for _ in range(num_chunks)
     ]
-    block_ids = list(range(num_blocks))
-
     ops.multi_layer_block_kv_transfer(
-        paged_layers, d2h_chunks,
+        paged_layers_hnd, d2h_chunks_hnd,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_hnd, 0,
     )
-
-    paged_h2d = [torch.zeros_like(l) for l in paged_layers]
+    paged_h2d_hnd = [torch.zeros_like(l) for l in paged_layers_hnd]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
+        paged_h2d_hnd, d2h_chunks_hnd,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_hnd, 0,
     )
-
-    results = {}
     for i in range(num_layers):
-        orig = paged_layers[i].cpu()
-        recon = paged_h2d[i].cpu()
-        results[f"block_kv_hnd_layer{i}"] = torch.stack([orig, recon])
+        orig = paged_layers_hnd[i].cpu()
+        recon = paged_h2d_hnd[i].cpu()
+        results[f"hnd_layer{i}"] = torch.stack([orig, recon])
         assert torch.allclose(orig, recon, atol=1e-6), (
             f"HND Layer {i} round-trip mismatch"
         )
-    return results
 
-
-def scenario_multi_layer_block_kv_transfer_mla(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with MLA format (no K/V split)."""
+    # --- MLA per-layer ---
     torch.manual_seed(789)
-
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    hidden_dim = 16
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    dtype = torch.float32
-
-    # MLA: [NB, BS, HS]
-    paged_layers = [
-        torch.randn(num_blocks, block_size, hidden_dim,
+    mla_hidden = 16
+    paged_layers_mla = [
+        torch.randn(num_blocks, block_size, mla_hidden,
                      dtype=dtype, device=device)
         for _ in range(num_layers)
     ]
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = 1
-    shape_desc.hs = hidden_dim
-
-    gpu_kv_format = ops.GPUKVFormat.NL_X_NB_BS_HS
-    num_chunks = num_blocks // blocks_per_chunk
-    d2h_chunks = [
-        torch.zeros(num_layers, chunk_tokens, hidden_dim, dtype=dtype)
+    shape_desc_mla = ops.PageBufferShapeDesc()
+    shape_desc_mla.nl = num_layers
+    shape_desc_mla.nb = num_blocks
+    shape_desc_mla.bs = block_size
+    shape_desc_mla.nh = 1
+    shape_desc_mla.hs = mla_hidden
+    gpu_kv_format_mla = ops.GPUKVFormat.NL_X_NB_BS_HS
+    d2h_chunks_mla = [
+        torch.zeros(num_layers, chunk_tokens, mla_hidden, dtype=dtype)
         for _ in range(num_chunks)
     ]
-    block_ids = list(range(num_blocks))
-
     ops.multi_layer_block_kv_transfer(
-        paged_layers, d2h_chunks,
+        paged_layers_mla, d2h_chunks_mla,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc_mla, chunk_tokens, gpu_kv_format_mla, 0,
     )
-
-    paged_h2d = [torch.zeros_like(l) for l in paged_layers]
+    paged_h2d_mla = [torch.zeros_like(l) for l in paged_layers_mla]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
+        paged_h2d_mla, d2h_chunks_mla,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc_mla, chunk_tokens, gpu_kv_format_mla, 0,
     )
-
-    results = {}
     for i in range(num_layers):
-        orig = paged_layers[i].cpu()
-        recon = paged_h2d[i].cpu()
-        results[f"block_kv_mla_layer{i}"] = torch.stack([orig, recon])
+        orig = paged_layers_mla[i].cpu()
+        recon = paged_h2d_mla[i].cpu()
+        results[f"mla_layer{i}"] = torch.stack([orig, recon])
         assert torch.allclose(orig, recon, atol=1e-6), (
             f"MLA Layer {i} round-trip mismatch"
         )
-    return results
 
-
-def scenario_multi_layer_block_kv_transfer_cross_layer_nhd(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with cross-layer NHD (single tensor)."""
+    # --- Cross-layer NHD ---
     torch.manual_seed(101)
-
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    num_heads = 2
-    head_size = 8
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    hidden_dim = num_heads * head_size
-    dtype = torch.float32
-
-    # Cross-layer NHD: [NB, NL, 2, BS, NH, HS]
-    paged_tensor = torch.randn(
+    paged_cross_nhd = torch.randn(
         num_blocks, num_layers, 2, block_size, num_heads, head_size,
         dtype=dtype, device=device,
     )
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = num_heads
-    shape_desc.hs = head_size
-
-    gpu_kv_format = ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS
-    num_chunks = num_blocks // blocks_per_chunk
-    d2h_chunks = [
+    gpu_kv_format_cross_nhd = ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS
+    d2h_chunks_cross_nhd = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
         for _ in range(num_chunks)
     ]
-    block_ids = list(range(num_blocks))
-
     ops.multi_layer_block_kv_transfer(
-        paged_tensor, d2h_chunks,
+        paged_cross_nhd, d2h_chunks_cross_nhd,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_cross_nhd, 0,
     )
-
-    paged_h2d = torch.zeros_like(paged_tensor)
+    paged_h2d_cross_nhd = torch.zeros_like(paged_cross_nhd)
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
+        paged_h2d_cross_nhd, d2h_chunks_cross_nhd,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_cross_nhd, 0,
     )
-
-    orig = paged_tensor.cpu()
-    recon = paged_h2d.cpu()
-    results = {"block_kv_cross_nhd": torch.stack([orig, recon])}
+    orig = paged_cross_nhd.cpu()
+    recon = paged_h2d_cross_nhd.cpu()
+    results["cross_nhd"] = torch.stack([orig, recon])
     assert torch.allclose(orig, recon, atol=1e-6), "Cross-layer NHD mismatch"
-    return results
 
-
-def scenario_multi_layer_block_kv_transfer_cross_layer_hnd(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with cross-layer HND (single tensor + permute)."""
+    # --- Cross-layer HND ---
     torch.manual_seed(202)
-
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    num_heads = 2
-    head_size = 8
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    hidden_dim = num_heads * head_size
-    dtype = torch.float32
-
-    # Cross-layer HND: [NB, NL, 2, NH, BS, HS]
-    paged_tensor = torch.randn(
+    paged_cross_hnd = torch.randn(
         num_blocks, num_layers, 2, num_heads, block_size, head_size,
         dtype=dtype, device=device,
     )
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = num_heads
-    shape_desc.hs = head_size
-
-    gpu_kv_format = ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS
-    num_chunks = num_blocks // blocks_per_chunk
-    d2h_chunks = [
+    gpu_kv_format_cross_hnd = ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS
+    d2h_chunks_cross_hnd = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
         for _ in range(num_chunks)
     ]
-    block_ids = list(range(num_blocks))
-
     ops.multi_layer_block_kv_transfer(
-        paged_tensor, d2h_chunks,
+        paged_cross_hnd, d2h_chunks_cross_hnd,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_cross_hnd, 0,
     )
-
-    paged_h2d = torch.zeros_like(paged_tensor)
+    paged_h2d_cross_hnd = torch.zeros_like(paged_cross_hnd)
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
+        paged_h2d_cross_hnd, d2h_chunks_cross_hnd,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_cross_hnd, 0,
     )
-
-    orig = paged_tensor.cpu()
-    recon = paged_h2d.cpu()
-    results = {"block_kv_cross_hnd": torch.stack([orig, recon])}
+    orig = paged_cross_hnd.cpu()
+    recon = paged_h2d_cross_hnd.cpu()
+    results["cross_hnd"] = torch.stack([orig, recon])
     assert torch.allclose(orig, recon, atol=1e-6), "Cross-layer HND mismatch"
-    return results
 
-
-def scenario_multi_layer_block_kv_transfer_sglang_nbbs(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with SGLang MHA flat layout (NBBS)."""
+    # --- SGLang MHA flat (NBBS) ---
     torch.manual_seed(303)
-
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    num_heads = 2
-    head_size = 8
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    hidden_dim = num_heads * head_size
     pbs = num_blocks * block_size
-    dtype = torch.float32
-
-    # SGLang MHA NBBS: 2*NL tensors [NB*BS, NH, HS]
-    paged_tensors = [
+    paged_sglang_nbbs = [
         [torch.randn(pbs, num_heads, head_size, dtype=dtype, device=device)
          for _ in range(num_layers)],
         [torch.randn(pbs, num_heads, head_size, dtype=dtype, device=device)
          for _ in range(num_layers)],
     ]
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = num_heads
-    shape_desc.hs = head_size
-
-    gpu_kv_format = ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS
-    num_chunks = num_blocks // blocks_per_chunk
-    d2h_chunks = [
+    gpu_kv_format_sglang_nbbs = ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS
+    d2h_chunks_sglang_nbbs = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
         for _ in range(num_chunks)
     ]
-    block_ids = list(range(num_blocks))
-
     ops.multi_layer_block_kv_transfer(
-        paged_tensors, d2h_chunks,
+        paged_sglang_nbbs, d2h_chunks_sglang_nbbs,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_sglang_nbbs, 0,
     )
-
-    paged_h2d = [
-        [torch.zeros_like(t) for t in group] for group in paged_tensors
+    paged_h2d_sglang_nbbs = [
+        [torch.zeros_like(t) for t in group] for group in paged_sglang_nbbs
     ]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
+        paged_h2d_sglang_nbbs, d2h_chunks_sglang_nbbs,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_sglang_nbbs, 0,
     )
-
-    results = {}
     for kv in range(2):
         for i in range(num_layers):
-            orig = paged_tensors[kv][i].cpu()
-            recon = paged_h2d[kv][i].cpu()
-            results[f"block_kv_sglang_nbbs_kv{kv}_l{i}"] = torch.stack(
-                [orig, recon]
-            )
+            orig = paged_sglang_nbbs[kv][i].cpu()
+            recon = paged_h2d_sglang_nbbs[kv][i].cpu()
+            results[f"sglang_nbbs_kv{kv}_l{i}"] = torch.stack([orig, recon])
             assert torch.allclose(orig, recon, atol=1e-6), (
                 f"SGLang NBBS kv={kv} layer={i} mismatch"
             )
-    return results
 
-
-def scenario_multi_layer_block_kv_transfer_sglang_nb(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with SGLang MHA block layout (NB_BS)."""
+    # --- SGLang MHA block (NB_BS) ---
     torch.manual_seed(404)
-
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    num_heads = 2
-    head_size = 8
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    hidden_dim = num_heads * head_size
-    dtype = torch.float32
-
-    # SGLang MHA NB_BS: 2*NL tensors [NB, BS, NH, HS]
-    paged_tensors = [
+    paged_sglang_nb = [
         [torch.randn(num_blocks, block_size, num_heads, head_size,
                       dtype=dtype, device=device)
          for _ in range(num_layers)],
@@ -2229,184 +2043,123 @@ def scenario_multi_layer_block_kv_transfer_sglang_nb(
                       dtype=dtype, device=device)
          for _ in range(num_layers)],
     ]
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = num_heads
-    shape_desc.hs = head_size
-
-    gpu_kv_format = ops.GPUKVFormat.TWO_X_NL_X_NB_BS_NH_HS
-    num_chunks = num_blocks // blocks_per_chunk
-    d2h_chunks = [
+    gpu_kv_format_sglang_nb = ops.GPUKVFormat.TWO_X_NL_X_NB_BS_NH_HS
+    d2h_chunks_sglang_nb = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
         for _ in range(num_chunks)
     ]
-    block_ids = list(range(num_blocks))
-
     ops.multi_layer_block_kv_transfer(
-        paged_tensors, d2h_chunks,
+        paged_sglang_nb, d2h_chunks_sglang_nb,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_sglang_nb, 0,
     )
-
-    paged_h2d = [
-        [torch.zeros_like(t) for t in group] for group in paged_tensors
+    paged_h2d_sglang_nb = [
+        [torch.zeros_like(t) for t in group] for group in paged_sglang_nb
     ]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
+        paged_h2d_sglang_nb, d2h_chunks_sglang_nb,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc, chunk_tokens, gpu_kv_format_sglang_nb, 0,
     )
-
-    results = {}
     for kv in range(2):
         for i in range(num_layers):
-            orig = paged_tensors[kv][i].cpu()
-            recon = paged_h2d[kv][i].cpu()
-            results[f"block_kv_sglang_nb_kv{kv}_l{i}"] = torch.stack(
-                [orig, recon]
-            )
+            orig = paged_sglang_nb[kv][i].cpu()
+            recon = paged_h2d_sglang_nb[kv][i].cpu()
+            results[f"sglang_nb_kv{kv}_l{i}"] = torch.stack([orig, recon])
             assert torch.allclose(orig, recon, atol=1e-6), (
                 f"SGLang NB kv={kv} layer={i} mismatch"
             )
-    return results
 
-
-def scenario_multi_layer_block_kv_transfer_skip(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with skip_prefix_n_blocks > 0."""
+    # --- skip_prefix_n_blocks > 0 ---
     torch.manual_seed(505)
-
-    num_layers = 2
-    num_blocks = 8
-    block_size = 4
-    num_heads = 2
-    head_size = 8
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    hidden_dim = num_heads * head_size
-    dtype = torch.float32
     skip_n = 2
-
-    # NHD format
-    paged_layers = [
+    paged_layers_skip = [
         torch.randn(2, num_blocks, block_size, num_heads, head_size,
                      dtype=dtype, device=device)
         for _ in range(num_layers)
     ]
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = num_heads
-    shape_desc.hs = head_size
-
-    gpu_kv_format = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
-    # After skipping 2 blocks, only 6 blocks remain → 1 full chunk + partial
-    num_chunks = (num_blocks - skip_n) // blocks_per_chunk
-    d2h_chunks = [
+    gpu_kv_format_nhd = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
+    # With skip=2, effective blocks start at index 2.
+    # Object 0 occupies flat indices [0, blocks_per_chunk), skipping first 2.
+    # Object 1 occupies flat indices [blocks_per_chunk, 2*blocks_per_chunk).
+    d2h_chunks_skip = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
         for _ in range(num_chunks)
     ]
-    block_ids = list(range(num_blocks))
-
     ops.multi_layer_block_kv_transfer(
-        paged_layers, d2h_chunks,
+        paged_layers_skip, d2h_chunks_skip,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, skip_n,
+        shape_desc, chunk_tokens, gpu_kv_format_nhd, skip_n,
     )
-
-    # H2D with skip to verify round-trip of the non-skipped portion
-    paged_h2d = [torch.zeros_like(l) for l in paged_layers]
+    paged_h2d_skip = [torch.zeros_like(l) for l in paged_layers_skip]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
+        paged_h2d_skip, d2h_chunks_skip,
         torch.tensor(block_ids, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, skip_n,
+        shape_desc, chunk_tokens, gpu_kv_format_nhd, skip_n,
     )
-
-    # Blocks at indices [skip_n:skip_n+blocks_per_chunk] should match
-    results = {}
+    # Blocks [skip_n:num_blocks] should round-trip at their original positions
     for layer_idx in range(num_layers):
         for kv in range(2):
-            orig_blocks = paged_layers[layer_idx][kv, skip_n:skip_n + blocks_per_chunk]
-            recon_blocks = paged_h2d[layer_idx][kv, skip_n:skip_n + blocks_per_chunk]
-            key = f"block_kv_skip_l{layer_idx}_kv{kv}"
+            orig_blocks = paged_layers_skip[layer_idx][kv, skip_n:num_blocks]
+            recon_blocks = paged_h2d_skip[layer_idx][kv, skip_n:num_blocks]
+            key = f"skip_l{layer_idx}_kv{kv}"
             results[key] = torch.stack([orig_blocks.cpu(), recon_blocks.cpu()])
             assert torch.allclose(orig_blocks, recon_blocks, atol=1e-6), (
                 f"Skip mismatch at layer={layer_idx} kv={kv}"
             )
-    return results
+    # Skipped blocks [0:skip_n] should remain zero
+    for layer_idx in range(num_layers):
+        for kv in range(2):
+            skipped = paged_h2d_skip[layer_idx][kv, :skip_n]
+            assert torch.all(skipped == 0), (
+                f"Skipped blocks not zero at layer={layer_idx} kv={kv}"
+            )
 
-
-def scenario_multi_layer_block_kv_transfer_multi_chunk(
-    ops: Any, device: str
-) -> dict[str, torch.Tensor]:
-    """Test multi_layer_block_kv_transfer with num_blocks > blocks_per_chunk."""
+    # --- Multi-chunk (num_blocks > blocks_per_chunk) ---
     torch.manual_seed(606)
-
-    num_layers = 2
-    num_blocks = 12
-    block_size = 4
-    num_heads = 2
-    head_size = 8
-    blocks_per_chunk = 4
-    chunk_tokens = blocks_per_chunk * block_size
-    hidden_dim = num_heads * head_size
-    dtype = torch.float32
-
-    # NHD format with 3 chunks
-    paged_layers = [
-        torch.randn(2, num_blocks, block_size, num_heads, head_size,
+    num_blocks_mc = 12
+    paged_layers_mc = [
+        torch.randn(2, num_blocks_mc, block_size, num_heads, head_size,
                      dtype=dtype, device=device)
         for _ in range(num_layers)
     ]
-
-    shape_desc = ops.PageBufferShapeDesc()
-    shape_desc.nl = num_layers
-    shape_desc.nb = num_blocks
-    shape_desc.bs = block_size
-    shape_desc.nh = num_heads
-    shape_desc.hs = head_size
-
-    gpu_kv_format = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
-    num_chunks = num_blocks // blocks_per_chunk  # 3 chunks
-    d2h_chunks = [
+    shape_desc_mc = ops.PageBufferShapeDesc()
+    shape_desc_mc.nl = num_layers
+    shape_desc_mc.nb = num_blocks_mc
+    shape_desc_mc.bs = block_size
+    shape_desc_mc.nh = num_heads
+    shape_desc_mc.hs = head_size
+    num_chunks_mc = num_blocks_mc // blocks_per_chunk  # 3 chunks
+    d2h_chunks_mc = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
-        for _ in range(num_chunks)
+        for _ in range(num_chunks_mc)
     ]
-    block_ids = list(range(num_blocks))
-
+    block_ids_mc = list(range(num_blocks_mc))
     ops.multi_layer_block_kv_transfer(
-        paged_layers, d2h_chunks,
-        torch.tensor(block_ids, dtype=torch.int64),
+        paged_layers_mc, d2h_chunks_mc,
+        torch.tensor(block_ids_mc, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.D2H,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc_mc, chunk_tokens, gpu_kv_format_nhd, 0,
     )
-
-    paged_h2d = [torch.zeros_like(l) for l in paged_layers]
+    paged_h2d_mc = [torch.zeros_like(l) for l in paged_layers_mc]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d, d2h_chunks,
-        torch.tensor(block_ids, dtype=torch.int64),
+        paged_h2d_mc, d2h_chunks_mc,
+        torch.tensor(block_ids_mc, dtype=torch.int64),
         torch.device(device), ops.TransferDirection.H2D,
-        shape_desc, chunk_tokens, gpu_kv_format, 0,
+        shape_desc_mc, chunk_tokens, gpu_kv_format_nhd, 0,
     )
-
-    results = {}
     for i in range(num_layers):
-        orig = paged_layers[i].cpu()
-        recon = paged_h2d[i].cpu()
-        results[f"block_kv_multi_chunk_l{i}"] = torch.stack([orig, recon])
+        orig = paged_layers_mc[i].cpu()
+        recon = paged_h2d_mc[i].cpu()
+        results[f"multi_chunk_l{i}"] = torch.stack([orig, recon])
         assert torch.allclose(orig, recon, atol=1e-6), (
             f"Multi-chunk Layer {i} round-trip mismatch"
         )
+
     return results
 
 
@@ -2420,14 +2173,6 @@ SCENARIO_REGISTRY = {
     "multi_layer_kv_transfer": scenario_multi_layer_kv_transfer,
     "multi_layer_kv_transfer_unilateral": scenario_multi_layer_kv_transfer_unilateral,
     "multi_layer_block_kv_transfer": scenario_multi_layer_block_kv_transfer,
-    "multi_layer_block_kv_transfer_hnd": scenario_multi_layer_block_kv_transfer_hnd,
-    "multi_layer_block_kv_transfer_mla": scenario_multi_layer_block_kv_transfer_mla,
-    "multi_layer_block_kv_transfer_cross_layer_nhd": scenario_multi_layer_block_kv_transfer_cross_layer_nhd,
-    "multi_layer_block_kv_transfer_cross_layer_hnd": scenario_multi_layer_block_kv_transfer_cross_layer_hnd,
-    "multi_layer_block_kv_transfer_sglang_nbbs": scenario_multi_layer_block_kv_transfer_sglang_nbbs,
-    "multi_layer_block_kv_transfer_sglang_nb": scenario_multi_layer_block_kv_transfer_sglang_nb,
-    "multi_layer_block_kv_transfer_skip": scenario_multi_layer_block_kv_transfer_skip,
-    "multi_layer_block_kv_transfer_multi_chunk": scenario_multi_layer_block_kv_transfer_multi_chunk,
     "single_layer_kv_transfer": scenario_single_layer_kv_transfer,
     "single_layer_kv_transfer_sgl": scenario_single_layer_kv_transfer_sgl,
     "load_and_reshape_flash": scenario_load_and_reshape_flash,
