@@ -1835,7 +1835,7 @@ def scenario_multi_layer_block_kv_transfer(
 
     paged_layers = [
         torch.randn(2, num_blocks, block_size, num_heads, head_size,
-                     dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     shape_desc = ops.PageBufferShapeDesc()
@@ -1885,7 +1885,7 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(234)
     paged_layers_fi_nhd = [
         torch.randn(num_blocks, 2, block_size, num_heads, head_size,
-                    dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     gpu_kv_format_fi_nhd = ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS
@@ -1924,7 +1924,7 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(456)
     paged_layers_hnd = [
         torch.randn(2, num_blocks, num_heads, block_size, head_size,
-                     dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     gpu_kv_format_hnd = ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS
@@ -1963,7 +1963,7 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(567)
     paged_layers_fi_hnd = [
         torch.randn(num_blocks, 2, num_heads, block_size, head_size,
-                    dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     gpu_kv_format_fi_hnd = ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS
@@ -2003,7 +2003,7 @@ def scenario_multi_layer_block_kv_transfer(
     mla_hidden = 16
     paged_layers_mla = [
         torch.randn(num_blocks, block_size, mla_hidden,
-                     dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     shape_desc_mla = ops.PageBufferShapeDesc()
@@ -2050,7 +2050,7 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(890)
     paged_layers_sglang_mla = [
         torch.randn(num_blocks * block_size, 1, mla_hidden,
-                    dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     gpu_kv_format_sglang_mla = ops.GPUKVFormat.NL_X_NBBS_ONE_HS
@@ -2091,8 +2091,8 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(101)
     paged_cross_nhd = torch.randn(
         num_blocks, num_layers, 2, block_size, num_heads, head_size,
-        dtype=dtype, device=device,
-    )
+        dtype=dtype,
+    ).to(device)
     gpu_kv_format_cross_nhd = ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS
     d2h_chunks_cross_nhd = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
@@ -2124,8 +2124,8 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(202)
     paged_cross_hnd = torch.randn(
         num_blocks, num_layers, 2, num_heads, block_size, head_size,
-        dtype=dtype, device=device,
-    )
+        dtype=dtype,
+    ).to(device)
     gpu_kv_format_cross_hnd = ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS
     d2h_chunks_cross_hnd = [
         torch.zeros(2, num_layers, chunk_tokens, hidden_dim, dtype=dtype)
@@ -2157,9 +2157,9 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(303)
     pbs = num_blocks * block_size
     paged_sglang_nbbs = [
-        [torch.randn(pbs, num_heads, head_size, dtype=dtype, device=device)
+        [torch.randn(pbs, num_heads, head_size, dtype=dtype).to(device)
          for _ in range(num_layers)],
-        [torch.randn(pbs, num_heads, head_size, dtype=dtype, device=device)
+        [torch.randn(pbs, num_heads, head_size, dtype=dtype).to(device)
          for _ in range(num_layers)],
     ]
     gpu_kv_format_sglang_nbbs = ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS
@@ -2203,10 +2203,10 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(404)
     paged_sglang_nb = [
         [torch.randn(num_blocks, block_size, num_heads, head_size,
-                      dtype=dtype, device=device)
+                     dtype=dtype).to(device)
          for _ in range(num_layers)],
         [torch.randn(num_blocks, block_size, num_heads, head_size,
-                      dtype=dtype, device=device)
+                     dtype=dtype).to(device)
          for _ in range(num_layers)],
     ]
     gpu_kv_format_sglang_nb = ops.GPUKVFormat.TWO_X_NL_X_NB_BS_NH_HS
@@ -2251,7 +2251,7 @@ def scenario_multi_layer_block_kv_transfer(
     skip_n = 2
     paged_layers_skip = [
         torch.randn(2, num_blocks, block_size, num_heads, head_size,
-                     dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     gpu_kv_format_nhd = ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
@@ -2306,7 +2306,7 @@ def scenario_multi_layer_block_kv_transfer(
     torch.manual_seed(515)
     paged_layers_permuted = [
         torch.randn(2, num_blocks, block_size, num_heads, head_size,
-                    dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     generator = torch.Generator(device="cpu").manual_seed(616)
@@ -2349,7 +2349,7 @@ def scenario_multi_layer_block_kv_transfer(
     num_blocks_mc = 12
     paged_layers_mc = [
         torch.randn(2, num_blocks_mc, block_size, num_heads, head_size,
-                     dtype=dtype, device=device)
+                    dtype=dtype).to(device)
         for _ in range(num_layers)
     ]
     shape_desc_mc = ops.PageBufferShapeDesc()
