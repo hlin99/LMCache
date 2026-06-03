@@ -250,9 +250,9 @@ def gather_paged_kv_to_cpu(
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
-        out: Optional pre-allocated output tensors (one per entry in
-            ``chunk_indices`` when ``chunk_indices`` is given, or one per
-            chunk otherwise).
+        out: Optional pre-allocated output tensors.  If provided, length
+            must equal ``len(chunk_indices)`` when ``chunk_indices`` is
+            given, or the total number of chunks otherwise.
         chunk_indices: Optional list of chunk positions (into the full
             ``block_ids`` sequence) to gather.  When provided together with
             ``out``, only those chunks are gathered and written into
