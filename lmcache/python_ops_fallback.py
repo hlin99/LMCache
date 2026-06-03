@@ -914,146 +914,117 @@ def multi_layer_block_kv_transfer(
         obj_dtype,
     )
     block_id_list = _to_block_id_list(block_ids)
+    # Simplify skip: slice block_ids at entry, then process from chunk 0.
+    if skip_prefix_n_blocks > 0:
+        block_id_list = block_id_list[skip_prefix_n_blocks:]
     blocks_per_object = lmcache_chunk_size // int(shape_desc.bs)
     block_size = int(shape_desc.bs)
     use_mla = _is_mla_format(gpu_kv_format)
     use_hnd = _is_hnd_format(gpu_kv_format)
 
-    for object_idx, obj in enumerate(object_tensors):
-        obj_block_start = object_idx * blocks_per_object
-        obj_block_ids = block_id_list[
-            obj_block_start : obj_block_start + blocks_per_object
-        ]
-        if not obj_block_ids:
-            continue
-
-        skip_blocks_for_object = 0
-        if is_h2d and skip_prefix_n_blocks > 0:
-            skip_blocks_for_object = max(skip_prefix_n_blocks - obj_block_start, 0)
-            if skip_blocks_for_object >= len(obj_block_ids):
+    # Layer-major loop: outer layer_id, inner object_idx.
+    for layer_idx, layer in enumerate(layer_tensors):
+        for object_idx, obj in enumerate(object_tensors):
+            obj_block_start = object_idx * blocks_per_object
+            obj_block_ids = block_id_list[
+                obj_block_start : obj_block_start + blocks_per_object
+            ]
+            if not obj_block_ids:
                 continue
 
-        effective_block_ids = obj_block_ids[skip_blocks_for_object:]
-        skip_tokens = skip_blocks_for_object * block_size
-
-        if is_d2h:
-            if use_mla:
-                gathered_layers: list[torch.Tensor] = []
-                for layer in layer_tensors:
-                    idx = torch.tensor(
-                        effective_block_ids, dtype=torch.long, device=layer.device
-                    )
-                    layer_blocks = layer[idx]
-                    gathered_layers.append(
-                        layer_blocks.reshape(
-                            len(effective_block_ids) * block_size,
-                            layer_blocks.shape[-1],
-                        )
-                    )
-                gathered = torch.stack(gathered_layers, dim=0)
-                obj.copy_(gathered, non_blocking=True)
-                continue
-
-            k_layers: list[torch.Tensor] = []
-            v_layers: list[torch.Tensor] = []
-            for layer in layer_tensors:
-                idx = torch.tensor(
-                    effective_block_ids, dtype=torch.long, device=layer.device
-                )
-                if use_hnd:
-                    if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_NH_BS_HS):
-                        k_t = layer[0]
-                        v_t = layer[1]
-                    else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _nb, nh, _bs, hs = k_t.shape
-                    k_blocks = k_t[idx]
-                    v_blocks = v_t[idx]
-                    k_layers.append(
-                        k_blocks.permute(0, 2, 1, 3).reshape(
-                            len(effective_block_ids) * block_size, nh * hs
-                        )
-                    )
-                    v_layers.append(
-                        v_blocks.permute(0, 2, 1, 3).reshape(
-                            len(effective_block_ids) * block_size, nh * hs
-                        )
-                    )
-                else:
-                    if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_BS_NH_HS):
-                        k_t = layer[0]
-                        v_t = layer[1]
-                    else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _nb, _bs, nh, hs = k_t.shape
-                    k_blocks = k_t[idx]
-                    v_blocks = v_t[idx]
-                    k_layers.append(
-                        k_blocks.reshape(len(effective_block_ids) * block_size, nh * hs)
-                    )
-                    v_layers.append(
-                        v_blocks.reshape(len(effective_block_ids) * block_size, nh * hs)
-                    )
-
-            gathered = torch.stack(
-                [torch.stack(k_layers, dim=0), torch.stack(v_layers, dim=0)], dim=0
-            )
-            obj.copy_(gathered, non_blocking=True)
-            continue
-
-        obj_device = obj.to(layer_tensors[0].device)
-        if use_mla:
-            for layer_idx, layer in enumerate(layer_tensors):
-                eff_idx = torch.tensor(
-                    effective_block_ids, dtype=torch.long, device=layer.device
-                )
-                src = obj_device[layer_idx, skip_tokens:]
-                hidden_size = layer.shape[-1]
-                layer[eff_idx] = src.reshape(
-                    len(effective_block_ids),
-                    block_size,
-                    hidden_size,
-                )
-            continue
-
-        for layer_idx, layer in enumerate(layer_tensors):
-            k_src = obj_device[0, layer_idx, skip_tokens:]
-            v_src = obj_device[1, layer_idx, skip_tokens:]
+            n_blocks = len(obj_block_ids)
+            n_tokens = n_blocks * block_size
             eff_idx = torch.tensor(
-                effective_block_ids, dtype=torch.long, device=layer.device
+                obj_block_ids, dtype=torch.long, device=layer.device
             )
-            if use_hnd:
-                if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_NH_BS_HS):
-                    k_t = layer[0]
-                    v_t = layer[1]
+
+            if is_d2h:
+                if use_mla:
+                    layer_blocks = layer[eff_idx]
+                    flat = layer_blocks.reshape(n_tokens, layer.shape[-1])
+                    obj[layer_idx, :n_tokens].copy_(flat, non_blocking=True)
                 else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
-                _nb, nh, _bs, hs = k_t.shape
-                k_blocks = k_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                ).permute(0, 2, 1, 3)
-                v_blocks = v_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                ).permute(0, 2, 1, 3)
-                k_t[eff_idx] = k_blocks
-                v_t[eff_idx] = v_blocks
+                    if use_hnd:
+                        if int(gpu_kv_format) == int(
+                            GPUKVFormat.NL_X_TWO_NB_NH_BS_HS
+                        ):
+                            k_t, v_t = layer[0], layer[1]
+                        else:
+                            k_t, v_t = layer[:, 0], layer[:, 1]
+                        _nb, nh, _bs, hs = k_t.shape
+                        k_blocks = (
+                            k_t[eff_idx]
+                            .permute(0, 2, 1, 3)
+                            .reshape(n_tokens, nh * hs)
+                        )
+                        v_blocks = (
+                            v_t[eff_idx]
+                            .permute(0, 2, 1, 3)
+                            .reshape(n_tokens, nh * hs)
+                        )
+                    else:
+                        if int(gpu_kv_format) == int(
+                            GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
+                        ):
+                            k_t, v_t = layer[0], layer[1]
+                        else:
+                            k_t, v_t = layer[:, 0], layer[:, 1]
+                        _nb, _bs, nh, hs = k_t.shape
+                        k_blocks = k_t[eff_idx].reshape(n_tokens, nh * hs)
+                        v_blocks = v_t[eff_idx].reshape(n_tokens, nh * hs)
+                    obj[0, layer_idx, :n_tokens].copy_(
+                        k_blocks, non_blocking=True
+                    )
+                    obj[1, layer_idx, :n_tokens].copy_(
+                        v_blocks, non_blocking=True
+                    )
             else:
-                if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_BS_NH_HS):
-                    k_t = layer[0]
-                    v_t = layer[1]
+                # H2D scatter using index_copy_
+                obj_device = obj.to(layer.device)
+                if use_mla:
+                    src = obj_device[layer_idx, :n_tokens]
+                    hidden_size = layer.shape[-1]
+                    src_blocks = src.reshape(n_blocks, block_size, hidden_size)
+                    layer.index_copy_(0, eff_idx, src_blocks)
                 else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
-                _nb, _bs, nh, hs = k_t.shape
-                k_t[eff_idx] = k_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                )
-                v_t[eff_idx] = v_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                )
+                    if use_hnd:
+                        if int(gpu_kv_format) == int(
+                            GPUKVFormat.NL_X_TWO_NB_NH_BS_HS
+                        ):
+                            k_t, v_t = layer[0], layer[1]
+                        else:
+                            k_t, v_t = layer[:, 0], layer[:, 1]
+                        _nb, nh, _bs, hs = k_t.shape
+                        k_src = obj_device[0, layer_idx, :n_tokens]
+                        v_src = obj_device[1, layer_idx, :n_tokens]
+                        k_blocks = k_src.reshape(
+                            n_blocks, block_size, nh, hs
+                        ).permute(0, 2, 1, 3)
+                        v_blocks = v_src.reshape(
+                            n_blocks, block_size, nh, hs
+                        ).permute(0, 2, 1, 3)
+                        k_t.index_copy_(0, eff_idx, k_blocks)
+                        v_t.index_copy_(0, eff_idx, v_blocks)
+                    else:
+                        if int(gpu_kv_format) == int(
+                            GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
+                        ):
+                            k_t, v_t = layer[0], layer[1]
+                        else:
+                            k_t, v_t = layer[:, 0], layer[:, 1]
+                        _nb, _bs, nh, hs = k_t.shape
+                        k_src = obj_device[0, layer_idx, :n_tokens]
+                        v_src = obj_device[1, layer_idx, :n_tokens]
+                        k_t.index_copy_(
+                            0,
+                            eff_idx,
+                            k_src.reshape(n_blocks, block_size, nh, hs),
+                        )
+                        v_t.index_copy_(
+                            0,
+                            eff_idx,
+                            v_src.reshape(n_blocks, block_size, nh, hs),
+                        )
 
 
 def single_layer_kv_transfer(
