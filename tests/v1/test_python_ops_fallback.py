@@ -1899,7 +1899,7 @@ def scenario_multi_layer_block_kv_transfer(
             [layer.data_ptr() for layer in paged_layers_fi_nhd],
             dtype=torch.uint64, device=device),
         d2h_chunks_fi_nhd if use_tensor_list else [c.data_ptr() for c in d2h_chunks_fi_nhd],
-        block_ids,
+        torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device), ops.TransferDirection.D2H,
         shape_desc, chunk_tokens, gpu_kv_format_fi_nhd, 0,
     )
@@ -1909,7 +1909,7 @@ def scenario_multi_layer_block_kv_transfer(
             [layer.data_ptr() for layer in paged_h2d_fi_nhd],
             dtype=torch.uint64, device=device),
         d2h_chunks_fi_nhd if use_tensor_list else [c.data_ptr() for c in d2h_chunks_fi_nhd],
-        block_ids,
+        torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device), ops.TransferDirection.H2D,
         shape_desc, chunk_tokens, gpu_kv_format_fi_nhd, 0,
     )
@@ -2323,7 +2323,7 @@ def scenario_multi_layer_block_kv_transfer(
             [layer.data_ptr() for layer in paged_layers_permuted],
             dtype=torch.uint64, device=device),
         d2h_chunks_permuted if use_tensor_list else [c.data_ptr() for c in d2h_chunks_permuted],
-        permuted_block_ids,
+        torch.tensor(permuted_block_ids, dtype=torch.int64, device=device),
         torch.device(device), ops.TransferDirection.D2H,
         shape_desc, chunk_tokens, gpu_kv_format_nhd, 0,
     )
@@ -2333,7 +2333,7 @@ def scenario_multi_layer_block_kv_transfer(
             [layer.data_ptr() for layer in paged_h2d_permuted],
             dtype=torch.uint64, device=device),
         d2h_chunks_permuted if use_tensor_list else [c.data_ptr() for c in d2h_chunks_permuted],
-        permuted_block_ids,
+        torch.tensor(permuted_block_ids, dtype=torch.int64, device=device),
         torch.device(device), ops.TransferDirection.H2D,
         shape_desc, chunk_tokens, gpu_kv_format_nhd, 0,
     )
