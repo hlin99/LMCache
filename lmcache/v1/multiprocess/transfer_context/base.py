@@ -275,9 +275,6 @@ def gather_paged_kv_to_cpu(
         normalize_kv_and_discover_format,
     )
     import lmcache.c_ops as lmc_ops
-    from lmcache.v1.multiprocess.transfer_context.block_kv_transfer import (
-        multi_layer_block_kv_transfer,
-    )
 
     tensors = list(kv_caches.values())
     fmt, normalized = normalize_kv_and_discover_format(
@@ -341,7 +338,7 @@ def gather_paged_kv_to_cpu(
         )
 
     if selected_block_ids:
-        multi_layer_block_kv_transfer(
+        lmc_ops.multi_layer_block_kv_transfer(
             cast("DiscoverableKVCache", normalized),
             chunks,
             selected_block_ids,
@@ -385,9 +382,6 @@ def scatter_cpu_to_paged_kv(
         normalize_kv_and_discover_format,
     )
     import lmcache.c_ops as lmc_ops
-    from lmcache.v1.multiprocess.transfer_context.block_kv_transfer import (
-        multi_layer_block_kv_transfer,
-    )
 
     if not chunks:
         return
@@ -428,7 +422,7 @@ def scatter_cpu_to_paged_kv(
     if not selected_block_ids:
         return
 
-    multi_layer_block_kv_transfer(
+    lmc_ops.multi_layer_block_kv_transfer(
         cast("DiscoverableKVCache", normalized),
         chunks,
         selected_block_ids,

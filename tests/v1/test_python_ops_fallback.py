@@ -1956,3 +1956,140 @@ def test_alloc_pinned_ptr_is_page_aligned(size: int) -> None:
             assert buf[i] == ((i & 0xFF) ^ 0xA5)
     finally:
         _py_ops.free_pinned_ptr(ptr)
+
+
+def _make_block_kv_caches(
+    num_layers: int = 2,
+    num_blocks: int = 8,
+    block_size: int = 4,
+    num_heads: int = 2,
+    head_size: int = 8,
+) -> dict[str, torch.Tensor]:
+    return {
+        f"layer_{idx}": torch.randn(2, num_blocks, block_size, num_heads, head_size)
+        for idx in range(num_layers)
+    }
+
+
+def test_multi_layer_block_kv_transfer_matches_gather_scatter_cpu() -> None:
+    # First Party
+    import lmcache.c_ops as lmc_ops
+    from lmcache.utils import EngineType
+    from lmcache.v1.gpu_connector.utils import (
+        get_block_size,
+        get_num_blocks,
+        get_num_layers,
+        make_page_buffer_shape_desc,
+        normalize_kv_and_discover_format,
+    )
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    source = _make_block_kv_caches()
+    block_ids = [0, 1, 2, 3]
+    blocks_per_chunk = 2
+    source_chunks = gather_paged_kv_to_cpu(source, block_ids, blocks_per_chunk)
+
+    tensors = list(source.values())
+    fmt, normalized = normalize_kv_and_discover_format(tensors, EngineType.VLLM)
+    block_size = get_block_size(normalized, fmt)
+    shape_desc = make_page_buffer_shape_desc(
+        normalized,
+        fmt,
+        layer_idx=0,
+        num_layers_in_group=get_num_layers(normalized, fmt),
+        num_blocks=get_num_blocks(normalized, fmt),
+        block_size=block_size,
+    )
+    chunk_tokens = blocks_per_chunk * block_size
+
+    direct_gather = [torch.empty_like(chunk) for chunk in source_chunks]
+    _py_ops.multi_layer_block_kv_transfer(
+        normalized,
+        direct_gather,
+        torch.tensor(block_ids, dtype=torch.int64),
+        tensors[0].device,
+        lmc_ops.TransferDirection.D2H,
+        shape_desc,
+        chunk_tokens,
+        fmt,
+        0,
+    )
+    for got, exp in zip(direct_gather, source_chunks, strict=True):
+        assert torch.allclose(got, exp)
+
+    destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
+    scatter_cpu_to_paged_kv(destination, [4, 5, 6, 7], source_chunks, blocks_per_chunk)
+    fmt2, normalized2 = normalize_kv_and_discover_format(
+        list(destination.values()), EngineType.VLLM
+    )
+    shape_desc2 = make_page_buffer_shape_desc(
+        normalized2,
+        fmt2,
+        layer_idx=0,
+        num_layers_in_group=get_num_layers(normalized2, fmt2),
+        num_blocks=get_num_blocks(normalized2, fmt2),
+        block_size=block_size,
+    )
+    expected = {name: tensor.clone() for name, tensor in destination.items()}
+    for tensor in destination.values():
+        tensor.zero_()
+
+    _py_ops.multi_layer_block_kv_transfer(
+        normalized2,
+        source_chunks,
+        [4, 5, 6, 7],
+        list(destination.values())[0].device,
+        lmc_ops.TransferDirection.H2D,
+        shape_desc2,
+        chunk_tokens,
+        fmt2,
+        0,
+    )
+    for name in expected:
+        assert torch.allclose(destination[name], expected[name])
+
+
+def test_multi_layer_block_kv_transfer_pointer_objects_with_tensor_paged() -> None:
+    # First Party
+    import lmcache.c_ops as lmc_ops
+    from lmcache.utils import EngineType
+    from lmcache.v1.gpu_connector.utils import (
+        get_block_size,
+        get_num_blocks,
+        get_num_layers,
+        make_page_buffer_shape_desc,
+        normalize_kv_and_discover_format,
+    )
+    from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+
+    source = _make_block_kv_caches(num_layers=1, num_blocks=4)
+    block_ids = [0]
+    chunks = gather_paged_kv_to_cpu(source, block_ids, blocks_per_chunk=1)
+
+    tensors = list(source.values())
+    fmt, normalized = normalize_kv_and_discover_format(tensors, EngineType.VLLM)
+    block_size = get_block_size(normalized, fmt)
+    shape_desc = make_page_buffer_shape_desc(
+        normalized,
+        fmt,
+        layer_idx=0,
+        num_layers_in_group=get_num_layers(normalized, fmt),
+        num_blocks=get_num_blocks(normalized, fmt),
+        block_size=block_size,
+    )
+    out = [torch.zeros_like(chunks[0])]
+    _py_ops.multi_layer_block_kv_transfer(
+        normalized,
+        [out[0].data_ptr()],
+        block_ids,
+        tensors[0].device,
+        lmc_ops.TransferDirection.D2H,
+        shape_desc,
+        block_size,
+        fmt,
+        0,
+    )
+    assert torch.allclose(out[0], chunks[0])
