@@ -899,7 +899,7 @@ def multi_layer_block_kv_transfer(
     elif _is_mla_format(gpu_kv_format):
         _transfer_per_layer_mla(
             normalized, object_tensors, block_id_list, blocks_per_object,
-            block_size, is_d2h, skip_prefix_n_blocks,
+            block_size, gpu_kv_format, is_d2h, skip_prefix_n_blocks,
         )
     elif _is_hnd_format(gpu_kv_format):
         _transfer_per_layer_hnd(
@@ -1105,6 +1105,7 @@ def _transfer_per_layer_mla(
     block_id_list: list[int],
     blocks_per_object: int,
     block_size: int,
+    gpu_kv_format: GPUKVFormat,
     is_d2h: bool,
     skip_prefix_n_blocks: int,
 ) -> None:
@@ -1114,6 +1115,7 @@ def _transfer_per_layer_mla(
         objs_on_device = [obj.to(target_device) for obj in object_tensors]
 
     for layer_idx, layer in enumerate(layer_tensors):
+        is_flat = int(gpu_kv_format) == int(GPUKVFormat.NL_X_NBBS_ONE_HS)
         for object_idx, obj in enumerate(object_tensors):
             valid = _valid_block_range(
                 object_idx, block_id_list, blocks_per_object, block_size,
@@ -1127,9 +1129,19 @@ def _transfer_per_layer_mla(
             eff_idx = torch.tensor(
                 engine_block_ids, dtype=torch.long, device=layer.device
             )
+            if is_flat:
+                token_offsets = torch.arange(
+                    block_size, dtype=torch.long, device=layer.device
+                )
+                token_indices = (
+                    eff_idx[:, None] * block_size + token_offsets[None, :]
+                ).reshape(-1)
 
             if is_d2h:
-                layer_blocks = layer.index_select(0, eff_idx)
+                if is_flat:
+                    layer_blocks = layer.index_select(0, token_indices)
+                else:
+                    layer_blocks = layer.index_select(0, eff_idx)
                 flat = layer_blocks.reshape(n_valid * block_size, layer.shape[-1])
                 obj[layer_idx, offset_in_object:token_end].copy_(
                     flat, non_blocking=True
@@ -1138,8 +1150,12 @@ def _transfer_per_layer_mla(
                 obj_device = objs_on_device[object_idx]
                 src = obj_device[layer_idx, offset_in_object:token_end]
                 hidden_size = layer.shape[-1]
-                src_blocks = src.reshape(n_valid, block_size, hidden_size)
-                layer.index_copy_(0, eff_idx, src_blocks)
+                if is_flat:
+                    src_tokens = src.reshape(n_valid * block_size, 1, hidden_size)
+                    layer.index_copy_(0, token_indices, src_tokens)
+                else:
+                    src_blocks = src.reshape(n_valid, block_size, hidden_size)
+                    layer.index_copy_(0, eff_idx, src_blocks)
 
 
 def _transfer_per_layer_hnd(
