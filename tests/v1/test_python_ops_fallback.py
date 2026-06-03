@@ -1818,8 +1818,9 @@ def scenario_multi_layer_block_kv_transfer(
     """
     results = {}
 
-    # Use pointer mode for C++ bindings (cpu/cuda/xpu); Python fallback only
-    # supports tensor-list mode for multi_layer_block_kv_transfer.
+    # C++ bindings (cuda_c_ops, xpu_sycl_ops) expect uint64 pointer tensors for
+    # paged_buffer_ptrs_tensor and list[int] for lmcache_objects_ptrs.
+    # The Python fallback (cpu_py_ops, cuda_py_ops) expects tensor objects directly.
     use_tensor_list = (ops is _py_ops) or device not in ("cpu", "cuda", "xpu")
 
     # --- NHD per-layer ---
