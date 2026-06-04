@@ -242,6 +242,82 @@ def test_create_transfer_context_uses_non_cuda_context_on_cpu() -> None:
     assert isinstance(context, DataTransferContext)
 
 
+def test_data_transfer_context_submit_store_logs_timing_and_uses_flat_block_ids(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer as wt
+
+    context = wt.DataTransferContext()
+    non_gpu_context = MagicMock()
+    non_gpu_context.metadata.block_size = 4
+    non_gpu_context.prepare_store.return_value = (None, None)
+    non_gpu_context.commit_store.return_value = True
+    context._non_gpu_context = non_gpu_context
+
+    captured: dict[str, Any] = {}
+
+    def _fake_gather(kv_caches: Any, block_ids: list[int], *args: Any, **kwargs: Any) -> Any:
+        captured["block_ids"] = block_ids
+        return [torch.zeros(1)]
+
+    monkeypatch.setattr(wt, "gather_paged_kv_to_cpu", _fake_gather)
+    monkeypatch.setattr(wt.torch_dev, "synchronize", lambda: None)
+    monkeypatch.setattr(wt.time, "perf_counter", MagicMock(side_effect=[1.0, 1.25]))
+
+    caplog.set_level("INFO", logger=wt.logger.name)
+    future = context.submit_store(
+        _request_id="req",
+        key=_default_key(),
+        instance_id=1,
+        kv_caches=_make_kv_caches(),
+        block_ids=[[1, 2, 3]],
+        _event=MagicMock(),
+        blocks_in_chunk=2,
+    )
+
+    assert future.result() is True
+    assert captured["block_ids"] == [1, 2, 3]
+    assert "Stored 12 tokens in 0.250 seconds" in caplog.text
+
+
+def test_data_transfer_context_submit_retrieve_logs_timing_and_uses_flat_block_ids(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer as wt
+
+    context = wt.DataTransferContext()
+    non_gpu_context = MagicMock()
+    non_gpu_context.metadata.block_size = 4
+    non_gpu_context.prepare_retrieve.return_value = [torch.zeros(1)]
+    context._non_gpu_context = non_gpu_context
+
+    captured: dict[str, Any] = {}
+
+    def _fake_scatter(kv_caches: Any, block_ids: list[int], *args: Any, **kwargs: Any) -> None:
+        captured["block_ids"] = block_ids
+
+    monkeypatch.setattr(wt, "scatter_cpu_to_paged_kv", _fake_scatter)
+    monkeypatch.setattr(wt.torch_dev, "synchronize", lambda: None)
+    monkeypatch.setattr(wt.time, "perf_counter", MagicMock(side_effect=[2.0, 2.5]))
+
+    caplog.set_level("INFO", logger=wt.logger.name)
+    future = context.submit_retrieve(
+        _request_id="req",
+        key=_default_key(),
+        instance_id=1,
+        kv_caches=_make_kv_caches(),
+        block_ids=[[4, 5]],
+        _event=MagicMock(),
+        blocks_in_chunk=2,
+    )
+
+    assert future.result() is True
+    assert captured["block_ids"] == [4, 5]
+    assert "Retrieved 8 tokens in 0.500 seconds" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("builder_fn", "expected_block_size", "expected_hidden_dim", "layout_hints"),
     [

@@ -3,6 +3,7 @@
 
 # Standard
 from abc import ABC, abstractmethod
+import time
 from typing import Any, Callable, Protocol
 
 # Third Party
@@ -38,6 +39,13 @@ class IPCEvent(Protocol):
 
 
 SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], MessagingFuture]
+
+
+def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
+    """Return the flat block-id list for transports without HMA support."""
+    if len(block_ids) != 1:
+        raise RuntimeError("non-GPU transfer does not support hybrid KV cache groups")
+    return block_ids[0]
 
 
 class TransferContext(ABC):
@@ -334,7 +342,10 @@ class DataTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
+        start_time = time.perf_counter()
         torch_dev.synchronize()
+        flat_block_ids = _single_group_block_ids(block_ids)
+        num_tokens = len(flat_block_ids) * self._non_gpu_context.metadata.block_size
         result = self._non_gpu_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
         # All chunks already in cache — nothing to gather or commit.
@@ -344,7 +355,7 @@ class DataTransferContext(TransferContext):
             return future
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
-            block_ids,
+            flat_block_ids,
             blocks_in_chunk,
             layout_hints=self._layout_hints,
             gpu_kv_format=self._gpu_kv_format,
@@ -355,6 +366,8 @@ class DataTransferContext(TransferContext):
             # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
         ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
+        elapsed = time.perf_counter() - start_time
+        logger.info("Stored %d tokens in %.3f seconds", num_tokens, elapsed)
 
         future = MessagingFuture()
         future.set_result(ok)
@@ -377,13 +390,16 @@ class DataTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
+        start_time = time.perf_counter()
+        flat_block_ids = _single_group_block_ids(block_ids)
+        num_tokens = len(flat_block_ids) * self._non_gpu_context.metadata.block_size
         src_buffers = self._non_gpu_context.prepare_retrieve(key, instance_id)
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
                 scatter_cpu_to_paged_kv(
                     kv_caches,
-                    block_ids,
+                    flat_block_ids,
                     src_buffers,
                     blocks_in_chunk,
                     skip_first_n_tokens=skip_first_n_tokens,
@@ -397,6 +413,9 @@ class DataTransferContext(TransferContext):
             # the SHM slot (server may immediately reuse it after commit_retrieve).
             torch_dev.synchronize()
         self._non_gpu_context.commit_retrieve(key, instance_id)
+        elapsed = time.perf_counter() - start_time
+        if ok:
+            logger.info("Retrieved %d tokens in %.3f seconds", num_tokens, elapsed)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
