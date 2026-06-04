@@ -30,6 +30,29 @@ from lmcache.v1.multiprocess.transfer_context.base import (
 logger = init_logger(__name__)
 
 
+def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
+    """Validate that block_ids contains at most one KV group and return it.
+
+    Args:
+        block_ids: A list of per-group block ID lists.
+
+    Returns:
+        The single group's flat block ID list, or an empty list when
+        ``block_ids`` is empty.
+
+    Raises:
+        RuntimeError: If ``block_ids`` contains more than one group, since
+            the non-GPU transfer path does not support hybrid KV cache groups.
+    """
+    if not block_ids:
+        return []
+    if len(block_ids) != 1:
+        raise RuntimeError(
+            "non-GPU transfer does not support hybrid KV cache groups"
+        )
+    return block_ids[0]
+
+
 class IPCEvent(Protocol):
     """Protocol for IPC-capable CUDA events used by transport operations."""
 
@@ -324,7 +347,7 @@ class DataTransferContext(TransferContext):
         key: Any,
         instance_id: int,
         kv_caches: dict[str, torch.Tensor],
-        block_ids: list[int],
+        block_ids: list[int] | list[list[int]],
         _event: IPCEvent,
         blocks_in_chunk: int,
     ) -> MessagingFuture:
@@ -333,6 +356,10 @@ class DataTransferContext(TransferContext):
                 "Data transfer context is not registered. "
                 "Call register() before submit_store()."
             )
+
+        if block_ids and not isinstance(block_ids[0], list):
+            block_ids = [block_ids]  # type: ignore[list-item]
+        flat_block_ids = _single_group_block_ids(block_ids)  # type: ignore[arg-type]
 
         torch_dev.synchronize()
         result = self._non_gpu_context.prepare_store(key, instance_id)
@@ -344,7 +371,7 @@ class DataTransferContext(TransferContext):
             return future
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
-            block_ids,
+            flat_block_ids,
             blocks_in_chunk,
             layout_hints=self._layout_hints,
             gpu_kv_format=self._gpu_kv_format,
@@ -366,7 +393,7 @@ class DataTransferContext(TransferContext):
         key: Any,
         instance_id: int,
         kv_caches: dict[str, torch.Tensor],
-        block_ids: list[int],
+        block_ids: list[int] | list[list[int]],
         _event: IPCEvent,
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
@@ -377,13 +404,17 @@ class DataTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
+        if block_ids and not isinstance(block_ids[0], list):
+            block_ids = [block_ids]  # type: ignore[list-item]
+        flat_block_ids = _single_group_block_ids(block_ids)  # type: ignore[arg-type]
+
         src_buffers = self._non_gpu_context.prepare_retrieve(key, instance_id)
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
                 scatter_cpu_to_paged_kv(
                     kv_caches,
-                    block_ids,
+                    flat_block_ids,
                     src_buffers,
                     blocks_in_chunk,
                     skip_first_n_tokens=skip_first_n_tokens,
