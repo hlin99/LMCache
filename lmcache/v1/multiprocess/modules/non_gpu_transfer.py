@@ -4,7 +4,6 @@
 # Standard
 from dataclasses import dataclass
 import threading
-import time
 
 # Third Party
 import torch
@@ -344,18 +343,13 @@ class NonGPUTransferModule:
             raise ValueError(
                 f"transfer strategy not registered for instance ID {instance_id}"
             )
-        st = time.perf_counter()
-        result = strategy.commit_store(
+        return strategy.commit_store(
             key=key,
             instance_id=instance_id,
             cpu_data=cpu_data,
             context=entry.metadata,
             resolve_obj_keys=self._ctx.resolve_obj_keys,
         )
-        ed = time.perf_counter()
-        num_tokens = len(self._ctx.resolve_obj_keys(key)) * self._ctx.chunk_size
-        logger.info("Stored %d tokens in %.3f seconds", num_tokens, ed - st)
-        return result
 
     @_lmcache_nvtx_annotate
     def prepare_retrieve(
@@ -381,17 +375,11 @@ class NonGPUTransferModule:
             raise ValueError(
                 f"transfer strategy not registered for instance ID {instance_id}"
             )
-        st = time.perf_counter()
-        response = strategy.prepare_retrieve(
+        return strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
             resolve_obj_keys=self._ctx.resolve_obj_keys,
         )
-        ed = time.perf_counter()
-        if response.success:
-            num_tokens = len(self._ctx.resolve_obj_keys(key)) * self._ctx.chunk_size
-            logger.info("Retrieved %d tokens in %.3f seconds", num_tokens, ed - st)
-        return response
 
     @_lmcache_nvtx_annotate
     def commit_retrieve(

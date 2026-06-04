@@ -2,6 +2,7 @@
 """Transfer context abstractions for LMCache multiprocess worker adapters."""
 
 # Standard
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any, Callable, Protocol
@@ -356,6 +357,7 @@ class DataTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
+        st = time.perf_counter()
         torch_dev.synchronize()
         result = self._non_gpu_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
@@ -377,6 +379,9 @@ class DataTransferContext(TransferContext):
             # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
         ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
+        ed = time.perf_counter()
+        num_tokens = len(_single_group_block_ids(block_ids)) * self._non_gpu_context.metadata.block_size
+        logger.info("Store %d tokens in %.3f seconds (end-to-end)", num_tokens, ed - st)
 
         future = MessagingFuture()
         future.set_result(ok)
@@ -399,6 +404,7 @@ class DataTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
+        st = time.perf_counter()
         src_buffers = self._non_gpu_context.prepare_retrieve(key, instance_id)
         ok = src_buffers is not None
         if src_buffers is not None:
@@ -419,6 +425,10 @@ class DataTransferContext(TransferContext):
             # the SHM slot (server may immediately reuse it after commit_retrieve).
             torch_dev.synchronize()
         self._non_gpu_context.commit_retrieve(key, instance_id)
+        ed = time.perf_counter()
+        if ok:
+            num_tokens = len(_single_group_block_ids(block_ids)) * self._non_gpu_context.metadata.block_size
+            logger.info("Retrieve %d tokens in %.3f seconds (end-to-end)", num_tokens, ed - st)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
