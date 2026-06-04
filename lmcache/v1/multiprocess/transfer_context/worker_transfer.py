@@ -366,9 +366,10 @@ class DataTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
+        flat_block_ids = _single_group_block_ids(block_ids)
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
-            _single_group_block_ids(block_ids),
+            flat_block_ids,
             blocks_in_chunk,
             layout_hints=self._layout_hints,
             gpu_kv_format=self._gpu_kv_format,
@@ -380,7 +381,7 @@ class DataTransferContext(TransferContext):
             torch_dev.synchronize()
         ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
         ed = time.perf_counter()
-        num_tokens = len(_single_group_block_ids(block_ids)) * self._non_gpu_context.metadata.block_size
+        num_tokens = len(flat_block_ids) * self._non_gpu_context.metadata.block_size
         logger.info("Store %d tokens in %.3f seconds (end-to-end)", num_tokens, ed - st)
 
         future = MessagingFuture()
@@ -407,11 +408,12 @@ class DataTransferContext(TransferContext):
         st = time.perf_counter()
         src_buffers = self._non_gpu_context.prepare_retrieve(key, instance_id)
         ok = src_buffers is not None
+        flat_block_ids = _single_group_block_ids(block_ids)
         if src_buffers is not None:
             try:
                 scatter_cpu_to_paged_kv(
                     kv_caches,
-                    _single_group_block_ids(block_ids),
+                    flat_block_ids,
                     src_buffers,
                     blocks_in_chunk,
                     skip_first_n_tokens=skip_first_n_tokens,
@@ -427,7 +429,7 @@ class DataTransferContext(TransferContext):
         self._non_gpu_context.commit_retrieve(key, instance_id)
         ed = time.perf_counter()
         if ok:
-            num_tokens = len(_single_group_block_ids(block_ids)) * self._non_gpu_context.metadata.block_size
+            num_tokens = len(flat_block_ids) * self._non_gpu_context.metadata.block_size
             logger.info("Retrieve %d tokens in %.3f seconds (end-to-end)", num_tokens, ed - st)
 
         future: MessagingFuture[bool] = MessagingFuture()
