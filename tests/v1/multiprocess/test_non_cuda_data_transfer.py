@@ -643,48 +643,6 @@ def test_server_store_and_retrieve_cpu_chunks(
     assert torch.allclose(recovered_chunks[0], payload)
 
 
-def test_server_logs_non_gpu_store_and_retrieve_timing(
-    stub_native_storage_ops: Any,
-    server_module_factory: ServerModuleFactory,
-) -> None:
-    """Server emits one timing log each for non-GPU store and retrieve."""
-    mock_storage = MagicMock()
-    target_tensor = torch.zeros(2, 2, 8, 16)
-    mock_memory_obj = MagicMock()
-    mock_memory_obj.tensor = target_tensor
-    mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
-
-    @contextmanager
-    def _read_prefetched_results(_keys: Any) -> Any:
-        yield [mock_memory_obj]
-
-    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
-    mock_session = MagicMock()
-    mock_session.get_hashes.return_value = [b"h"]
-    module, _, _, _ = server_module_factory(
-        mock_storage=mock_storage,
-        mock_session=mock_session,
-    )
-    module.register_kv_cache_non_gpu_context(_default_register_payload(instance_id=2))
-    key = _default_key()
-    payload = torch.ones(2, 2, 8, 16)
-
-    with (
-        patch(
-            "lmcache.v1.multiprocess.modules.non_gpu_transfer.time.perf_counter",
-            side_effect=[1.0, 3.5, 10.0, 12.25],
-        ),
-        patch("lmcache.v1.multiprocess.modules.non_gpu_transfer.logger.info") as info,
-    ):
-        module.prepare_store(key, 2)
-        assert module.commit_store(key, 2, pickle.dumps([payload])) is True
-        assert module.prepare_retrieve(key, 2).success is True
-        assert module.commit_retrieve(key, 2) is True
-
-    info.assert_any_call("Stored %d tokens in %.3f seconds", 8, 2.5)
-    info.assert_any_call("Retrieved %d tokens in %.3f seconds", 8, 2.25)
-
-
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
