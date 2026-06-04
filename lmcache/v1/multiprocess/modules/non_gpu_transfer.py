@@ -156,6 +156,8 @@ class NonGPUTransferModule:
         """Release resources owned by this module."""
         self._non_gpu_contexts.clear()
         self._strategies.clear()
+        self._store_start_times.clear()
+        self._retrieve_start_times.clear()
 
     @staticmethod
     def _make_transfer_key(
@@ -264,6 +266,14 @@ class NonGPUTransferModule:
             for transfer_key in self._pending_shm_reads:
                 if transfer_key[0] == instance_id:
                     stale_reads.append(transfer_key)
+            stale_store_timing_keys = []
+            for transfer_key in self._store_start_times:
+                if transfer_key[0] == instance_id:
+                    stale_store_timing_keys.append(transfer_key)
+            stale_retrieve_timing_keys = []
+            for transfer_key in self._retrieve_start_times:
+                if transfer_key[0] == instance_id:
+                    stale_retrieve_timing_keys.append(transfer_key)
 
             write_obj_keys = []
             for transfer_key in stale_writes:
@@ -272,6 +282,10 @@ class NonGPUTransferModule:
             read_obj_keys = []
             for transfer_key in stale_reads:
                 read_obj_keys.append(self._pending_shm_reads.pop(transfer_key))
+            for transfer_key in stale_store_timing_keys:
+                self._store_start_times.pop(transfer_key, None)
+            for transfer_key in stale_retrieve_timing_keys:
+                self._retrieve_start_times.pop(transfer_key, None)
 
         for obj_keys in write_obj_keys:
             if obj_keys:
