@@ -81,7 +81,16 @@ def _resolve_mode(mode: "str | MPTransferMode | None") -> MPTransferMode:
 
 
 def _resolve_async_store(async_store: "bool | str | None") -> bool:
-    """Coerce ``async_store`` into a boolean, falling back to env."""
+    """Coerce ``async_store`` into a boolean, falling back to env.
+
+    Args:
+        async_store: Optional boolean-like override. When ``None``, the
+            ``LMCACHE_MP_ASYNC_STORE`` environment variable is consulted.
+
+    Returns:
+        ``True`` when async commit-only store mode should be enabled for the
+        non-GPU transfer path, otherwise ``False``.
+    """
     raw = (
         async_store
         if async_store is not None
@@ -333,6 +342,15 @@ class DataTransferContext(TransferContext):
         async_store: bool = False,
         max_inflight_async_stores: int = DEFAULT_MAX_INFLIGHT_ASYNC_STORES,
     ) -> None:
+        """Initialize the non-GPU worker transfer context.
+
+        Args:
+            async_store: When ``True``, keep the gather phase synchronous but run
+                ``commit_store`` on a background thread pool.
+            max_inflight_async_stores: Maximum number of gathered-but-not-yet-
+                committed async stores allowed at once. When the limit is hit,
+                new submits block until a slot frees.
+        """
         self._non_gpu_context: NonGpuContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._gpu_kv_format: Any = None
@@ -561,7 +579,12 @@ class DataTransferContext(TransferContext):
             self._non_gpu_context = None
 
     def discard_pending_stores(self) -> None:
-        """Suppress completion callbacks for pending async stores."""
+        """Suppress callbacks for pending async stores during unhealthy teardown.
+
+        This keeps late background completions from resolving futures that the
+        adapter has already dropped while leaving the underlying tasks free to
+        finish or time out safely.
+        """
         self._discard_pending_stores()
 
     def _submit_async_commit(
@@ -573,6 +596,11 @@ class DataTransferContext(TransferContext):
         cpu_chunks: list[torch.Tensor],
         non_gpu_context: NonGpuContext,
     ) -> MessagingFuture:
+        """Submit ``commit_store`` to the background executor.
+
+        The returned future is unresolved on return and is completed later by
+        ``_complete_async_commit`` once the executor task finishes.
+        """
         if self._commit_executor is None:
             raise RuntimeError("Async store executor is not initialized")
 
@@ -601,6 +629,13 @@ class DataTransferContext(TransferContext):
         cpu_chunks: list[torch.Tensor],
         non_gpu_context: NonGpuContext,
     ) -> bool:
+        """Run ``commit_store`` on a worker thread.
+
+        Returns:
+            ``True`` on successful commit, ``False`` when ``commit_store``
+            returns a falsey value or raises. Errors are logged here so the
+            forward thread never crashes on async commit failures.
+        """
         try:
             ok = bool(non_gpu_context.commit_store(key, instance_id, cpu_chunks))
             if not ok:
@@ -617,6 +652,12 @@ class DataTransferContext(TransferContext):
             return False
 
     def _complete_async_commit(self, executor_future: Future[bool]) -> None:
+        """Finalize one executor-backed async commit.
+
+        This callback runs on the executor completion path, releases the
+        backpressure slot, and resolves the user-visible ``MessagingFuture``
+        unless result delivery was suppressed during teardown.
+        """
         deliver_result = False
         future: MessagingFuture[bool] | None = None
         with self._pending_commits_lock:
@@ -637,20 +678,24 @@ class DataTransferContext(TransferContext):
             future.set_result(False)
 
     def _discard_pending_stores(self) -> None:
+        """Mark pending async commits as non-deliverable and try to cancel them."""
         with self._pending_commits_lock:
             for executor_future, state in self._pending_commits.items():
                 state["deliver_result"] = False
                 executor_future.cancel()
 
     def _pending_commit_futures(self) -> list[Future[bool]]:
+        """Return a snapshot of outstanding executor futures."""
         with self._pending_commits_lock:
             return list(self._pending_commits)
 
     def _release_async_slot(self) -> None:
+        """Release one async-store backpressure slot."""
         if self._inflight_async_slots is not None:
             self._inflight_async_slots.release()
 
     def _acquire_async_slot(self) -> None:
+        """Block until an async-store slot is available or the context closes."""
         if self._inflight_async_slots is None:
             return
         while not self._closed:
@@ -677,6 +722,12 @@ def create_transfer_context(
         mode: Optional routing override. When ``None`` the value of
             ``LMCACHE_MP_TRANSFER_MODE`` is consulted, defaulting to
             :attr:`MPTransferMode.AUTO`.
+        async_store: Optional boolean-like override for async commit-only store
+            mode on the non-GPU data path. When ``None``,
+            ``LMCACHE_MP_ASYNC_STORE`` is consulted.
+        max_inflight_async_stores: Maximum number of pending async data-path
+            commits allowed before new stores block. Ignored for handle mode and
+            when async store is disabled.
         **kwargs: Unused placeholder for forward-compatible factory extension.
 
     Returns:
