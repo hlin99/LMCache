@@ -12,7 +12,10 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.multiprocess.transfer_context import worker_transfer
+from lmcache.v1.multiprocess.transfer_context import async_data, worker_transfer
+from lmcache.v1.multiprocess.transfer_context.async_data import (
+    AsyncDataTransferContext,
+)
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import DataTransferContext
 
 
@@ -94,6 +97,9 @@ def _install_fake_gather(monkeypatch: pytest.MonkeyPatch) -> None:
             tensor.fill_(1.0)
         return out
 
+    # The async path resolves ``gather_paged_kv_to_cpu`` from async_data, the
+    # sync path from worker_transfer; patch both so either is exercised.
+    monkeypatch.setattr(async_data, "gather_paged_kv_to_cpu", _gather)
     monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _gather)
 
 
@@ -103,15 +109,11 @@ def _new_context(
     gather_gate: threading.Event,
     commit_impl: Callable[[list[torch.Tensor]], bool],
     max_inflight: int = 8,
-) -> DataTransferContext:
-    monkeypatch.setattr(worker_transfer, "torch_dev", _FakeTorchDev(gather_gate))
+) -> AsyncDataTransferContext:
+    monkeypatch.setattr(async_data, "torch_dev", _FakeTorchDev(gather_gate))
     _install_fake_gather(monkeypatch)
-    ctx = DataTransferContext(max_inflight_stores=max_inflight)
+    ctx = AsyncDataTransferContext(max_inflight_stores=max_inflight)
     ctx._non_gpu_context = _FakeStoreContext(commit_impl=commit_impl)
-    # Async tests exercise the async store path directly; enable it explicitly
-    # so the capability probe (which needs real pinned memory) is bypassed.
-    ctx._async_capable = True
-    ctx._create_async_resources()
     return ctx
 
 
@@ -232,7 +234,7 @@ def test_commit_failure_sets_false_and_logs(
         raise RuntimeError("commit failed")
 
     log_exception = MagicMock()
-    monkeypatch.setattr(worker_transfer.logger, "exception", log_exception)
+    monkeypatch.setattr(async_data.logger, "exception", log_exception)
     ctx = _new_context(monkeypatch, gather_gate=gather_gate, commit_impl=_commit)
     future = ctx.submit_store(
         "r1", object(), 1, {"k": torch.zeros(1)}, [[0]], _FakeEvent(gather_gate), 1
@@ -240,6 +242,19 @@ def test_commit_failure_sets_false_and_logs(
     gather_gate.set()
     assert future.result(timeout=1) is False
     log_exception.assert_called_once()
+    ctx.close()
+
+
+def test_flush_inflight_gathers_no_inflight_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gather_gate = threading.Event()
+    gather_gate.set()
+    ctx = _new_context(
+        monkeypatch, gather_gate=gather_gate, commit_impl=lambda _c: True
+    )
+    # No in-flight events: flush is a cheap no-op and must not raise.
+    ctx.flush_inflight_gathers()
     ctx.close()
 
 
@@ -266,7 +281,7 @@ class _RecordingTorchDev:
         return _FakeEvent(threading.Event())
 
 
-def test_submit_store_sync_path_returns_resolved_future(
+def test_sync_data_context_returns_resolved_future(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = _RecordingTorchDev()
@@ -274,7 +289,6 @@ def test_submit_store_sync_path_returns_resolved_future(
     _install_fake_gather(monkeypatch)
     ctx = DataTransferContext()
     ctx._non_gpu_context = _FakeStoreContext(commit_impl=lambda _c: True)
-    assert ctx._async_capable is False
 
     future = ctx.submit_store(
         "r1",
@@ -292,68 +306,48 @@ def test_submit_store_sync_path_returns_resolved_future(
     assert fake.stream_calls == 0
     assert fake.event_calls == 0
     assert fake.synchronize_calls >= 1
+    # flush_inflight_gathers is the inherited base no-op; neither it nor close
+    # must raise on the synchronous path.
+    ctx.flush_inflight_gathers()
     ctx.close()
 
 
-def test_submit_store_dispatches_on_capability(
+def test_sync_data_context_has_no_async_resources() -> None:
+    # The synchronous DataTransferContext must not create any async resources
+    # and must not expose async-only attributes.
+    ctx = DataTransferContext()
+    assert not hasattr(ctx, "_copy_stream")
+    assert not hasattr(ctx, "_commit_executor")
+    assert not hasattr(ctx, "_inflight_semaphore")
+    # close() on an unregistered sync context must not raise.
+    ctx.close()
+
+
+def test_build_data_context_dispatches_on_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ctx = DataTransferContext()
-    ctx._non_gpu_context = MagicMock()
-    async_mock = MagicMock(return_value="async")
-    sync_mock = MagicMock(return_value="sync")
-    monkeypatch.setattr(ctx, "_submit_store_async", async_mock)
-    monkeypatch.setattr(ctx, "_submit_store_sync", sync_mock)
+    kv_caches = {"k": torch.zeros(1)}
 
-    ctx._async_capable = True
-    assert ctx.submit_store("r", None, 1, {}, [[0]], None, 1) == "async"
-    async_mock.assert_called_once()
-    sync_mock.assert_not_called()
+    monkeypatch.setattr(worker_transfer, "_supports_async_primitives", lambda _kv: True)
+    # Avoid touching real stream/event primitives when instantiating the async
+    # context returned by the capable branch.
+    monkeypatch.setattr(async_data, "torch_dev", _FakeTorchDev(threading.Event()))
+    capable = worker_transfer._build_data_context(kv_caches)
+    assert isinstance(capable, AsyncDataTransferContext)
+    capable.close()
 
-    async_mock.reset_mock()
-    ctx._async_capable = False
-    assert ctx.submit_store("r", None, 1, {}, [[0]], None, 1) == "sync"
-    sync_mock.assert_called_once()
-    async_mock.assert_not_called()
+    monkeypatch.setattr(
+        worker_transfer, "_supports_async_primitives", lambda _kv: False
+    )
+    fallback = worker_transfer._build_data_context(kv_caches)
+    assert isinstance(fallback, DataTransferContext)
+    assert not isinstance(fallback, AsyncDataTransferContext)
+    fallback.close()
 
 
-def test_init_async_capability_non_capable_skips_resources(
+def test_supports_async_primitives_false_without_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A torch_dev without Stream/Event is not async-capable.
     monkeypatch.setattr(worker_transfer, "torch_dev", object())
-    ctx = DataTransferContext()
-    assert ctx._copy_stream is None
-    assert ctx._commit_executor is None
-
-    ctx._init_async_capability()
-
-    assert ctx._async_capable is False
-    assert ctx._copy_stream is None
-    assert ctx._commit_executor is None
-    assert ctx._inflight_semaphore is None
-    # close() must not raise even though async resources were never created.
-    ctx.close()
-
-
-def test_init_async_capability_capable_creates_resources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(worker_transfer, "torch_dev", _FakeTorchDev(threading.Event()))
-    # Make the pinned-memory probe succeed regardless of host CUDA support.
-    real_empty = torch.empty
-
-    def _fake_empty(*args: object, **kwargs: object) -> torch.Tensor:
-        kwargs.pop("pin_memory", None)
-        return real_empty(*args, **kwargs)
-
-    monkeypatch.setattr(worker_transfer.torch, "empty", _fake_empty)
-
-    ctx = DataTransferContext()
-    ctx._init_async_capability()
-
-    assert ctx._async_capable is True
-    assert ctx._copy_stream is not None
-    assert ctx._commit_executor is not None
-    assert ctx._inflight_semaphore is not None
-    ctx.close()
+    assert worker_transfer._supports_async_primitives({"k": torch.zeros(1)}) is False

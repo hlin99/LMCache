@@ -4,12 +4,9 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from concurrent.futures import Future as ConcurrentFuture
-from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
-import threading
 
 # Third Party
 import torch
@@ -42,11 +39,6 @@ logger = init_logger(__name__)
 # string values of :class:`MPTransferMode` (``auto`` / ``handle`` /
 # ``data``); ``auto`` reproduces the historical device-type-based dispatch.
 ENV_MP_TRANSFER_MODE = "LMCACHE_MP_TRANSFER_MODE"
-DEFAULT_MAX_ASYNC_NON_GPU_STORES = 8
-# Number of background threads used to run commit (CPU->server) work for the
-# async non-GPU store path. >1 so that a slow gather for one store does not
-# block the commit of another store whose gather already finished.
-DEFAULT_NON_GPU_COMMIT_WORKERS = 4
 
 
 class MPTransferMode(str, Enum):
@@ -101,6 +93,9 @@ class IPCEvent(Protocol):
 
     def ipc_handle(self) -> object:
         """Return an IPC handle consumable by the multiprocess server."""
+
+    def wait(self, stream: object | None = None) -> None:
+        """Make ``stream`` wait for this event (async ordering primitive)."""
 
 
 SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], MessagingFuture]
@@ -320,139 +315,12 @@ class HandleTransferContext(TransferContext):
 
 
 class DataTransferContext(TransferContext):
-    """Data transfer context for non-CUDA workers.
+    """Data transfer context for non-CUDA workers."""
 
-    Store on the non-GPU path is two-phase and fully async *when the worker
-    device supports the required async primitives* (a stream, an event with
-    ``record``/``synchronize``/``wait``, and pinned host memory):
-    1) gather: enqueue GPU->CPU copies on a dedicated copy stream into
-       LMCache-owned pinned staging buffers (ordered behind the per-step event).
-    2) commit: wait for gather completion in a background thread, then perform
-       commit_store() (pickle or SHM commit) and resolve the returned future.
-
-    When those primitives are not available (e.g. a CPU-only backend without
-    streams/events/pinned memory), the context automatically falls back to the
-    original synchronous store implementation. This dispatch is internal and
-    capability-based; there is no user-facing async/sync flag, and async stays
-    the default whenever the device can support it.
-
-    SHM note: SHM slots are generally pageable, so device->SHM DtoH copies may
-    implicitly synchronize. To keep gather async, we always gather into pinned
-    bounce buffers first, then copy to SHM slots on the commit thread.
-    """
-
-    def __init__(
-        self,
-        max_inflight_stores: int = DEFAULT_MAX_ASYNC_NON_GPU_STORES,
-        commit_workers: int = DEFAULT_NON_GPU_COMMIT_WORKERS,
-    ) -> None:
-        """Initialize the context (async resources are created lazily).
-
-        Args:
-            max_inflight_stores: Max number of concurrently in-flight async
-                stores before ``submit_store`` blocks (backpressure). Async
-                mode only.
-            commit_workers: Number of background threads used to run commit
-                (CPU->server) work in async mode. >1 so a slow gather for one
-                store does not block the commit of another whose gather is
-                already done. Async mode only.
-        """
+    def __init__(self) -> None:
         self._non_gpu_context: NonGpuContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._gpu_kv_format: Any = None
-        self._max_inflight_stores = max(1, int(max_inflight_stores))
-        self._commit_workers = max(1, int(commit_workers))
-        # Capability-based dispatch decided in register(); defaults to the
-        # synchronous fallback until the device is known to be async-capable.
-        self._async_capable = False
-        # Async-only resources. Created lazily (never in __init__) and only when
-        # the device is async-capable, so backends without Stream/Event/pinned
-        # memory never touch these primitives.
-        self._copy_stream: Any = None
-        self._commit_executor: ThreadPoolExecutor | None = None
-        self._inflight_semaphore: threading.BoundedSemaphore | None = None
-        self._inflight_lock = threading.Lock()
-        self._inflight_gather_events: set[Any] = set()
-        self._inflight_commits: set[ConcurrentFuture[None]] = set()
-        self._staging_pool: dict[
-            tuple[tuple[int, ...], torch.dtype], list[torch.Tensor]
-        ] = {}
-        self._is_closing = False
-
-    def _detect_async_capable(self) -> bool:
-        """Probe whether the worker device supports the async store primitives.
-
-        Requires a stream, an event exposing ``record``/``synchronize``/
-        ``wait``, and pinned (page-locked) host memory. The probe is performed
-        once (cached by ``register()``); it never runs per ``submit_store``.
-
-        Returns:
-            True if all required async primitives are available, else False.
-        """
-        if not hasattr(torch_dev, "Stream") or not hasattr(torch_dev, "Event"):
-            return False
-        try:
-            torch_dev.Stream()
-            event = torch_dev.Event()
-        except Exception:
-            return False
-        for attr in ("record", "synchronize", "wait"):
-            if not callable(getattr(event, attr, None)):
-                return False
-        try:
-            torch.empty(1, dtype=torch.uint8, device="cpu", pin_memory=True)
-        except (RuntimeError, TypeError):
-            return False
-        return True
-
-    def _create_async_resources(self) -> None:
-        """Create the copy stream / commit executor / backpressure semaphore."""
-        self._copy_stream = torch_dev.Stream()
-        self._commit_executor = ThreadPoolExecutor(
-            max_workers=self._commit_workers,
-            thread_name_prefix="lmcache_non_gpu_commit",
-        )
-        self._inflight_semaphore = threading.BoundedSemaphore(self._max_inflight_stores)
-
-    def _init_async_capability(self) -> None:
-        """Detect device async capability and lazily create async resources."""
-        self._async_capable = self._detect_async_capable()
-        if self._async_capable:
-            self._create_async_resources()
-
-    def _alloc_pinned_staging(
-        self, shape: torch.Size, dtype: torch.dtype, count: int
-    ) -> list[torch.Tensor]:
-        key = (tuple(shape), dtype)
-        with self._inflight_lock:
-            pooled = self._staging_pool.setdefault(key, [])
-            staged = [pooled.pop() for _ in range(min(len(pooled), count))]
-        if len(staged) == count:
-            return staged
-
-        missing = count - len(staged)
-        for _ in range(missing):
-            try:
-                staged.append(
-                    torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-                )
-            except RuntimeError:
-                # Graceful fallback for CPU-only / pin-memory-disabled setups.
-                logger.warning(
-                    "Falling back to non-pinned CPU staging buffer "
-                    "(shape=%s, dtype=%s)",
-                    tuple(shape),
-                    dtype,
-                )
-                staged.append(torch.empty(shape, dtype=dtype, device="cpu"))
-        return staged
-
-    def _release_staging(self, chunks: list[torch.Tensor]) -> None:
-        if not chunks:
-            return
-        key = (tuple(chunks[0].shape), chunks[0].dtype)
-        with self._inflight_lock:
-            self._staging_pool.setdefault(key, []).extend(chunks)
 
     def register(
         self,
@@ -534,13 +402,10 @@ class DataTransferContext(TransferContext):
             pool_size=pool_size,
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
-        self._init_async_capability()
         logger.info(
-            "Worker non-GPU transfer context registered "
-            "(instance_id=%d, mode=%s, store=%s)",
+            "Worker non-GPU transfer context registered (instance_id=%d, mode=%s)",
             instance_id,
             supported_transfer_mode,
-            "async" if self._async_capable else "sync",
         )
 
     def submit_store(
@@ -558,40 +423,7 @@ class DataTransferContext(TransferContext):
                 "Data transfer context is not registered. "
                 "Call register() before submit_store()."
             )
-        if self._async_capable:
-            return self._submit_store_async(
-                _request_id,
-                key,
-                instance_id,
-                kv_caches,
-                block_ids,
-                _event,
-                blocks_in_chunk,
-            )
-        return self._submit_store_sync(
-            key,
-            instance_id,
-            kv_caches,
-            block_ids,
-            blocks_in_chunk,
-        )
 
-    def _submit_store_sync(
-        self,
-        key: Any,
-        instance_id: int,
-        kv_caches: dict[str, torch.Tensor],
-        block_ids: list[list[int]],
-        blocks_in_chunk: int,
-    ) -> MessagingFuture:
-        """Original synchronous store path (capability fallback).
-
-        Reproduces the pre-async behaviour exactly: synchronize, prepare,
-        gather, (SHM) synchronize, commit, and return an already-resolved
-        future. See :meth:`submit_store` for argument semantics (``key``,
-        ``instance_id``, ``kv_caches``, ``block_ids``, ``blocks_in_chunk``).
-        """
-        assert self._non_gpu_context is not None
         torch_dev.synchronize()
         result = self._non_gpu_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
@@ -617,152 +449,6 @@ class DataTransferContext(TransferContext):
         future = MessagingFuture()
         future.set_result(ok)
         return future
-
-    def _submit_store_async(
-        self,
-        _request_id: str,
-        key: Any,
-        instance_id: int,
-        kv_caches: dict[str, torch.Tensor],
-        block_ids: list[list[int]],
-        _event: IPCEvent,
-        blocks_in_chunk: int,
-    ) -> MessagingFuture:
-        """Two-phase async store path (gather on copy stream, deferred commit).
-
-        Returns an unresolved future that resolves only after both gather
-        completion and the commit ACK. See :meth:`submit_store` for argument
-        semantics.
-        """
-        completion: MessagingFuture[bool] = MessagingFuture()
-        non_gpu_context = self._non_gpu_context
-        semaphore = self._inflight_semaphore
-        commit_executor = self._commit_executor
-        assert non_gpu_context is not None
-        assert semaphore is not None
-        assert commit_executor is not None
-
-        semaphore.acquire()
-        staged_chunks: list[torch.Tensor] = []
-        shm_out_buffers: list[torch.Tensor] | None = None
-        gather_done: Any | None = None
-        try:
-            with self._inflight_lock:
-                if self._is_closing:
-                    completion.set_result(False)
-                    semaphore.release()
-                    return completion
-
-            result = non_gpu_context.prepare_store(key, instance_id)
-            out_buffers, chunk_indices = result if result is not None else (None, None)
-            if chunk_indices is not None and len(chunk_indices) == 0:
-                # All chunks are already in cache: no gather, no commit.
-                completion.set_result(True)
-                semaphore.release()
-                return completion
-
-            full_block_ids = _single_group_block_ids(block_ids)
-            num_chunks = (
-                len(chunk_indices)
-                if chunk_indices is not None
-                else len(full_block_ids) // blocks_in_chunk
-            )
-            if not non_gpu_context.layout_desc.shapes:
-                raise RuntimeError("non-GPU layout_desc.shapes is empty")
-            if not non_gpu_context.layout_desc.dtypes:
-                raise RuntimeError("non-GPU layout_desc.dtypes is empty")
-            staged_chunks = self._alloc_pinned_staging(
-                non_gpu_context.layout_desc.shapes[0],
-                non_gpu_context.layout_desc.dtypes[0],
-                num_chunks,
-            )
-            shm_out_buffers = out_buffers
-            with torch_dev.stream(self._copy_stream):
-                _event.wait(stream=self._copy_stream)
-                gather_paged_kv_to_cpu(
-                    kv_caches,
-                    full_block_ids,
-                    blocks_in_chunk,
-                    layout_hints=self._layout_hints,
-                    gpu_kv_format=self._gpu_kv_format,
-                    out=staged_chunks,
-                    chunk_indices=chunk_indices,
-                )
-                gather_done = torch_dev.Event()
-                gather_done.record(self._copy_stream)
-
-            with self._inflight_lock:
-                if gather_done is not None:
-                    self._inflight_gather_events.add(gather_done)
-
-            def _commit_after_gather() -> None:
-                ok = False
-                try:
-                    if gather_done is not None:
-                        gather_done.synchronize()
-                    if shm_out_buffers is not None:
-                        if len(staged_chunks) != len(shm_out_buffers):
-                            raise RuntimeError(
-                                "SHM staging chunk count mismatch: "
-                                f"{len(staged_chunks)} vs {len(shm_out_buffers)} "
-                                f"(request_id={_request_id}, instance_id={instance_id})"
-                            )
-                        for staged, shm_view in zip(
-                            staged_chunks, shm_out_buffers, strict=True
-                        ):
-                            shm_view.copy_(staged)
-                        ok = non_gpu_context.commit_store(
-                            key, instance_id, shm_out_buffers
-                        )
-                    else:
-                        ok = non_gpu_context.commit_store(
-                            key, instance_id, staged_chunks
-                        )
-                    if not ok:
-                        logger.error(
-                            "Async non-GPU commit_store failed for request_id=%s",
-                            _request_id,
-                        )
-                except Exception:
-                    logger.exception(
-                        "Async non-GPU store failed for request_id=%s",
-                        _request_id,
-                    )
-                    ok = False
-                finally:
-                    self._release_staging(staged_chunks)
-                    with self._inflight_lock:
-                        if gather_done is not None:
-                            self._inflight_gather_events.discard(gather_done)
-                    completion.set_result(ok)
-                    semaphore.release()
-
-            # Submitting the commit task is the ownership-transfer point: once it
-            # succeeds, the commit task is solely responsible for releasing the
-            # semaphore, releasing staging buffers, and resolving the future. The
-            # except below therefore only handles failures that occur *before*
-            # this submit, so it can never double-release or double-resolve.
-            commit_future = commit_executor.submit(_commit_after_gather)
-        except Exception:
-            logger.exception("Failed to submit async non-GPU store")
-            if staged_chunks:
-                self._release_staging(staged_chunks)
-            if gather_done is not None:
-                with self._inflight_lock:
-                    self._inflight_gather_events.discard(gather_done)
-            completion.set_result(False)
-            semaphore.release()
-            return completion
-
-        with self._inflight_lock:
-            self._inflight_commits.add(commit_future)
-
-        def _drop_commit_future(done_future: ConcurrentFuture[None]) -> None:
-            with self._inflight_lock:
-                self._inflight_commits.discard(done_future)
-
-        commit_future.add_done_callback(_drop_commit_future)
-        return completion
 
     def submit_retrieve(
         self,
@@ -807,32 +493,9 @@ class DataTransferContext(TransferContext):
         return future
 
     def close(self) -> None:
-        # Drain in-flight async work only when async resources were created.
-        # In sync (fallback) mode there is no copy stream / executor / inflight
-        # state, so guard against touching never-created attributes.
-        if self._async_capable:
-            with self._inflight_lock:
-                self._is_closing = True
-                gather_events = list(self._inflight_gather_events)
-            for event in gather_events:
-                try:
-                    event.synchronize()
-                except Exception:
-                    logger.exception("Failed while draining gather events")
-            if self._commit_executor is not None:
-                self._commit_executor.shutdown(wait=True, cancel_futures=False)
         if self._non_gpu_context is not None:
             self._non_gpu_context.close()
             self._non_gpu_context = None
-
-    def flush_inflight_gathers(self) -> None:
-        # Cheap no-op in sync mode: no copy stream / in-flight gather events.
-        if not self._async_capable:
-            return
-        with self._inflight_lock:
-            gather_events = list(self._inflight_gather_events)
-        for event in gather_events:
-            event.synchronize()
 
 
 def create_transfer_context(
@@ -878,8 +541,59 @@ def create_transfer_context(
     if resolved_mode is MPTransferMode.HANDLE:
         return _build_handle_context(device_type)
     if resolved_mode is MPTransferMode.DATA:
-        return DataTransferContext()
+        return _build_data_context(kv_caches)
     # AUTO: preserve the historical device-type-based dispatch.
     if device_type == "cuda":
         return HandleTransferContext()
+    return _build_data_context(kv_caches)
+
+
+def _supports_async_primitives(kv_caches: dict[str, torch.Tensor]) -> bool:
+    """Probe whether the worker device supports the async store primitives.
+
+    The async non-GPU store path needs a stream, an event exposing
+    ``record``/``synchronize``/``wait``, and pinned (page-locked) host memory.
+    When any of these is unavailable (e.g. a CPU-only backend), the factory
+    falls back to the synchronous :class:`DataTransferContext`. This dispatch is
+    internal and capability-based; there is no user-facing async/sync flag.
+
+    Args:
+        kv_caches: Worker KV cache tensors keyed by layer name. Currently unused
+            (capability is a property of ``torch_dev``), accepted to keep the
+            probe signature forward-compatible with device-specific checks.
+
+    Returns:
+        True if all required async primitives are available, else False.
+    """
+    if not hasattr(torch_dev, "Stream") or not hasattr(torch_dev, "Event"):
+        return False
+    try:
+        torch_dev.Stream()
+        event = torch_dev.Event()
+    except Exception:
+        return False
+    for attr in ("record", "synchronize", "wait"):
+        if not callable(getattr(event, attr, None)):
+            return False
+    try:
+        torch.empty(1, dtype=torch.uint8, device="cpu", pin_memory=True)
+    except (RuntimeError, TypeError):
+        return False
+    return True
+
+
+def _build_data_context(kv_caches: dict[str, torch.Tensor]) -> "TransferContext":
+    """Build the non-GPU data context, async when device-capable else sync.
+
+    Routes the ``DATA`` and AUTO non-cuda branches through a single capability
+    check. ``AsyncDataTransferContext`` is imported lazily to avoid an import
+    cycle and to keep the synchronous path free of stream/event dependencies.
+    """
+    if _supports_async_primitives(kv_caches):
+        # Local
+        from lmcache.v1.multiprocess.transfer_context.async_data import (
+            AsyncDataTransferContext,
+        )
+
+        return AsyncDataTransferContext()
     return DataTransferContext()

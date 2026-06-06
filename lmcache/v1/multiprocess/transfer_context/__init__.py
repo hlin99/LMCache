@@ -7,6 +7,7 @@ sub-module.
 """
 
 # Local
+from .async_data import AsyncDataTransferContext
 from .base import (
     NonGpuContext,
     NonGpuContextMetadata,
@@ -26,6 +27,7 @@ from .worker_transfer import (
 )
 
 __all__ = [
+    "AsyncDataTransferContext",
     "DataTransferContext",
     "HandleTransferContext",
     "MPTransferMode",
