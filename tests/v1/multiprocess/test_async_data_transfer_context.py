@@ -86,7 +86,8 @@ def _install_fake_gather(monkeypatch: pytest.MonkeyPatch) -> None:
     ) -> list[torch.Tensor]:
         out = kwargs.get("out")
         if out is None:
-            # Sync path may pass out=None; gather allocates its own buffers.
+            # Sync fallback path passes out=None: gather allocates its own
+            # buffers and returns them, so mirror that contract here.
             return [torch.ones(1)]
         assert isinstance(out, list)
         for tensor in out:

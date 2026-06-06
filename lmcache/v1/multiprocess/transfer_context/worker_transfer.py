@@ -346,6 +346,17 @@ class DataTransferContext(TransferContext):
         max_inflight_stores: int = DEFAULT_MAX_ASYNC_NON_GPU_STORES,
         commit_workers: int = DEFAULT_NON_GPU_COMMIT_WORKERS,
     ) -> None:
+        """Initialize the context (async resources are created lazily).
+
+        Args:
+            max_inflight_stores: Max number of concurrently in-flight async
+                stores before ``submit_store`` blocks (backpressure). Async
+                mode only.
+            commit_workers: Number of background threads used to run commit
+                (CPU->server) work in async mode. >1 so a slow gather for one
+                store does not block the commit of another whose gather is
+                already done. Async mode only.
+        """
         self._non_gpu_context: NonGpuContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._gpu_kv_format: Any = None
@@ -374,6 +385,9 @@ class DataTransferContext(TransferContext):
         Requires a stream, an event exposing ``record``/``synchronize``/
         ``wait``, and pinned (page-locked) host memory. The probe is performed
         once (cached by ``register()``); it never runs per ``submit_store``.
+
+        Returns:
+            True if all required async primitives are available, else False.
         """
         if not hasattr(torch_dev, "Stream") or not hasattr(torch_dev, "Event"):
             return False
@@ -574,7 +588,8 @@ class DataTransferContext(TransferContext):
 
         Reproduces the pre-async behaviour exactly: synchronize, prepare,
         gather, (SHM) synchronize, commit, and return an already-resolved
-        future.
+        future. See :meth:`submit_store` for argument semantics (``key``,
+        ``instance_id``, ``kv_caches``, ``block_ids``, ``blocks_in_chunk``).
         """
         assert self._non_gpu_context is not None
         torch_dev.synchronize()
@@ -613,6 +628,12 @@ class DataTransferContext(TransferContext):
         _event: IPCEvent,
         blocks_in_chunk: int,
     ) -> MessagingFuture:
+        """Two-phase async store path (gather on copy stream, deferred commit).
+
+        Returns an unresolved future that resolves only after both gather
+        completion and the commit ACK. See :meth:`submit_store` for argument
+        semantics.
+        """
         completion: MessagingFuture[bool] = MessagingFuture()
         non_gpu_context = self._non_gpu_context
         semaphore = self._inflight_semaphore

@@ -1017,10 +1017,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         evicted_req_ids = getattr(scheduler_output, "evicted_req_ids", None)
         if evicted_req_ids:
             return True
-        # Conservative fallback: if cached requests are present but expose none
-        # of the known preemption fields, the schema is unrecognized and we
-        # cannot prove the step is preemption-free. Flush rather than risk
-        # corruption.
+        # Conservative fallback: a recognized cached-request schema is expected
+        # to expose at least one of ``resumed_req_ids`` /
+        # ``resumed_from_preemption`` (older vLLM exposes the former, newer the
+        # latter; they are version-dependent alternatives, not required to
+        # co-exist). If cached requests are present but expose neither, the
+        # schema is unrecognized and we cannot prove the step is
+        # preemption-free, so flush rather than risk corruption.
         if cached_reqs is not None and not (
             hasattr(cached_reqs, "resumed_req_ids")
             or hasattr(cached_reqs, "resumed_from_preemption")
