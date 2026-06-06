@@ -2,12 +2,14 @@
 # Standard
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 from unittest.mock import MagicMock, patch
 import mmap
 import os
 import pickle
 import sys
+import threading
+import time
 
 # Third Party
 import pytest
@@ -277,6 +279,30 @@ def test_resolve_extra_config_overrides_mp_transfer_mode() -> None:
     assert cfg[ExtraConfigDefault.mp_transfer_mode.name] == "data"
 
 
+def test_resolve_extra_config_default_async_store_is_false() -> None:
+    """Without override the resolved async_store flag must be ``False``."""
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        ExtraConfigDefault,
+        _resolve_extra_config,
+    )
+
+    cfg = _resolve_extra_config(None)
+    assert cfg[ExtraConfigDefault.async_store.name] is False
+
+
+def test_resolve_extra_config_overrides_async_store_bool() -> None:
+    """``lmcache.mp.async_store`` should parse string booleans correctly."""
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        ExtraConfigDefault,
+        _resolve_extra_config,
+    )
+
+    cfg = _resolve_extra_config({"lmcache.mp.async_store": "true"})
+    assert cfg[ExtraConfigDefault.async_store.name] is True
+
+
 def test_create_transfer_context_force_data_mode() -> None:
     """``mode='data'`` must always pick DataTransferContext, even for CUDA."""
     # First Party
@@ -290,6 +316,21 @@ def test_create_transfer_context_force_data_mode() -> None:
         {"layer_0": torch.randn(2, 2)}, mode=MPTransferMode.DATA
     )
     assert isinstance(context, DataTransferContext)
+
+
+def test_create_transfer_context_uses_async_store_env(monkeypatch: Any) -> None:
+    """The async-store env flag should flow into CPU data transfer contexts."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        ENV_MP_ASYNC_STORE,
+        DataTransferContext,
+        create_transfer_context,
+    )
+
+    monkeypatch.setenv(ENV_MP_ASYNC_STORE, "1")
+    context = create_transfer_context({"layer_0": torch.randn(2, 2)})
+    assert isinstance(context, DataTransferContext)
+    assert context._async_store is True
 
 
 def test_create_transfer_context_invalid_mode_raises() -> None:
@@ -1162,3 +1203,272 @@ def test_non_gpu_context_shm_close_is_idempotent() -> None:
     finally:
         if os.path.exists(shm_path):
             os.unlink(shm_path)
+
+
+class _ControlledNonGpuContext:
+    def __init__(self) -> None:
+        self.prepare_result: tuple[list[torch.Tensor], list[int]] | None = None
+        self.commit_waiters: list[threading.Event | None] = []
+        self.commit_results: list[bool] = []
+        self.commit_errors: list[BaseException | None] = []
+        self.commit_started = threading.Event()
+        self.commit_calls = 0
+        self.closed = False
+
+    def prepare_store(self, key: Any, instance_id: int) -> Any:  # noqa: ARG002
+        return self.prepare_result
+
+    def commit_store(
+        self, key: Any, instance_id: int, chunks: list[torch.Tensor]  # noqa: ARG002
+    ) -> bool:
+        idx = self.commit_calls
+        self.commit_calls += 1
+        self.commit_started.set()
+        waiter = self.commit_waiters[idx] if idx < len(self.commit_waiters) else None
+        if waiter is not None:
+            assert waiter.wait(timeout=5)
+        error = self.commit_errors[idx] if idx < len(self.commit_errors) else None
+        if error is not None:
+            raise error
+        if idx < len(self.commit_results):
+            return self.commit_results[idx]
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _make_data_transfer_context(
+    *,
+    async_store: bool,
+    max_inflight_async_stores: int = 8,
+) -> tuple[Any, _ControlledNonGpuContext, Any]:
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+
+    context = worker_transfer.DataTransferContext(
+        async_store=async_store,
+        max_inflight_async_stores=max_inflight_async_stores,
+    )
+    non_gpu_context = _ControlledNonGpuContext()
+    context._non_gpu_context = cast(Any, non_gpu_context)
+    return context, non_gpu_context, worker_transfer
+
+
+def test_data_transfer_context_async_store_returns_pending_future() -> None:
+    context, non_gpu_context, worker_transfer = _make_data_transfer_context(
+        async_store=True
+    )
+    commit_gate = threading.Event()
+    non_gpu_context.commit_waiters = [commit_gate]
+    cpu_chunks = [torch.ones(1)]
+    try:
+        with (
+            patch.object(
+                worker_transfer, "gather_paged_kv_to_cpu", return_value=cpu_chunks
+            ),
+            patch.object(worker_transfer.torch_dev, "synchronize", return_value=None),
+        ):
+            future = context.submit_store(
+                "req-1",
+                key="key",
+                instance_id=1,
+                kv_caches={"layer_0": torch.zeros(1)},
+                block_ids=[[0]],
+                _event=MagicMock(),
+                blocks_in_chunk=1,
+            )
+            assert non_gpu_context.commit_started.wait(timeout=1)
+            assert future.query() is False
+
+            commit_gate.set()
+
+            assert future.result(timeout=2) is True
+            assert future.query() is True
+    finally:
+        commit_gate.set()
+        context.close()
+
+
+def test_data_transfer_context_sync_store_returns_completed_future() -> None:
+    context, non_gpu_context, worker_transfer = _make_data_transfer_context(
+        async_store=False
+    )
+    try:
+        with (
+            patch.object(
+                worker_transfer,
+                "gather_paged_kv_to_cpu",
+                return_value=[torch.ones(1)],
+            ),
+            patch.object(worker_transfer.torch_dev, "synchronize", return_value=None),
+        ):
+            future = context.submit_store(
+                "req-1",
+                key="key",
+                instance_id=1,
+                kv_caches={"layer_0": torch.zeros(1)},
+                block_ids=[[0]],
+                _event=MagicMock(),
+                blocks_in_chunk=1,
+            )
+            assert future.query() is True
+            assert future.result() is True
+            assert non_gpu_context.commit_calls == 1
+    finally:
+        context.close()
+
+
+def test_data_transfer_context_async_store_backpressure_blocks_submit() -> None:
+    context, non_gpu_context, worker_transfer = _make_data_transfer_context(
+        async_store=True, max_inflight_async_stores=1
+    )
+    first_commit_gate = threading.Event()
+    second_commit_gate = threading.Event()
+    second_commit_gate.set()
+    non_gpu_context.commit_waiters = [first_commit_gate, second_commit_gate]
+    second_submit_returned = threading.Event()
+    holder: dict[str, Any] = {}
+    try:
+        with (
+            patch.object(
+                worker_transfer,
+                "gather_paged_kv_to_cpu",
+                return_value=[torch.ones(1)],
+            ),
+            patch.object(worker_transfer.torch_dev, "synchronize", return_value=None),
+        ):
+            first_future = context.submit_store(
+                "req-1",
+                key="key-1",
+                instance_id=1,
+                kv_caches={"layer_0": torch.zeros(1)},
+                block_ids=[[0]],
+                _event=MagicMock(),
+                blocks_in_chunk=1,
+            )
+            assert non_gpu_context.commit_started.wait(timeout=1)
+
+            def _submit_second() -> None:
+                holder["future"] = context.submit_store(
+                    "req-2",
+                    key="key-2",
+                    instance_id=1,
+                    kv_caches={"layer_0": torch.zeros(1)},
+                    block_ids=[[0]],
+                    _event=MagicMock(),
+                    blocks_in_chunk=1,
+                )
+                second_submit_returned.set()
+
+            thread = threading.Thread(target=_submit_second, daemon=True)
+            thread.start()
+            time.sleep(0.1)
+            assert second_submit_returned.is_set() is False
+
+            first_commit_gate.set()
+
+            assert first_future.result(timeout=2) is True
+            assert second_submit_returned.wait(timeout=2)
+            assert holder["future"].result(timeout=2) is True
+            thread.join(timeout=2)
+            assert thread.is_alive() is False
+    finally:
+        first_commit_gate.set()
+        second_commit_gate.set()
+        context.close()
+
+
+def test_data_transfer_context_close_drains_without_setting_results() -> None:
+    context, non_gpu_context, worker_transfer = _make_data_transfer_context(
+        async_store=True
+    )
+    commit_gate = threading.Event()
+    non_gpu_context.commit_waiters = [commit_gate]
+    try:
+        with (
+            patch.object(
+                worker_transfer,
+                "gather_paged_kv_to_cpu",
+                return_value=[torch.ones(1)],
+            ),
+            patch.object(worker_transfer.torch_dev, "synchronize", return_value=None),
+        ):
+            future = context.submit_store(
+                "req-1",
+                key="key",
+                instance_id=1,
+                kv_caches={"layer_0": torch.zeros(1)},
+                block_ids=[[0]],
+                _event=MagicMock(),
+                blocks_in_chunk=1,
+            )
+            assert non_gpu_context.commit_started.wait(timeout=1)
+
+            close_thread = threading.Thread(target=context.close, daemon=True)
+            close_thread.start()
+            time.sleep(0.1)
+            assert close_thread.is_alive() is True
+            assert future.query() is False
+
+            commit_gate.set()
+
+            close_thread.join(timeout=2)
+            assert close_thread.is_alive() is False
+            assert future.query() is False
+            assert non_gpu_context.closed is True
+    finally:
+        commit_gate.set()
+        if not non_gpu_context.closed:
+            context.close()
+
+
+@pytest.mark.parametrize(
+    ("commit_result", "commit_error"),
+    [
+        pytest.param(False, None, id="returns-false"),
+        pytest.param(None, RuntimeError("boom"), id="raises"),
+    ],
+)
+def test_data_transfer_context_async_store_failures_resolve_false_and_log(
+    commit_result: bool | None,
+    commit_error: BaseException | None,
+) -> None:
+    context, non_gpu_context, worker_transfer = _make_data_transfer_context(
+        async_store=True
+    )
+    if commit_result is not None:
+        non_gpu_context.commit_results = [commit_result]
+    if commit_error is not None:
+        non_gpu_context.commit_errors = [commit_error]
+    try:
+        error_logger = MagicMock()
+        exception_logger = MagicMock()
+        with (
+            patch.object(
+                worker_transfer,
+                "gather_paged_kv_to_cpu",
+                return_value=[torch.ones(1)],
+            ),
+            patch.object(worker_transfer.torch_dev, "synchronize", return_value=None),
+            patch.object(worker_transfer.logger, "error", error_logger),
+            patch.object(worker_transfer.logger, "exception", exception_logger),
+        ):
+            future = context.submit_store(
+                "req-1",
+                key="key",
+                instance_id=1,
+                kv_caches={"layer_0": torch.zeros(1)},
+                block_ids=[[0]],
+                _event=MagicMock(),
+                blocks_in_chunk=1,
+            )
+            assert future.result(timeout=2) is False
+            if commit_error is None:
+                error_logger.assert_called_once()
+                exception_logger.assert_not_called()
+            else:
+                exception_logger.assert_called_once()
+                error_logger.assert_not_called()
+    finally:
+        context.close()

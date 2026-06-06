@@ -16,6 +16,7 @@ import zmq
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import _lmcache_nvtx_annotate, init_logger
+from lmcache.v1.config_base import _to_bool
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheEngineKey,
@@ -59,6 +60,8 @@ class ExtraConfigDefault(enum.Enum):
     # ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config key wins
     # when both are set.
     mp_transfer_mode = "auto"
+    # Enable async commit-only stores for the non-GPU MP transfer path.
+    async_store = False
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -100,7 +103,12 @@ def _resolve_extra_config(
     for item in ExtraConfigDefault:
         default = item.value
         raw = stripped.get(item.name)
-        value = type(default)(raw) if raw is not None else default
+        if raw is None:
+            value = default
+        elif isinstance(default, bool):
+            value = _to_bool(raw)
+        else:
+            value = type(default)(raw)
         if value != default:
             logger.info(
                 "%s%s = %s (overridden, default: %s)",
@@ -898,8 +906,10 @@ class LMCacheMPWorkerAdapter:
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
             self._mp_transfer_mode = cfg[ExtraConfigDefault.mp_transfer_mode.name]
+            self._mp_async_store = cfg[ExtraConfigDefault.async_store.name]
         else:
             self._mp_transfer_mode = ExtraConfigDefault.mp_transfer_mode.value
+            self._mp_async_store = ExtraConfigDefault.async_store.value
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -1060,8 +1070,13 @@ class LMCacheMPWorkerAdapter:
                 mq_timeout.
         """
         self.kv_caches = kv_caches
+        old_transfer_ctx = self.transfer_ctx
+        if old_transfer_ctx is not None:
+            old_transfer_ctx.close()
         self.transfer_ctx = create_transfer_context(
-            kv_caches, mode=self._mp_transfer_mode
+            kv_caches,
+            mode=self._mp_transfer_mode,
+            async_store=self._mp_async_store,
         )
         layout_hints = vllm_layout_hints()
         layout_hints["inference_engine_logical_block_size"] = (
@@ -1333,6 +1348,8 @@ class LMCacheMPWorkerAdapter:
         """
         # If unhealthy, drain all pending futures immediately
         if not self.is_healthy:
+            if isinstance(self.transfer_ctx, DataTransferContext):
+                self.transfer_ctx.discard_pending_stores()
             finished_stores = set(self.store_futures.keys())
             finished_retrieves = set()
             for request_id, (

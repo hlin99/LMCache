@@ -2,11 +2,13 @@
 """Transfer context abstractions for LMCache multiprocess worker adapters."""
 
 # Standard
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
+import threading
 
 # Third Party
 import torch
@@ -14,6 +16,7 @@ import torch
 # First Party
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
+from lmcache.v1.config_base import _to_bool
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
 from lmcache.v1.multiprocess.custom_types import RegisterNonGpuContextPayload
@@ -39,6 +42,8 @@ logger = init_logger(__name__)
 # string values of :class:`MPTransferMode` (``auto`` / ``handle`` /
 # ``data``); ``auto`` reproduces the historical device-type-based dispatch.
 ENV_MP_TRANSFER_MODE = "LMCACHE_MP_TRANSFER_MODE"
+ENV_MP_ASYNC_STORE = "LMCACHE_MP_ASYNC_STORE"
+DEFAULT_MAX_INFLIGHT_ASYNC_STORES = 8
 
 
 class MPTransferMode(str, Enum):
@@ -73,6 +78,16 @@ def _resolve_mode(mode: "str | MPTransferMode | None") -> MPTransferMode:
         raise ValueError(
             "Invalid MP transfer mode %r (valid: %s)" % (raw, valid)
         ) from exc
+
+
+def _resolve_async_store(async_store: "bool | str | None") -> bool:
+    """Coerce ``async_store`` into a boolean, falling back to env."""
+    raw = (
+        async_store
+        if async_store is not None
+        else os.environ.get(ENV_MP_ASYNC_STORE, "false")
+    )
+    return _to_bool(raw)
 
 
 def _build_handle_context(device_type: str) -> "TransferContext":
@@ -303,12 +318,41 @@ class HandleTransferContext(TransferContext):
 
 
 class DataTransferContext(TransferContext):
-    """Data transfer context for non-CUDA workers."""
+    """Data transfer context for non-CUDA workers.
 
-    def __init__(self) -> None:
+    Store operations always gather paged KV into LMCache-owned CPU / SHM
+    buffers synchronously before returning. When ``async_store`` is enabled,
+    only the commit phase runs on a background thread, so SHM slots remain
+    reserved until that commit finishes while the worker can leave
+    ``wait_for_save()`` once the synchronous gather completes.
+    """
+
+    def __init__(
+        self,
+        *,
+        async_store: bool = False,
+        max_inflight_async_stores: int = DEFAULT_MAX_INFLIGHT_ASYNC_STORES,
+    ) -> None:
         self._non_gpu_context: NonGpuContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._gpu_kv_format: Any = None
+        self._async_store = async_store
+        self._commit_executor = (
+            ThreadPoolExecutor(
+                max_workers=max_inflight_async_stores,
+                thread_name_prefix="lmcache-mp-store",
+            )
+            if async_store
+            else None
+        )
+        self._inflight_async_slots = (
+            threading.BoundedSemaphore(max_inflight_async_stores)
+            if async_store
+            else None
+        )
+        self._pending_commits: dict[Future[bool], dict[str, Any]] = {}
+        self._pending_commits_lock = threading.Lock()
+        self._closed = False
 
     def register(
         self,
@@ -398,7 +442,7 @@ class DataTransferContext(TransferContext):
 
     def submit_store(
         self,
-        _request_id: str,
+        request_id: str,
         key: Any,
         instance_id: int,
         kv_caches: dict[str, torch.Tensor],
@@ -406,37 +450,59 @@ class DataTransferContext(TransferContext):
         _event: IPCEvent,
         blocks_in_chunk: int,
     ) -> MessagingFuture:
-        if self._non_gpu_context is None:
+        if self._non_gpu_context is None or self._closed:
             raise RuntimeError(
                 "Data transfer context is not registered. "
                 "Call register() before submit_store()."
             )
 
-        torch_dev.synchronize()
-        result = self._non_gpu_context.prepare_store(key, instance_id)
-        out_buffers, chunk_indices = result if result is not None else (None, None)
-        # All chunks already in cache — nothing to gather or commit.
-        if chunk_indices is not None and len(chunk_indices) == 0:
-            future: MessagingFuture[bool] = MessagingFuture()
-            future.set_result(True)
-            return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            gpu_kv_format=self._gpu_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
-        if out_buffers is not None:
-            # SHM path uses async device->CPU copies; complete them before commit.
-            torch_dev.synchronize()
-        ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
+        async_slot_acquired = False
+        if self._async_store:
+            assert self._inflight_async_slots is not None
+            self._inflight_async_slots.acquire()
+            async_slot_acquired = True
 
-        future = MessagingFuture()
-        future.set_result(ok)
-        return future
+        torch_dev.synchronize()
+        try:
+            result = self._non_gpu_context.prepare_store(key, instance_id)
+            out_buffers, chunk_indices = result if result is not None else (None, None)
+            # All chunks already in cache — nothing to gather or commit.
+            if chunk_indices is not None and len(chunk_indices) == 0:
+                future: MessagingFuture[bool] = MessagingFuture()
+                future.set_result(True)
+                if async_slot_acquired:
+                    self._release_async_slot()
+                return future
+            cpu_chunks = gather_paged_kv_to_cpu(
+                kv_caches,
+                _single_group_block_ids(block_ids),
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                gpu_kv_format=self._gpu_kv_format,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
+            if out_buffers is not None:
+                # SHM path uses async device->CPU copies; complete them before the
+                # async commit notifies the server that the reserved slot may be
+                # reused.
+                torch_dev.synchronize()
+            if not self._async_store:
+                ok = self._non_gpu_context.commit_store(key, instance_id, cpu_chunks)
+                future = MessagingFuture()
+                future.set_result(ok)
+                return future
+            return self._submit_async_commit(
+                request_id=request_id,
+                key=key,
+                instance_id=instance_id,
+                cpu_chunks=cpu_chunks,
+                non_gpu_context=self._non_gpu_context,
+            )
+        except Exception:
+            if async_slot_acquired:
+                self._release_async_slot()
+            raise
 
     def submit_retrieve(
         self,
@@ -481,14 +547,114 @@ class DataTransferContext(TransferContext):
         return future
 
     def close(self) -> None:
+        self._closed = True
+        self._discard_pending_stores()
+        pending = self._pending_commit_futures()
+        if pending:
+            wait(pending)
+        if self._commit_executor is not None:
+            self._commit_executor.shutdown(wait=True, cancel_futures=True)
+            self._commit_executor = None
         if self._non_gpu_context is not None:
             self._non_gpu_context.close()
             self._non_gpu_context = None
+
+    def discard_pending_stores(self) -> None:
+        """Suppress completion callbacks for pending async stores."""
+        self._discard_pending_stores()
+
+    def _submit_async_commit(
+        self,
+        *,
+        request_id: str,
+        key: Any,
+        instance_id: int,
+        cpu_chunks: list[torch.Tensor],
+        non_gpu_context: NonGpuContext,
+    ) -> MessagingFuture:
+        if self._commit_executor is None:
+            raise RuntimeError("Async store executor is not initialized")
+
+        future: MessagingFuture[bool] = MessagingFuture()
+        executor_future = self._commit_executor.submit(
+            self._commit_store_background,
+            request_id,
+            key,
+            instance_id,
+            cpu_chunks,
+            non_gpu_context,
+        )
+        with self._pending_commits_lock:
+            self._pending_commits[executor_future] = {
+                "future": future,
+                "deliver_result": True,
+            }
+        executor_future.add_done_callback(self._complete_async_commit)
+        return future
+
+    def _commit_store_background(
+        self,
+        request_id: str,
+        key: Any,
+        instance_id: int,
+        cpu_chunks: list[torch.Tensor],
+        non_gpu_context: NonGpuContext,
+    ) -> bool:
+        try:
+            ok = bool(non_gpu_context.commit_store(key, instance_id, cpu_chunks))
+            if not ok:
+                logger.error(
+                    "Async non-GPU commit_store failed for request_id=%s",
+                    request_id,
+                )
+            return ok
+        except Exception:
+            logger.exception(
+                "Async non-GPU commit_store failed for request_id=%s",
+                request_id,
+            )
+            return False
+
+    def _complete_async_commit(self, executor_future: Future[bool]) -> None:
+        deliver_result = False
+        future: MessagingFuture[bool] | None = None
+        with self._pending_commits_lock:
+            state = self._pending_commits.pop(executor_future, None)
+            if state is not None:
+                future = state["future"]
+                deliver_result = bool(state["deliver_result"])
+        self._release_async_slot()
+        if future is None or not deliver_result:
+            return
+        if executor_future.cancelled():
+            future.set_result(False)
+            return
+        try:
+            future.set_result(bool(executor_future.result()))
+        except Exception:
+            logger.exception("Async non-GPU commit future callback failed")
+            future.set_result(False)
+
+    def _discard_pending_stores(self) -> None:
+        with self._pending_commits_lock:
+            for executor_future, state in self._pending_commits.items():
+                state["deliver_result"] = False
+                executor_future.cancel()
+
+    def _pending_commit_futures(self) -> list[Future[bool]]:
+        with self._pending_commits_lock:
+            return list(self._pending_commits)
+
+    def _release_async_slot(self) -> None:
+        if self._inflight_async_slots is not None:
+            self._inflight_async_slots.release()
 
 
 def create_transfer_context(
     kv_caches: dict[str, torch.Tensor],
     mode: "str | MPTransferMode | None" = None,
+    async_store: "bool | str | None" = None,
+    max_inflight_async_stores: int = DEFAULT_MAX_INFLIGHT_ASYNC_STORES,
     **_kwargs: Any,
 ) -> TransferContext:
     """Create a transfer context from KV cache device type.
@@ -521,16 +687,24 @@ def create_transfer_context(
         )
     device_type = next(iter(device_types))
     resolved_mode = _resolve_mode(mode)
+    resolved_async_store = _resolve_async_store(async_store)
     logger.info(
-        "Creating transfer context (device_type=%s, mode=%s)",
+        "Creating transfer context (device_type=%s, mode=%s, async_store=%s)",
         device_type,
         resolved_mode.value,
+        resolved_async_store,
     )
     if resolved_mode is MPTransferMode.HANDLE:
         return _build_handle_context(device_type)
     if resolved_mode is MPTransferMode.DATA:
-        return DataTransferContext()
+        return DataTransferContext(
+            async_store=resolved_async_store,
+            max_inflight_async_stores=max_inflight_async_stores,
+        )
     # AUTO: preserve the historical device-type-based dispatch.
     if device_type == "cuda":
         return HandleTransferContext()
-    return DataTransferContext()
+    return DataTransferContext(
+        async_store=resolved_async_store,
+        max_inflight_async_stores=max_inflight_async_stores,
+    )

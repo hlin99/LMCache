@@ -115,6 +115,32 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     assert args[1] == RequestType.REGISTER_KV_CACHE
 
 
+def test_register_kv_caches_passes_async_store_to_transfer_factory(
+    fake_adapter, monkeypatch
+):
+    """Adapter registration should plumb the resolved async_store flag."""
+    adapter, _send_mock, _ = fake_adapter
+    adapter._mp_async_store = True
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cpu"
+    transfer_ctx = MagicMock()
+    create_transfer_context = MagicMock(return_value=transfer_ctx)
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", create_transfer_context)
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.utils.vllm_layout_hints",
+        lambda: {},
+        raising=False,
+    )
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    create_transfer_context.assert_called_once_with(
+        {"layer.0": fake_tensor},
+        mode=adapter._mp_transfer_mode,
+        async_store=True,
+    )
+
+
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     """Public register_kv_caches surfaces ConnectionError on MQ timeout."""
     adapter, _send_mock, future = fake_adapter
