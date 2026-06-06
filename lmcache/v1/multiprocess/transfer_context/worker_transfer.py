@@ -450,7 +450,9 @@ class DataTransferContext(TransferContext):
         _event: IPCEvent,
         blocks_in_chunk: int,
     ) -> MessagingFuture:
-        if self._non_gpu_context is None or self._closed:
+        if self._closed:
+            raise RuntimeError("Data transfer context is already closed.")
+        if self._non_gpu_context is None:
             raise RuntimeError(
                 "Data transfer context is not registered. "
                 "Call register() before submit_store()."
@@ -458,8 +460,7 @@ class DataTransferContext(TransferContext):
 
         async_slot_acquired = False
         if self._async_store:
-            assert self._inflight_async_slots is not None
-            self._inflight_async_slots.acquire()
+            self._acquire_async_slot()
             async_slot_acquired = True
 
         torch_dev.synchronize()
@@ -648,6 +649,14 @@ class DataTransferContext(TransferContext):
     def _release_async_slot(self) -> None:
         if self._inflight_async_slots is not None:
             self._inflight_async_slots.release()
+
+    def _acquire_async_slot(self) -> None:
+        if self._inflight_async_slots is None:
+            return
+        while not self._closed:
+            if self._inflight_async_slots.acquire(timeout=0.1):
+                return
+        raise RuntimeError("Data transfer context is already closed.")
 
 
 def create_transfer_context(

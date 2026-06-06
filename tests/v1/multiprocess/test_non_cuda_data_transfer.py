@@ -1327,6 +1327,7 @@ def test_data_transfer_context_async_store_backpressure_blocks_submit() -> None:
     second_commit_gate = threading.Event()
     second_commit_gate.set()
     non_gpu_context.commit_waiters = [first_commit_gate, second_commit_gate]
+    second_submit_started = threading.Event()
     second_submit_returned = threading.Event()
     holder: dict[str, Any] = {}
     try:
@@ -1350,6 +1351,7 @@ def test_data_transfer_context_async_store_backpressure_blocks_submit() -> None:
             assert non_gpu_context.commit_started.wait(timeout=1)
 
             def _submit_second() -> None:
+                second_submit_started.set()
                 holder["future"] = context.submit_store(
                     "req-2",
                     key="key-2",
@@ -1363,8 +1365,8 @@ def test_data_transfer_context_async_store_backpressure_blocks_submit() -> None:
 
             thread = threading.Thread(target=_submit_second, daemon=True)
             thread.start()
-            time.sleep(0.1)
-            assert second_submit_returned.is_set() is False
+            assert second_submit_started.wait(timeout=1)
+            assert second_submit_returned.wait(timeout=0.1) is False
 
             first_commit_gate.set()
 
@@ -1407,7 +1409,10 @@ def test_data_transfer_context_close_drains_without_setting_results() -> None:
 
             close_thread = threading.Thread(target=context.close, daemon=True)
             close_thread.start()
-            time.sleep(0.1)
+            for _ in range(20):
+                if close_thread.is_alive():
+                    break
+                time.sleep(0.01)
             assert close_thread.is_alive() is True
             assert future.query() is False
 
