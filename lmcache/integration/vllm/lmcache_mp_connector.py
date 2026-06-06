@@ -518,11 +518,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
                 f"num_blocks={len(req_meta.op.block_ids[0])}, "
                 f"block_ids={req_meta.op.block_ids})"
             )
-        return (
-            f"need_flush={self.need_flush}; ["
-            + "\n".join(request_strs)
-            + "]"
-        )
+        return f"need_flush={self.need_flush}; [" + "\n".join(request_strs) + "]"
 
     def __repr__(self):
         return self.__str__()
@@ -998,8 +994,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         return metadata
 
     def _scheduler_step_needs_flush(self, scheduler_output: SchedulerOutput) -> bool:
-        """Return whether this scheduler step can overwrite preempted blocks."""
-        # vLLM 0.10+ exposes resumed preemptions through cached-request fields.
+        """Return whether this scheduler step can overwrite preempted blocks.
+
+        Under-syncing here risks KV-block corruption (a paged block may be
+        overwritten before a deferred async gather reads it), while over-syncing
+        only costs performance, so we prefer a spurious flush over a missed one.
+        """
+        # In vLLM v1, resumed preemptions are surfaced on the cached-request
+        # struct via ``resumed_req_ids`` / ``resumed_from_preemption``.
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
         resumed_req_ids = getattr(cached_reqs, "resumed_req_ids", None)
         if resumed_req_ids:
@@ -1007,12 +1009,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         resumed_flags = getattr(cached_reqs, "resumed_from_preemption", None)
         if resumed_flags and any(resumed_flags):
             return True
-        # Conservative fallback for alternate scheduler output schemas.
+        # Resilient optional checks: these fields may not exist on every vLLM
+        # ``SchedulerOutput`` version; getattr keeps the probe harmless when so.
         preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", None)
         if preempted_req_ids:
             return True
         evicted_req_ids = getattr(scheduler_output, "evicted_req_ids", None)
         if evicted_req_ids:
+            return True
+        # Conservative fallback: if cached requests are present but expose none
+        # of the known preemption fields, the schema is unrecognized and we
+        # cannot prove the step is preemption-free. Flush rather than risk
+        # corruption.
+        if cached_reqs is not None and not (
+            hasattr(cached_reqs, "resumed_req_ids")
+            or hasattr(cached_reqs, "resumed_from_preemption")
+        ):
+            logger.warning(
+                "Unrecognized scheduled_cached_reqs schema (%s); conservatively "
+                "flushing in-flight async gathers to avoid KV block corruption.",
+                type(cached_reqs).__name__,
+            )
             return True
         return False
 

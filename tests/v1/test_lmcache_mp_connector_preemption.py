@@ -104,3 +104,22 @@ def test_handle_preemptions_forwards_flush_hint_to_worker_adapter() -> None:
     metadata.need_flush = True
     connector.handle_preemptions(metadata)
     connector.worker_adapter.handle_preemptions.assert_called_once_with(True)
+
+
+def test_scheduler_step_needs_flush_conservative_on_unknown_schema() -> None:
+    connector = _new_connector_without_init()
+    scheduler_output = SimpleNamespace(
+        scheduled_cached_reqs=SimpleNamespace(unexpected_field=["req-1"])
+    )
+    assert connector._scheduler_step_needs_flush(scheduler_output) is True
+
+
+def test_scheduler_step_needs_flush_false_for_recognized_no_preemption() -> None:
+    connector = _new_connector_without_init()
+    scheduler_output = SimpleNamespace(
+        scheduled_cached_reqs=SimpleNamespace(
+            resumed_req_ids=[],
+            resumed_from_preemption=[],
+        )
+    )
+    assert connector._scheduler_step_needs_flush(scheduler_output) is False
