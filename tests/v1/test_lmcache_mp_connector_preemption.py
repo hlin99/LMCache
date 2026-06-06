@@ -46,12 +46,8 @@ def test_build_connector_meta_keeps_need_flush_false_without_signal() -> None:
     connector._report_block_allocation_deltas = lambda scheduler_output: None
 
     scheduler_output = SimpleNamespace(
-        scheduled_cached_reqs=SimpleNamespace(
-            resumed_req_ids=[],
-            resumed_from_preemption=[],
-        ),
+        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=[]),
         preempted_req_ids=[],
-        evicted_req_ids=[],
     )
     metadata = connector.build_connector_meta(scheduler_output)
     assert isinstance(metadata, LMCacheMPConnectorMetadata)
@@ -61,26 +57,14 @@ def test_build_connector_meta_keeps_need_flush_false_without_signal() -> None:
 @pytest.mark.parametrize(
     "scheduler_output",
     [
+        # Resumed-from-preemption signal (CachedRequestData.resumed_req_ids).
         SimpleNamespace(
-            scheduled_cached_reqs=SimpleNamespace(
-                resumed_req_ids=[],
-                resumed_from_preemption=[False, True],
-            )
+            scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=["req-1"]),
         ),
+        # Preempted-this-step signal (SchedulerOutput.preempted_req_ids).
         SimpleNamespace(
-            scheduled_cached_reqs=SimpleNamespace(
-                resumed_req_ids=[],
-                resumed_from_preemption=[],
-            ),
+            scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=[]),
             preempted_req_ids=["req-1"],
-        ),
-        SimpleNamespace(
-            scheduled_cached_reqs=SimpleNamespace(
-                resumed_req_ids=[],
-                resumed_from_preemption=[],
-            ),
-            preempted_req_ids=[],
-            evicted_req_ids=["req-2"],
         ),
     ],
 )
@@ -117,9 +101,6 @@ def test_scheduler_step_needs_flush_conservative_on_unknown_schema() -> None:
 def test_scheduler_step_needs_flush_false_for_recognized_no_preemption() -> None:
     connector = _new_connector_without_init()
     scheduler_output = SimpleNamespace(
-        scheduled_cached_reqs=SimpleNamespace(
-            resumed_req_ids=[],
-            resumed_from_preemption=[],
-        )
+        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=[])
     )
     assert connector._scheduler_step_needs_flush(scheduler_output) is False
