@@ -296,3 +296,15 @@ def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     transfer_ctx.reset_mock()
     gc.collect()
     assert event_ref() is None
+
+
+def test_handle_preemptions_flushes_only_when_signaled(fake_adapter):
+    adapter, _send_mock, _future = fake_adapter
+    transfer_ctx = MagicMock()
+    adapter.transfer_ctx = transfer_ctx
+
+    adapter.handle_preemptions(False)
+    transfer_ctx.flush_inflight_gathers.assert_not_called()
+
+    adapter.handle_preemptions(True)
+    transfer_ctx.flush_inflight_gathers.assert_called_once_with()

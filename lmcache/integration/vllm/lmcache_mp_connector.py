@@ -496,6 +496,11 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
+        # True only on scheduler steps where preemption/eviction may overwrite
+        # blocks referenced by in-flight async stores. Worker-side
+        # handle_preemptions() uses this hint to flush deferred gather
+        # (device->CPU copy) work before vLLM can overwrite source KV blocks.
+        self.need_flush: bool = False
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)
@@ -513,7 +518,11 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
                 f"num_blocks={len(req_meta.op.block_ids[0])}, "
                 f"block_ids={req_meta.op.block_ids})"
             )
-        return "[" + "\n".join(request_strs) + "]"
+        return (
+            f"need_flush={self.need_flush}; ["
+            + "\n".join(request_strs)
+            + "]"
+        )
 
     def __repr__(self):
         return self.__str__()
@@ -741,6 +750,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request_ids, ops, event, cache_salts=cache_salts
         )
 
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        """Flush async non-GPU gathers only when scheduler metadata requests it."""
+        worker_adapter = getattr(self, "worker_adapter", None)
+        if self.role != KVConnectorRole.WORKER or worker_adapter is None:
+            return
+        need_flush = (
+            isinstance(kv_connector_metadata, LMCacheMPConnectorMetadata)
+            and kv_connector_metadata.need_flush
+        )
+        worker_adapter.handle_preemptions(need_flush)
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -963,6 +983,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         metadata = LMCacheMPConnectorMetadata()
+        metadata.need_flush = self._scheduler_step_needs_flush(scheduler_output)
 
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
@@ -975,6 +996,25 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._report_block_allocation_deltas(scheduler_output)
 
         return metadata
+
+    def _scheduler_step_needs_flush(self, scheduler_output: SchedulerOutput) -> bool:
+        """Return whether this scheduler step can overwrite preempted blocks."""
+        # vLLM 0.10+ exposes resumed preemptions through cached-request fields.
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        resumed_req_ids = getattr(cached_reqs, "resumed_req_ids", None)
+        if resumed_req_ids:
+            return True
+        resumed_flags = getattr(cached_reqs, "resumed_from_preemption", None)
+        if resumed_flags and any(resumed_flags):
+            return True
+        # Conservative fallback for alternate scheduler output schemas.
+        preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", None)
+        if preempted_req_ids:
+            return True
+        evicted_req_ids = getattr(scheduler_output, "evicted_req_ids", None)
+        if evicted_req_ids:
+            return True
+        return False
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """

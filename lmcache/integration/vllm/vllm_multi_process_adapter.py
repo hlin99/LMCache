@@ -1430,6 +1430,18 @@ class LMCacheMPWorkerAdapter:
         self.error_block_ids.clear()
         return errors
 
+    def handle_preemptions(self, need_flush: bool) -> None:
+        """Handle worker-side preemption hints from connector metadata.
+
+        When ``need_flush`` is true, synchronize deferred non-GPU gather work
+        before the next forward pass can overwrite paged KV blocks.
+        """
+        if not need_flush:
+            return
+        if not self.is_healthy or self.transfer_ctx is None:
+            return
+        self.transfer_ctx.flush_inflight_gathers()
+
     def shutdown(self):
         """
         Shutdown the LMCache MP worker adapter
