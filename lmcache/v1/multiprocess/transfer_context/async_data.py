@@ -33,6 +33,12 @@ DEFAULT_NON_GPU_COMMIT_WORKERS = 4
 class AsyncDataTransferContext(DataTransferContext):
     """Fully async non-GPU data transfer context (store-only async).
 
+    "Store-only async" means ``submit_store`` returns an *unresolved* future
+    that resolves only after the deferred gather (GPU->CPU copy) and commit
+    (CPU->server) both complete off the forward thread, while
+    ``submit_retrieve`` stays synchronous and returns an already-resolved
+    future exactly as on the base context.
+
     Inherits :class:`DataTransferContext` and reuses its ``register()`` (layout
     / SHM registration, no stream dependency) and ``submit_retrieve()`` (this
     path does not change retrieve). Only the store is made async.
@@ -265,6 +271,13 @@ class AsyncDataTransferContext(DataTransferContext):
         return completion
 
     def flush_inflight_gathers(self) -> None:
+        """Synchronize all in-flight gather (GPU->CPU) events.
+
+        Called at preemption/eviction time (and during ``close``) so that vLLM
+        cannot overwrite paged KV blocks before a deferred gather has finished
+        reading them. Only gather completion is awaited; commit futures are not
+        affected, since commits read from LMCache-owned staging buffers.
+        """
         with self._inflight_lock:
             gather_events = list(self._inflight_gather_events)
         for event in gather_events:
