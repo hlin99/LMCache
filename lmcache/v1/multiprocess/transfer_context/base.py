@@ -251,8 +251,9 @@ def gather_paged_kv_to_cpu(
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
         out: Optional pre-allocated output tensors.  If provided, length
-            must equal ``len(chunk_indices)`` when ``chunk_indices`` is
-            given, or the total number of chunks otherwise.
+            must be at least ``len(chunk_indices)`` when ``chunk_indices``
+            is given, or the total number of chunks otherwise.  Any extra
+            buffers beyond the number of gathered chunks are ignored.
         chunk_indices: Optional list of chunk positions (into the full
             ``block_ids`` sequence) to gather.  When provided together with
             ``out``, only those chunks are gathered and written into
@@ -264,6 +265,10 @@ def gather_paged_kv_to_cpu(
         ``[2, num_layers, chunk_tokens, hidden_dim]`` where dimension ``0``
         stores ``(K, V)``. For MLA (multi-head latent attention) each chunk
         has shape ``[num_layers, chunk_tokens, hidden_dim]``.
+
+    Raises:
+        ValueError: If ``out`` is provided with fewer buffers than the number
+            of gathered chunks.
     """
     # First Party
     from lmcache.v1.gpu_connector.utils import (
@@ -271,6 +276,7 @@ def gather_paged_kv_to_cpu(
         get_hidden_dim_size,
         get_num_blocks,
         get_num_layers,
+        is_mla,
         make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
     )
@@ -302,14 +308,17 @@ def gather_paged_kv_to_cpu(
     iter_indices = (
         list(chunk_indices) if chunk_indices is not None else list(range(num_chunks))
     )
-    if out is not None and len(out) != len(iter_indices):
-        raise ValueError("Length of out must match number of gathered chunks")
+    # Require at least one output buffer per gathered chunk. Extra trailing
+    # buffers are ignored (see ``chunks = out[: len(iter_indices)]`` below),
+    # mirroring the scatter-side length check for consistency.
+    if out is not None and len(out) < len(iter_indices):
+        raise ValueError(
+            f"out length ({len(out)}) must be at least the number of "
+            f"gathered chunks ({len(iter_indices)})"
+        )
 
     if out is None:
-        use_mla = gpu_kv_format in (
-            lmc_ops.GPUKVFormat.NL_X_NB_BS_HS,
-            lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS,
-        )
+        use_mla = is_mla(gpu_kv_format)
         if use_mla:
             chunks = [
                 torch.empty(
@@ -329,7 +338,9 @@ def gather_paged_kv_to_cpu(
                 for _ in iter_indices
             ]
     else:
-        chunks = out
+        # Ignore any extra trailing buffers beyond what we actually gather so
+        # the kernel's ``total_blocks % num_objects`` invariant still holds.
+        chunks = out[: len(iter_indices)]
 
     selected_block_ids: list[int] = []
     for chunk_idx in iter_indices:
@@ -365,13 +376,22 @@ def scatter_cpu_to_paged_kv(
 
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
-        block_ids: Flattened destination block IDs for all chunks.
+        block_ids: Flattened destination block IDs for all chunks.  Length
+            must be at least ``len(chunks) * blocks_per_chunk``; any extra
+            trailing block IDs are ignored.
         chunks: List of CPU chunk tensors (as returned by
             :func:`gather_paged_kv_to_cpu`).
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
-        skip_first_n_tokens: Token prefix to skip when scattering.
+        skip_first_n_tokens: Token prefix to skip when scattering.  Must be a
+            multiple of ``block_size``; non-aligned values are rounded down
+            to the nearest whole block and an error is logged (matching the
+            GPU transfer path).
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
+
+    Raises:
+        ValueError: If ``block_ids`` is shorter than
+            ``len(chunks) * blocks_per_chunk``.
     """
     # First Party
     from lmcache.v1.gpu_connector.utils import (
@@ -386,6 +406,16 @@ def scatter_cpu_to_paged_kv(
     if not chunks:
         return
 
+    # Require enough block IDs to cover every chunk. Extra trailing block IDs
+    # are ignored by the per-chunk slicing below, mirroring the gather-side
+    # ``out`` length check for consistency.
+    if len(block_ids) < len(chunks) * blocks_per_chunk:
+        raise ValueError(
+            f"block_ids length ({len(block_ids)}) must be at least "
+            f"len(chunks) ({len(chunks)}) * blocks_per_chunk "
+            f"({blocks_per_chunk})"
+        )
+
     tensors = list(kv_caches.values())
     fmt, normalized = normalize_kv_and_discover_format(
         tensors, EngineType.VLLM, layout_hints=layout_hints
@@ -398,9 +428,17 @@ def scatter_cpu_to_paged_kv(
     num_blocks = get_num_blocks(normalized, gpu_kv_format)
     chunk_tokens = blocks_per_chunk * block_size
 
+    # Block-level transfer can only skip whole blocks. A non-aligned prefix is
+    # rounded down to the nearest block (matching the GPU transfer path in
+    # gpu_transfer.py) rather than raising, so a slightly misaligned skip
+    # degrades gracefully instead of failing the whole retrieve.
     if skip_first_n_tokens % block_size != 0:
-        raise ValueError(
-            "skip_first_n_tokens must be block-aligned for block KV transfer."
+        logger.error(
+            "skip_first_n_tokens (%d) is not block-aligned (block_size=%d); "
+            "rounding down to %d blocks",
+            skip_first_n_tokens,
+            block_size,
+            skip_first_n_tokens // block_size,
         )
     skip_prefix_n_blocks = skip_first_n_tokens // block_size
 
