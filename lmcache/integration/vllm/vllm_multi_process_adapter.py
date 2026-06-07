@@ -476,6 +476,11 @@ class LoadStoreOp:
     @property
     def flat_block_ids(self) -> list[int]:
         """Return all block IDs flattened for group-blind error paths."""
+        if not self.block_ids:
+            return []
+        # Defend against IPC serialization flattening [[20, 21, …]] → [20, 21, …]
+        if isinstance(self.block_ids[0], int):
+            return list(self.block_ids)
         return [
             block_id
             for group_block_ids in self.block_ids
