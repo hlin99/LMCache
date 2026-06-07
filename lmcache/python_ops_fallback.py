@@ -1403,50 +1403,53 @@ def _transfer_per_layer_mla(
     skip_prefix_n_blocks: int,
 ) -> None:
     """Handle MLA per-layer formats: [NB, BS, HS]."""
-    if not is_d2h and layer_tensors and object_tensors:
-        target_device = layer_tensors[0].device
-        objs_on_device = [obj.to(target_device) for obj in object_tensors]
+    if not layer_tensors or not object_tensors:
+        return
 
-    for layer_idx, layer in enumerate(layer_tensors):
-        is_flat = int(gpu_kv_format) == int(GPUKVFormat.NL_X_NBBS_ONE_HS)
+    target_device = layer_tensors[0].device
+    is_flat = int(gpu_kv_format) == int(GPUKVFormat.NL_X_NBBS_ONE_HS)
+    if is_flat:
+        token_offsets = torch.arange(block_size, dtype=torch.long, device=target_device)
+
+    for object_idx, obj in enumerate(object_tensors):
+        valid = _valid_block_range(
+            object_idx,
+            block_id_list,
+            blocks_per_object,
+            block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        engine_block_ids, offset_in_object = valid
+        n_valid = len(engine_block_ids)
+        token_end = offset_in_object + n_valid * block_size
+        eff_idx = torch.tensor(engine_block_ids, dtype=torch.long, device=target_device)
+
         if is_flat:
-            token_offsets = torch.arange(
-                block_size, dtype=torch.long, device=layer.device
-            )
-        for object_idx, obj in enumerate(object_tensors):
-            valid = _valid_block_range(
-                object_idx,
-                block_id_list,
-                blocks_per_object,
-                block_size,
-                skip_prefix_n_blocks,
-            )
-            if valid is None:
-                continue
-            engine_block_ids, offset_in_object = valid
-            n_valid = len(engine_block_ids)
-            token_end = offset_in_object + n_valid * block_size
-            eff_idx = torch.tensor(
-                engine_block_ids, dtype=torch.long, device=layer.device
-            )
-            if is_flat:
-                token_indices = (
-                    eff_idx[:, None] * block_size + token_offsets[None, :]
-                ).reshape(-1)
+            token_indices = (
+                eff_idx[:, None] * block_size + token_offsets[None, :]
+            ).reshape(-1)
 
-            if is_d2h:
+        if is_d2h:
+            gathered_layers = []
+            for layer in layer_tensors:
                 if is_flat:
                     layer_blocks = layer.index_select(0, token_indices)
                 else:
                     layer_blocks = layer.index_select(0, eff_idx)
-                flat = layer_blocks.reshape(n_valid * block_size, layer.shape[-1])
-                obj[layer_idx, offset_in_object:token_end].copy_(
-                    flat, non_blocking=True
+                gathered_layers.append(
+                    layer_blocks.reshape(n_valid * block_size, layer.shape[-1])
                 )
-            else:
-                obj_device = objs_on_device[object_idx]
-                src = obj_device[layer_idx, offset_in_object:token_end]
+            chunk_gpu = torch.stack(gathered_layers)
+            obj[:, offset_in_object:token_end].copy_(chunk_gpu, non_blocking=True)
+        else:
+            chunk_gpu = obj[:, offset_in_object:token_end].to(
+                target_device, non_blocking=True
+            )
+            for layer_idx, layer in enumerate(layer_tensors):
                 hidden_size = layer.shape[-1]
+                src = chunk_gpu[layer_idx]
                 if is_flat:
                     src_tokens = src.reshape(n_valid * block_size, 1, hidden_size)
                     layer.index_copy_(0, token_indices, src_tokens)
@@ -1466,56 +1469,60 @@ def _transfer_per_layer_hnd(
     skip_prefix_n_blocks: int,
 ) -> None:
     """Handle per-layer HND formats: heads before block tokens."""
-    if not is_d2h and layer_tensors and object_tensors:
-        target_device = layer_tensors[0].device
-        objs_on_device = [obj.to(target_device) for obj in object_tensors]
+    if not layer_tensors or not object_tensors:
+        return
 
-    for layer_idx, layer in enumerate(layer_tensors):
-        # Determine K/V split based on specific format
-        if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_NH_BS_HS):
-            k_t, v_t = layer[0], layer[1]
-        else:
-            k_t, v_t = layer[:, 0], layer[:, 1]
-        _nb, nh, _bs, hs = k_t.shape
+    target_device = layer_tensors[0].device
+    is_nl_two = int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_NH_BS_HS)
 
-        for object_idx, obj in enumerate(object_tensors):
-            valid = _valid_block_range(
-                object_idx,
-                block_id_list,
-                blocks_per_object,
-                block_size,
-                skip_prefix_n_blocks,
-            )
-            if valid is None:
-                continue
-            engine_block_ids, offset_in_object = valid
-            n_valid = len(engine_block_ids)
-            token_end = offset_in_object + n_valid * block_size
-            eff_idx = torch.tensor(
-                engine_block_ids, dtype=torch.long, device=layer.device
-            )
+    for object_idx, obj in enumerate(object_tensors):
+        valid = _valid_block_range(
+            object_idx,
+            block_id_list,
+            blocks_per_object,
+            block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        engine_block_ids, offset_in_object = valid
+        n_valid = len(engine_block_ids)
+        token_end = offset_in_object + n_valid * block_size
+        eff_idx = torch.tensor(engine_block_ids, dtype=torch.long, device=target_device)
 
-            if is_d2h:
-                k_blocks = (
+        if is_d2h:
+            k_all_layers = []
+            v_all_layers = []
+            for layer in layer_tensors:
+                if is_nl_two:
+                    k_t, v_t = layer[0], layer[1]
+                else:
+                    k_t, v_t = layer[:, 0], layer[:, 1]
+                _nb, nh, _bs, hs = k_t.shape
+                k_all_layers.append(
                     k_t.index_select(0, eff_idx)
                     .permute(0, 2, 1, 3)
                     .reshape(n_valid * block_size, nh * hs)
                 )
-                v_blocks = (
+                v_all_layers.append(
                     v_t.index_select(0, eff_idx)
                     .permute(0, 2, 1, 3)
                     .reshape(n_valid * block_size, nh * hs)
                 )
-                obj[0, layer_idx, offset_in_object:token_end].copy_(
-                    k_blocks, non_blocking=True
-                )
-                obj[1, layer_idx, offset_in_object:token_end].copy_(
-                    v_blocks, non_blocking=True
-                )
-            else:
-                obj_device = objs_on_device[object_idx]
-                k_src = obj_device[0, layer_idx, offset_in_object:token_end]
-                v_src = obj_device[1, layer_idx, offset_in_object:token_end]
+            chunk_gpu = torch.stack([torch.stack(k_all_layers), torch.stack(v_all_layers)])
+            obj[:, :, offset_in_object:token_end].copy_(chunk_gpu, non_blocking=True)
+        else:
+            chunk_gpu = obj[:, :, offset_in_object:token_end].to(
+                target_device, non_blocking=True
+            )
+            for layer_idx, layer in enumerate(layer_tensors):
+                if is_nl_two:
+                    k_t, v_t = layer[0], layer[1]
+                else:
+                    k_t, v_t = layer[:, 0], layer[:, 1]
+                _nb, nh, _bs, hs = k_t.shape
+                k_src = chunk_gpu[0, layer_idx]
+                v_src = chunk_gpu[1, layer_idx]
                 k_blocks = k_src.reshape(n_valid, block_size, nh, hs).permute(
                     0, 2, 1, 3
                 )
@@ -1537,61 +1544,63 @@ def _transfer_per_layer_nhd(
     skip_prefix_n_blocks: int,
 ) -> None:
     """Handle per-layer NHD formats: block tokens before heads."""
-    if not is_d2h and layer_tensors and object_tensors:
-        target_device = layer_tensors[0].device
-        objs_on_device = [obj.to(target_device) for obj in object_tensors]
+    if not layer_tensors or not object_tensors:
+        return
 
-    for layer_idx, layer in enumerate(layer_tensors):
-        # Determine K/V split based on specific format
-        if int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_BS_NH_HS):
-            k_t, v_t = layer[0], layer[1]
+    target_device = layer_tensors[0].device
+    is_nl_two = int(gpu_kv_format) == int(GPUKVFormat.NL_X_TWO_NB_BS_NH_HS)
+
+    for object_idx, obj in enumerate(object_tensors):
+        valid = _valid_block_range(
+            object_idx,
+            block_id_list,
+            blocks_per_object,
+            block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        engine_block_ids, offset_in_object = valid
+        n_valid = len(engine_block_ids)
+        token_end = offset_in_object + n_valid * block_size
+        eff_idx = torch.tensor(engine_block_ids, dtype=torch.long, device=target_device)
+
+        if is_d2h:
+            k_all_layers = []
+            v_all_layers = []
+            for layer in layer_tensors:
+                if is_nl_two:
+                    k_t, v_t = layer[0], layer[1]
+                else:
+                    k_t, v_t = layer[:, 0], layer[:, 1]
+                _nb, _bs, nh, hs = k_t.shape
+                k_all_layers.append(
+                    k_t.index_select(0, eff_idx).reshape(n_valid * block_size, nh * hs)
+                )
+                v_all_layers.append(
+                    v_t.index_select(0, eff_idx).reshape(n_valid * block_size, nh * hs)
+                )
+            chunk_gpu = torch.stack([torch.stack(k_all_layers), torch.stack(v_all_layers)])
+            obj[:, :, offset_in_object:token_end].copy_(chunk_gpu, non_blocking=True)
         else:
-            k_t, v_t = layer[:, 0], layer[:, 1]
-        _nb, _bs, nh, hs = k_t.shape
-
-        for object_idx, obj in enumerate(object_tensors):
-            valid = _valid_block_range(
-                object_idx,
-                block_id_list,
-                blocks_per_object,
-                block_size,
-                skip_prefix_n_blocks,
+            chunk_gpu = obj[:, :, offset_in_object:token_end].to(
+                target_device, non_blocking=True
             )
-            if valid is None:
-                continue
-            engine_block_ids, offset_in_object = valid
-            n_valid = len(engine_block_ids)
-            token_end = offset_in_object + n_valid * block_size
-            eff_idx = torch.tensor(
-                engine_block_ids, dtype=torch.long, device=layer.device
-            )
-
-            if is_d2h:
-                k_blocks = k_t.index_select(0, eff_idx).reshape(
-                    n_valid * block_size, nh * hs
-                )
-                v_blocks = v_t.index_select(0, eff_idx).reshape(
-                    n_valid * block_size, nh * hs
-                )
-                obj[0, layer_idx, offset_in_object:token_end].copy_(
-                    k_blocks, non_blocking=True
-                )
-                obj[1, layer_idx, offset_in_object:token_end].copy_(
-                    v_blocks, non_blocking=True
-                )
-            else:
-                obj_device = objs_on_device[object_idx]
-                k_src = obj_device[0, layer_idx, offset_in_object:token_end]
-                v_src = obj_device[1, layer_idx, offset_in_object:token_end]
+            for layer_idx, layer in enumerate(layer_tensors):
+                if is_nl_two:
+                    k_t, v_t = layer[0], layer[1]
+                else:
+                    k_t, v_t = layer[:, 0], layer[:, 1]
+                _nb, _bs, nh, hs = k_t.shape
                 k_t.index_copy_(
                     0,
                     eff_idx,
-                    k_src.reshape(n_valid, block_size, nh, hs),
+                    chunk_gpu[0, layer_idx].reshape(n_valid, block_size, nh, hs),
                 )
                 v_t.index_copy_(
                     0,
                     eff_idx,
-                    v_src.reshape(n_valid, block_size, nh, hs),
+                    chunk_gpu[1, layer_idx].reshape(n_valid, block_size, nh, hs),
                 )
 
 
