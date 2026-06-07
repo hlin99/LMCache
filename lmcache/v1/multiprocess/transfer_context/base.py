@@ -33,6 +33,7 @@ from lmcache.v1.multiprocess.mq import MessageQueueClient
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.gpu_connector.utils import DiscoverableKVCache
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
@@ -249,9 +250,9 @@ def gather_paged_kv_to_cpu(
         blocks_per_chunk: Number of paged blocks in one LMCache chunk.
         layout_hints: Optional engine layout hints.
         gpu_kv_format: Optional pre-detected KV format.
-        out: Optional pre-allocated output tensors (one per entry in
-            ``chunk_indices`` when ``chunk_indices`` is given, or one per
-            chunk otherwise).
+        out: Optional pre-allocated output tensors.  If provided, length
+            must equal ``len(chunk_indices)`` when ``chunk_indices`` is
+            given, or the total number of chunks otherwise.
         chunk_indices: Optional list of chunk positions (into the full
             ``block_ids`` sequence) to gather.  When provided together with
             ``out``, only those chunks are gathered and written into
@@ -267,7 +268,10 @@ def gather_paged_kv_to_cpu(
     # First Party
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
-        is_mla,
+        get_hidden_dim_size,
+        get_num_blocks,
+        get_num_layers,
+        make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
     )
     import lmcache.c_ops as lmc_ops
@@ -278,99 +282,73 @@ def gather_paged_kv_to_cpu(
     )
     if gpu_kv_format is None:
         gpu_kv_format = fmt
-    use_mla = is_mla(gpu_kv_format)
-    is_hnd = gpu_kv_format in (
-        lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
-        lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
-    )
 
     block_size = get_block_size(normalized, gpu_kv_format)
+    num_layers = get_num_layers(normalized, gpu_kv_format)
+    hidden_dim_size = get_hidden_dim_size(normalized, gpu_kv_format)
+    num_blocks = get_num_blocks(normalized, gpu_kv_format)
     num_chunks = len(block_ids) // blocks_per_chunk
+    chunk_tokens = blocks_per_chunk * block_size
 
-    # After normalization the structure is always a list of per-layer
-    # tensors. Cast once so all downstream indexing is typed correctly.
-    layer_tensors = cast(list[torch.Tensor], normalized)
+    shape_desc = make_page_buffer_shape_desc(
+        normalized,
+        gpu_kv_format,
+        layer_idx=0,
+        num_layers_in_group=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+    )
 
-    chunks: list[torch.Tensor] = [] if out is None else out
+    iter_indices = (
+        list(chunk_indices) if chunk_indices is not None else list(range(num_chunks))
+    )
+    if out is not None and len(out) != len(iter_indices):
+        raise ValueError("Length of out must match number of gathered chunks")
 
-    # When chunk_indices is given (SHM partial-reservation path), only
-    # process the specified subset.  The i-th entry in chunk_indices is the
-    # position of that chunk within the full block_ids sequence; the
-    # corresponding pre-allocated slot lives at out[i].
-    iter_indices = chunk_indices if chunk_indices is not None else range(num_chunks)
-
-    for out_idx, chunk_idx in enumerate(iter_indices):
-        chunk_block_ids = block_ids[
-            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
-        ]
+    if out is None:
+        use_mla = gpu_kv_format in (
+            lmc_ops.GPUKVFormat.NL_X_NB_BS_HS,
+            lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS,
+        )
         if use_mla:
-            mla_layers: list[torch.Tensor] = []
-            idx = torch.tensor(chunk_block_ids, dtype=torch.long)
-            for layer in layer_tensors:
-                layer_blocks = layer[idx]
-                mla_layers.append(
-                    layer_blocks.reshape(
-                        len(chunk_block_ids) * block_size, layer_blocks.shape[-1]
-                    )
+            chunks = [
+                torch.empty(
+                    (num_layers, chunk_tokens, hidden_dim_size),
+                    dtype=tensors[0].dtype,
+                    device=torch.device("cpu"),
                 )
-            chunk_tensor = torch.stack(mla_layers, dim=0)
-            if out is not None:
-                out[out_idx].copy_(chunk_tensor, non_blocking=True)
-            else:
-                chunks.append(chunk_tensor.cpu())
+                for _ in iter_indices
+            ]
         else:
-            k_layers: list[torch.Tensor] = []
-            v_layers: list[torch.Tensor] = []
-            for layer in layer_tensors:
-                if is_hnd:
-                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                        k_t = layer[0]
-                        v_t = layer[1]
-                    else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _num_blocks, num_heads, _block_size, head_size = k_t.shape
-                    k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    # HND blocks are [NB, NH, BS, HS]; convert to token-major
-                    # [NB, BS, NH, HS] before flattening to [tokens, NH*HS].
-                    k_layers.append(
-                        k_blocks.permute(0, 2, 1, 3).reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
-                        )
-                    )
-                    v_layers.append(
-                        v_blocks.permute(0, 2, 1, 3).reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
-                        )
-                    )
-                else:
-                    if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                        k_t = layer[0]
-                        v_t = layer[1]
-                    else:
-                        k_t = layer[:, 0]
-                        v_t = layer[:, 1]
-                    _num_blocks, _block_size, num_heads, head_size = k_t.shape
-                    k_blocks = k_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    v_blocks = v_t[torch.tensor(chunk_block_ids, dtype=torch.long)]
-                    k_layers.append(
-                        k_blocks.reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
-                        )
-                    )
-                    v_layers.append(
-                        v_blocks.reshape(
-                            len(chunk_block_ids) * block_size, num_heads * head_size
-                        )
-                    )
-            k_stacked = torch.stack(k_layers, dim=0)
-            v_stacked = torch.stack(v_layers, dim=0)
-            chunk_tensor = torch.stack([k_stacked, v_stacked], dim=0)
-            if out is not None:
-                out[out_idx].copy_(chunk_tensor, non_blocking=True)
-            else:
-                chunks.append(chunk_tensor.cpu())
+            chunks = [
+                torch.empty(
+                    (2, num_layers, chunk_tokens, hidden_dim_size),
+                    dtype=tensors[0].dtype,
+                    device=torch.device("cpu"),
+                )
+                for _ in iter_indices
+            ]
+    else:
+        chunks = out
+
+    selected_block_ids: list[int] = []
+    for chunk_idx in iter_indices:
+        selected_block_ids.extend(
+            block_ids[chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk]
+        )
+
+    if selected_block_ids:
+        lmc_ops.multi_layer_block_kv_transfer(
+            cast("DiscoverableKVCache", normalized),
+            chunks,
+            selected_block_ids,
+            tensors[0].device,
+            lmc_ops.TransferDirection.D2H,
+            shape_desc,
+            chunk_tokens,
+            gpu_kv_format,
+            0,
+        )
     return chunks
 
 
@@ -398,7 +376,9 @@ def scatter_cpu_to_paged_kv(
     # First Party
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
-        is_mla,
+        get_num_blocks,
+        get_num_layers,
+        make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
     )
     import lmcache.c_ops as lmc_ops
@@ -412,84 +392,44 @@ def scatter_cpu_to_paged_kv(
     )
     if gpu_kv_format is None:
         gpu_kv_format = fmt
-    use_mla = is_mla(gpu_kv_format)
 
     block_size = get_block_size(normalized, gpu_kv_format)
-    device = tensors[0].device
-    is_hnd = gpu_kv_format in (
-        lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
-        lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
+    num_layers = get_num_layers(normalized, gpu_kv_format)
+    num_blocks = get_num_blocks(normalized, gpu_kv_format)
+    chunk_tokens = blocks_per_chunk * block_size
+
+    if skip_first_n_tokens % block_size != 0:
+        raise ValueError(
+            "skip_first_n_tokens must be block-aligned for block KV transfer."
+        )
+    skip_prefix_n_blocks = skip_first_n_tokens // block_size
+
+    shape_desc = make_page_buffer_shape_desc(
+        normalized,
+        gpu_kv_format,
+        layer_idx=0,
+        num_layers_in_group=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
     )
 
-    # After normalization the structure is always a list of per-layer
-    # tensors. Cast once so all downstream indexing is typed correctly.
-    layer_tensors = cast(list[torch.Tensor], normalized)
+    selected_block_ids: list[int] = []
+    for chunk_idx in range(len(chunks)):
+        selected_block_ids.extend(
+            block_ids[chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk]
+        )
 
-    for chunk_idx, chunk_cpu in enumerate(chunks):
-        chunk_block_ids = block_ids[
-            chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk
-        ]
-        if not chunk_block_ids:
-            continue
+    if not selected_block_ids:
+        return
 
-        chunk_start_token = chunk_idx * blocks_per_chunk * block_size
-        chunk_end_token = chunk_start_token + len(chunk_block_ids) * block_size
-        effective_start = max(chunk_start_token, skip_first_n_tokens)
-        if effective_start >= chunk_end_token:
-            continue
-
-        skip_blocks_in_chunk = (effective_start - chunk_start_token) // block_size
-        effective_block_ids = chunk_block_ids[skip_blocks_in_chunk:]
-        if not effective_block_ids:
-            continue
-
-        skip_tokens = skip_blocks_in_chunk * block_size
-        chunk_device = chunk_cpu.to(device)
-
-        if use_mla:
-            eff_idx = torch.tensor(effective_block_ids, dtype=torch.long)
-            for layer_idx, layer in enumerate(layer_tensors):
-                mla_src = chunk_device[layer_idx, skip_tokens:]
-                hidden_size = layer.shape[-1]
-                mla_src_3d = mla_src.reshape(
-                    len(effective_block_ids), block_size, hidden_size
-                )
-                layer[eff_idx] = mla_src_3d
-        elif is_hnd:
-            for layer_idx, layer in enumerate(layer_tensors):
-                k_src = chunk_device[0, layer_idx, skip_tokens:]
-                v_src = chunk_device[1, layer_idx, skip_tokens:]
-                if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
-                    k_t = layer[0]
-                    v_t = layer[1]
-                else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
-                _nb, nh, _bs, hs = k_t.shape
-                k_blocks = k_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                ).permute(0, 2, 1, 3)
-                v_blocks = v_src.reshape(
-                    len(effective_block_ids), block_size, nh, hs
-                ).permute(0, 2, 1, 3)
-                k_t[effective_block_ids] = k_blocks
-                v_t[effective_block_ids] = v_blocks
-        else:
-            for layer_idx, layer in enumerate(layer_tensors):
-                k_src = chunk_device[0, layer_idx, skip_tokens:]
-                v_src = chunk_device[1, layer_idx, skip_tokens:]
-                if gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
-                    k_t = layer[0]
-                    v_t = layer[1]
-                else:
-                    k_t = layer[:, 0]
-                    v_t = layer[:, 1]
-                _num_blocks, _block_size, num_heads, head_size = k_t.shape
-                k_src_4d = k_src.reshape(
-                    len(effective_block_ids), block_size, num_heads, head_size
-                )
-                v_src_4d = v_src.reshape(
-                    len(effective_block_ids), block_size, num_heads, head_size
-                )
-                k_t[effective_block_ids] = k_src_4d
-                v_t[effective_block_ids] = v_src_4d
+    lmc_ops.multi_layer_block_kv_transfer(
+        cast("DiscoverableKVCache", normalized),
+        chunks,
+        selected_block_ids,
+        tensors[0].device,
+        lmc_ops.TransferDirection.H2D,
+        shape_desc,
+        chunk_tokens,
+        gpu_kv_format,
+        skip_prefix_n_blocks,
+    )
