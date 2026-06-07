@@ -475,7 +475,14 @@ class LoadStoreOp:
 
     @property
     def flat_block_ids(self) -> list[int]:
-        """Return all block IDs flattened for group-blind error paths."""
+        """Return all block IDs flattened for group-blind error paths.
+
+        Handles both the normal ``list[list[int]]`` format and the
+        IPC-flattened ``list[int]`` format that vLLM v0.19.0 produces when
+        ``SchedulerOutput`` serializes single-element nested lists across
+        process boundaries (e.g. ``[[20, 21]]`` → ``[20, 21]``).
+        Returns an empty list when ``block_ids`` is empty.
+        """
         if not self.block_ids:
             return []
         # Defend against IPC serialization flattening [[20, 21, …]] → [20, 21, …]
