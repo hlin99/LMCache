@@ -342,7 +342,10 @@ def gather_paged_kv_to_cpu(
         # the kernel's ``total_blocks % num_objects`` invariant still holds.
         # Return ``out`` unchanged when no trimming is needed so the in-place
         # fill contract (result is out) is preserved.
-        chunks = out if len(out) == len(iter_indices) else out[: len(iter_indices)]
+        if len(out) == len(iter_indices):
+            chunks = out
+        else:
+            chunks = out[: len(iter_indices)]
 
     selected_block_ids: list[int] = []
     for chunk_idx in iter_indices:
