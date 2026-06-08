@@ -91,6 +91,15 @@ logger.info(
 )
 
 
+def _is_fallback_backend() -> bool:
+    """Return True if multi_layer_block_kv_transfer is the Python fallback."""
+    import lmcache.c_ops as lmc_ops
+    # The fallback is defined in python_ops_fallback module;
+    # compiled C++/CUDA/XPU ops come from native extensions.
+    module = getattr(lmc_ops.multi_layer_block_kv_transfer, "__module__", "")
+    return "fallback" in module
+
+
 def _tensors_to_ptrs(tensors: list[torch.Tensor]) -> list[int]:
     """Convert a list of tensors to a list of their data_ptr() values."""
     return [t.data_ptr() for t in tensors]
@@ -421,16 +430,22 @@ def gather_paged_kv_to_cpu(
         else:
             objs_arg = _tensors_to_ptrs(chunks)
 
-        _ptrs_np = np.array([t.data_ptr() for t in normalized], dtype=np.uint64).view(np.int64)
-        paged_buffer_ptrs_tensor = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
-        block_ids_tensor = torch.tensor(
-            selected_block_ids, dtype=torch.int64, device=tensors[0].device
-        )
+        if _is_fallback_backend():
+            # Python fallback accepts tensor list directly, no pointer conversion needed.
+            paged_arg = normalized
+            block_ids_arg = selected_block_ids
+        else:
+            # Compiled C++/CUDA/XPU binding requires int64 pointer tensor.
+            _ptrs_np = np.array([t.data_ptr() for t in normalized], dtype=np.uint64).view(np.int64)
+            paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
+            block_ids_arg = torch.tensor(
+                selected_block_ids, dtype=torch.int64, device=tensors[0].device
+            )
 
         lmc_ops.multi_layer_block_kv_transfer(
-            paged_buffer_ptrs_tensor,
+            paged_arg,
             objs_arg,
-            block_ids_tensor,
+            block_ids_arg,
             tensors[0].device,
             lmc_ops.TransferDirection.D2H,
             shape_desc,
@@ -545,16 +560,22 @@ def scatter_cpu_to_paged_kv(
     else:
         objs_arg = _tensors_to_ptrs(chunks)
 
-    _ptrs_np = np.array([t.data_ptr() for t in normalized], dtype=np.uint64).view(np.int64)
-    paged_buffer_ptrs_tensor = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
-    block_ids_tensor = torch.tensor(
-        selected_block_ids, dtype=torch.int64, device=tensors[0].device
-    )
+    if _is_fallback_backend():
+        # Python fallback accepts tensor list directly, no pointer conversion needed.
+        paged_arg = normalized
+        block_ids_arg = selected_block_ids
+    else:
+        # Compiled C++/CUDA/XPU binding requires int64 pointer tensor.
+        _ptrs_np = np.array([t.data_ptr() for t in normalized], dtype=np.uint64).view(np.int64)
+        paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
+        block_ids_arg = torch.tensor(
+            selected_block_ids, dtype=torch.int64, device=tensors[0].device
+        )
 
     lmc_ops.multi_layer_block_kv_transfer(
-        paged_buffer_ptrs_tensor,
+        paged_arg,
         objs_arg,
-        block_ids_tensor,
+        block_ids_arg,
         tensors[0].device,
         lmc_ops.TransferDirection.H2D,
         shape_desc,
