@@ -1143,7 +1143,7 @@ def multi_layer_block_kv_transfer(
         gpu_kv_format=gpu_kv_format,
         dtype=kv_dtype,
     )
-    block_ids_len = int(block_ids.numel()) if isinstance(block_ids, torch.Tensor) else len(
+    n_block_ids = int(block_ids.numel()) if isinstance(block_ids, torch.Tensor) else len(
         block_ids
     )
     blocks_per_object = lmcache_chunk_size // int(shape_desc.bs)
@@ -1154,7 +1154,7 @@ def multi_layer_block_kv_transfer(
             normalized,
             object_tensors,
             block_ids,
-            block_ids_len,
+            n_block_ids,
             blocks_per_object,
             block_size,
             gpu_kv_format,
@@ -1166,7 +1166,7 @@ def multi_layer_block_kv_transfer(
             normalized,
             object_tensors,
             block_ids,
-            block_ids_len,
+            n_block_ids,
             blocks_per_object,
             block_size,
             gpu_kv_format,
@@ -1178,7 +1178,7 @@ def multi_layer_block_kv_transfer(
             normalized,
             object_tensors,
             block_ids,
-            block_ids_len,
+            n_block_ids,
             blocks_per_object,
             block_size,
             gpu_kv_format,
@@ -1190,7 +1190,7 @@ def multi_layer_block_kv_transfer(
             normalized,
             object_tensors,
             block_ids,
-            block_ids_len,
+            n_block_ids,
             blocks_per_object,
             block_size,
             gpu_kv_format,
@@ -1202,7 +1202,7 @@ def multi_layer_block_kv_transfer(
             normalized,
             object_tensors,
             block_ids,
-            block_ids_len,
+            n_block_ids,
             blocks_per_object,
             block_size,
             gpu_kv_format,
