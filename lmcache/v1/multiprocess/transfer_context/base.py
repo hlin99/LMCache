@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 # Third Party
+import numpy as np
 import torch
 
 # First Party
@@ -69,24 +70,6 @@ def _detect_block_transfer_accepts_tensor() -> bool:
         except (ValueError, TypeError):
             pass
 
-        # Attempt 2: parse __doc__ (pybind11 always generates docstrings
-        # showing the C++ signature, e.g. "lmcache_objects_ptrs: list[Tensor]")
-        doc = getattr(fn, "__doc__", None) or ""
-        # Look for the parameter section in the docstring
-        # pybind11 format: "multi_layer_block_kv_transfer(..., lmcache_objects_ptrs: List[Tensor], ...)"
-        if "lmcache_objects_ptrs" in doc:
-            # Find the type annotation following the parameter name
-            idx = doc.index("lmcache_objects_ptrs")
-            # Grab a reasonable window after the param name to check the type
-            snippet = doc[idx : idx + 80]
-            if "Tensor" in snippet:
-                return True
-            # Parameter found in doc but type doesn't mention Tensor → ptr-only
-            return False
-
-        # Attempt 3: try passing a small dummy tensor list and see if it
-        # raises TypeError (too risky to actually call with real data, skip)
-
     except Exception:
         # Import failed or any other error → conservative: assume ptr-only
         pass
@@ -101,6 +84,11 @@ _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR: bool = (
 """If True, ``lmc_ops.multi_layer_block_kv_transfer`` accepts
 ``list[torch.Tensor]`` directly for ``lmcache_objects_ptrs``.
 If False, callers must convert tensors to ``list[int]`` data pointers."""
+
+logger.info(
+    "multi_layer_block_kv_transfer mode: %s",
+    "tensor" if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR else "ptr",
+)
 
 
 def _tensors_to_ptrs(tensors: list[torch.Tensor]) -> list[int]:
@@ -433,9 +421,8 @@ def gather_paged_kv_to_cpu(
         else:
             objs_arg = _tensors_to_ptrs(chunks)
 
-        paged_buffer_ptrs_tensor = torch.tensor(
-            [t.data_ptr() for t in normalized], dtype=torch.int64, device=tensors[0].device
-        )
+        _ptrs_np = np.array([t.data_ptr() for t in normalized], dtype=np.uint64).view(np.int64)
+        paged_buffer_ptrs_tensor = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
         block_ids_tensor = torch.tensor(
             selected_block_ids, dtype=torch.int64, device=tensors[0].device
         )
@@ -558,9 +545,8 @@ def scatter_cpu_to_paged_kv(
     else:
         objs_arg = _tensors_to_ptrs(chunks)
 
-    paged_buffer_ptrs_tensor = torch.tensor(
-        [t.data_ptr() for t in normalized], dtype=torch.int64, device=tensors[0].device
-    )
+    _ptrs_np = np.array([t.data_ptr() for t in normalized], dtype=np.uint64).view(np.int64)
+    paged_buffer_ptrs_tensor = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
     block_ids_tensor = torch.tensor(
         selected_block_ids, dtype=torch.int64, device=tensors[0].device
     )
