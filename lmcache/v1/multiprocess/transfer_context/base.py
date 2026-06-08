@@ -414,22 +414,24 @@ def gather_paged_kv_to_cpu(
         )
 
     if selected_block_ids:
+        # Compiled bindings always require the first argument as an int64 pointer
+        # tensor, even when object pointers accept tensor objects.
+        _ptrs_np = np.array(
+            [t.data_ptr() for t in normalized],  # type: ignore[union-attr]
+            dtype=np.uint64,
+        ).view(np.int64)
+        paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
+
+        # The second argument is backend-dependent.
         if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
-            # Python fallback: accepts tensor list directly for all params.
-            paged_arg = normalized
             objs_arg = chunks
-            block_ids_arg = selected_block_ids
         else:
-            # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-            _ptrs_np = np.array(
-                [t.data_ptr() for t in normalized],  # type: ignore[union-attr]
-                dtype=np.uint64,
-            ).view(np.int64)
-            paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
             objs_arg = _tensors_to_ptrs(chunks)
-            block_ids_arg = torch.tensor(
-                selected_block_ids, dtype=torch.int64, device=tensors[0].device
-            )
+
+        # Compiled bindings always require block ids as int64 tensor.
+        block_ids_arg = torch.tensor(
+            selected_block_ids, dtype=torch.int64, device=tensors[0].device
+        )
 
         lmc_ops.multi_layer_block_kv_transfer(
             paged_arg,
@@ -542,22 +544,24 @@ def scatter_cpu_to_paged_kv(
     if not selected_block_ids:
         return
 
+    # Compiled bindings always require the first argument as an int64 pointer
+    # tensor, even when object pointers accept tensor objects.
+    _ptrs_np = np.array(
+        [t.data_ptr() for t in normalized],  # type: ignore[union-attr]
+        dtype=np.uint64,
+    ).view(np.int64)
+    paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
+
+    # The second argument is backend-dependent.
     if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
-        # Python fallback: accepts tensor list directly for all params.
-        paged_arg = normalized
         objs_arg = chunks
-        block_ids_arg = selected_block_ids
     else:
-        # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-        _ptrs_np = np.array(
-            [t.data_ptr() for t in normalized],  # type: ignore[union-attr]
-            dtype=np.uint64,
-        ).view(np.int64)
-        paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
         objs_arg = _tensors_to_ptrs(chunks)
-        block_ids_arg = torch.tensor(
-            selected_block_ids, dtype=torch.int64, device=tensors[0].device
-        )
+
+    # Compiled bindings always require block ids as int64 tensor.
+    block_ids_arg = torch.tensor(
+        selected_block_ids, dtype=torch.int64, device=tensors[0].device
+    )
 
     lmc_ops.multi_layer_block_kv_transfer(
         paged_arg,
