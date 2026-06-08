@@ -16,6 +16,7 @@ This module provides:
 from __future__ import annotations
 
 # Standard
+import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -37,6 +38,79 @@ if TYPE_CHECKING:
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Global capability flag: does lmc_ops.multi_layer_block_kv_transfer accept
+# list[torch.Tensor] directly for lmcache_objects_ptrs, or only list[int]?
+#
+# We inspect the function signature once at import time. If the annotation
+# for ``lmcache_objects_ptrs`` includes ``Tensor``, the op can handle tensors
+# natively and we pass them through. Otherwise (annotation is list[int], or
+# inspect fails entirely) we must convert tensors to data pointers before
+# calling.
+# ---------------------------------------------------------------------------
+def _detect_block_transfer_accepts_tensor() -> bool:
+    """Return True if lmc_ops.multi_layer_block_kv_transfer accepts
+    list[torch.Tensor] for its lmcache_objects_ptrs parameter."""
+    try:
+        import lmcache.c_ops as _lmc_ops
+
+        fn = _lmc_ops.multi_layer_block_kv_transfer
+
+        # Attempt 1: use inspect.signature (works on newer pybind11 builds)
+        try:
+            sig = inspect.signature(fn)
+            param = sig.parameters.get("lmcache_objects_ptrs")
+            if param is not None and param.annotation is not inspect.Parameter.empty:
+                ann_str = str(param.annotation)
+                if "Tensor" in ann_str:
+                    return True
+                # Annotation exists but no Tensor mention → ptr-only
+                return False
+        except (ValueError, TypeError):
+            pass
+
+        # Attempt 2: parse __doc__ (pybind11 always generates docstrings
+        # showing the C++ signature, e.g. "lmcache_objects_ptrs: list[Tensor]")
+        doc = getattr(fn, "__doc__", None) or ""
+        # Look for the parameter section in the docstring
+        # pybind11 format: "multi_layer_block_kv_transfer(..., lmcache_objects_ptrs: List[Tensor], ...)"
+        if "lmcache_objects_ptrs" in doc:
+            # Find the type annotation following the parameter name
+            idx = doc.index("lmcache_objects_ptrs")
+            # Grab a reasonable window after the param name to check the type
+            snippet = doc[idx : idx + 80]
+            if "Tensor" in snippet:
+                return True
+            # Parameter found in doc but type doesn't mention Tensor → ptr-only
+            return False
+
+        # Attempt 3: try passing a small dummy tensor list and see if it
+        # raises TypeError (too risky to actually call with real data, skip)
+
+    except Exception:
+        # Import failed or any other error → conservative: assume ptr-only
+        pass
+
+    # Default: inspect failed or lmc_ops not available → assume ptr-only
+    return False
+
+
+_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR: bool = (
+    _detect_block_transfer_accepts_tensor()
+)
+"""If True, ``lmc_ops.multi_layer_block_kv_transfer`` accepts
+``list[torch.Tensor]`` directly for ``lmcache_objects_ptrs``.
+If False, callers must convert tensors to ``list[int]`` data pointers."""
+
+
+def _tensors_to_ptrs(tensors: list[torch.Tensor]) -> list[int]:
+    """Convert a list of tensors to a list of their data_ptr() values."""
+    return [t.data_ptr() for t in tensors]
+
+
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -354,9 +428,16 @@ def gather_paged_kv_to_cpu(
         )
 
     if selected_block_ids:
+        # Determine what to pass as lmcache_objects_ptrs based on capability
+        objs_arg: list[torch.Tensor] | list[int]
+        if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+            objs_arg = chunks
+        else:
+            objs_arg = _tensors_to_ptrs(chunks)
+
         lmc_ops.multi_layer_block_kv_transfer(
             cast("DiscoverableKVCache", normalized),
-            chunks,
+            objs_arg,
             selected_block_ids,
             tensors[0].device,
             lmc_ops.TransferDirection.D2H,
@@ -465,9 +546,16 @@ def scatter_cpu_to_paged_kv(
     if not selected_block_ids:
         return
 
+    # Determine what to pass as lmcache_objects_ptrs based on capability
+    objs_arg: list[torch.Tensor] | list[int]
+    if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+        objs_arg = chunks
+    else:
+        objs_arg = _tensors_to_ptrs(chunks)
+
     lmc_ops.multi_layer_block_kv_transfer(
         cast("DiscoverableKVCache", normalized),
-        chunks,
+        objs_arg,
         selected_block_ids,
         tensors[0].device,
         lmc_ops.TransferDirection.H2D,
