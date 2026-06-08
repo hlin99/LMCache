@@ -319,6 +319,10 @@ def test_create_transfer_context_handle_mode_unsupported_device_raises(
         platform_registry.restore(snapshot)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for multi_layer_block_kv_transfer kernel",
+)
 @pytest.mark.parametrize(
     ("builder_fn", "expected_block_size", "expected_hidden_dim", "layout_hints"),
     [
@@ -354,7 +358,7 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip(
         scatter_cpu_to_paged_kv,
     )
 
-    source = builder_fn()
+    source = {k: v.cuda() for k, v in builder_fn().items()}
     (
         block_size,
         num_layers,
@@ -382,6 +386,10 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip(
             assert torch.allclose(source[name][1], destination[name][5])
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for multi_layer_block_kv_transfer kernel",
+)
 @pytest.mark.parametrize(
     ("hnd_builder", "expected_format"),
     [
@@ -402,7 +410,7 @@ def test_gather_scatter_roundtrip_hnd_layout(
     )
     import lmcache.c_ops as lmc_ops
 
-    source = hnd_builder(2, 8, 4, 2, 8)
+    source = {k: v.cuda() for k, v in hnd_builder(2, 8, 4, 2, 8).items()}
     layout_hints: LayoutHints = {"kv_layout": "HND"}
     (
         block_size,
@@ -453,6 +461,10 @@ def test_compute_kv_layout_empty_raises_value_error() -> None:
         compute_kv_layout({})
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for multi_layer_block_kv_transfer kernel",
+)
 @pytest.mark.parametrize(
     (
         "builder_fn",
@@ -501,7 +513,7 @@ def test_scatter_respects_skip_first_n_tokens(
         scatter_cpu_to_paged_kv,
     )
 
-    source = builder_fn()
+    source = {k: v.cuda() for k, v in builder_fn().items()}
     destination = {
         name: torch.full_like(tensor, 999.0) for name, tensor in source.items()
     }
@@ -876,6 +888,10 @@ def test_server_unregister_non_gpu_context_releases_pending_shm_locks(
     mock_storage.finish_read_prefetched.assert_called_once()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for multi_layer_block_kv_transfer kernel",
+)
 def test_gather_paged_kv_with_chunk_indices_subset() -> None:
     """gather_paged_kv_to_cpu with chunk_indices only gathers the specified chunks.
 
@@ -887,7 +903,7 @@ def test_gather_paged_kv_with_chunk_indices_subset() -> None:
     from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
 
     # 3 chunks (6 blocks, 2 blocks per chunk), but we only want chunks 0 and 2
-    source = _make_kv_caches(num_layers=2, num_blocks=6, block_size=4)
+    source = {k: v.cuda() for k, v in _make_kv_caches(num_layers=2, num_blocks=6, block_size=4).items()}
     blocks_per_chunk = 2
     # Pre-allocate output buffers for chunks 0 and 2 only (2 tensors, not 3).
     # Shape: [2, num_layers, chunk_tokens, hidden_dim] where

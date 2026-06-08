@@ -19,7 +19,7 @@ from __future__ import annotations
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 # Third Party
 import torch
@@ -33,8 +33,6 @@ from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 
 if TYPE_CHECKING:
-    # First Party
-    from lmcache.v1.gpu_connector.utils import DiscoverableKVCache
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
@@ -435,10 +433,17 @@ def gather_paged_kv_to_cpu(
         else:
             objs_arg = _tensors_to_ptrs(chunks)
 
+        paged_buffer_ptrs_tensor = torch.tensor(
+            [t.data_ptr() for t in normalized], dtype=torch.int64, device=tensors[0].device
+        )
+        block_ids_tensor = torch.tensor(
+            selected_block_ids, dtype=torch.int64, device=tensors[0].device
+        )
+
         lmc_ops.multi_layer_block_kv_transfer(
-            cast("DiscoverableKVCache", normalized),
+            paged_buffer_ptrs_tensor,
             objs_arg,
-            selected_block_ids,
+            block_ids_tensor,
             tensors[0].device,
             lmc_ops.TransferDirection.D2H,
             shape_desc,
@@ -553,10 +558,17 @@ def scatter_cpu_to_paged_kv(
     else:
         objs_arg = _tensors_to_ptrs(chunks)
 
+    paged_buffer_ptrs_tensor = torch.tensor(
+        [t.data_ptr() for t in normalized], dtype=torch.int64, device=tensors[0].device
+    )
+    block_ids_tensor = torch.tensor(
+        selected_block_ids, dtype=torch.int64, device=tensors[0].device
+    )
+
     lmc_ops.multi_layer_block_kv_transfer(
-        cast("DiscoverableKVCache", normalized),
+        paged_buffer_ptrs_tensor,
         objs_arg,
-        selected_block_ids,
+        block_ids_tensor,
         tensors[0].device,
         lmc_ops.TransferDirection.H2D,
         shape_desc,
