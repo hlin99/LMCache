@@ -2859,3 +2859,107 @@ def test_alloc_pinned_ptr_is_page_aligned(size: int) -> None:
             assert buf[i] == ((i & 0xFF) ^ 0xA5)
     finally:
         _py_ops.free_pinned_ptr(ptr)
+
+
+def test_flashinfer_block_transfer_avoids_strided_index_ops() -> None:
+    """Ensure flash_infer transfer avoids strided index_select/index_copy_ ops."""
+    num_layers = 2
+    num_blocks = 4
+    block_size = 2
+    num_heads = 2
+    head_size = 4
+    hidden_size = num_heads * head_size
+    chunk_tokens = num_blocks * block_size
+
+    shape_desc = _py_ops.PageBufferShapeDesc()
+    shape_desc.kv_size = 2
+    shape_desc.nl = num_layers
+    shape_desc.nb = num_blocks
+    shape_desc.bs = block_size
+    shape_desc.nh = num_heads
+    shape_desc.hs = head_size
+    shape_desc.element_size = torch.empty((), dtype=torch.float32).element_size()
+
+    block_ids = torch.tensor([3, 1], dtype=torch.int64)
+    original_index_select = torch.index_select
+    original_index_copy = torch.Tensor.index_copy_
+
+    for gpu_kv_format, layer_shape in (
+        (
+            _py_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
+            (num_blocks, 2, block_size, num_heads, head_size),
+        ),
+        (
+            _py_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
+            (num_blocks, 2, num_heads, block_size, head_size),
+        ),
+    ):
+        paged_layers = [
+            torch.randn(*layer_shape, dtype=torch.float32) for _ in range(num_layers)
+        ]
+        object_tensors = [
+            torch.zeros(2, num_layers, chunk_tokens, hidden_size, dtype=torch.float32)
+        ]
+        saw_non_contiguous_source = False
+
+        def _recording_index_select(
+            input_tensor: torch.Tensor,
+            dim: int,
+            index_tensor: torch.Tensor,
+            out: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """Track whether index_select reads from a non-contiguous source."""
+            nonlocal saw_non_contiguous_source
+            if not input_tensor.is_contiguous():
+                saw_non_contiguous_source = True
+            if out is None:
+                return original_index_select(input_tensor, dim, index_tensor)
+            return original_index_select(input_tensor, dim, index_tensor, out=out)
+
+        with unittest.mock.patch(
+            "torch.index_select", side_effect=_recording_index_select
+        ):
+            _py_ops.multi_layer_block_kv_transfer(
+                paged_layers,
+                object_tensors,
+                block_ids,
+                torch.device("cpu"),
+                _py_ops.TransferDirection.D2H,
+                shape_desc,
+                chunk_tokens,
+                gpu_kv_format,
+                0,
+            )
+
+        assert not saw_non_contiguous_source
+
+        saw_non_contiguous_target = False
+
+        def _recording_index_copy(
+            target_tensor: torch.Tensor,
+            dim: int,
+            index_tensor: torch.Tensor,
+            source_tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            """Track whether index_copy_ writes into a non-contiguous target."""
+            nonlocal saw_non_contiguous_target
+            if not target_tensor.is_contiguous():
+                saw_non_contiguous_target = True
+            return original_index_copy(target_tensor, dim, index_tensor, source_tensor)
+
+        with unittest.mock.patch.object(
+            torch.Tensor, "index_copy_", new=_recording_index_copy
+        ):
+            _py_ops.multi_layer_block_kv_transfer(
+                paged_layers,
+                object_tensors,
+                block_ids,
+                torch.device("cpu"),
+                _py_ops.TransferDirection.H2D,
+                shape_desc,
+                chunk_tokens,
+                gpu_kv_format,
+                0,
+            )
+
+        assert not saw_non_contiguous_target
