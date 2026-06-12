@@ -46,11 +46,11 @@ FORMAT_PARAMS = [
 
 
 def _create_random_tensor(shape, dtype, device):
-    return torch.rand(shape, dtype=torch.bfloat16, device=device).to(dtype)
+    return torch.rand(shape, dtype=dtype, device=device)
 
 
 def _create_zero_tensor(shape, dtype, device):
-    return torch.zeros(shape, dtype=torch.bfloat16, device=device).to(dtype)
+    return torch.zeros(shape, dtype=dtype, device=device)
 
 
 def create_vllm_tensors(gpu_kv_format, nl, nb, bs, nh, hs, dtype, device):
