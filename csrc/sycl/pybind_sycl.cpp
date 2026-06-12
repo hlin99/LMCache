@@ -5,8 +5,10 @@
 // Exposed as `lmcache.xpu_ops`.
 //
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <torch/torch.h>
 #include "mem_kernels_sycl.h"
+#include "mp_mem_kernels_sycl.h"
 #include "cachegen_kernels_sycl.h"
 
 namespace py = pybind11;
@@ -45,6 +47,23 @@ PYBIND11_MODULE(xpu_ops, m) {
   m.def("reshape_and_cache_back_flash", &reshape_and_cache_back_flash);
   m.def("lmcache_memcpy_async", &lmcache_memcpy_async,
         py::call_guard<py::gil_scoped_release>());
+  m.def("multi_layer_block_kv_transfer", &multi_layer_block_kv_transfer,
+        py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),
+        py::arg("block_ids"), py::arg("device"), py::arg("direction"),
+        py::arg("shape_desc"), py::arg("lmcache_chunk_size"),
+        py::arg("gpu_kv_format"), py::arg("skip_prefix_n_blocks"),
+        py::call_guard<py::gil_scoped_release>());
+  py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc")
+      .def(py::init<>())
+      .def_readwrite("kv_size", &PageBufferShapeDesc::kv_size)
+      .def_readwrite("nl", &PageBufferShapeDesc::nl)
+      .def_readwrite("nb", &PageBufferShapeDesc::nb)
+      .def_readwrite("bs", &PageBufferShapeDesc::bs)
+      .def_readwrite("nh", &PageBufferShapeDesc::nh)
+      .def_readwrite("hs", &PageBufferShapeDesc::hs)
+      .def_readwrite("element_size", &PageBufferShapeDesc::element_size)
+      .def_readwrite("block_stride_elems",
+                     &PageBufferShapeDesc::block_stride_elems);
 
   // CacheGen / RoPE kernels (Intel XPU).  Names match the
   // lmcache.python_ops_fallback module so lmcache._get_backend() can
