@@ -173,7 +173,7 @@ def call_block_kernel(
 # ---------------------------------------------------------------------------
 # Test configuration
 # ---------------------------------------------------------------------------
-NB = 100
+NB = 200  # Must be >= 2 * TOTAL_BLOCKS so disjoint D2H and H2D block ID sets fit
 BS = 16
 NUM_MEMORY_OBJECTS = 4
 TOKENS_PER_OBJECT = 256
