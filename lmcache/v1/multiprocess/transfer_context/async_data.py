@@ -213,10 +213,13 @@ class AsyncDataTransferContext(DataTransferContext):
                                 f"{len(staged_chunks)} vs {len(shm_out_buffers)} "
                                 f"(request_id={_request_id}, instance_id={instance_id})"
                             )
-                        for staged, shm_view in zip(
-                            staged_chunks, shm_out_buffers, strict=True
-                        ):
-                            shm_view.copy_(staged)
+                        # Exit InferenceMode inherited from the vLLM main
+                        # thread — inplace copy_ is disallowed under it.
+                        with torch.inference_mode(False):
+                            for staged, shm_view in zip(
+                                staged_chunks, shm_out_buffers, strict=True
+                            ):
+                                shm_view.copy_(staged)
                         ok = non_gpu_context.commit_store(
                             key, instance_id, shm_out_buffers
                         )
