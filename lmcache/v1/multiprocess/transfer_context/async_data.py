@@ -44,18 +44,15 @@ class AsyncDataTransferContext(DataTransferContext):
     path does not change retrieve). Only the store is made async.
 
     Store is two-phase:
-    1) gather: enqueue GPU->CPU copies on a dedicated copy stream into
-       LMCache-owned pinned staging buffers (ordered behind the per-step event).
+    1) gather: enqueue GPU->CPU copies on a dedicated copy stream. When SHM
+       buffers are available, gather writes directly into SHM views (matching
+       the synchronous path). Otherwise, gather targets pinned staging buffers.
     2) commit: wait for gather completion in a background thread, then perform
-       commit_store() (pickle or SHM commit) and resolve the returned future.
+       commit_store() and resolve the returned future.
 
     This class is only instantiated by the factory when the device is
     async-capable, so the constructor creates async resources unconditionally;
     there is no ``self._async_capable`` flag.
-
-    SHM note: SHM slots are generally pageable, so device->SHM DtoH copies may
-    implicitly synchronize. To keep gather async, we always gather into pinned
-    bounce buffers first, then copy to SHM slots on the commit thread.
     """
 
     def __init__(
@@ -150,8 +147,10 @@ class AsyncDataTransferContext(DataTransferContext):
 
         semaphore.acquire()
         staged_chunks: list[torch.Tensor] = []
-        shm_out_buffers: list[torch.Tensor] | None = None
         gather_done: Any | None = None
+        # Whether we gathered directly into SHM views (True) or into
+        # pinned staging buffers that need to be released later (False).
+        used_shm_direct = False
         try:
             with self._inflight_lock:
                 if self._is_closing:
@@ -173,16 +172,27 @@ class AsyncDataTransferContext(DataTransferContext):
                 if chunk_indices is not None
                 else len(full_block_ids) // blocks_in_chunk
             )
-            if not non_gpu_context.layout_desc.shapes:
-                raise RuntimeError("non-GPU layout_desc.shapes is empty")
-            if not non_gpu_context.layout_desc.dtypes:
-                raise RuntimeError("non-GPU layout_desc.dtypes is empty")
-            staged_chunks = self._alloc_pinned_staging(
-                non_gpu_context.layout_desc.shapes[0],
-                non_gpu_context.layout_desc.dtypes[0],
-                num_chunks,
-            )
-            shm_out_buffers = out_buffers
+
+            # Determine gather target:
+            # - SHM path (out_buffers available): gather directly into SHM views
+            # - Pickle path (no out_buffers): gather into pinned staging buffers
+            if out_buffers is not None:
+                # SHM path: gather directly into SHM views, no staging needed.
+                gather_target = out_buffers
+                used_shm_direct = True
+            else:
+                # Pickle path: allocate pinned staging buffers.
+                if not non_gpu_context.layout_desc.shapes:
+                    raise RuntimeError("non-GPU layout_desc.shapes is empty")
+                if not non_gpu_context.layout_desc.dtypes:
+                    raise RuntimeError("non-GPU layout_desc.dtypes is empty")
+                staged_chunks = self._alloc_pinned_staging(
+                    non_gpu_context.layout_desc.shapes[0],
+                    non_gpu_context.layout_desc.dtypes[0],
+                    num_chunks,
+                )
+                gather_target = staged_chunks
+
             with torch_dev.stream(self._copy_stream):
                 _event.wait(stream=self._copy_stream)
                 gather_paged_kv_to_cpu(
@@ -191,7 +201,7 @@ class AsyncDataTransferContext(DataTransferContext):
                     blocks_in_chunk,
                     layout_hints=self._layout_hints,
                     gpu_kv_format=self._gpu_kv_format,
-                    out=staged_chunks,
+                    out=gather_target,
                     chunk_indices=chunk_indices,
                 )
                 gather_done = torch_dev.Event()
@@ -201,32 +211,18 @@ class AsyncDataTransferContext(DataTransferContext):
                 if gather_done is not None:
                     self._inflight_gather_events.add(gather_done)
 
+            # Capture variables for the closure
+            _used_shm_direct = used_shm_direct
+            _gather_target = gather_target
+
             def _commit_after_gather() -> None:
                 ok = False
                 try:
                     if gather_done is not None:
                         gather_done.synchronize()
-                    if shm_out_buffers is not None:
-                        if len(staged_chunks) != len(shm_out_buffers):
-                            raise RuntimeError(
-                                "SHM staging chunk count mismatch: "
-                                f"{len(staged_chunks)} vs {len(shm_out_buffers)} "
-                                f"(request_id={_request_id}, instance_id={instance_id})"
-                            )
-                        # Exit InferenceMode inherited from the vLLM main
-                        # thread — inplace copy_ is disallowed under it.
-                        with torch.inference_mode(False):
-                            for staged, shm_view in zip(
-                                staged_chunks, shm_out_buffers, strict=True
-                            ):
-                                shm_view.copy_(staged)
-                        ok = non_gpu_context.commit_store(
-                            key, instance_id, shm_out_buffers
-                        )
-                    else:
-                        ok = non_gpu_context.commit_store(
-                            key, instance_id, staged_chunks
-                        )
+                    ok = non_gpu_context.commit_store(
+                        key, instance_id, _gather_target
+                    )
                     if not ok:
                         logger.error(
                             "Async non-GPU commit_store failed for request_id=%s",
@@ -239,7 +235,8 @@ class AsyncDataTransferContext(DataTransferContext):
                     )
                     ok = False
                 finally:
-                    self._release_staging(staged_chunks)
+                    if not _used_shm_direct:
+                        self._release_staging(staged_chunks)
                     with self._inflight_lock:
                         if gather_done is not None:
                             self._inflight_gather_events.discard(gather_done)
