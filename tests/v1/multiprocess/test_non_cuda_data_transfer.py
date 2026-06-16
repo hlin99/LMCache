@@ -1286,4 +1286,10 @@ def test_non_gpu_context_shm_register_failure_warns_and_skips_unregister(
 
     assert fake_cudart.unregister_calls == []
     warning_mock.assert_called_once()
-    assert "cudaHostRegister failed" in warning_mock.call_args[0][0]
+    message, logged_shm_name, _logged_ptr, logged_size, logged_err = (
+        warning_mock.call_args[0]
+    )
+    assert "cudaHostRegister failed" in message
+    assert logged_shm_name == shm_name
+    assert logged_size == 4096
+    assert logged_err == 1
