@@ -83,7 +83,6 @@ class AsyncDataTransferContext(DataTransferContext):
             max_workers=self._commit_workers,
             thread_name_prefix="lmcache_non_gpu_commit",
         )
-        self._inflight_semaphore = threading.BoundedSemaphore(self._max_inflight_stores)
         self._inflight_lock = threading.Lock()
         self._inflight_gather_events: set[Any] = set()
         self._inflight_commits: set[ConcurrentFuture[None]] = set()
@@ -143,6 +142,8 @@ class AsyncDataTransferContext(DataTransferContext):
         the background ``commit_executor``.  Returns an unresolved future that
         resolves only after both gather completion and the commit ACK.
         """
+        import time
+        _t_entry = time.perf_counter()
         if self._non_gpu_context is None:
             raise RuntimeError(
                 "Data transfer context is not registered. "
@@ -150,10 +151,8 @@ class AsyncDataTransferContext(DataTransferContext):
             )
         completion: MessagingFuture[bool] = MessagingFuture()
         non_gpu_context = self._non_gpu_context
-        semaphore = self._inflight_semaphore
         commit_executor = self._commit_executor
 
-        semaphore.acquire()
         staged_chunks: list[torch.Tensor] = []
         # Whether we gathered directly into SHM views (True) or into
         # pinned staging buffers that need to be released later (False).
@@ -162,7 +161,6 @@ class AsyncDataTransferContext(DataTransferContext):
             with self._inflight_lock:
                 if self._is_closing:
                     completion.set_result(False)
-                    semaphore.release()
                     return completion
 
             result = non_gpu_context.prepare_store(key, instance_id)
@@ -170,7 +168,6 @@ class AsyncDataTransferContext(DataTransferContext):
             if chunk_indices is not None and len(chunk_indices) == 0:
                 # All chunks are already in cache: no gather, no commit.
                 completion.set_result(True)
-                semaphore.release()
                 return completion
 
             full_block_ids = _single_group_block_ids(block_ids)
@@ -208,7 +205,7 @@ class AsyncDataTransferContext(DataTransferContext):
                 gather_done: Any | None = None
                 ok = False
                 try:
-                    with torch_dev.stream(self._copy_stream):
+                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
 
                         gather_paged_kv_to_cpu(
@@ -249,20 +246,18 @@ class AsyncDataTransferContext(DataTransferContext):
                         if gather_done is not None:
                             self._inflight_gather_events.discard(gather_done)
                     completion.set_result(ok)
-                    semaphore.release()
 
             # Submitting the commit task is the ownership-transfer point: once it
             # succeeds, the commit task is solely responsible for releasing the
-            # semaphore, releasing staging buffers, and resolving the future. The
-            # except below therefore only handles failures that occur *before*
-            # this submit, so it can never double-release or double-resolve.
+            # staging buffers, and resolving the future. The except below therefore
+            # only handles failures that occur *before* this submit, so it can never
+            # double-release or double-resolve.
             commit_future = commit_executor.submit(_commit_after_gather)
         except Exception:
             logger.exception("Failed to submit async non-GPU store")
             if staged_chunks:
                 self._release_staging(staged_chunks)
             completion.set_result(False)
-            semaphore.release()
             return completion
 
         with self._inflight_lock:
@@ -273,6 +268,8 @@ class AsyncDataTransferContext(DataTransferContext):
                 self._inflight_commits.discard(done_future)
 
         commit_future.add_done_callback(_drop_commit_future)
+        logger.info("[submit_store] forward thread returned at %.3f ms since entry",
+                    (time.perf_counter() - _t_entry) * 1000)
         return completion
 
     def flush_inflight_gathers(self) -> None:
