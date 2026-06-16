@@ -110,6 +110,7 @@ class NonGpuContextShm(NonGpuContext):
             unregister(f"/{self._shm.name}", "shared_memory")
             self._shm_buffer = self._shm.buf
             self._register_shm_buffer()
+            logger.info("SHM pinned=%s for shm_name=%s", self._pinned, self._shm_name)
         except Exception:
             self._shm = None
             self._shm_buffer = None

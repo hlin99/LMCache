@@ -590,11 +590,14 @@ def _build_data_context(kv_caches: dict[str, torch.Tensor]) -> "TransferContext"
     cycle and to keep the synchronous path free of stream/event dependencies.
     """
     if _supports_async_primitives(kv_caches):
-        # Local
+        # First Party
         from lmcache.v1.multiprocess.transfer_context.async_data import (
             AsyncDataTransferContext,
         )
-        logger.info(" >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> AsyncDataTransferContext ")
+
+        logger.info(
+            " >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> AsyncDataTransferContext "
+        )
         return AsyncDataTransferContext()
 
     logger.info(" >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> SyncDataTransferContext ")

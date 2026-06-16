@@ -193,12 +193,14 @@ class AsyncDataTransferContext(DataTransferContext):
                 )
                 gather_target = staged_chunks
 
+            # Standard
             import time
+            t00 = time.perf_counter()
 
             with torch_dev.stream(self._copy_stream):
-                t1 = time.perf_counter()
                 _event.wait(stream=self._copy_stream)
-                t2 = time.perf_counter()
+                torch_dev.synchronize()
+                t1 = time.perf_counter()
 
                 gather_paged_kv_to_cpu(
                     kv_caches,
@@ -209,6 +211,8 @@ class AsyncDataTransferContext(DataTransferContext):
                     out=gather_target,
                     chunk_indices=chunk_indices,
                 )
+                t2 = time.perf_counter()
+                torch_dev.synchronize()
                 t3 = time.perf_counter()
 
                 gather_done = torch_dev.Event()
@@ -216,12 +220,14 @@ class AsyncDataTransferContext(DataTransferContext):
                 t4 = time.perf_counter()
                 # Print intervals in milliseconds (ms)
                 logger.info(
-                    "[Store Profiler] wait: %.3f ms | gather_to_cpu: %.3f ms | record_event: %.3f ms | total: %.3f ms",
+                    "[Store Profiler] launch: %.3f ms | gpu_exec: %.3f ms | total: %.3f ms",
                     (t2 - t1) * 1000,
                     (t3 - t2) * 1000,
-                    (t4 - t3) * 1000,
-                    (t4 - t1) * 1000
+                    (t3 - t1) * 1000,
                 )
+            t11 = time.perf_counter()
+            logger.info("[Store Profiler] submit block time: %.3f ms", (t11 - t00) * 1000)
+
             with self._inflight_lock:
                 if gather_done is not None:
                     self._inflight_gather_events.add(gather_done)
@@ -235,9 +241,7 @@ class AsyncDataTransferContext(DataTransferContext):
                 try:
                     if gather_done is not None:
                         gather_done.synchronize()
-                    ok = non_gpu_context.commit_store(
-                        key, instance_id, _gather_target
-                    )
+                    ok = non_gpu_context.commit_store(key, instance_id, _gather_target)
                     if not ok:
                         logger.error(
                             "Async non-GPU commit_store failed for request_id=%s",
