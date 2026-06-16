@@ -543,8 +543,8 @@ def create_transfer_context(
     if resolved_mode is MPTransferMode.DATA:
         return _build_data_context(kv_caches)
     # AUTO: preserve the historical device-type-based dispatch.
-    if device_type == "cuda":
-        return HandleTransferContext()
+    # if device_type == "cuda":
+    #    return HandleTransferContext()
     return _build_data_context(kv_caches)
 
 
@@ -594,6 +594,8 @@ def _build_data_context(kv_caches: dict[str, torch.Tensor]) -> "TransferContext"
         from lmcache.v1.multiprocess.transfer_context.async_data import (
             AsyncDataTransferContext,
         )
-
+        logger.info(" >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> AsyncDataTransferContext ")
         return AsyncDataTransferContext()
+
+    logger.info(" >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> SyncDataTransferContext ")
     return DataTransferContext()

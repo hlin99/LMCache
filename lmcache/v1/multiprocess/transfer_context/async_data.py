@@ -193,8 +193,13 @@ class AsyncDataTransferContext(DataTransferContext):
                 )
                 gather_target = staged_chunks
 
+            import time
+
             with torch_dev.stream(self._copy_stream):
+                t1 = time.perf_counter()
                 _event.wait(stream=self._copy_stream)
+                t2 = time.perf_counter()
+
                 gather_paged_kv_to_cpu(
                     kv_caches,
                     full_block_ids,
@@ -204,9 +209,19 @@ class AsyncDataTransferContext(DataTransferContext):
                     out=gather_target,
                     chunk_indices=chunk_indices,
                 )
+                t3 = time.perf_counter()
+
                 gather_done = torch_dev.Event()
                 gather_done.record(self._copy_stream)
-
+                t4 = time.perf_counter()
+                # Print intervals in milliseconds (ms)
+                logger.info(
+                    "[Store Profiler] wait: %.3f ms | gather_to_cpu: %.3f ms | record_event: %.3f ms | total: %.3f ms",
+                    (t2 - t1) * 1000,
+                    (t3 - t2) * 1000,
+                    (t4 - t3) * 1000,
+                    (t4 - t1) * 1000
+                )
             with self._inflight_lock:
                 if gather_done is not None:
                     self._inflight_gather_events.add(gather_done)
