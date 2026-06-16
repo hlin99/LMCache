@@ -244,7 +244,7 @@ class NonGpuContextShm(NonGpuContext):
             err = torch_dev.cudart().cudaHostRegister(ptr, self._pool_size, 0)
         except Exception as exc:
             logger.warning(
-                "Failed to register SHM buffer for shm_name=%s: %s; "
+                "Failed to register SHM buffer for shm_name=%s: %r; "
                 "D2H copies will be synchronous",
                 self._shm_name,
                 exc,
@@ -280,7 +280,7 @@ class NonGpuContextShm(NonGpuContext):
                 )
         except Exception as exc:
             logger.warning(
-                "Failed to unregister SHM buffer for shm_name=%s: %s",
+                "Failed to unregister SHM buffer for shm_name=%s: %r",
                 self._shm_name,
                 exc,
             )
