@@ -1162,3 +1162,128 @@ def test_non_gpu_context_shm_close_is_idempotent() -> None:
     finally:
         if os.path.exists(shm_path):
             os.unlink(shm_path)
+
+
+def test_non_gpu_context_shm_registers_and_unregisters_host_memory(
+    monkeypatch: Any,
+) -> None:
+    shm_name = f"lmcache_test_pin_{os.getpid()}"
+    shm_path = _create_shm_file(shm_name, 4096)
+
+    class FakeCudaRt:
+        def __init__(self) -> None:
+            self.register_calls: list[tuple[int, int, int]] = []
+            self.unregister_calls: list[int] = []
+
+        def cudaHostRegister(self, ptr: int, size: int, flags: int) -> int:
+            self.register_calls.append((ptr, size, flags))
+            return 0
+
+        def cudaHostUnregister(self, ptr: int) -> int:
+            self.unregister_calls.append(ptr)
+            return 0
+
+    class FakeTorchDev:
+        def __init__(self, cudart: FakeCudaRt) -> None:
+            self._cudart = cudart
+
+        def is_available(self) -> bool:
+            return True
+
+        def cudart(self) -> FakeCudaRt:
+            return self._cudart
+
+    # First Party
+    import lmcache.v1.multiprocess.transfer_context.shm as shm_module
+
+    fake_cudart = FakeCudaRt()
+    monkeypatch.setattr(shm_module, "torch_dev", FakeTorchDev(fake_cudart))
+
+    context = NonGpuContextShm(
+        metadata=NonGpuContextMetadata(
+            layout_desc=MemoryLayoutDesc(
+                shapes=[torch.Size([2, 2])],
+                dtypes=[torch.float32],
+            ),
+            block_size=1,
+            use_mla=False,
+        ),
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        shm_name=shm_name,
+        pool_size=4096,
+    )
+    try:
+        assert len(fake_cudart.register_calls) == 1
+        ptr, size, flags = fake_cudart.register_calls[0]
+        assert ptr > 0
+        assert size == 4096
+        assert flags == 0
+    finally:
+        context.close()
+        if os.path.exists(shm_path):
+            os.unlink(shm_path)
+
+    assert fake_cudart.unregister_calls == [ptr]
+
+
+def test_non_gpu_context_shm_register_failure_warns_and_skips_unregister(
+    monkeypatch: Any,
+) -> None:
+    shm_name = f"lmcache_test_pin_fail_{os.getpid()}"
+    shm_path = _create_shm_file(shm_name, 4096)
+
+    class FakeCudaRt:
+        def __init__(self) -> None:
+            self.register_calls: list[tuple[int, int, int]] = []
+            self.unregister_calls: list[int] = []
+
+        def cudaHostRegister(self, ptr: int, size: int, flags: int) -> int:
+            self.register_calls.append((ptr, size, flags))
+            return 1
+
+        def cudaHostUnregister(self, ptr: int) -> int:
+            self.unregister_calls.append(ptr)
+            return 0
+
+    class FakeTorchDev:
+        def __init__(self, cudart: FakeCudaRt) -> None:
+            self._cudart = cudart
+
+        def is_available(self) -> bool:
+            return True
+
+        def cudart(self) -> FakeCudaRt:
+            return self._cudart
+
+    # First Party
+    import lmcache.v1.multiprocess.transfer_context.shm as shm_module
+
+    fake_cudart = FakeCudaRt()
+    monkeypatch.setattr(shm_module, "torch_dev", FakeTorchDev(fake_cudart))
+
+    with patch.object(shm_module.logger, "warning") as warning_mock:
+        context = NonGpuContextShm(
+            metadata=NonGpuContextMetadata(
+                layout_desc=MemoryLayoutDesc(
+                    shapes=[torch.Size([2, 2])],
+                    dtypes=[torch.float32],
+                ),
+                block_size=1,
+                use_mla=False,
+            ),
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            shm_name=shm_name,
+            pool_size=4096,
+        )
+        try:
+            assert len(fake_cudart.register_calls) == 1
+        finally:
+            context.close()
+            if os.path.exists(shm_path):
+                os.unlink(shm_path)
+
+    assert fake_cudart.unregister_calls == []
+    warning_mock.assert_called_once()
+    assert "cudaHostRegister failed" in warning_mock.call_args[0][0]
