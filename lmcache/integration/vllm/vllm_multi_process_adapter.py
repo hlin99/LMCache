@@ -1375,7 +1375,7 @@ class LMCacheMPWorkerAdapter:
             if _t_submit is not None:
                 logger.info(
                     "[E2E-STORE] req=%s e2e=%.3f ms",
-                    str(request_id),
+                    request_id,
                     (_t_done - _t_submit) * 1000,
                 )
 
