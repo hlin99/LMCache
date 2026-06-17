@@ -501,6 +501,16 @@ class GPUTransferModule:
                 _t_record_start = time.perf_counter()
                 event.record()
                 _t_record_end = time.perf_counter()
+
+                _t_sync_start = time.perf_counter()
+                event.synchronize()  # 等 GPU 上所有 kernel + D2H 真正完成
+                _t_sync_end = time.perf_counter()
+                logger.info(
+                    "[GPU-STORE-SYNC] req=%s gpu_sync=%.3f total_with_sync=%.3f ms",
+                    str(key.request_id),
+                    (_t_sync_end - _t_sync_start) * 1000,
+                    (_t_sync_end - st) * 1000,
+                )
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(reserved_dict) if store_succeeded else 0
