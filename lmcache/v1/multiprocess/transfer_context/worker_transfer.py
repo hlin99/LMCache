@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
+import time
 
 # Third Party
 import torch
@@ -281,11 +282,26 @@ class HandleTransferContext(TransferContext):
                 "Handle transfer context is not registered. "
                 "Call register() before submit_store()."
             )
-        return self._send_request(
+        _t0 = time.perf_counter()
+        ipc_handle = event.ipc_handle()
+        _t_ipc = time.perf_counter()
+        mq_future = self._send_request(
             self._mq_client,
             RequestType.STORE,
-            [key, instance_id, block_ids, event.ipc_handle()],
-        ).to_cuda_future()
+            [key, instance_id, block_ids, ipc_handle],
+        )
+        _t_send = time.perf_counter()
+        cuda_future = mq_future.to_cuda_future()
+        _t_cuda = time.perf_counter()
+        logger.info(
+            "[FWD-IPC] req=%s ipc_handle=%.3f send_request=%.3f to_cuda_future=%.3f total=%.3f ms",
+            _request_id,
+            (_t_ipc - _t0) * 1000,
+            (_t_send - _t_ipc) * 1000,
+            (_t_cuda - _t_send) * 1000,
+            (_t_cuda - _t0) * 1000,
+        )
+        return cuda_future
 
     def submit_retrieve(
         self,
