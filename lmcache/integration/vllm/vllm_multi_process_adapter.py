@@ -7,6 +7,7 @@ from typing import Any, Callable, NoReturn, Protocol
 import enum
 import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -936,6 +937,10 @@ class LMCacheMPWorkerAdapter:
         # Prevents re-reporting the same ID after drain clears tracking sets.
         self._returned_finished: set[str] = set()
 
+        # Timestamps recorded when submit_store_request is called, used to
+        # measure E2E wall-clock time until the future is resolved.
+        self._store_submit_times: dict[str, float] = {}
+
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
 
@@ -1185,6 +1190,7 @@ class LMCacheMPWorkerAdapter:
         )
         self.store_futures[request_id] = future
         self.store_events[request_id] = event
+        self._store_submit_times[request_id] = time.perf_counter()
 
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
@@ -1345,6 +1351,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.clear()
             self.store_events.clear()
             self.retrieve_events.clear()
+            self._store_submit_times.clear()
 
             ret_stores = self._process_finished_stores(
                 finished_stores, finished_req_ids_from_engine
@@ -1362,6 +1369,15 @@ class LMCacheMPWorkerAdapter:
         for request_id, s_future in self.store_futures.items():
             if not s_future.query():
                 continue
+
+            _t_done = time.perf_counter()
+            _t_submit = self._store_submit_times.pop(request_id, None)
+            if _t_submit is not None:
+                logger.info(
+                    "[E2E-STORE] req=%s e2e=%.3f ms",
+                    str(request_id),
+                    (_t_done - _t_submit) * 1000,
+                )
 
             s_result = s_future.result()
             finished_stores.add(request_id)
