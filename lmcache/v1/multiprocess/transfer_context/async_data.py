@@ -322,6 +322,7 @@ class AsyncDataTransferContext(DataTransferContext):
             (_t_alloc - _t_block_ids) * 1000,
             (_t_submit_end - _t_submit_start) * 1000,
             (_t_exit - _t_submit_end) * 1000,
+            (_t_exit - _t_entry) * 1000,
             num_chunks,
             _used_shm_direct,
         )
