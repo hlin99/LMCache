@@ -429,6 +429,11 @@ class GPUTransferModule:
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             store_succeeded = False
+            _t_reserve = _t_publish
+            _t_loop_end = _t_publish
+            _t_record_start = _t_publish
+            _t_record_end = _t_publish
+            _t_callback_end = _t_publish
             try:
                 layout_desc = get_layout_desc(gpu_context, self._ctx.chunk_size)
                 reserved_dict = self._ctx.storage_manager.reserve_write(
