@@ -434,6 +434,7 @@ class GPUTransferModule:
             _t_record_start = _t_publish
             _t_record_end = _t_publish
             _t_callback_end = _t_publish
+            use_c_ops = False
             try:
                 layout_desc = get_layout_desc(gpu_context, self._ctx.chunk_size)
                 reserved_dict = self._ctx.storage_manager.reserve_write(
@@ -460,30 +461,49 @@ class GPUTransferModule:
                         chunk_block_ids_gpu = block_ids_per_group_gpu[group_idx][
                             idx * bpc : (idx + 1) * bpc
                         ]
-                        tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
-                        group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                        if use_c_ops:
+                            tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
+                            group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
                         # Kernel contract: ``group_lmcache_chunk_size`` here is the
                         # number of *physical* slots per chunk for this group
                         # (= logical chunk_size // compress_ratio).
                         group_lmcache_chunk_size = gpu_context.get_physical_chunk_size(
                             group_idx
                         )
-                        lmc_ops.multi_layer_block_kv_transfer(
-                            group_kv_pointers,
-                            [tmp_buffer.data_ptr()],
-                            chunk_block_ids_gpu,
-                            gpu_context.device,
-                            lmc_ops.TransferDirection.D2H,
-                            gpu_context.get_shape_desc(group_idx),
-                            group_lmcache_chunk_size,
-                            gpu_context.gpu_kv_format_,
-                            0,
-                        )
+                        if use_c_ops:
+                            lmc_ops.multi_layer_block_kv_transfer(
+                                group_kv_pointers,
+                                [tmp_buffer.data_ptr()],
+                                chunk_block_ids_gpu,
+                                gpu_context.device,
+                                lmc_ops.TransferDirection.D2H,
+                                gpu_context.get_shape_desc(group_idx),
+                                group_lmcache_chunk_size,
+                                gpu_context.gpu_kv_format_,
+                                0,
+                            )
+                        else:
+                            group = gpu_context.kv_layer_groups_manager.kv_layer_groups[group_idx]
+                            kv_tensors = [gpu_context.kv_tensors[i] for i in group.layer_indices]
+    
+                            lmc_ops.multi_layer_block_kv_transfer(
+                                kv_tensors,
+                                [memory_obj.tensor],
+                                chunk_block_ids_gpu,
+                                gpu_context.device,
+                                lmc_ops.TransferDirection.D2H,
+                                gpu_context.get_shape_desc(group_idx),
+                                group_lmcache_chunk_size,
+                                gpu_context.gpu_kv_format_,
+                                0,
+                            )
+
                     _t_kernel_end = time.perf_counter()
-                    # Store is not batched, so we always use chunk_idx=0 (single slot)
-                    lmcache_memcpy_async_d2h(
-                        gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
-                    )
+                    if use_c_ops:
+                        # Store is not batched, so we always use chunk_idx=0 (single slot)
+                        lmcache_memcpy_async_d2h(
+                            gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
+                        )
                     _t_memcpy_end = time.perf_counter()
                     logger.info(
                         "[GPU-STORE-CHUNK] req=%s chunk_idx=%d kernel=%.3f memcpy_d2h=%.3f ms",
