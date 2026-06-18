@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 import abc
 import pickle
+import time
 
 # Third Party
 import torch
@@ -208,11 +209,14 @@ class PickleTransferStrategy(TransferStrategy):
         Returns:
             ``True`` when every reserved object is written successfully.
         """
+        t_start = time.perf_counter()
         obj_keys = resolve_obj_keys(key)
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        t_deserialize = time.perf_counter()
         reserved_dict = self._storage_manager.reserve_write(
             obj_keys, context.layout_desc, "new"
         )
+        t_reserve_write = time.perf_counter()
         written_keys: list[ObjectKey] = []
         try:
             for idx, obj_key in enumerate(obj_keys):
@@ -229,9 +233,21 @@ class PickleTransferStrategy(TransferStrategy):
                 memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
+            t_copy_loop = time.perf_counter()
             if written_keys:
                 self._storage_manager.finish_write(written_keys)
-
+            t_finish_write = time.perf_counter()
+        logger.info(
+            "[PICKLE-COMMIT] req=%s deserialize=%.3f reserve_write=%.3f"
+            " copy_loop=%.3f finish_write=%.3f total=%.3f ms (num_chunks=%d)",
+            key.request_id,
+            (t_deserialize - t_start) * 1000,
+            (t_reserve_write - t_deserialize) * 1000,
+            (t_copy_loop - t_reserve_write) * 1000,
+            (t_finish_write - t_copy_loop) * 1000,
+            (t_finish_write - t_start) * 1000,
+            len(chunks),
+        )
         return len(written_keys) == len(reserved_dict)
 
     def prepare_retrieve(
@@ -321,10 +337,13 @@ class ShmTransferStrategy(TransferStrategy):
         Returns:
             Context with ``slots`` and ``chunk_indices``.
         """
+        t_start = time.perf_counter()
         obj_keys = resolve_obj_keys(key)
+        t_resolve = time.perf_counter()
         reserved = self._storage_manager.reserve_write(
             obj_keys, context.layout_desc, "new"
         )
+        t_reserve_write = time.perf_counter()
         slots: list[dict[str, Any]] = []
         chunk_indices: list[int] = []
         reserved_keys: list[ObjectKey] = []
@@ -350,6 +369,17 @@ class ShmTransferStrategy(TransferStrategy):
             ]
             if unused_keys:
                 self._storage_manager.finish_write(unused_keys)
+        t_slots = time.perf_counter()
+        logger.info(
+            "[SHM-PREPARE] req=%s resolve_keys=%.3f reserve_write=%.3f"
+            " slots=%.3f total=%.3f ms (num_slots=%d)",
+            key.request_id,
+            (t_resolve - t_start) * 1000,
+            (t_reserve_write - t_resolve) * 1000,
+            (t_slots - t_reserve_write) * 1000,
+            (t_slots - t_start) * 1000,
+            len(reserved_keys),
+        )
         if not reserved_keys:
             return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
         transfer_key = self._transfer_key_factory(key, instance_id)
@@ -380,13 +410,23 @@ class ShmTransferStrategy(TransferStrategy):
                 context=context,
                 resolve_obj_keys=resolve_obj_keys,
             )
+        t_start = time.perf_counter()
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
             reserved_keys = self._pending_writes.pop(transfer_key, None)
         if reserved_keys is None:
             return False
+        t_before_fw = time.perf_counter()
         if reserved_keys:
             self._storage_manager.finish_write(reserved_keys)
+        t_finish_write = time.perf_counter()
+        logger.info(
+            "[SHM-COMMIT] req=%s finish_write=%.3f total=%.3f ms (num_keys=%d)",
+            key.request_id,
+            (t_finish_write - t_before_fw) * 1000,
+            (t_finish_write - t_start) * 1000,
+            len(reserved_keys),
+        )
         return True
 
     def prepare_retrieve(
