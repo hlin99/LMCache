@@ -226,7 +226,9 @@ class AsyncDataTransferContext(DataTransferContext):
 
                         gather_done = torch_dev.Event()
                         gather_done.record(self._copy_stream)
-                        _timer.mark("copy_submitted")
+
+                    # All GPU copies have been enqueued and CPU has returned.
+                    _timer.mark("copy_submitted")
 
                     with self._inflight_lock:
                         if gather_done is not None:

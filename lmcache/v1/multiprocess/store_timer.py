@@ -6,7 +6,7 @@ import logging
 import time
 
 # First Party
-from lmcache.logging import init_logger
+from lmcache.utils import init_logger
 
 logger = init_logger(__name__)
 
