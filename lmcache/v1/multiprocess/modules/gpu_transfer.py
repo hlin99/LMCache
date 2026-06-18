@@ -454,7 +454,9 @@ class GPUTransferModule:
                         ]
                         if use_c_ops:
                             tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
-                            group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                            group_kv_pointers = gpu_context.get_group_kv_pointers(
+                                group_idx
+                            )
                         # Kernel contract: ``group_lmcache_chunk_size`` here is the
                         # number of *physical* slots per chunk for this group
                         # (= logical chunk_size // compress_ratio).
@@ -474,9 +476,14 @@ class GPUTransferModule:
                                 0,
                             )
                         else:
-                            group = gpu_context.kv_layer_groups_manager.kv_layer_groups[group_idx]
-                            kv_tensors = [gpu_context.kv_tensors[i] for i in group.layer_indices]
-    
+                            group = gpu_context.kv_layer_groups_manager.kv_layer_groups[
+                                group_idx
+                            ]
+                            kv_tensors = [
+                                gpu_context.kv_tensors[i]
+                                for i in group.layer_indices
+                            ]
+
                             lmc_ops.multi_layer_block_kv_transfer(
                                 kv_tensors,
                                 [memory_obj.tensor],
@@ -490,7 +497,8 @@ class GPUTransferModule:
                             )
 
                     if use_c_ops:
-                        # Store is not batched, so we always use chunk_idx=0 (single slot)
+                        # Store is not batched, so we always use chunk_idx=0
+                        # (single slot).
                         lmcache_memcpy_async_d2h(
                             gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
                         )
@@ -501,10 +509,6 @@ class GPUTransferModule:
             finally:
                 event.record()
                 timer.mark("copy_submitted")
-
-                # hlin99: debug mode
-                # event.synchronize()  # 等 GPU 上所有 kernel + D2H 真正完成
-                timer.mark("kv_releasable")
 
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.

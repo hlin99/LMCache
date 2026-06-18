@@ -66,6 +66,14 @@ class StoreTimer:
         if self._enabled:
             self._marks[name] = time.perf_counter()
 
+    def set_path(self, path: str) -> None:
+        """Update the path label after construction.
+
+        Args:
+            path: Short label for the resolved store path.
+        """
+        self._path = path
+
     def emit(self) -> None:
         """Emit a single ``[STORE-TIMING]`` debug log line.
 

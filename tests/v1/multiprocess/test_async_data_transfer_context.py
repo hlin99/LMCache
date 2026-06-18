@@ -103,6 +103,62 @@ def _install_fake_gather(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _gather)
 
 
+@pytest.mark.parametrize(
+    ("prepare_result", "expected_path"),
+    [
+        (([torch.zeros(1)], [0]), "shm"),
+        (None, "pickle"),
+    ],
+)
+def test_submit_store_starts_timer_before_prepare_and_updates_path(
+    monkeypatch: pytest.MonkeyPatch,
+    prepare_result: tuple[list[torch.Tensor], list[int]] | None,
+    expected_path: str,
+) -> None:
+    gather_gate = threading.Event()
+    gather_gate.set()
+    calls: list[tuple[str, str]] = []
+
+    class _RecordingStoreTimer:
+        def __init__(self, request_id: str, path: str) -> None:
+            calls.append(("init", path))
+            calls.append(("request_id", request_id))
+
+        def set_path(self, path: str) -> None:
+            calls.append(("set_path", path))
+
+        def mark(self, name: str) -> None:
+            calls.append(("mark", name))
+
+        def emit(self) -> None:
+            calls.append(("emit", ""))
+
+    class _RecordingStoreContext(_FakeStoreContext):
+        def prepare_store(
+            self, _key: object, _instance_id: int
+        ) -> tuple[list[torch.Tensor], list[int]] | None:
+            calls.append(("prepare", ""))
+            return super().prepare_store(_key, _instance_id)
+
+    monkeypatch.setattr(async_data, "StoreTimer", _RecordingStoreTimer)
+    monkeypatch.setattr(async_data, "torch_dev", _FakeTorchDev(gather_gate))
+    _install_fake_gather(monkeypatch)
+    ctx = AsyncDataTransferContext()
+    ctx._non_gpu_context = _RecordingStoreContext(
+        commit_impl=lambda _c: True,
+        prepare_result=prepare_result,
+    )
+
+    future = ctx.submit_store(
+        "r1", object(), 1, {"k": torch.zeros(1)}, [[0]], _FakeEvent(gather_gate), 1
+    )
+
+    assert future.result(timeout=1) is True
+    assert calls.index(("init", "data")) < calls.index(("prepare", ""))
+    assert ("set_path", expected_path) in calls
+    ctx.close()
+
+
 def _new_context(
     monkeypatch: pytest.MonkeyPatch,
     *,
