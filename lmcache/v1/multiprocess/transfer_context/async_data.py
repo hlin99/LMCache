@@ -149,6 +149,7 @@ class AsyncDataTransferContext(DataTransferContext):
                 "Data transfer context is not registered. "
                 "Call register() before submit_store()."
             )
+        _timer = StoreTimer(_request_id, path="data")
         completion: MessagingFuture[bool] = MessagingFuture()
         non_gpu_context = self._non_gpu_context
         commit_executor = self._commit_executor
@@ -199,13 +200,11 @@ class AsyncDataTransferContext(DataTransferContext):
                 )
                 gather_target = staged_chunks
 
+            _timer.set_path("shm" if used_shm_direct else "pickle")
+
             # Capture variables for the closure
             _used_shm_direct = used_shm_direct
             _gather_target = gather_target
-            _timer = StoreTimer(
-                _request_id,
-                path="shm" if used_shm_direct else "pickle",
-            )
 
             def _commit_after_gather() -> None:
                 gather_done: Any | None = None
