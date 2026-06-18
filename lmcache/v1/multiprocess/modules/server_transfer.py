@@ -86,6 +86,15 @@ class TransferStrategy(abc.ABC):
     shared-memory-based transfers behind a common interface.
     """
 
+    @property
+    @abc.abstractmethod
+    def strategy_name(self) -> str:
+        """Return a short human-readable name identifying this strategy.
+
+        Returns:
+            A lowercase string label such as ``"pickle"`` or ``"shm"``.
+        """
+
     @abc.abstractmethod
     def prepare_store(
         self,
@@ -182,6 +191,11 @@ class PickleTransferStrategy(TransferStrategy):
             storage_manager: Storage manager used for reserve/read/finish calls.
         """
         self._storage_manager = storage_manager
+
+    @property
+    def strategy_name(self) -> str:
+        """Return ``"pickle"`` as the strategy identifier."""
+        return "pickle"
 
     def prepare_store(
         self,
@@ -324,6 +338,11 @@ class ShmTransferStrategy(TransferStrategy):
         self._pending_lock = pending_lock
         self._transfer_key_factory = transfer_key_factory
         self._fallback_strategy = fallback_strategy
+
+    @property
+    def strategy_name(self) -> str:
+        """Return ``"shm"`` as the strategy identifier."""
+        return "shm"
 
     def prepare_store(
         self,
