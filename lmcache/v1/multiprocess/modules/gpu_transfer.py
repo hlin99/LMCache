@@ -42,6 +42,7 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.v1.multiprocess.store_timer import StoreTimer
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
@@ -337,15 +338,15 @@ class GPUTransferModule:
             store completed without such a failure.
         """
         st = time.perf_counter()
+        timer = StoreTimer(key.request_id, path="gpu_ipc")
+        timer.mark("fwd_return")
         obj_keys = self._ctx.resolve_obj_keys(key)
-        _t_resolve = time.perf_counter()
 
         entry = self._gpu_contexts.get(instance_id)
         if entry is None:
             raise ValueError(f"No GPU context registered for instance ID {instance_id}")
         gpu_context = entry.gpu_context
         model_name = entry.model_name
-        _num_groups = gpu_context.kv_layer_groups_manager.num_groups
 
         # NOTE: different engine groups may have different block sizes, so
         # ``blocks_per_chunk[i]`` is the number of blocks in one chunk for
@@ -365,7 +366,6 @@ class GPUTransferModule:
             block_ids_per_group_gpu = gpu_context.copy_view_block_ids_to_gpu(
                 gpu_block_ids
             )
-            _t_copy_ids = time.perf_counter()
 
             # Fail closed: every LMCache group must have block IDs covering all
             # chunks. A short list (e.g. a caller/protocol bug) would otherwise
@@ -400,7 +400,6 @@ class GPUTransferModule:
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
-            _t_event_wait = time.perf_counter()
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -425,22 +424,15 @@ class GPUTransferModule:
                     },
                 ),
             )
-            _t_publish = time.perf_counter()
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             store_succeeded = False
-            _t_reserve = _t_publish
-            _t_loop_end = _t_publish
-            _t_record_start = _t_publish
-            _t_record_end = _t_publish
-            _t_callback_end = _t_publish
             use_c_ops = True
             try:
                 layout_desc = get_layout_desc(gpu_context, self._ctx.chunk_size)
                 reserved_dict = self._ctx.storage_manager.reserve_write(
                     obj_keys, layout_desc, "new"
                 )
-                _t_reserve = time.perf_counter()
 
                 # NOTE: Store is not batched because some obj_keys may be
                 # skipped (not in reserved_dict), making block_ids
@@ -453,7 +445,6 @@ class GPUTransferModule:
                     else:
                         continue
 
-                    _t_chunk_start = time.perf_counter()
                     # Copy from GPU paged buffer to tmp buffer, then to CPU — per
                     # group. Each group uses its own block-id list (HMA).
                     for group_idx in range(num_groups):
@@ -498,40 +489,23 @@ class GPUTransferModule:
                                 0,
                             )
 
-                    _t_kernel_end = time.perf_counter()
                     if use_c_ops:
                         # Store is not batched, so we always use chunk_idx=0 (single slot)
                         lmcache_memcpy_async_d2h(
                             gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
                         )
-                    _t_memcpy_end = time.perf_counter()
-                    logger.info(
-                        "[GPU-STORE-CHUNK] req=%s chunk_idx=%d kernel=%.3f memcpy_d2h=%.3f ms",
-                        key.request_id,
-                        idx,
-                        (_t_kernel_end - _t_chunk_start) * 1000,
-                        (_t_memcpy_end - _t_kernel_end) * 1000,
-                    )
                 store_succeeded = True
-                _t_loop_end = time.perf_counter()
             except Exception:
                 logger.exception("Cannot store keys due to exception")
                 return event.ipc_handle(), False
             finally:
-                _t_record_start = time.perf_counter()
                 event.record()
-                _t_record_end = time.perf_counter()
+                timer.mark("copy_submitted")
 
-                _t_sync_start = time.perf_counter()
                 # hlin99: debug mode
                 # event.synchronize()  # 等 GPU 上所有 kernel + D2H 真正完成
-                _t_sync_end = time.perf_counter()
-                logger.info(
-                    "[GPU-STORE-SYNC] req=%s gpu_sync=%.3f total_with_sync=%.3f ms",
-                    str(key.request_id),
-                    (_t_sync_end - _t_sync_start) * 1000,
-                    (_t_sync_end - st) * 1000,
-                )
+                timer.mark("kv_releasable")
+
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(reserved_dict) if store_succeeded else 0
@@ -541,7 +515,7 @@ class GPUTransferModule:
                         "finish_write",
                         list(reserved_dict.keys()),
                     )
-                _t_callback_end = time.perf_counter()
+                timer.mark("e2e_complete")
                 # All reserved MemoryObjs share one layout_desc, so per-object
                 # size is identical — avoid summing N identical values.
                 total_bytes = (
@@ -565,24 +539,7 @@ class GPUTransferModule:
                 )
 
         ed = time.perf_counter()
-        logger.info(
-            "[GPU-STORE] req=%s resolve_keys=%.3f copy_block_ids=%.3f "
-            "event_ipc_wait=%.3f event_publish=%.3f reserve_write=%.3f "
-            "kernel_loop=%.3f event_record=%.3f submit_cb=%.3f total=%.3f ms "
-            "(num_chunks=%d, num_groups=%d)",
-            key.request_id,
-            (_t_resolve - st) * 1000,
-            (_t_copy_ids - _t_resolve) * 1000,
-            (_t_event_wait - _t_copy_ids) * 1000,
-            (_t_publish - _t_event_wait) * 1000,
-            (_t_reserve - _t_publish) * 1000,
-            (_t_loop_end - _t_reserve) * 1000,
-            (_t_record_end - _t_record_start) * 1000,
-            (_t_callback_end - _t_record_end) * 1000,
-            (ed - st) * 1000,
-            len(obj_keys),
-            _num_groups,
-        )
+        timer.emit()
         if length := len(reserved_dict):
             logger.info(
                 "Stored %d tokens in %.3f seconds",
