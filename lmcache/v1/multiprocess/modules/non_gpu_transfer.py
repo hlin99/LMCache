@@ -35,6 +35,7 @@ from lmcache.v1.multiprocess.transfer_context.base import NonGpuContextMetadata
 
 # Local
 from .server_transfer import (
+    ShmTransferStrategy,
     TransferStrategy,
     create_transfer_strategy,
 )
@@ -296,6 +297,7 @@ class NonGPUTransferModule:
         Returns:
             PrepareStoreResponse with empty slots for pickle mode.
         """
+        t_start = time.perf_counter()
         entry = self._non_gpu_contexts.get(instance_id)
         if entry is None:
             raise ValueError(
@@ -306,14 +308,26 @@ class NonGPUTransferModule:
             raise ValueError(
                 f"transfer strategy not registered for instance ID {instance_id}"
             )
+        t_resolve = time.perf_counter()
         response = strategy.prepare_store(
             key=key,
             instance_id=instance_id,
             context=entry.metadata,
             resolve_obj_keys=self._ctx.resolve_obj_keys,
         )
+        t_prepare = time.perf_counter()
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
+        strategy_name = "shm" if isinstance(strategy, ShmTransferStrategy) else "pickle"
+        logger.info(
+            "[SRV-PREPARE-STORE] req=%s resolve_keys=%.3f prepare=%.3f"
+            " total=%.3f ms (strategy=%s)",
+            key.request_id,
+            (t_resolve - t_start) * 1000,
+            (t_prepare - t_resolve) * 1000,
+            (t_prepare - t_start) * 1000,
+            strategy_name,
+        )
         return response
 
     @_lmcache_nvtx_annotate
@@ -349,6 +363,7 @@ class NonGPUTransferModule:
             )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("store_start_time", None)
+        t_commit_start = time.perf_counter()
         result = strategy.commit_store(
             key=key,
             instance_id=instance_id,
@@ -356,12 +371,25 @@ class NonGPUTransferModule:
             context=entry.metadata,
             resolve_obj_keys=self._ctx.resolve_obj_keys,
         )
+        t_commit_end = time.perf_counter()
         if st is not None and result:
             num_tokens = len(self._ctx.resolve_obj_keys(key)) * self._ctx.chunk_size
+            strategy_name = (
+                "shm" if isinstance(strategy, ShmTransferStrategy) else "pickle"
+            )
             logger.info(
                 "Stored %d tokens in %.3f seconds",
                 num_tokens,
                 time.perf_counter() - st,
+            )
+            logger.info(
+                "[SRV-COMMIT-STORE] req=%s commit=%.3f total_since_prepare=%.3f ms"
+                " (strategy=%s, num_tokens=%d)",
+                key.request_id,
+                (t_commit_end - t_commit_start) * 1000,
+                (t_commit_end - st) * 1000,
+                strategy_name,
+                num_tokens,
             )
         return result
 
