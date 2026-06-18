@@ -559,8 +559,8 @@ def create_transfer_context(
     if resolved_mode is MPTransferMode.DATA:
         return _build_data_context(kv_caches)
     # AUTO: preserve the historical device-type-based dispatch.
-    if device_type == "cuda":
-        return HandleTransferContext()
+    # if device_type == "cuda":
+    #    return HandleTransferContext()
     return _build_data_context(kv_caches)
 
 

@@ -434,7 +434,7 @@ class GPUTransferModule:
             _t_record_start = _t_publish
             _t_record_end = _t_publish
             _t_callback_end = _t_publish
-            use_c_ops = False
+            use_c_ops = True
             try:
                 layout_desc = get_layout_desc(gpu_context, self._ctx.chunk_size)
                 reserved_dict = self._ctx.storage_manager.reserve_write(
@@ -523,7 +523,8 @@ class GPUTransferModule:
                 _t_record_end = time.perf_counter()
 
                 _t_sync_start = time.perf_counter()
-                event.synchronize()  # 等 GPU 上所有 kernel + D2H 真正完成
+                # hlin99: debug mode
+                # event.synchronize()  # 等 GPU 上所有 kernel + D2H 真正完成
                 _t_sync_end = time.perf_counter()
                 logger.info(
                     "[GPU-STORE-SYNC] req=%s gpu_sync=%.3f total_with_sync=%.3f ms",
