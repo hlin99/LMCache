@@ -35,7 +35,6 @@ from lmcache.v1.multiprocess.transfer_context.base import NonGpuContextMetadata
 
 # Local
 from .server_transfer import (
-    ShmTransferStrategy,
     TransferStrategy,
     create_transfer_strategy,
 )
@@ -318,7 +317,6 @@ class NonGPUTransferModule:
         t_prepare = time.perf_counter()
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
-        strategy_name = "shm" if isinstance(strategy, ShmTransferStrategy) else "pickle"
         logger.info(
             "[SRV-PREPARE-STORE] req=%s resolve_keys=%.3f prepare=%.3f"
             " total=%.3f ms (strategy=%s)",
@@ -326,7 +324,7 @@ class NonGPUTransferModule:
             (t_resolve - t_start) * 1000,
             (t_prepare - t_resolve) * 1000,
             (t_prepare - t_start) * 1000,
-            strategy_name,
+            strategy.strategy_name,
         )
         return response
 
@@ -374,9 +372,6 @@ class NonGPUTransferModule:
         t_commit_end = time.perf_counter()
         if st is not None and result:
             num_tokens = len(self._ctx.resolve_obj_keys(key)) * self._ctx.chunk_size
-            strategy_name = (
-                "shm" if isinstance(strategy, ShmTransferStrategy) else "pickle"
-            )
             logger.info(
                 "Stored %d tokens in %.3f seconds",
                 num_tokens,
@@ -388,7 +383,7 @@ class NonGPUTransferModule:
                 key.request_id,
                 (t_commit_end - t_commit_start) * 1000,
                 (t_commit_end - st) * 1000,
-                strategy_name,
+                strategy.strategy_name,
                 num_tokens,
             )
         return result
