@@ -109,7 +109,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
             # unlink the segment when this worker exits.
             unregister(f"/{self._shm.name}", "shared_memory")
             self._shm_buffer = self._shm.buf
-            self._register_shm_buffer()
+            self._pin_shm_buffer()
             logger.info("SHM pinned=%s for shm_name=%s", self._pinned, self._shm_name)
         except Exception:
             self._shm = None
@@ -230,7 +230,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
                 self._shm = None
                 self._shm_buffer = None
 
-    def _register_shm_buffer(self) -> None:
+    def _pin_shm_buffer(self) -> None:
         """Pin the SHM buffer as page-locked host memory via cudaHostRegister.
 
         Enables faster async D2H CUDA copies to the SHM region. If pinning is
