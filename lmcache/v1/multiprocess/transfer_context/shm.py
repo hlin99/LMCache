@@ -6,11 +6,14 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from multiprocessing.resource_tracker import unregister
 from typing import Any
+import ctypes
 
 # Third Party
 import torch
 
 # First Party
+from lmcache import torch_dev
+from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -18,6 +21,8 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,9 @@ class EngineDrivenContextShm(EngineDrivenContext):
         self._pool_size = pool_size
         self._shm: shared_memory.SharedMemory | None = None
         self._shm_buffer: memoryview | None = None
+        self._pinned = False
+        self._pinned_ptr = 0
+        self._pinned_size = 0
         try:
             self._shm = shared_memory.SharedMemory(
                 name=shm_name.lstrip("/"), create=False
@@ -101,6 +109,8 @@ class EngineDrivenContextShm(EngineDrivenContext):
             # unlink the segment when this worker exits.
             unregister(f"/{self._shm.name}", "shared_memory")
             self._shm_buffer = self._shm.buf
+            self._register_shm_buffer()
+            logger.info("SHM pinned=%s for shm_name=%s", self._pinned, self._shm_name)
         except Exception:
             self._shm = None
             self._shm_buffer = None
@@ -212,7 +222,76 @@ class EngineDrivenContextShm(EngineDrivenContext):
         if self._shm is None:
             return
         try:
-            self._shm.close()
+            self._unregister_shm_buffer()
         finally:
-            self._shm = None
-            self._shm_buffer = None
+            try:
+                self._shm.close()
+            finally:
+                self._shm = None
+                self._shm_buffer = None
+
+    def _register_shm_buffer(self) -> None:
+        """Pin the SHM buffer as page-locked host memory via cudaHostRegister.
+
+        Enables faster async D2H CUDA copies to the SHM region. If pinning is
+        not available or fails, logs a warning and continues without pinning.
+        """
+        if self._shm_buffer is None or not torch_dev.is_available():
+            return
+        if not hasattr(torch_dev, "cudart"):
+            logger.warning(
+                "Skipping SHM host registration for shm_name=%s: "
+                "backend does not support cudart(); D2H copies will be synchronous",
+                self._shm_name,
+            )
+            return
+        try:
+            ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._shm_buffer))
+            err = torch_dev.cudart().cudaHostRegister(ptr, self._pool_size, 0)
+        except Exception as exc:
+            logger.warning(
+                "Failed to register SHM buffer for shm_name=%s: %r; "
+                "D2H copies will be synchronous",
+                self._shm_name,
+                exc,
+            )
+            return
+        if err != 0:
+            logger.warning(
+                "cudaHostRegister failed for shm_name=%s (ptr=%d, size=%d, err=%s); "
+                "D2H copies will be synchronous",
+                self._shm_name,
+                ptr,
+                self._pool_size,
+                err,
+            )
+            return
+        self._pinned = True
+        self._pinned_ptr = ptr
+        self._pinned_size = self._pool_size
+
+    def _unregister_shm_buffer(self) -> None:
+        """Unpin the SHM buffer if it was previously pinned via cudaHostRegister."""
+        if not self._pinned or self._pinned_ptr == 0:
+            return
+        try:
+            err = torch_dev.cudart().cudaHostUnregister(self._pinned_ptr)
+            if err != 0:
+                logger.warning(
+                    "cudaHostUnregister failed for shm_name=%s (ptr=%d, size=%d, "
+                    "err=%s)",
+                    self._shm_name,
+                    self._pinned_ptr,
+                    self._pinned_size,
+                    err,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to unregister SHM buffer for shm_name=%s: %r",
+                self._shm_name,
+                exc,
+            )
+        finally:
+            self._pinned = False
+            self._pinned_ptr = 0
+            self._pinned_size = 0
