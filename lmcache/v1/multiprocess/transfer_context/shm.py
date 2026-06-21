@@ -223,7 +223,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         if self._shm is None:
             return
         try:
-            self._unregister_shm_buffer()
+            self._unpin_shm_buffer()
         finally:
             try:
                 self._shm.close()
@@ -254,7 +254,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
             self._pinned_ptr = ptr
             self._pinned_size = self._pool_size
 
-    def _unregister_shm_buffer(self) -> None:
+    def _unpin_shm_buffer(self) -> None:
         """Unpin the SHM buffer if it was previously pinned via cudaHostRegister."""
         if not self._pinned or self._pinned_ptr == 0:
             return
