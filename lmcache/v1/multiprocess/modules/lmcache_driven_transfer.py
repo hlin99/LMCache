@@ -755,6 +755,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             key, list(range(num_object_groups))
         )
         num_chunks = len(obj_keys_per_obj_group[0])
+        _t_resolve = time.perf_counter()
+        _num_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
 
         # NOTE: different engine groups may have different block sizes, so
         # ``blocks_per_chunk[i]`` is the number of blocks in one chunk for
@@ -800,6 +802,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
                 cache_context, gpu_block_ids
             )
+            _t_copy_ids = time.perf_counter()
 
             if not hasattr(torch_dev.Event, "from_ipc_handle"):
                 raise RuntimeError(
@@ -811,6 +814,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 cache_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=cache_context.stream)
+            _t_event_wait = time.perf_counter()
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -835,11 +839,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     },
                 ),
             )
+            _t_publish = time.perf_counter()
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             all_dict: dict[ObjectKey, MemoryObj] = {}
             total_bytes: int = 0
             store_succeeded = False
+            _t_reserve = _t_publish
+            _t_loop_end = _t_publish
+            _t_record_end = _t_publish
+            _t_callback_end = _t_publish
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
@@ -875,11 +884,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
 
                 store_succeeded = True
+                _t_loop_end = time.perf_counter()
             except Exception:
                 logger.exception("Cannot store keys due to exception")
                 return event.ipc_handle(), False
             finally:
+                _t_record_start = time.perf_counter()
                 event.record()
+                _t_record_end = time.perf_counter()
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
@@ -905,8 +917,26 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+                _t_callback_end = time.perf_counter()
 
         ed = time.perf_counter()
+        logger.info(
+            "[GPU-STORE] req=%s resolve_keys=%.3f copy_block_ids=%.3f "
+            "event_ipc_wait=%.3f event_publish=%.3f "
+            "kernel_loop=%.3f event_record=%.3f submit_cb=%.3f total=%.3f ms "
+            "(num_chunks=%d, num_groups=%d)",
+            key.request_id,
+            (_t_resolve - st) * 1000,
+            (_t_copy_ids - _t_resolve) * 1000,
+            (_t_event_wait - _t_copy_ids) * 1000,
+            (_t_publish - _t_event_wait) * 1000,
+            (_t_loop_end - _t_publish) * 1000,
+            (_t_record_end - _t_record_start) * 1000,
+            (_t_callback_end - _t_record_end) * 1000,
+            (ed - st) * 1000,
+            num_chunks,
+            _num_groups,
+        )
         if stored_count:
             logger.info(
                 "Stored %d tokens in %.3f seconds",
