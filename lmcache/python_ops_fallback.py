@@ -28,7 +28,7 @@ from lmcache.utils import try_pin_buffer, try_unpin_buffer
 _tensor_registry: dict[int, torch.Tensor] = {}
 _shm_registry: dict[int, shared_memory.SharedMemory] = {}
 _buf_registry: dict[int, ctypes.Array] = {}
-_pinned_shm_registry: dict[int, int] = {}  # ptr -> size, for cudaHostUnregister
+_pinned_ptr_registry: dict[int, int] = {}  # ptr -> size, for cudaHostUnregister
 
 # Cached copy library for lmcache_memcpy_async (lazy-initialized)
 _copy_lib_NOT_LOADED = object()
@@ -402,6 +402,8 @@ def _alloc_page_aligned_pinned_view(size: int) -> Tuple[torch.Tensor, int]:
 def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     """Non-CUDA equivalent of allocating pinned memory with NUMA awareness.
     On XPU, uses pin_memory=True (SYCL USM host allocation) for fast transfers.
+    Attempts to pin the buffer via cudaHostRegister for async D2H;
+    if pinning fails, continues without pinning.
     Note: NUMA node selection is not supported on non-CUDA."""
 
     view, aligned_ptr = _alloc_page_aligned_pinned_view(size)
@@ -409,11 +411,22 @@ def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     # holding the view in the registry transitively keeps the underlying
     # memory alive.
     _tensor_registry[aligned_ptr] = view
+
+    # Try to pin the buffer for async D2H copies
+    if try_pin_buffer(aligned_ptr, size):
+        _pinned_ptr_registry[aligned_ptr] = size
+
     return aligned_ptr
 
 
 def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
-    """Non-CUDA equivalent of freeing a previously allocated NUMA pointer."""
+    """Non-CUDA equivalent of freeing a previously allocated NUMA pointer.
+    Unregisters pinned memory if it was pinned."""
+
+    # Unpin if previously registered
+    if ptr in _pinned_ptr_registry:
+        try_unpin_buffer(ptr)
+        _pinned_ptr_registry.pop(ptr, None)
 
     # Release the tensor object for that pointer reference
     _tensor_registry.pop(ptr, None)
@@ -422,15 +435,27 @@ def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
 def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     """Non-CUDA equivalent of allocating pinned memory and returning pointer
     to it. On XPU, uses pin_memory=True (SYCL USM host allocation) for
-    fast DMA transfers. On other non-CUDA platforms, pinning is not supported."""
+    fast DMA transfers. Attempts to pin the buffer via cudaHostRegister
+    for async D2H; if pinning fails, continues without pinning."""
 
     view, aligned_ptr = _alloc_page_aligned_pinned_view(size)
     _tensor_registry[aligned_ptr] = view
+
+    # Try to pin the buffer for async D2H copies
+    if try_pin_buffer(aligned_ptr, size):
+        _pinned_ptr_registry[aligned_ptr] = size
+
     return aligned_ptr
 
 
 def free_pinned_ptr(ptr: int) -> None:
-    """Non-CUDA equivalent of freeing a previously allocated pinned pointer."""
+    """Non-CUDA equivalent of freeing a previously allocated pinned pointer.
+    Unregisters pinned memory if it was pinned."""
+
+    # Unpin if previously registered
+    if ptr in _pinned_ptr_registry:
+        try_unpin_buffer(ptr)
+        _pinned_ptr_registry.pop(ptr, None)
 
     # Release the tensor object for that pointer reference
     _tensor_registry.pop(ptr, None)
@@ -486,7 +511,7 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
 
     # Try to pin the SHM buffer for async D2H copies
     if try_pin_buffer(ptr, size):
-        _pinned_shm_registry[ptr] = size
+        _pinned_ptr_registry[ptr] = size
 
     return ptr
 
@@ -496,9 +521,9 @@ def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
     pinned pointer. Unregisters pinned memory if it was pinned."""
 
     # Unpin if previously registered
-    if ptr in _pinned_shm_registry:
+    if ptr in _pinned_ptr_registry:
         try_unpin_buffer(ptr)
-        _pinned_shm_registry.pop(ptr, None)
+        _pinned_ptr_registry.pop(ptr, None)
 
     # Release in order: tensor -> ctypes buf -> shm
     _tensor_registry.pop(ptr, None)
