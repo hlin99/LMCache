@@ -21,6 +21,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev
+from lmcache.utils import try_pin_buffer, try_unpin_buffer
 
 # Store the tensor objects in memory so that they can be accessed
 # outside the scope of this file
@@ -484,25 +485,8 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     _shm_registry[ptr] = shm
 
     # Try to pin the SHM buffer for async D2H copies
-    if torch_dev.is_available() and hasattr(torch_dev, "cudart"):
-        try:
-            err = torch_dev.cudart().cudaHostRegister(ptr, size, 0)
-            if err == 0:
-                _pinned_shm_registry[ptr] = size
-            else:
-                warnings.warn(
-                    f"cudaHostRegister failed for shm_name={shm_name} "
-                    f"(err={err}); D2H copies will be synchronous",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        except Exception as exc:
-            warnings.warn(
-                f"Failed to pin SHM buffer for shm_name={shm_name}: {exc!r}; "
-                "D2H copies will be synchronous",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+    if try_pin_buffer(ptr, size):
+        _pinned_shm_registry[ptr] = size
 
     return ptr
 
@@ -513,10 +497,7 @@ def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
 
     # Unpin if previously registered
     if ptr in _pinned_shm_registry:
-        try:
-            torch_dev.cudart().cudaHostUnregister(ptr)
-        except Exception:
-            pass
+        try_unpin_buffer(ptr)
         _pinned_shm_registry.pop(ptr, None)
 
     # Release in order: tensor -> ctypes buf -> shm

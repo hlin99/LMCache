@@ -14,6 +14,7 @@ import torch
 # First Party
 from lmcache import torch_dev
 from lmcache.logging import init_logger
+from lmcache.utils import try_pin_buffer, try_unpin_buffer
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -238,60 +239,26 @@ class EngineDrivenContextShm(EngineDrivenContext):
         """
         if self._shm_buffer is None or not torch_dev.is_available():
             return
-        if not hasattr(torch_dev, "cudart"):
-            logger.warning(
-                "Skipping SHM host registration for shm_name=%s: "
-                "backend does not support cudart(); D2H copies will be synchronous",
-                self._shm_name,
-            )
-            return
         try:
             ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._shm_buffer))
-            err = torch_dev.cudart().cudaHostRegister(ptr, self._pool_size, 0)
         except Exception as exc:
             logger.warning(
-                "Failed to register SHM buffer for shm_name=%s: %r; "
+                "Failed to get pointer for shm_name=%s: %r; "
                 "D2H copies will be synchronous",
                 self._shm_name,
                 exc,
             )
             return
-        if err != 0:
-            logger.warning(
-                "cudaHostRegister failed for shm_name=%s (ptr=%d, size=%d, err=%s); "
-                "D2H copies will be synchronous",
-                self._shm_name,
-                ptr,
-                self._pool_size,
-                err,
-            )
-            return
-        self._pinned = True
-        self._pinned_ptr = ptr
-        self._pinned_size = self._pool_size
+        if try_pin_buffer(ptr, self._pool_size):
+            self._pinned = True
+            self._pinned_ptr = ptr
+            self._pinned_size = self._pool_size
 
     def _unregister_shm_buffer(self) -> None:
         """Unpin the SHM buffer if it was previously pinned via cudaHostRegister."""
         if not self._pinned or self._pinned_ptr == 0:
             return
-        try:
-            err = torch_dev.cudart().cudaHostUnregister(self._pinned_ptr)
-            if err != 0:
-                logger.warning(
-                    "cudaHostUnregister failed for shm_name=%s (ptr=%d, size=%d, "
-                    "err=%s)",
-                    self._shm_name,
-                    self._pinned_ptr,
-                    self._pinned_size,
-                    err,
-                )
-        except Exception as exc:
-            logger.warning(
-                "Failed to unregister SHM buffer for shm_name=%s: %r",
-                self._shm_name,
-                exc,
-            )
-        finally:
-            self._pinned = False
-            self._pinned_ptr = 0
-            self._pinned_size = 0
+        try_unpin_buffer(self._pinned_ptr)
+        self._pinned = False
+        self._pinned_ptr = 0
+        self._pinned_size = 0
