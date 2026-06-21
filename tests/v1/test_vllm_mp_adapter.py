@@ -178,18 +178,21 @@ def fake_adapter(monkeypatch):
 
 
 def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
-    """Public register_kv_caches stores the dict and submits one request."""
+    """Public register_kv_caches stores the dict and submits one request.
+
+    AUTO mode now always routes through EngineDrivenTransferContext so the
+    request type is REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT regardless of
+    device type.
+    """
     adapter, send_mock, _ = fake_adapter
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
-    new_caches = {"layer.0": fake_tensor, "layer.1": fake_tensor}
+    new_caches = {"layer.0": torch.randn(2, 8, 4, 2, 8)}
 
     adapter.register_kv_caches(new_caches)
 
     assert adapter.kv_caches is new_caches
     assert send_mock.call_count == 1
     args, _kwargs = send_mock.call_args
-    assert args[1] == RequestType.REGISTER_KV_CACHE
+    assert args[1] == RequestType.REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
 
 
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
@@ -198,9 +201,7 @@ def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     future.result.side_effect = TimeoutError("server down")
 
     with pytest.raises(ConnectionError, match="did not respond"):
-        fake_tensor = MagicMock()
-        fake_tensor.device.type = "cuda"
-        adapter.register_kv_caches({"layer.0": fake_tensor})
+        adapter.register_kv_caches({"layer.0": torch.randn(2, 8, 4, 2, 8)})
 
 
 def test_register_kv_caches_cpu_submits_engine_driven_context_registration(
@@ -746,3 +747,15 @@ def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
     assert len(contexts) == 3
     assert adapter.transfer_ctx is contexts[2]
     contexts[1].close.assert_not_called()
+
+
+def test_handle_preemptions_flushes_only_when_signaled(fake_adapter):
+    adapter, _send_mock, _future = fake_adapter
+    transfer_ctx = MagicMock()
+    adapter.transfer_ctx = transfer_ctx
+
+    adapter.handle_preemptions(False)
+    transfer_ctx.flush_inflight_gathers.assert_not_called()
+
+    adapter.handle_preemptions(True)
+    transfer_ctx.flush_inflight_gathers.assert_called_once_with()
