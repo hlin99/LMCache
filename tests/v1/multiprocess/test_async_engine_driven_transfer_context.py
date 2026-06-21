@@ -103,7 +103,8 @@ def _install_fake_gather(monkeypatch: pytest.MonkeyPatch) -> None:
             tensor.fill_(1.0)
         return out
 
-    # Patch gather in both modules so either path is exercised.
+    # Patch gather in both modules: async_data for AsyncEngineDrivenTransferContext
+    # tests, worker_transfer for EngineDrivenTransferContext (sync) tests.
     monkeypatch.setattr(async_data, "gather_paged_kv_to_cpu", _gather)
     monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _gather)
 

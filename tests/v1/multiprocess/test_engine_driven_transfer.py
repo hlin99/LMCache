@@ -1687,9 +1687,12 @@ def test_engine_driven_context_shm_register_failure_warns_and_skips_unregister(
 
     assert fake_cudart.unregister_calls == []
     warning_mock.assert_called_once()
-    message, logged_shm_name, _logged_ptr, logged_size, logged_err = (
-        warning_mock.call_args[0]
+    warning_args = warning_mock.call_args[0]
+    assert len(warning_args) == 5, (
+        f"Expected 5 warning args (message, shm_name, ptr, size, err), "
+        f"got {len(warning_args)}"
     )
+    message, logged_shm_name, _logged_ptr, logged_size, logged_err = warning_args
     assert "cudaHostRegister failed" in message
     assert logged_shm_name == shm_name
     assert logged_size == 4096
