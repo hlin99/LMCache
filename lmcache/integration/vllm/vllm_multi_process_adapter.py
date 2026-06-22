@@ -28,6 +28,7 @@ from lmcache.v1.multiprocess.group_view import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.store_timer import StoreTimer
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
@@ -1069,6 +1070,8 @@ class LMCacheMPWorkerAdapter:
             },
         )
 
+        self._store_timer = StoreTimer(prefix="adapter")
+
     @property
     def is_healthy(self) -> bool:
         """Whether the LMCache server is healthy.
@@ -1266,6 +1269,7 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        self._store_timer.mark(f"vllm_store_{request_id}", "vllm_return")
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -1293,6 +1297,8 @@ class LMCacheMPWorkerAdapter:
             event,
             self.blocks_in_chunk,
         )
+        self._store_timer.mark(f"vllm_store_{request_id}", "submit_done")
+        self._store_timer.emit(f"vllm_store_{request_id}")
         self.store_futures[request_id] = future
         self.store_events[request_id] = event
 
@@ -1318,6 +1324,7 @@ class LMCacheMPWorkerAdapter:
                 model inference step
             cache_salt: Per-user isolation salt.
         """
+        self._store_timer.mark(f"vllm_retrieve_{request_id}", "vllm_return")
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
@@ -1348,6 +1355,8 @@ class LMCacheMPWorkerAdapter:
             self.blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
+        self._store_timer.mark(f"vllm_retrieve_{request_id}", "submit_done")
+        self._store_timer.emit(f"vllm_retrieve_{request_id}")
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         self.retrieve_events[request_id] = event
 

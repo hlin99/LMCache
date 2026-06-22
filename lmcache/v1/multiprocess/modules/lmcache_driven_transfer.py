@@ -46,6 +46,7 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.v1.multiprocess.store_timer import StoreTimer
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
 from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.c_ops as lmc_ops
@@ -447,6 +448,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         self._device_host_func_dispatcher.start()
 
+        self._store_timer = StoreTimer(prefix="store")
+
     @property
     def context(self) -> MPCacheServerContext:
         """Return the shared engine context. Exposed for testing only."""
@@ -743,6 +746,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             store completed without such a failure.
         """
         st = time.perf_counter()
+        timer_name = f"lmcache_driven_{key.request_id}"
+        self._store_timer.mark(timer_name, "ipc_server_enter")
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -811,6 +816,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 cache_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=cache_context.stream)
+            self._store_timer.mark(timer_name, "kv_sync")
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -880,6 +886,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 return event.ipc_handle(), False
             finally:
                 event.record()
+                self._store_timer.mark(timer_name, "ipc_server_return")
                 # Fail closed: commit the reserved objects only when every chunk
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
@@ -888,6 +895,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         cache_context.cupy_stream,
                         "finish_write",
                         list(all_dict.keys()),
+                    )
+                    _timer = self._store_timer
+                    _tname = timer_name
+
+                    def _on_store_copy_done(_arg: None) -> None:
+                        _timer.mark(_tname, "ipc_copy_done")
+                        _timer.emit(_tname)
+
+                    cache_context.cupy_stream.launch_host_func(
+                        _on_store_copy_done, None
                     )
                 else:
                     total_bytes = 0
@@ -947,6 +964,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no GPU context is registered for the given instance ID.
         """
         st = time.perf_counter()
+        timer_name = f"lmcache_driven_retrieve_{key.request_id}"
+        self._store_timer.mark(timer_name, "ipc_server_enter")
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -1057,11 +1076,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 return event.ipc_handle(), False
             finally:
                 event.record()
+                self._store_timer.mark(timer_name, "ipc_server_return")
                 if prefetched_keys:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
                         "finish_read_prefetched",
                         prefetched_keys,
+                    )
+                    _timer = self._store_timer
+                    _tname = timer_name
+
+                    def _on_retrieve_copy_done(_arg: None) -> None:
+                        _timer.mark(_tname, "ipc_copy_done")
+                        _timer.emit(_tname)
+
+                    cache_context.cupy_stream.launch_host_func(
+                        _on_retrieve_copy_done, None
                     )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
