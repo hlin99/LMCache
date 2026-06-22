@@ -14,7 +14,6 @@ import torch
 # First Party
 from lmcache import torch_dev
 from lmcache.logging import init_logger
-from lmcache.utils import try_pin_buffer, try_unpin_buffer
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -250,7 +249,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
                 exc,
             )
             return
-        if try_pin_buffer(ptr, self._pool_size):
+        if torch_dev.ext.pin_memory(ptr, self._pool_size):
             self._pinned = True
             self._pinned_ptr = ptr
             self._pinned_size = self._pool_size
@@ -259,7 +258,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         """Unpin the SHM buffer if it was previously pinned via cudaHostRegister."""
         if not self._pinned or self._pinned_ptr == 0:
             return
-        try_unpin_buffer(self._pinned_ptr)
+        torch_dev.ext.unpin_memory(self._pinned_ptr)
         self._pinned = False
         self._pinned_ptr = 0
         self._pinned_size = 0

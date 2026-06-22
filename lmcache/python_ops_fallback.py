@@ -21,7 +21,6 @@ import torch
 
 # First Party
 from lmcache import torch_dev
-from lmcache.utils import try_pin_buffer, try_unpin_buffer
 
 # Store the tensor objects in memory so that they can be accessed
 # outside the scope of this file
@@ -413,7 +412,7 @@ def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     _tensor_registry[aligned_ptr] = view
 
     # Try to pin the buffer for async D2H copies
-    if try_pin_buffer(aligned_ptr, size):
+    if torch_dev.ext.pin_memory(aligned_ptr, size):
         _pinned_ptr_registry[aligned_ptr] = size
 
     return aligned_ptr
@@ -425,7 +424,7 @@ def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
 
     # Unpin if previously registered
     if ptr in _pinned_ptr_registry:
-        try_unpin_buffer(ptr)
+        torch_dev.ext.unpin_memory(ptr)
         _pinned_ptr_registry.pop(ptr, None)
 
     # Release the tensor object for that pointer reference
@@ -442,7 +441,7 @@ def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     _tensor_registry[aligned_ptr] = view
 
     # Try to pin the buffer for async D2H copies
-    if try_pin_buffer(aligned_ptr, size):
+    if torch_dev.ext.pin_memory(aligned_ptr, size):
         _pinned_ptr_registry[aligned_ptr] = size
 
     return aligned_ptr
@@ -454,7 +453,7 @@ def free_pinned_ptr(ptr: int) -> None:
 
     # Unpin if previously registered
     if ptr in _pinned_ptr_registry:
-        try_unpin_buffer(ptr)
+        torch_dev.ext.unpin_memory(ptr)
         _pinned_ptr_registry.pop(ptr, None)
 
     # Release the tensor object for that pointer reference
@@ -510,7 +509,7 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     _shm_registry[ptr] = shm
 
     # Try to pin the SHM buffer for async D2H copies
-    if try_pin_buffer(ptr, size):
+    if torch_dev.ext.pin_memory(ptr, size):
         _pinned_ptr_registry[ptr] = size
 
     return ptr
@@ -522,7 +521,7 @@ def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
 
     # Unpin if previously registered
     if ptr in _pinned_ptr_registry:
-        try_unpin_buffer(ptr)
+        torch_dev.ext.unpin_memory(ptr)
         _pinned_ptr_registry.pop(ptr, None)
 
     # Release in order: tensor -> ctypes buf -> shm
