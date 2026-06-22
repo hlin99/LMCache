@@ -62,6 +62,71 @@ torch_dev, torch_device_type = _detect_device()
 logger.info(" torch_dev=%s, torch_device_type=%s", torch_dev, torch_device_type)
 
 
+class DeviceExt:
+    """Extension namespace attached as ``torch_dev.ext``.
+
+    Holds platform-specific capabilities that do not exist on the original
+    torch device module.  New capabilities can be added as methods or
+    properties here without changing call-sites.
+
+    Intended usage::
+
+        torch_dev.ext.pin_memory(ptr, size)
+        torch_dev.ext.unpin_memory(ptr, size)
+        if not torch_dev.ext.is_pin_supported:
+            raise RuntimeError(...)
+    """
+
+    def __init__(self, device_type: str) -> None:
+        # First Party
+        from lmcache.v1.platform.base import PinMemoryBackend
+
+        if device_type == "cuda":
+            # First Party
+            from lmcache.v1.platform.cuda.pin_memory import CudaPinMemoryBackend
+
+            self._pin: PinMemoryBackend = CudaPinMemoryBackend()
+        elif device_type == "xpu":
+            # First Party
+            from lmcache.v1.platform.xpu.pin_memory import XPUPinMemoryBackend
+
+            self._pin = XPUPinMemoryBackend()
+        else:
+            self._pin = PinMemoryBackend()
+
+    def pin_memory(self, ptr: int, size: int) -> bool:
+        """Pin a host memory region for DMA access.
+
+        Args:
+            ptr: Raw pointer (data_ptr) to the memory region.
+            size: Size in bytes of the region to pin.
+
+        Returns:
+            True if pinning succeeded, False otherwise.
+        """
+        return self._pin.pin_memory(ptr, size)
+
+    def unpin_memory(self, ptr: int, size: int = 0) -> bool:
+        """Unpin a previously pinned host memory region.
+
+        Args:
+            ptr: Raw pointer (data_ptr) to the memory region.
+            size: Size in bytes (optional, used by some platforms).
+
+        Returns:
+            True if unpinning succeeded, False otherwise.
+        """
+        return self._pin.unpin_memory(ptr, size)
+
+    @property
+    def is_pin_supported(self) -> bool:
+        """Whether the current platform supports memory pinning."""
+        return self._pin.is_pin_supported()
+
+
+torch_dev.ext = DeviceExt(torch_device_type)
+
+
 # --------------------------
 # Dynamic backend selection
 # --------------------------

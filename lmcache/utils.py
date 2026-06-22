@@ -95,7 +95,7 @@ def check_interprocess_event_support() -> None:
 
 
 def try_pin_buffer(ptr: int, size: int) -> bool:
-    """Try to pin a host buffer via cudaHostRegister for async D2H copies.
+    """Try to pin a host buffer for async D2H copies.
 
     Args:
         ptr: Raw host pointer (integer address) to pin.
@@ -107,23 +107,20 @@ def try_pin_buffer(ptr: int, size: int) -> bool:
     # First Party
     from lmcache import torch_dev
 
-    if not torch_dev.is_available() or not hasattr(torch_dev, "cudart"):
+    if not torch_dev.ext.is_pin_supported:
         logger.warning(
-            "torch_dev does not have cudart... not able to pin memory by cudart"
+            "Memory pinning is not supported on the current backend; "
+            "D2H copies will be synchronous"
         )
         return False
     try:
-        # TODO: take torch_dev.cudart().cudaHostRegister as temp solution
-        # may abstract a function for ptr register for diff platforms
-        err = torch_dev.cudart().cudaHostRegister(ptr, size, 0)
-        if err == 0:
+        result = torch_dev.ext.pin_memory(ptr, size)
+        if result:
             return True
         logger.warning(
-            "cudaHostRegister failed (ptr=%d, size=%d, err=%s); "
-            "D2H copies will be synchronous",
+            "pin_memory failed (ptr=%d, size=%d); D2H copies will be synchronous",
             ptr,
             size,
-            err,
         )
     except Exception as exc:
         logger.warning(
@@ -137,7 +134,7 @@ def try_pin_buffer(ptr: int, size: int) -> bool:
 
 
 def try_unpin_buffer(ptr: int) -> bool:
-    """Try to unpin a host buffer via cudaHostUnregister.
+    """Try to unpin a host buffer.
 
     Args:
         ptr: Raw host pointer (integer address) to unpin.
@@ -148,22 +145,19 @@ def try_unpin_buffer(ptr: int) -> bool:
     # First Party
     from lmcache import torch_dev
 
-    if not torch_dev.is_available() or not hasattr(torch_dev, "cudart"):
+    if not torch_dev.ext.is_pin_supported:
         logger.warning(
-            "torch_dev does not have cudart... not able to unpin memory by cudart"
+            "Memory pinning is not supported on the current backend; skipping unpin"
         )
         return False
 
     try:
-        # TODO: take torch_dev.cudart().cudaHostUnregister as temp solution
-        # may abstract a function for ptr unregister for diff platforms
-        err = torch_dev.cudart().cudaHostUnregister(ptr)
-        if err == 0:
+        result = torch_dev.ext.unpin_memory(ptr)
+        if result:
             return True
         logger.warning(
-            "cudaHostUnregister failed (ptr=%d, err=%s)",
+            "unpin_memory failed (ptr=%d)",
             ptr,
-            err,
         )
     except Exception as exc:
         logger.warning(
