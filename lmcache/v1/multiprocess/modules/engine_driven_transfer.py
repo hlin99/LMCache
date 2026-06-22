@@ -576,8 +576,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     "retrieved_count": retrieved_count,
                     "engine_id": instance_id,
                     "model_name": entry.model_name,
-                    "total_bytes": retrieved_count
-                    * self._bytes_per_object(entry.metadata),
+                    "total_bytes": (
+                        retrieved_count * self._bytes_per_object(entry.metadata)
+                    ),
                 },
             )
         )
