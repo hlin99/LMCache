@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
+import functools
 import math
 import threading
 import time
@@ -615,6 +616,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         return total_bytes
 
     @staticmethod
+    @functools.cache
     def _dtype_size_in_bytes(dtype: torch.dtype) -> int:
         """Return element size in bytes for a supported torch dtype.
 
