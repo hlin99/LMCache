@@ -5,7 +5,6 @@
 import logging
 import threading
 import time
-from typing import Optional
 
 # First Party
 from lmcache.utils import init_logger
@@ -17,14 +16,18 @@ class StoreTimer:
     """Thread-safe timing utility supporting multiple named groups.
 
     Only records timestamps when debug logging is enabled — zero overhead in
-    production.  All public methods (mark, emit, elapsed_ms, etc.) early-return
-    immediately when not at DEBUG level, avoiding any lock acquisition,
-    dict lookup, or time.perf_counter() call.
+    production.  All public methods (mark, emit) early-return immediately
+    when not at DEBUG level, avoiding any lock acquisition, dict lookup, or
+    time.perf_counter() call.
 
     A single timer instance can track multiple independent *names* (e.g.
     different store paths or sub-operations), each with its own ordered
     sequence of (step, time) entries.  Safe for concurrent use from multiple
     threads.
+
+    The log output shows **elapsed time between adjacent steps** (delta),
+    not absolute time from t0, making it easy to identify which step is the
+    bottleneck.
 
     Usage::
 
@@ -33,7 +36,10 @@ class StoreTimer:
         # Thread A — GPU IPC path
         timer.mark("gpu_ipc", "copy_start")
         timer.mark("gpu_ipc", "copy_done")
+        timer.mark("gpu_ipc", "kv_releasable")
         timer.emit("gpu_ipc")
+        # [STORE-TIMING] prefix=req-42 name=gpu_ipc
+        #   copy_start→copy_done=3.089 copy_done→kv_releasable=2.228 total=5.317 ms
 
         # Thread B — SHM path (can run concurrently)
         timer.mark("shm", "serialize_start")
@@ -46,10 +52,10 @@ class StoreTimer:
             grep / filtering (e.g. request id).
     """
 
-    __slots__ = ("_enabled", "_prefix", "_t0", "_groups", "_lock")
+    __slots__ = ("_enabled", "_prefix", "_groups", "_lock")
 
     def __init__(self, prefix: str = "") -> None:
-        """Initialize the timer and capture the entry timestamp if debug is on.
+        """Initialize the timer.
 
         Args:
             prefix: Optional prefix for log output (e.g. request id).
@@ -58,7 +64,6 @@ class StoreTimer:
         if not self._enabled:
             return
         self._prefix = prefix
-        self._t0 = time.perf_counter()
         self._groups: dict[str, list[tuple[str, float]]] = {}
         self._lock = threading.Lock()
 
@@ -84,8 +89,11 @@ class StoreTimer:
     def emit(self, name: str) -> None:
         """Emit a ``[STORE-TIMING]`` debug log line for a specific name group.
 
+        The output shows the **delta** between each pair of adjacent steps,
+        plus the total time from first to last step.
+
         Early-returns when debug logging is disabled.  If *name* has not been
-        recorded, this is a no-op.
+        recorded or has fewer than 2 steps, this is a no-op.
 
         Args:
             name: The group name to emit timing for.
@@ -94,20 +102,27 @@ class StoreTimer:
             return
         with self._lock:
             entries = self._groups.get(name)
-            if entries is None:
+            if entries is None or len(entries) < 2:
                 return
             # snapshot under lock
             entries = list(entries)
 
-        t0 = self._t0
-        parts = " ".join(
-            f"{step}={((t - t0) * 1000):.3f}" for step, t in entries
-        )
+        # Build delta pairs: step_a→step_b=<delta_ms>
+        parts = []
+        for i in range(1, len(entries)):
+            prev_step, prev_t = entries[i - 1]
+            curr_step, curr_t = entries[i]
+            delta_ms = (curr_t - prev_t) * 1000
+            parts.append(f"{prev_step}\u2192{curr_step}={delta_ms:.3f}")
+
+        total_ms = (entries[-1][1] - entries[0][1]) * 1000
+        parts.append(f"total={total_ms:.3f}")
+
         logger.debug(
             "[STORE-TIMING] %sname=%s %s ms",
             f"prefix={self._prefix} " if self._prefix else "",
             name,
-            parts,
+            " ".join(parts),
         )
 
     def emit_all(self) -> None:
@@ -121,54 +136,3 @@ class StoreTimer:
             names = list(self._groups.keys())
         for name in names:
             self.emit(name)
-
-    def elapsed_ms(self, name: str, step: str) -> Optional[float]:
-        """Return elapsed ms from construction to the first occurrence of step.
-
-        Early-returns None when debug logging is disabled.
-
-        Args:
-            name: The group name.
-            step: The step name to look up.
-
-        Returns:
-            Elapsed time in milliseconds, or None if not found or disabled.
-        """
-        if not self._enabled:
-            return None
-        with self._lock:
-            entries = self._groups.get(name)
-        if entries is None:
-            return None
-        for s, t in entries:
-            if s == step:
-                return (t - self._t0) * 1000
-        return None
-
-    def names(self) -> list[str]:
-        """Return the list of recorded group names (insertion order).
-
-        Returns empty list when debug logging is disabled.
-        """
-        if not self._enabled:
-            return []
-        with self._lock:
-            return list(self._groups.keys())
-
-    def steps(self, name: str) -> list[tuple[str, float]]:
-        """Return all (step, elapsed_ms) pairs for a given name.
-
-        Returns empty list when debug logging is disabled.
-
-        Args:
-            name: The group name.
-
-        Returns:
-            Ordered list of (step_name, elapsed_ms) tuples.
-        """
-        if not self._enabled:
-            return []
-        with self._lock:
-            entries = self._groups.get(name, [])
-        t0 = self._t0
-        return [(s, (t - t0) * 1000) for s, t in entries]
