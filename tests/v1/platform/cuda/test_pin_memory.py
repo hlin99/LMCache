@@ -78,7 +78,11 @@ def _install_torch_stub(
 
 
 def _import_pin_memory_module() -> ModuleType:
-    """Import the CUDA pinning module after clearing cached ``lmcache`` state."""
+    """Import the CUDA pinning module after clearing cached ``lmcache`` state.
+
+    Clearing cached modules keeps module-level initialization tied to the torch
+    stub installed for the current test instead of leaking from earlier tests.
+    """
     _clear_lmcache_modules()
     return importlib.import_module("lmcache.v1.platform.cuda.pin_memory")
 

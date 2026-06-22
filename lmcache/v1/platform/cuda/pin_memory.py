@@ -13,7 +13,11 @@ logger = init_logger(__name__)
 
 
 def _load_libcudart() -> ctypes.CDLL | None:
-    """Try to load ``libcudart`` and bind the pinning symbols.
+    """Try to load ``libcudart`` and bind the CUDA pinning symbols.
+
+    The loaded library is configured with the ``cudaHostRegister(void*, size_t,
+    unsigned int)`` and ``cudaHostUnregister(void*)`` signatures expected by
+    the backend.
 
     Returns:
         The loaded ``ctypes.CDLL`` library with bound symbols on success, or
@@ -65,6 +69,12 @@ class CudaPinMemoryBackend(PinMemoryBackend):
         lightest path when torch already exposes the CUDA runtime binding. If
         that import or lookup fails, it falls back to loading ``libcudart``
         directly via :mod:`ctypes`.
+
+        Notes:
+            Import and cudart lookup failures are handled internally. When both
+            the torch path and the ``libcudart`` fallback fail, the backend
+            stays in an unsupported state and ``is_pin_supported()`` returns
+            ``False``.
         """
         self._cudart = None
         self._libcudart = None
