@@ -66,14 +66,22 @@ class CudaPinMemoryBackend(PinMemoryBackend):
             # Third Party
             import torch
         except ImportError as exc:
-            logger.debug("CudaPinMemoryBackend: torch import failed: %s", exc)
+            logger.debug(
+                "CudaPinMemoryBackend: torch import failed, "
+                "attempting libcudart fallback: %s",
+                exc,
+            )
         else:
             try:
                 self._cudart = torch.cuda.cudart()
                 logger.info("CudaPinMemoryBackend: using torch cudart")
                 return
             except (AttributeError, RuntimeError) as exc:
-                logger.debug("CudaPinMemoryBackend: torch cudart unavailable: %s", exc)
+                logger.debug(
+                    "CudaPinMemoryBackend: torch cudart unavailable, "
+                    "attempting libcudart fallback: %s",
+                    exc,
+                )
 
         self._libcudart = _load_libcudart()
         if self._libcudart is not None:
