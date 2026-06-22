@@ -39,7 +39,7 @@ class StoreTimer:
         timer.mark("gpu_ipc", "kv_releasable")
         timer.emit("gpu_ipc")
         # [STORE-TIMING] prefix=req-42 name=gpu_ipc
-        #   copy_start→copy_done=3.089 copy_done→kv_releasable=2.228 total=5.317 ms
+        #   copy_start -> copy_done=3.089ms copy_done -> kv_releasable=2.228ms total=5.317ms
 
         # Thread B — SHM path (can run concurrently)
         timer.mark("shm", "serialize_start")
@@ -107,19 +107,19 @@ class StoreTimer:
             # snapshot under lock
             entries = list(entries)
 
-        # Build delta pairs: step_a→step_b=<delta_ms>
+        # Build delta pairs: step_a -> step_b=<delta>ms
         parts = []
         for i in range(1, len(entries)):
             prev_step, prev_t = entries[i - 1]
             curr_step, curr_t = entries[i]
             delta_ms = (curr_t - prev_t) * 1000
-            parts.append(f"{prev_step}\u2192{curr_step}={delta_ms:.3f}")
+            parts.append(f"{prev_step} -> {curr_step}={delta_ms:.3f}ms")
 
         total_ms = (entries[-1][1] - entries[0][1]) * 1000
-        parts.append(f"total={total_ms:.3f}")
+        parts.append(f"total={total_ms:.3f}ms")
 
         logger.debug(
-            "[STORE-TIMING] %sname=%s %s ms",
+            "[STORE-TIMING] %sname=%s %s",
             f"prefix={self._prefix} " if self._prefix else "",
             name,
             " ".join(parts),
