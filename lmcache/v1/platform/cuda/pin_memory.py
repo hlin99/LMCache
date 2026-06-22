@@ -20,9 +20,8 @@ def _load_libcudart() -> ctypes.CDLL | None:
         ``None`` if the library cannot be found or loaded.
 
     Notes:
-        ``OSError`` indicates that the located library could not be loaded.
-        ``AttributeError`` indicates that the loaded library does not expose
-        the required CUDA runtime symbols.
+        Missing symbols or load failures are treated as an unavailable
+        fallback path and cause this helper to return ``None``.
     """
     path = ctypes.util.find_library("cudart")
     if path is None:
@@ -66,15 +65,15 @@ class CudaPinMemoryBackend(PinMemoryBackend):
         try:
             # Third Party
             import torch
-        except ImportError:
-            pass
+        except ImportError as exc:
+            logger.debug("CudaPinMemoryBackend: torch import failed: %s", exc)
         else:
             try:
                 self._cudart = torch.cuda.cudart()
                 logger.info("CudaPinMemoryBackend: using torch cudart")
                 return
-            except (AttributeError, RuntimeError):
-                pass
+            except (AttributeError, RuntimeError) as exc:
+                logger.debug("CudaPinMemoryBackend: torch cudart unavailable: %s", exc)
 
         self._libcudart = _load_libcudart()
         if self._libcudart is not None:

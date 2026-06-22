@@ -45,7 +45,11 @@ class _FakeTorchCudart:
 
 
 def _clear_lmcache_modules() -> None:
-    """Remove cached ``lmcache`` modules so each test imports fresh code."""
+    """Remove cached ``lmcache`` modules before each fresh test import.
+
+    This keeps module-level initialization from one test's torch stub from
+    leaking into the next test.
+    """
     for name in list(sys.modules):
         if name == "lmcache" or name.startswith("lmcache."):
             sys.modules.pop(name, None)
@@ -79,7 +83,7 @@ def _import_pin_memory_module() -> ModuleType:
     return importlib.import_module("lmcache.v1.platform.cuda.pin_memory")
 
 
-def _raise_no_cudart() -> object:
+def _fail_cudart_lookup() -> object:
     """Raise a cudart lookup failure for fallback-path tests."""
     raise RuntimeError("no cudart")
 
@@ -129,7 +133,7 @@ def test_backend_uses_torch_cudart_first(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_backend_falls_back_to_libcudart(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_torch_stub(
         monkeypatch,
-        cudart_factory=_raise_no_cudart,
+        cudart_factory=_fail_cudart_lookup,
     )
     module = _import_pin_memory_module()
     fake_lib = _FakeLibcudart()
