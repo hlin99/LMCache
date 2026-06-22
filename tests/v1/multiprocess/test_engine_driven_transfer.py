@@ -21,6 +21,7 @@ from lmcache.v1.multiprocess.posix_shm import (
     shm_open_pool_as_mmap,
     shm_unlink,
 )
+from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.protocol import RequestType
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
@@ -1093,6 +1094,63 @@ def test_server_store_and_retrieve_cpu_chunks(
     recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     assert len(recovered_chunks) == 1
     assert torch.allclose(recovered_chunks[0], payload)
+
+
+def test_server_store_and_retrieve_publish_observability_events(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Engine-driven store/retrieve publishes MP transfer observability events."""
+    mock_storage = MagicMock()
+    target_tensor = torch.zeros(2, 2, 8, 16)
+    mock_memory_obj = MagicMock()
+    mock_memory_obj.tensor = target_tensor
+    mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
+
+    @contextmanager
+    def _read_prefetched_results(_keys: Any) -> Any:
+        yield [mock_memory_obj]
+
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+    module, _, _, ctx = server_module_factory(
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=2)
+    )
+    key = _default_key()
+    payload = torch.ones(2, 2, 8, 16)
+
+    assert module.prepare_store(key, 2) is not None
+    assert module.commit_store(key, 2, pickle.dumps([payload])) is True
+    assert module.prepare_retrieve(key, 2).success is True
+    assert module.commit_retrieve(key, 2) is True
+
+    events = [call.args[0] for call in ctx.event_bus.publish.call_args_list]
+    assert [event.event_type for event in events] == [
+        EventType.MP_STORE_SUBMITTED,
+        EventType.MP_STORE_START,
+        EventType.MP_STORE_END,
+        EventType.MP_RETRIEVE_SUBMITTED,
+        EventType.MP_RETRIEVE_START,
+        EventType.MP_RETRIEVE_END,
+    ]
+    assert all(event.session_id == key.request_id for event in events)
+    assert events[2].metadata == {
+        "stored_count": 1,
+        "engine_id": 2,
+        "model_name": "m",
+        "total_bytes": 2048,
+    }
+    assert events[5].metadata == {
+        "retrieved_count": 1,
+        "engine_id": 2,
+        "model_name": "m",
+        "total_bytes": 2048,
+    }
 
 
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(

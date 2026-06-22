@@ -26,6 +26,7 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ThreadPoolType,
 )
+from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
@@ -423,6 +424,20 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             PrepareStoreResponse with empty slots for pickle mode.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_STORE_SUBMITTED,
+                session_id=key.request_id,
+                metadata={"engine_id": instance_id},
+            )
+        )
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_STORE_START,
+                session_id=key.request_id,
+                metadata={"engine_id": instance_id, "model_name": entry.model_name},
+            )
+        )
         response = strategy.prepare_store(
             key=key,
             instance_id=instance_id,
@@ -464,6 +479,21 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
+        stored_count = len(self._resolve_single_group_obj_keys(key)) if result else 0
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_STORE_END,
+                session_id=key.request_id,
+                metadata={
+                    "stored_count": stored_count,
+                    "engine_id": instance_id,
+                    "model_name": entry.model_name,
+                    "total_bytes": (
+                        stored_count * self._bytes_per_object(entry.metadata)
+                    ),
+                },
+            )
+        )
         if st is not None and result:
             num_tokens = (
                 len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
@@ -494,7 +524,21 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_RETRIEVE_SUBMITTED,
+                session_id=key.request_id,
+                metadata={"engine_id": instance_id},
+            )
+        )
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_RETRIEVE_START,
+                session_id=key.request_id,
+                metadata={"engine_id": instance_id, "model_name": entry.model_name},
+            )
+        )
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
@@ -519,10 +563,24 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             Always ``True``.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("retrieve_start_time", None)
         result = strategy.commit_retrieve(key=key, instance_id=instance_id)
+        retrieved_count = len(self._resolve_single_group_obj_keys(key)) if result else 0
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_RETRIEVE_END,
+                session_id=key.request_id,
+                metadata={
+                    "retrieved_count": retrieved_count,
+                    "engine_id": instance_id,
+                    "model_name": entry.model_name,
+                    "total_bytes": retrieved_count
+                    * self._bytes_per_object(entry.metadata),
+                },
+            )
+        )
         if st is not None:
             num_tokens = (
                 len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
@@ -533,3 +591,15 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 time.perf_counter() - st,
             )
         return result
+
+    @staticmethod
+    def _bytes_per_object(context: EngineDrivenContextMetadata) -> int:
+        total_bytes = 0
+        for shape, dtype in zip(
+            context.layout_desc.shapes, context.layout_desc.dtypes, strict=True
+        ):
+            numel = 1
+            for dim in shape:
+                numel *= int(dim)
+            total_bytes += numel * torch.empty((), dtype=dtype).element_size()
+        return total_bytes
