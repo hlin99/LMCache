@@ -1134,7 +1134,13 @@ def test_server_store_and_retrieve_publish_observability_events(
     assert module.prepare_retrieve(key, 2).success is True
     assert module.commit_retrieve(key, 2) is True
 
-    events = [call[0][0] for call in ctx.event_bus.publish.call_args_list]
+    def _published_event(publish_call: Any) -> Any:
+        return publish_call.args[0]
+
+    events = [
+        _published_event(publish_call)
+        for publish_call in ctx.event_bus.publish.call_args_list
+    ]
     assert [event.event_type for event in events] == [
         EventType.MP_STORE_SUBMITTED,
         EventType.MP_STORE_START,

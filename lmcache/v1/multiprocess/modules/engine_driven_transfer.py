@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
+import math
 import threading
 import time
 
@@ -603,14 +604,20 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         """
         total_bytes = 0
         dtype_sizes = {
-            dtype: torch.empty((), dtype=dtype).element_size()
+            dtype: EngineDrivenTransferModule._dtype_size_in_bytes(dtype)
             for dtype in set(context.layout_desc.dtypes)
         }
         for shape, dtype in zip(
             context.layout_desc.shapes, context.layout_desc.dtypes, strict=True
         ):
-            numel = 1
-            for dim in shape:
-                numel *= int(dim)
+            numel = math.prod(shape)
             total_bytes += numel * dtype_sizes[dtype]
         return total_bytes
+
+    @staticmethod
+    def _dtype_size_in_bytes(dtype: torch.dtype) -> int:
+        if dtype.is_floating_point or dtype.is_complex:
+            return torch.finfo(dtype).bits // 8
+        if dtype is torch.bool:
+            return 1
+        return torch.iinfo(dtype).bits // 8
