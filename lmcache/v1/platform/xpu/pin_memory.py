@@ -29,7 +29,9 @@ class XPUPinMemoryBackend(PinMemoryBackend):
 
         Args:
             ptr: Raw pointer (``tensor.data_ptr()``) to the memory region.
-            size: Size in bytes of the region (unused).
+            size: Size in bytes of the region. Accepted for interface
+                compatibility but not used, since pinning is handled at
+                allocation time via SYCL USM host allocation.
 
         Returns:
             Always ``True``.
@@ -41,7 +43,8 @@ class XPUPinMemoryBackend(PinMemoryBackend):
 
         Args:
             ptr: Raw pointer (``tensor.data_ptr()``) to the memory region.
-            size: Size in bytes of the region (unused).
+            size: Size in bytes of the region. Accepted for interface
+                compatibility but not used.
 
         Returns:
             Always ``True``.

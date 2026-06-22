@@ -199,7 +199,8 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
 
         # Unpin all pinned memory chunks
         for ptr, size in self._pin_record:
-            pin_memory_backend.unpin_memory(ptr, size)
+            if not pin_memory_backend.unpin_memory(ptr, size):
+                logger.warning("unpin_memory failed for ptr=0x%x, size=%d", ptr, size)
         self._pin_record.clear()
 
         # Free the underlying buffer if using NUMA allocation
@@ -239,8 +240,10 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         assert offset + size <= self._final_size, "Pinning exceeds buffer size"
 
         ptr = self._buffer.data_ptr() + offset
-        pin_memory_backend.pin_memory(ptr, size)
-        self._pin_record.append((ptr, size))
+        if not pin_memory_backend.pin_memory(ptr, size):
+            logger.warning("pin_memory failed for ptr=0x%x, size=%d", ptr, size)
+        else:
+            self._pin_record.append((ptr, size))
 
     def _commit_expansion(self, expand_size: int):
         """
