@@ -602,11 +602,15 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             Total bytes for one object across all tensors in the layout.
         """
         total_bytes = 0
+        dtype_sizes = {
+            dtype: torch.empty((), dtype=dtype).element_size()
+            for dtype in set(context.layout_desc.dtypes)
+        }
         for shape, dtype in zip(
             context.layout_desc.shapes, context.layout_desc.dtypes, strict=True
         ):
             numel = 1
             for dim in shape:
                 numel *= int(dim)
-            total_bytes += numel * torch.empty((), dtype=dtype).element_size()
+            total_bytes += numel * dtype_sizes[dtype]
         return total_bytes
