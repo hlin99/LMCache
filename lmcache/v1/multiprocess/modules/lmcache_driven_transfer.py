@@ -448,7 +448,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         self._device_host_func_dispatcher.start()
 
-        self._store_timer = StoreTimer(prefix="store")
+        self._store_timer = StoreTimer(prefix="lmcache_driven")
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -896,16 +896,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "finish_write",
                         list(all_dict.keys()),
                     )
-                    _timer = self._store_timer
-                    _tname = timer_name
+                    if self._store_timer._enabled:
+                        _timer = self._store_timer
+                        _tname = timer_name
 
-                    def _on_store_copy_done(_unused: None) -> None:
-                        _timer.mark(_tname, "ipc_copy_done")
-                        _timer.emit(_tname)
+                        def _on_store_copy_done(_unused: None) -> None:
+                            _timer.mark(_tname, "ipc_copy_done")
+                            _timer.emit(_tname)
 
-                    cache_context.cupy_stream.launch_host_func(
-                        _on_store_copy_done, None
-                    )
+                        cache_context.cupy_stream.launch_host_func(
+                            _on_store_copy_done, None
+                        )
                 else:
                     total_bytes = 0
                 self._ctx.event_bus.publish_on_stream(
@@ -1083,16 +1084,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "finish_read_prefetched",
                         prefetched_keys,
                     )
-                    _timer = self._store_timer
-                    _tname = timer_name
+                    if self._store_timer._enabled:
+                        _timer = self._store_timer
+                        _tname = timer_name
 
-                    def _on_retrieve_copy_done(_unused: None) -> None:
-                        _timer.mark(_tname, "ipc_copy_done")
-                        _timer.emit(_tname)
+                        def _on_retrieve_copy_done(_unused: None) -> None:
+                            _timer.mark(_tname, "ipc_copy_done")
+                            _timer.emit(_tname)
 
-                    cache_context.cupy_stream.launch_host_func(
-                        _on_retrieve_copy_done, None
-                    )
+                        cache_context.cupy_stream.launch_host_func(
+                            _on_retrieve_copy_done, None
+                        )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
