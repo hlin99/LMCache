@@ -899,7 +899,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     _timer = self._store_timer
                     _tname = timer_name
 
-                    def _on_store_copy_done(_arg: None) -> None:
+                    def _on_store_copy_done(_unused: None) -> None:
                         _timer.mark(_tname, "ipc_copy_done")
                         _timer.emit(_tname)
 
@@ -1086,7 +1086,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     _timer = self._store_timer
                     _tname = timer_name
 
-                    def _on_retrieve_copy_done(_arg: None) -> None:
+                    def _on_retrieve_copy_done(_unused: None) -> None:
                         _timer.mark(_tname, "ipc_copy_done")
                         _timer.emit(_tname)
 
