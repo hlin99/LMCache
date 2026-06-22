@@ -616,8 +616,25 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
     @staticmethod
     def _dtype_size_in_bytes(dtype: torch.dtype) -> int:
+        """Return element size in bytes for a supported torch dtype.
+
+        Args:
+            dtype: Torch dtype to inspect.
+
+        Returns:
+            Size of one element in bytes.
+
+        Raises:
+            ValueError: If ``dtype`` is not supported by ``torch.finfo`` or
+                ``torch.iinfo``.
+        """
         if dtype.is_floating_point or dtype.is_complex:
             return torch.finfo(dtype).bits // 8
         if dtype is torch.bool:
             return 1
-        return torch.iinfo(dtype).bits // 8
+        try:
+            return torch.iinfo(dtype).bits // 8
+        except TypeError as exc:
+            raise ValueError(
+                f"Unsupported dtype for size computation: {dtype}"
+            ) from exc

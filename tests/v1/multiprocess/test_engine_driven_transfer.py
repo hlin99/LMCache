@@ -1150,19 +1150,20 @@ def test_server_store_and_retrieve_publish_observability_events(
         EventType.MP_RETRIEVE_END,
     ]
     assert all(event.session_id == key.request_id for event in events)
+    expected_total_bytes = 2 * 2 * 8 * 16 * 4
     store_end_event = events[2]
     retrieve_end_event = events[5]
     assert store_end_event.metadata == {
         "stored_count": 1,
         "engine_id": 2,
         "model_name": "m",
-        "total_bytes": 2048,
+        "total_bytes": expected_total_bytes,
     }
     assert retrieve_end_event.metadata == {
         "retrieved_count": 1,
         "engine_id": 2,
         "model_name": "m",
-        "total_bytes": 2048,
+        "total_bytes": expected_total_bytes,
     }
 
 
