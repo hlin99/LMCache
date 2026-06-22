@@ -57,13 +57,13 @@ def _clear_lmcache_modules() -> None:
 
 def _install_torch_stub(
     monkeypatch: pytest.MonkeyPatch,
-    cudart_factory: Callable[[], object] | None = None,
+    cudart_callable: Callable[[], object] | None = None,
 ) -> None:
     """Install a minimal torch stub for importing the CUDA pinning module.
 
     Args:
         monkeypatch: Pytest monkeypatch helper used to inject the stub.
-        cudart_factory: Optional callable used as ``torch.cuda.cudart``.
+        cudart_callable: Optional callable used as ``torch.cuda.cudart``.
     """
     torch = ModuleType("torch")
     torch.Tensor = object
@@ -71,8 +71,8 @@ def _install_torch_stub(
     torch.xpu = SimpleNamespace(is_available=lambda: False)
     torch.hpu = SimpleNamespace(is_available=lambda: False)
 
-    if cudart_factory is not None:
-        torch.cuda.cudart = cudart_factory
+    if cudart_callable is not None:
+        torch.cuda.cudart = cudart_callable
 
     monkeypatch.setitem(sys.modules, "torch", torch)
 
@@ -113,7 +113,7 @@ def test_load_libcudart_binds_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_backend_uses_torch_cudart_first(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_cudart = _FakeTorchCudart()
-    _install_torch_stub(monkeypatch, cudart_factory=lambda: fake_cudart)
+    _install_torch_stub(monkeypatch, cudart_callable=lambda: fake_cudart)
     module = _import_pin_memory_module()
     monkeypatch.setattr(
         module,
@@ -135,7 +135,7 @@ def test_backend_uses_torch_cudart_first(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_backend_falls_back_to_libcudart(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_torch_stub(
         monkeypatch,
-        cudart_factory=_fail_cudart_lookup,
+        cudart_callable=_fail_cudart_lookup,
     )
     module = _import_pin_memory_module()
     fake_lib = _FakeLibcudart()

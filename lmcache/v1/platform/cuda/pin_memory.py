@@ -25,6 +25,7 @@ def _load_libcudart() -> ctypes.CDLL | None:
     """
     path = ctypes.util.find_library("cudart")
     if path is None:
+        logger.debug("CudaPinMemoryBackend: libcudart not found")
         return None
 
     try:
@@ -38,7 +39,8 @@ def _load_libcudart() -> ctypes.CDLL | None:
         lib.cudaHostUnregister.restype = ctypes.c_int
         lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
         return lib
-    except (AttributeError, OSError):
+    except (AttributeError, OSError) as exc:
+        logger.debug("CudaPinMemoryBackend: failed to load libcudart: %s", exc)
         return None
 
 
