@@ -155,7 +155,7 @@ def test_backend_falls_back_to_libcudart(monkeypatch: pytest.MonkeyPatch) -> Non
     assert int(unregister_ptr.value) == 4321
 
 
-def test_backend_reports_unsupported_when_no_runtime(
+def test_backend_reports_unsupported_state_when_no_runtime_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_torch_stub(monkeypatch)

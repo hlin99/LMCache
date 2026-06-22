@@ -49,6 +49,11 @@ class CudaPinMemoryBackend(PinMemoryBackend):
 
     Pinning prefers ``torch.cuda.cudart()``. When the torch binding is
     unavailable, the backend falls back to loading ``libcudart`` directly.
+
+    Attributes:
+        _cudart: Torch cudart binding when ``torch.cuda.cudart()`` succeeds.
+        _libcudart: ``ctypes``-loaded CUDA runtime when torch cudart is
+            unavailable.
     """
 
     PIN_FLAGS = 0x02  # cudaHostRegisterMapped
@@ -77,6 +82,8 @@ class CudaPinMemoryBackend(PinMemoryBackend):
             try:
                 self._cudart = torch.cuda.cudart()
                 logger.info("CudaPinMemoryBackend: using torch cudart")
+                # Torch cudart succeeded, so there is no need to attempt the
+                # libcudart fallback path.
                 return
             except (AttributeError, RuntimeError) as exc:
                 logger.debug(
