@@ -1100,7 +1100,12 @@ def test_server_store_and_retrieve_publish_observability_events(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Engine-driven store/retrieve publishes MP transfer observability events."""
+    """Engine-driven store/retrieve publishes MP transfer observability events.
+
+    Args:
+        stub_native_storage_ops: Fixture that stubs native storage operations.
+        server_module_factory: Fixture that builds patched server module instances.
+    """
     mock_storage = MagicMock()
     target_tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj = MagicMock()

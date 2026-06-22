@@ -479,7 +479,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
         )
-        stored_count = len(self._resolve_single_group_obj_keys(key)) if result else 0
+        obj_key_count = len(self._resolve_single_group_obj_keys(key))
+        stored_count = obj_key_count if result else 0
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_STORE_END,
@@ -495,9 +496,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
         )
         if st is not None and result:
-            num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
-            )
+            num_tokens = obj_key_count * self._ctx.chunk_size
             logger.info(
                 "Stored %d tokens in %.3f seconds",
                 num_tokens,
@@ -566,8 +565,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         entry, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("retrieve_start_time", None)
+        obj_key_count = len(self._resolve_single_group_obj_keys(key))
         result = strategy.commit_retrieve(key=key, instance_id=instance_id)
-        retrieved_count = len(self._resolve_single_group_obj_keys(key)) if result else 0
+        retrieved_count = obj_key_count if result else 0
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_RETRIEVE_END,
@@ -582,9 +582,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
         )
         if st is not None:
-            num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
-            )
+            num_tokens = obj_key_count * self._ctx.chunk_size
             logger.info(
                 "Retrieved %d tokens in %.3f seconds",
                 num_tokens,
@@ -594,6 +592,14 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
     @staticmethod
     def _bytes_per_object(context: EngineDrivenContextMetadata) -> int:
+        """Return bytes represented by one non-GPU object for this context.
+
+        Args:
+            context: Transfer metadata containing per-object shapes and dtypes.
+
+        Returns:
+            Total bytes for one object across all tensors in the layout.
+        """
         total_bytes = 0
         for shape, dtype in zip(
             context.layout_desc.shapes, context.layout_desc.dtypes, strict=True
