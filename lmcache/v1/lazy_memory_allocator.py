@@ -17,6 +17,7 @@ from lmcache.v1.memory_management import (
     MemoryObj,
     TensorMemoryAllocator,
 )
+from lmcache.v1.platform.base import pin_memory_backend
 from lmcache.v1.system_detection import NUMAMapping
 import lmcache.c_ops as lmc_ops
 
@@ -91,16 +92,13 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         self._final_size = align_to(final_size, self.PIN_CHUNK_SIZE)
         # Underlying buffer for the memory allocation
         self._buffer: torch.Tensor
-        # Not all backends support cudart() for host memory pinning (CUDA-specific)
-        if not hasattr(torch_dev, "cudart"):
+        # Not all backends support host memory pinning.
+        if not pin_memory_backend.is_pin_supported():
             raise RuntimeError(
                 f"Backend '{torch_device_type}' does not support "
-                "cudart(). LazyMemoryAllocator requires pinned "
-                "memory via cudaHostRegister, which is not "
-                "available on this backend."
+                "memory pinning. LazyMemoryAllocator requires pinned "
+                "memory, which is not available on this backend."
             )
-        else:
-            self._cudart = torch_dev.cudart()
 
         # List of (ptr, size) for pinned memory chunks
         self._pin_record: list[tuple[int, int]] = []
@@ -201,7 +199,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
 
         # Unpin all pinned memory chunks
         for ptr, size in self._pin_record:
-            self._cudart.cudaHostUnregister(ptr)
+            pin_memory_backend.unpin_memory(ptr, size)
         self._pin_record.clear()
 
         # Free the underlying buffer if using NUMA allocation
@@ -241,8 +239,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         assert offset + size <= self._final_size, "Pinning exceeds buffer size"
 
         ptr = self._buffer.data_ptr() + offset
-        # Use flag: cudaHostRegisterMapped (0x02)
-        self._cudart.cudaHostRegister(ptr, size, 2)
+        pin_memory_backend.pin_memory(ptr, size)
         self._pin_record.append((ptr, size))
 
     def _commit_expansion(self, expand_size: int):

@@ -11,7 +11,6 @@ import argparse
 import os
 
 # First Party
-from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
@@ -149,12 +148,15 @@ class L1MemoryManagerConfig:
                 'l1-devdax-path requires SHM to be disabled. Please set --shm-name "".'
             )
 
-        # LazyMemoryAllocator requires cudart (CUDA host-pinned memory).
-        # Auto-disable on non-CUDA backends to avoid a RuntimeError.
-        if self.use_lazy and not hasattr(torch_dev, "cudart"):
+        # LazyMemoryAllocator requires host memory pinning support.
+        # Auto-disable on backends that don't support it to avoid a RuntimeError.
+        # First Party
+        from lmcache.v1.platform.base import pin_memory_backend
+
+        if self.use_lazy and not pin_memory_backend.is_pin_supported():
             logger.warning(
-                "LazyMemoryAllocator requires cudart which is not available "
-                "on the current backend. Disabling l1-use-lazy."
+                "LazyMemoryAllocator requires memory pinning which is not "
+                "available on the current backend. Disabling l1-use-lazy."
             )
             self.use_lazy = False
 

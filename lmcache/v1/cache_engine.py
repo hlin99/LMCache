@@ -55,6 +55,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.platform.base import pin_memory_backend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -2006,18 +2007,10 @@ class LMCacheEngineBuilder:
             )
 
             if corrected_device == "cpu":
-                # Not all backends support cudart() for host memory pinning
-                if not hasattr(torch_dev, "cudart"):
-                    raise RuntimeError(
-                        f"Backend '{torch_device_type}' does not support "
-                        "cudart(). NIXL storage CPU buffer requires "
-                        "pinned memory via cudaHostRegister, which is "
-                        "not available on this backend."
-                    )
-                else:
-                    torch_dev.cudart().cudaHostRegister(
-                        buffer.data_ptr(), config.nixl_buffer_size, 0
-                    )
+                if not pin_memory_backend.pin_memory(
+                    buffer.data_ptr(), config.nixl_buffer_size
+                ):
+                    raise RuntimeError("Failed to pin NIXL CPU buffer")
             else:
                 logger.info(f"Setting device to {corrected_device} ")
                 torch_dev.set_device(corrected_device)
