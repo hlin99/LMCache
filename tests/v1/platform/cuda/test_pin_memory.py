@@ -71,6 +71,10 @@ def _import_pin_memory_module() -> ModuleType:
     return importlib.import_module("lmcache.v1.platform.cuda.pin_memory")
 
 
+def _raise_no_cudart() -> object:
+    raise RuntimeError("no cudart")
+
+
 def test_load_libcudart_binds_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_torch_stub(monkeypatch)
     module = _import_pin_memory_module()
@@ -116,7 +120,7 @@ def test_backend_uses_torch_cudart_first(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_backend_falls_back_to_libcudart(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_torch_stub(
         monkeypatch,
-        cudart_factory=lambda: (_ for _ in ()).throw(RuntimeError("no cudart")),
+        cudart_factory=_raise_no_cudart,
     )
     module = _import_pin_memory_module()
     fake_lib = _FakeLibcudart()

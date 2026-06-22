@@ -13,7 +13,12 @@ logger = init_logger(__name__)
 
 
 def _load_libcudart() -> ctypes.CDLL | None:
-    """Try to load ``libcudart`` and bind the pinning symbols."""
+    """Try to load ``libcudart`` and bind the pinning symbols.
+
+    Returns:
+        The loaded ``ctypes.CDLL`` library with bound symbols on success, or
+        ``None`` if the library cannot be found or loaded.
+    """
     path = ctypes.util.find_library("cudart")
     if path is None:
         return None
@@ -49,13 +54,16 @@ class CudaPinMemoryBackend(PinMemoryBackend):
         try:
             # Third Party
             import torch
-
-            if hasattr(torch.cuda, "cudart"):
-                self._cudart = torch.cuda.cudart()
-                logger.info("CudaPinMemoryBackend: using torch cudart")
-                return
-        except Exception:
+        except ImportError:
             pass
+        else:
+            try:
+                if hasattr(torch.cuda, "cudart"):
+                    self._cudart = torch.cuda.cudart()
+                    logger.info("CudaPinMemoryBackend: using torch cudart")
+                    return
+            except (AttributeError, RuntimeError):
+                pass
 
         self._libcudart = _load_libcudart()
         if self._libcudart is not None:
