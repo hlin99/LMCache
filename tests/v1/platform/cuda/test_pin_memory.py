@@ -93,8 +93,10 @@ def test_load_libcudart_binds_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _import_pin_memory_module()
     fake_lib = _FakeLibcudart()
 
-    monkeypatch.setattr(module.ctypes.util, "find_library", lambda name: "libcudart.so")
-    monkeypatch.setattr(module.ctypes, "CDLL", lambda path: fake_lib)
+    monkeypatch.setattr(
+        module.ctypes.util, "find_library", lambda _name: "libcudart.so"
+    )
+    monkeypatch.setattr(module.ctypes, "CDLL", lambda _path: fake_lib)
 
     loaded = module._load_libcudart()
 
