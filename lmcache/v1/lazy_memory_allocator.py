@@ -196,7 +196,10 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
 
         # Unpin all pinned memory chunks
         for ptr, size in self._pin_record:
-            torch_dev.ext.unpin_memory(ptr, size)
+            if not torch_dev.ext.unpin_memory(ptr, size):
+                logger.warning(
+                    "unpin_memory failed for chunk at ptr=%d size=%d", ptr, size
+                )
         self._pin_record.clear()
 
         # Free the underlying buffer if using NUMA allocation
@@ -236,7 +239,13 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         assert offset + size <= self._final_size, "Pinning exceeds buffer size"
 
         ptr = self._buffer.data_ptr() + offset
-        torch_dev.ext.pin_memory(ptr, size)
+        if not torch_dev.ext.pin_memory(ptr, size):
+            logger.warning(
+                "pin_memory failed for chunk at ptr=%d size=%d; "
+                "DMA performance may be degraded",
+                ptr,
+                size,
+            )
         self._pin_record.append((ptr, size))
 
     def _commit_expansion(self, expand_size: int):
