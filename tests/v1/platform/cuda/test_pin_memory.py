@@ -45,6 +45,7 @@ class _FakeTorchCudart:
 
 
 def _clear_lmcache_modules() -> None:
+    """Remove cached ``lmcache`` modules so each test imports fresh code."""
     for name in list(sys.modules):
         if name == "lmcache" or name.startswith("lmcache."):
             sys.modules.pop(name, None)
@@ -54,6 +55,12 @@ def _install_torch_stub(
     monkeypatch: pytest.MonkeyPatch,
     cudart_factory: Callable[[], object] | None = None,
 ) -> None:
+    """Install a minimal torch stub for importing the CUDA pinning module.
+
+    Args:
+        monkeypatch: Pytest monkeypatch helper used to inject the stub.
+        cudart_factory: Optional callable used as ``torch.cuda.cudart``.
+    """
     torch = ModuleType("torch")
     torch.Tensor = object
     torch.cuda = SimpleNamespace(is_available=lambda: False)
@@ -67,11 +74,13 @@ def _install_torch_stub(
 
 
 def _import_pin_memory_module() -> ModuleType:
+    """Import the CUDA pinning module after clearing cached ``lmcache`` state."""
     _clear_lmcache_modules()
     return importlib.import_module("lmcache.v1.platform.cuda.pin_memory")
 
 
 def _raise_no_cudart() -> object:
+    """Raise a cudart lookup failure for fallback-path tests."""
     raise RuntimeError("no cudart")
 
 

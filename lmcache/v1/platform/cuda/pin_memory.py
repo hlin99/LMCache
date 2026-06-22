@@ -18,6 +18,11 @@ def _load_libcudart() -> ctypes.CDLL | None:
     Returns:
         The loaded ``ctypes.CDLL`` library with bound symbols on success, or
         ``None`` if the library cannot be found or loaded.
+
+    Notes:
+        ``OSError`` indicates that the located library could not be loaded.
+        ``AttributeError`` indicates that the loaded library does not expose
+        the required CUDA runtime symbols.
     """
     path = ctypes.util.find_library("cudart")
     if path is None:
@@ -48,6 +53,13 @@ class CudaPinMemoryBackend(PinMemoryBackend):
     PIN_FLAGS = 0x02  # cudaHostRegisterMapped
 
     def __init__(self) -> None:
+        """Initialize the backend with torch-first, libcudart-second fallback.
+
+        The backend first tries ``torch.cuda.cudart()`` because it is the
+        lightest path when torch already exposes the CUDA runtime binding. If
+        that import or lookup fails, it falls back to loading ``libcudart``
+        directly via :mod:`ctypes`.
+        """
         self._cudart = None
         self._libcudart = None
 
