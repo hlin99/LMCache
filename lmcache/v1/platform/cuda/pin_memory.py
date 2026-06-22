@@ -58,10 +58,9 @@ class CudaPinMemoryBackend(PinMemoryBackend):
             pass
         else:
             try:
-                if hasattr(torch.cuda, "cudart"):
-                    self._cudart = torch.cuda.cudart()
-                    logger.info("CudaPinMemoryBackend: using torch cudart")
-                    return
+                self._cudart = torch.cuda.cudart()
+                logger.info("CudaPinMemoryBackend: using torch cudart")
+                return
             except (AttributeError, RuntimeError):
                 pass
 

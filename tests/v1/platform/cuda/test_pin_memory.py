@@ -132,12 +132,12 @@ def test_backend_falls_back_to_libcudart(monkeypatch: pytest.MonkeyPatch) -> Non
     assert backend.pin_memory(4321, 128) is True
     assert backend.unpin_memory(4321) is True
 
-    register_call = fake_lib.cudaHostRegister.calls[0]
-    unregister_call = fake_lib.cudaHostUnregister.calls[0]
-    assert int(register_call[0].value) == 4321
-    assert int(register_call[1].value) == 128
-    assert int(register_call[2].value) == module.CudaPinMemoryBackend.PIN_FLAGS
-    assert int(unregister_call[0].value) == 4321
+    register_ptr, register_size, register_flags = fake_lib.cudaHostRegister.calls[0]
+    (unregister_ptr,) = fake_lib.cudaHostUnregister.calls[0]
+    assert int(register_ptr.value) == 4321
+    assert int(register_size.value) == 128
+    assert int(register_flags.value) == module.CudaPinMemoryBackend.PIN_FLAGS
+    assert int(unregister_ptr.value) == 4321
 
 
 def test_backend_reports_unsupported_when_no_runtime(
