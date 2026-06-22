@@ -1,55 +1,119 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA-specific memory pinning via cudaHostRegister/cudaHostUnregister."""
+"""CUDA memory pinning: try torch cudart first, then libcudart via ctypes."""
+
+# Standard
+import ctypes
+import ctypes.util
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.platform.base import PinMemoryBackend
+
+logger = init_logger(__name__)
+
+
+def _load_libcudart() -> ctypes.CDLL | None:
+    """Try to load ``libcudart`` and bind the pinning symbols."""
+    path = ctypes.util.find_library("cudart")
+    if path is None:
+        return None
+
+    try:
+        lib = ctypes.CDLL(path)
+        lib.cudaHostRegister.restype = ctypes.c_int
+        lib.cudaHostRegister.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        lib.cudaHostUnregister.restype = ctypes.c_int
+        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+        return lib
+    except (AttributeError, OSError):
+        return None
 
 
 class CudaPinMemoryBackend(PinMemoryBackend):
-    """CUDA memory pinning using the CUDA runtime (cudart).
+    """CUDA memory pinning backend.
 
-    Uses ``cudaHostRegisterMapped`` (flag ``0x02``) so that CUDA can
-    perform DMA directly from the pinned host buffer.
+    Pinning prefers ``torch.cuda.cudart()``. When the torch binding is
+    unavailable, the backend falls back to loading ``libcudart`` directly.
     """
 
     PIN_FLAGS = 0x02  # cudaHostRegisterMapped
 
     def __init__(self) -> None:
-        # Third Party
-        import torch
+        self._cudart = None
+        self._libcudart = None
 
-        self._cudart = torch.cuda.cudart()
+        try:
+            # Third Party
+            import torch
+
+            if hasattr(torch.cuda, "cudart"):
+                self._cudart = torch.cuda.cudart()
+                logger.info("CudaPinMemoryBackend: using torch cudart")
+                return
+        except Exception:
+            pass
+
+        self._libcudart = _load_libcudart()
+        if self._libcudart is not None:
+            logger.info("CudaPinMemoryBackend: using libcudart via ctypes")
+        else:
+            logger.warning(
+                "CudaPinMemoryBackend: neither torch cudart nor libcudart is available"
+            )
 
     def pin_memory(self, ptr: int, size: int) -> bool:
-        """Pin a host memory region using cudaHostRegister.
+        """Pin a host memory region using ``cudaHostRegister``.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
             size: Size in bytes of the region to pin.
 
         Returns:
-            True if cudaHostRegister returned 0 (success), False otherwise.
+            True if ``cudaHostRegister`` succeeded, False otherwise.
         """
-        err = self._cudart.cudaHostRegister(ptr, size, self.PIN_FLAGS)
-        return int(err) == 0
+        if self._cudart is not None:
+            err = self._cudart.cudaHostRegister(ptr, size, self.PIN_FLAGS)
+            return int(err) == 0
+
+        if self._libcudart is not None:
+            err = self._libcudart.cudaHostRegister(
+                ctypes.c_void_p(ptr),
+                ctypes.c_size_t(size),
+                ctypes.c_uint(self.PIN_FLAGS),
+            )
+            return err == 0
+
+        return False
 
     def unpin_memory(self, ptr: int, size: int = 0) -> bool:
-        """Unpin a previously pinned host memory region using cudaHostUnregister.
+        """Unpin a previously pinned host memory region.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
             size: Unused; present for interface compatibility.
 
         Returns:
-            True if cudaHostUnregister returned 0 (success), False otherwise.
+            True if ``cudaHostUnregister`` succeeded, False otherwise.
         """
-        err = self._cudart.cudaHostUnregister(ptr)
-        return int(err) == 0
+        if self._cudart is not None:
+            err = self._cudart.cudaHostUnregister(ptr)
+            return int(err) == 0
+
+        if self._libcudart is not None:
+            err = self._libcudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+            return err == 0
+
+        return False
 
     def is_pin_supported(self) -> bool:
         """Whether CUDA memory pinning is supported.
 
         Returns:
-            Always True for this backend.
+            True if either the torch cudart binding or ``libcudart`` is
+            available, False otherwise.
         """
-        return True
+        return self._cudart is not None or self._libcudart is not None
