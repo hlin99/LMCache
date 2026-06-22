@@ -266,8 +266,7 @@ class TestTTLAutoEmit:
             timer.emit("b")  # already consumed — no-op
             assert caplog.text.count("[PERF-STEP-TIMING]") == count_before
 
-            timer.emit("fresh")  # still present — produces a log
-            # "fresh" has only 1 step, so emit is a no-op
+            timer.emit("fresh")  # only 1 step, so emit is a no-op
             assert caplog.text.count("[PERF-STEP-TIMING]") == count_before
 
 

@@ -158,6 +158,8 @@ class PerfStepTimer:
     def _log_entries(self, name: str, entries: list[tuple[str, float]]) -> None:
         """Format and log timing entries for a group.
 
+        The caller must ensure ``len(entries) >= 2``.
+
         Args:
             name: The group name being logged.
             entries: Ordered list of ``(step, timestamp)`` pairs.
