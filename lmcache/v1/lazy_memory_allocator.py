@@ -237,7 +237,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
 
         ptr = self._buffer.data_ptr() + offset
         # Use flag: cudaHostRegisterMapped (0x02)
-        if not torch_dev.ext.pin_memory(ptr, size):
+        if not torch_dev.ext.pin_memory(ptr, size, 2):
             logger.warning(
                 "pin_memory failed for chunk at ptr=%d size=%d; "
                 "DMA performance may be degraded",
