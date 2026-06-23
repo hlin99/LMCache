@@ -60,8 +60,6 @@ class CudaPinMemoryBackend(PinMemoryBackend):
             unavailable.
     """
 
-    PIN_FLAGS = 0x02  # cudaHostRegisterMapped
-
     def __init__(self) -> None:
         """Initialize the backend with torch-first, libcudart-second fallback.
 
@@ -110,36 +108,39 @@ class CudaPinMemoryBackend(PinMemoryBackend):
                 "CudaPinMemoryBackend: neither torch cudart nor libcudart is available"
             )
 
-    def pin_memory(self, ptr: int, size: int) -> bool:
+    def pin_memory(self, ptr: int, size: int, flags: int = 0) -> bool:
         """Pin a host memory region using ``cudaHostRegister``.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
             size: Size in bytes of the region to pin.
+            flags: ``cudaHostRegister`` flags. Defaults to ``0``
+                (``cudaHostRegisterDefault``). Pass ``0x02``
+                (``cudaHostRegisterMapped``) to additionally map the region
+                into the device address space.
 
         Returns:
             True if ``cudaHostRegister`` succeeded, False otherwise.
         """
         if self._cudart is not None:
-            err = self._cudart.cudaHostRegister(ptr, size, self.PIN_FLAGS)
+            err = self._cudart.cudaHostRegister(ptr, size, flags)
             return int(err) == 0
 
         if self._libcudart is not None:
             err = self._libcudart.cudaHostRegister(
                 ctypes.c_void_p(ptr),
                 ctypes.c_size_t(size),
-                ctypes.c_uint(self.PIN_FLAGS),
+                ctypes.c_uint(flags),
             )
             return err == 0
 
         return False
 
-    def unpin_memory(self, ptr: int, size: int = 0) -> bool:
+    def unpin_memory(self, ptr: int) -> bool:
         """Unpin a previously pinned host memory region.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
-            size: Unused; present for interface compatibility.
 
         Returns:
             True if ``cudaHostUnregister`` succeeded, False otherwise.

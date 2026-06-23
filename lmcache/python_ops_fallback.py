@@ -399,11 +399,11 @@ def _alloc_page_aligned_pinned_view(size: int) -> Tuple[torch.Tensor, int]:
 
 
 def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
-    """Non-CUDA equivalent of allocating pinned memory with NUMA awareness.
-    On XPU, uses pin_memory=True (SYCL USM host allocation) for fast transfers.
-    Attempts to pin the buffer via cudaHostRegister for async D2H;
-    if pinning fails, continues without pinning.
-    Note: NUMA node selection is not supported on non-CUDA."""
+    """Non-CUDA equivalent of allocating a page-aligned host buffer with NUMA
+    awareness. The buffer is allocated with PyTorch page alignment but is NOT
+    registered with ``cudaHostRegister``; use ``alloc_shm_pinned_ptr`` when
+    DMA host registration is needed. NUMA node selection is not supported on
+    non-CUDA."""
 
     view, aligned_ptr = _alloc_page_aligned_pinned_view(size)
     # view shares storage with its over-allocated backing tensor;
@@ -411,50 +411,30 @@ def alloc_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     # memory alive.
     _tensor_registry[aligned_ptr] = view
 
-    # Try to pin the buffer for async D2H copies
-    if torch_dev.ext.pin_memory(aligned_ptr, size):
-        _pinned_ptr_registry[aligned_ptr] = size
-
     return aligned_ptr
 
 
 def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
-    """Non-CUDA equivalent of freeing a previously allocated NUMA pointer.
-    Unregisters pinned memory if it was pinned."""
-
-    # Unpin if previously registered
-    if ptr in _pinned_ptr_registry:
-        torch_dev.ext.unpin_memory(ptr)
-        _pinned_ptr_registry.pop(ptr, None)
+    """Non-CUDA equivalent of freeing a previously allocated NUMA pointer."""
 
     # Release the tensor object for that pointer reference
     _tensor_registry.pop(ptr, None)
 
 
 def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
-    """Non-CUDA equivalent of allocating pinned memory and returning pointer
-    to it. On XPU, uses pin_memory=True (SYCL USM host allocation) for
-    fast DMA transfers. Attempts to pin the buffer via cudaHostRegister
-    for async D2H; if pinning fails, continues without pinning."""
+    """Non-CUDA equivalent of allocating a page-aligned host buffer. The buffer
+    is allocated with PyTorch page alignment but is NOT registered with
+    ``cudaHostRegister``; use ``alloc_shm_pinned_ptr`` when DMA host
+    registration is needed."""
 
     view, aligned_ptr = _alloc_page_aligned_pinned_view(size)
     _tensor_registry[aligned_ptr] = view
-
-    # Try to pin the buffer for async D2H copies
-    if torch_dev.ext.pin_memory(aligned_ptr, size):
-        _pinned_ptr_registry[aligned_ptr] = size
 
     return aligned_ptr
 
 
 def free_pinned_ptr(ptr: int) -> None:
-    """Non-CUDA equivalent of freeing a previously allocated pinned pointer.
-    Unregisters pinned memory if it was pinned."""
-
-    # Unpin if previously registered
-    if ptr in _pinned_ptr_registry:
-        torch_dev.ext.unpin_memory(ptr)
-        _pinned_ptr_registry.pop(ptr, None)
+    """Non-CUDA equivalent of freeing a previously allocated pinned pointer."""
 
     # Release the tensor object for that pointer reference
     _tensor_registry.pop(ptr, None)

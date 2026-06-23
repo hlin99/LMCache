@@ -72,7 +72,8 @@ class DeviceExt:
     Intended usage::
 
         torch_dev.ext.pin_memory(ptr, size)
-        torch_dev.ext.unpin_memory(ptr, size)
+        torch_dev.ext.pin_memory(ptr, size, flags)
+        torch_dev.ext.unpin_memory(ptr)
         if not torch_dev.ext.is_pin_supported:
             raise RuntimeError(...)
     """
@@ -94,29 +95,30 @@ class DeviceExt:
         else:
             self._pin = PinMemoryBackend()
 
-    def pin_memory(self, ptr: int, size: int) -> bool:
+    def pin_memory(self, ptr: int, size: int, flags: int = 0) -> bool:
         """Pin a host memory region for DMA access.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
             size: Size in bytes of the region to pin.
+            flags: Platform-specific registration flags (e.g.
+                ``cudaHostRegisterDefault = 0``).
 
         Returns:
             True if pinning succeeded, False otherwise.
         """
-        return self._pin.pin_memory(ptr, size)
+        return self._pin.pin_memory(ptr, size, flags)
 
-    def unpin_memory(self, ptr: int, size: int = 0) -> bool:
+    def unpin_memory(self, ptr: int) -> bool:
         """Unpin a previously pinned host memory region.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
-            size: Size in bytes (optional, used by some platforms).
 
         Returns:
             True if unpinning succeeded, False otherwise.
         """
-        return self._pin.unpin_memory(ptr, size)
+        return self._pin.unpin_memory(ptr)
 
     @property
     def is_pin_supported(self) -> bool:

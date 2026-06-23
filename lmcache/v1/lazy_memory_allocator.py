@@ -196,7 +196,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
 
         # Unpin all pinned memory chunks
         for ptr, size in self._pin_record:
-            if not torch_dev.ext.unpin_memory(ptr, size):
+            if not torch_dev.ext.unpin_memory(ptr):
                 logger.warning(
                     "unpin_memory failed for chunk at ptr=%d size=%d", ptr, size
                 )

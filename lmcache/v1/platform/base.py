@@ -14,24 +14,25 @@ class PinMemoryBackend:
     so platforms that do not support pinning do not need to subclass this.
     """
 
-    def pin_memory(self, ptr: int, size: int) -> bool:
+    def pin_memory(self, ptr: int, size: int, flags: int = 0) -> bool:
         """Pin a host memory region for DMA access.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
             size: Size in bytes of the region to pin.
+            flags: Platform-specific registration flags (e.g.
+                ``cudaHostRegisterDefault = 0``).
 
         Returns:
             True if pinning succeeded, False otherwise.
         """
         return False
 
-    def unpin_memory(self, ptr: int, size: int = 0) -> bool:
+    def unpin_memory(self, ptr: int) -> bool:
         """Unpin a previously pinned host memory region.
 
         Args:
             ptr: Raw pointer (data_ptr) to the memory region.
-            size: Size in bytes (some platforms need it for unmapping).
 
         Returns:
             True if unpinning succeeded, False otherwise.

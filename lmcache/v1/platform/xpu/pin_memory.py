@@ -18,24 +18,24 @@ class XPUPinMemoryBackend(PinMemoryBackend):
     device-accessible.  Both methods return ``True`` to signal success.
     """
 
-    def pin_memory(self, ptr: int, size: int) -> bool:
+    def pin_memory(self, ptr: int, size: int, flags: int = 0) -> bool:
         """No-op pin for XPU — memory is pinned at allocation time.
 
         Args:
             ptr: Raw pointer to the memory region (unused).
             size: Size in bytes (unused).
+            flags: Registration flags (unused).
 
         Returns:
             Always True.
         """
         return True
 
-    def unpin_memory(self, ptr: int, size: int = 0) -> bool:
+    def unpin_memory(self, ptr: int) -> bool:
         """No-op unpin for XPU.
 
         Args:
             ptr: Raw pointer to the memory region (unused).
-            size: Size in bytes (unused).
 
         Returns:
             Always True.

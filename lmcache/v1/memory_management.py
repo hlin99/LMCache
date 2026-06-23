@@ -2686,7 +2686,7 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
     def _unregister_cuda_host_memory(self) -> None:
         if not self._host_memory_pinned:
             return
-        torch_dev.ext.unpin_memory(self.devdax_buffer.data_ptr(), self.size)
+        torch_dev.ext.unpin_memory(self.devdax_buffer.data_ptr())
         self._host_memory_pinned = False
 
     def _is_local_obj(self, memory_obj: MemoryObj) -> bool:
