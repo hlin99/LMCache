@@ -253,6 +253,14 @@ class EngineDrivenContextShm(EngineDrivenContext):
             self._pinned = True
             self._pinned_ptr = ptr
             self._pinned_size = self._pool_size
+        else:
+            logger.warning(
+                "pin_memory failed for shm_name=%s ptr=%#x size=%d; "
+                "D2H copies will be synchronous",
+                self._shm_name,
+                ptr,
+                self._pool_size,
+            )
 
     def _unpin_shm_buffer(self) -> None:
         """Unpin the SHM buffer if it was previously pinned via cudaHostRegister."""

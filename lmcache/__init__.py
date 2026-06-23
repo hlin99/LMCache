@@ -121,7 +121,11 @@ class DeviceExt:
         return self._pin.is_pin_supported()
 
 
-torch_dev.ext = DeviceExt(torch_device_type)
+# Attach the DeviceExt instance as ``torch_dev.ext``.  This monkey-patches a
+# standard torch module (e.g. ``torch.cuda``) with a custom attribute that does
+# not exist in the original module.  The ``# type: ignore[attr-defined]`` suppresses
+# the expected mypy/pyright "attr-defined" error from this intentional extension.
+torch_dev.ext = DeviceExt(torch_device_type)  # type: ignore[attr-defined]
 
 
 # --------------------------

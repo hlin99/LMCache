@@ -27,10 +27,7 @@ def _load_libcudart() -> ctypes.CDLL | None:
         Missing symbols or load failures are treated as an unavailable
         fallback path and cause this helper to return ``None``.
     """
-    path = ctypes.util.find_library("cudart")
-    if path is None:
-        logger.debug("CudaPinMemoryBackend: libcudart not found")
-        return None
+    path = ctypes.util.find_library("cudart") or "libcudart.so"
 
     try:
         lib = ctypes.CDLL(path)
@@ -122,17 +119,22 @@ class CudaPinMemoryBackend(PinMemoryBackend):
         Returns:
             True if ``cudaHostRegister`` succeeded, False otherwise.
         """
-        if self._cudart is not None:
-            err = self._cudart.cudaHostRegister(ptr, size, flags)
-            return int(err) == 0
+        try:
+            if self._cudart is not None:
+                err = self._cudart.cudaHostRegister(ptr, size, flags)
+                return int(err) == 0
 
-        if self._libcudart is not None:
-            err = self._libcudart.cudaHostRegister(
-                ctypes.c_void_p(ptr),
-                ctypes.c_size_t(size),
-                ctypes.c_uint(flags),
+            if self._libcudart is not None:
+                err = self._libcudart.cudaHostRegister(
+                    ctypes.c_void_p(ptr),
+                    ctypes.c_size_t(size),
+                    ctypes.c_uint(flags),
+                )
+                return err == 0
+        except Exception as exc:
+            logger.warning(
+                "cudaHostRegister failed for ptr=%#x size=%d: %s", ptr, size, exc
             )
-            return err == 0
 
         return False
 
@@ -145,13 +147,16 @@ class CudaPinMemoryBackend(PinMemoryBackend):
         Returns:
             True if ``cudaHostUnregister`` succeeded, False otherwise.
         """
-        if self._cudart is not None:
-            err = self._cudart.cudaHostUnregister(ptr)
-            return int(err) == 0
+        try:
+            if self._cudart is not None:
+                err = self._cudart.cudaHostUnregister(ptr)
+                return int(err) == 0
 
-        if self._libcudart is not None:
-            err = self._libcudart.cudaHostUnregister(ctypes.c_void_p(ptr))
-            return err == 0
+            if self._libcudart is not None:
+                err = self._libcudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+                return err == 0
+        except Exception as exc:
+            logger.warning("cudaHostUnregister failed for ptr=%#x: %s", ptr, exc)
 
         return False
 
