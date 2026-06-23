@@ -87,11 +87,6 @@ class DeviceExt:
             from lmcache.v1.platform.cuda.pin_memory import CudaPinMemoryBackend
 
             self._pin: PinMemoryBackend = CudaPinMemoryBackend()
-        elif device_type == "xpu":
-            # First Party
-            from lmcache.v1.platform.xpu.pin_memory import XPUPinMemoryBackend
-
-            self._pin = XPUPinMemoryBackend()
         else:
             self._pin = PinMemoryBackend()
 

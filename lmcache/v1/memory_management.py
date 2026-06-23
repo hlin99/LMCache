@@ -2601,7 +2601,7 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
         self._mmap_obj: mmap.mmap | None = None
         self._mmap_buffer: Any | None = None
         self._unregistered = False
-        self._host_memory_pinned: bool = False
+        self._host_memory_pinned_ptr: int | None = None
 
         self.devdax_buffer = self._map_devdax()
         self.devdax_allocator = TensorMemoryAllocator(
@@ -2681,13 +2681,13 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
                 "falling back to pageable host copies"
             )
             return
-        self._host_memory_pinned = True
+        self._host_memory_pinned_ptr = self.devdax_buffer.data_ptr()
 
     def _unregister_cuda_host_memory(self) -> None:
-        if not self._host_memory_pinned:
+        if self._host_memory_pinned_ptr is None:
             return
-        torch_dev.ext.unpin_memory(self.devdax_buffer.data_ptr())
-        self._host_memory_pinned = False
+        torch_dev.ext.unpin_memory(self._host_memory_pinned_ptr)
+        self._host_memory_pinned_ptr = None
 
     def _is_local_obj(self, memory_obj: MemoryObj) -> bool:
         return (

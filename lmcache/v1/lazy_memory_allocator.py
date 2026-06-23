@@ -196,10 +196,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
 
         # Unpin all pinned memory chunks
         for ptr, size in self._pin_record:
-            if not torch_dev.ext.unpin_memory(ptr):
-                logger.warning(
-                    "unpin_memory failed for chunk at ptr=%d size=%d", ptr, size
-                )
+            torch_dev.ext.unpin_memory(ptr)
         self._pin_record.clear()
 
         # Free the underlying buffer if using NUMA allocation
@@ -239,6 +236,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         assert offset + size <= self._final_size, "Pinning exceeds buffer size"
 
         ptr = self._buffer.data_ptr() + offset
+        # Use flag: cudaHostRegisterMapped (0x02)
         if not torch_dev.ext.pin_memory(ptr, size):
             logger.warning(
                 "pin_memory failed for chunk at ptr=%d size=%d; "
