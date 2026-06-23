@@ -57,11 +57,6 @@ def _detect_device() -> tuple[Any, str]:
         return StubCPUDevice("cpu"), "cpu"
 
 
-torch_dev, torch_device_type = _detect_device()
-
-logger.info(" torch_dev=%s, torch_device_type=%s", torch_dev, torch_device_type)
-
-
 class DeviceExt:
     """Extension namespace attached as ``torch_dev.ext``.
 
@@ -121,11 +116,68 @@ class DeviceExt:
         return self._pin.is_pin_supported()
 
 
-# Attach the DeviceExt instance as ``torch_dev.ext``.  This monkey-patches a
-# standard torch module (e.g. ``torch.cuda``) with a custom attribute that does
-# not exist in the original module.  The ``# type: ignore[attr-defined]`` suppresses
-# the expected mypy/pyright "attr-defined" error from this intentional extension.
-torch_dev.ext = DeviceExt(torch_device_type)  # type: ignore[attr-defined]
+class _DeviceModule:
+    """Thin proxy around the real torch device module (e.g. ``torch.cuda``).
+
+    Forwards all attribute access to the underlying module, but natively owns
+    the ``ext`` namespace — no monkey-patching needed.
+
+    This ensures ``torch_dev.ext.pin_memory(...)`` works while keeping
+    ``torch_dev.is_available()``, ``torch_dev.set_device()``, etc. fully
+    functional via transparent forwarding.
+
+    Attributes:
+        ext: :class:`DeviceExt` instance providing platform-specific
+            capabilities such as ``pin_memory`` and ``unpin_memory``.
+    """
+
+    __slots__ = ("_mod", "ext")
+
+    def __init__(self, mod: Any, device_type: str) -> None:
+        """Initialise the proxy wrapper.
+
+        Args:
+            mod: The underlying torch device module (e.g. ``torch.cuda``,
+                ``torch.xpu``) or a compatible stub such as
+                :class:`~lmcache.v1.platform.cpu.stub_cpu_device.StubCPUDevice`.
+                May be ``None`` in CLI-only environments where ``torch`` is
+                not installed.
+            device_type: Hardware identifier string, e.g. ``"cuda"``,
+                ``"xpu"``, ``"hpu"``, or ``"cpu"``.  Passed directly to
+                :class:`DeviceExt` to select the appropriate backend.
+        """
+        object.__setattr__(self, "_mod", mod)
+        object.__setattr__(self, "ext", DeviceExt(device_type))
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward attribute lookups to the underlying device module.
+
+        Returns attributes from the underlying torch device module, which are
+        typically callables like ``is_available()``, ``set_device()``,
+        ``synchronize()``, ``cudart()``, or device-class constructors such as
+        ``Event`` and ``Stream``.  Raises ``AttributeError`` if the attribute
+        does not exist on the underlying module.
+
+        Args:
+            name: Attribute name to look up.
+
+        Returns:
+            The attribute value from the underlying device module.
+
+        Raises:
+            AttributeError: If the underlying module does not have the
+                requested attribute.
+        """
+        return getattr(object.__getattribute__(self, "_mod"), name)
+
+    def __repr__(self) -> str:
+        return f"<_DeviceModule wrapping {object.__getattribute__(self, '_mod')}>"
+
+
+_raw_dev, torch_device_type = _detect_device()
+torch_dev = _DeviceModule(_raw_dev, torch_device_type)
+
+logger.info(" torch_dev=%s, torch_device_type=%s", torch_dev, torch_device_type)
 
 
 # --------------------------

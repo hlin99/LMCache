@@ -5,17 +5,19 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                      lmcache/__init__.py                        │
 │                                                                 │
-│  torch_dev, torch_device_type = _detect_device()                │
+│  _raw_dev, torch_device_type = _detect_device()                 │
+│  torch_dev = _DeviceModule(_raw_dev, torch_device_type)         │
 │                                                                 │
 │  ┌───────────┐     ┌───────────┐     ┌───────────┐              │
 │  │ torch.cuda│     │ torch.xpu │     │ torch.hpu │  ...         │
 │  └─────┬─────┘     └─────┬─────┘     └─────┬─────┘              │
 │        └──────────────────┴──────────────────┘                  │
 │                           │                                     │
-│                     torch_dev (unified entry)                   │
+│             _DeviceModule proxy (torch_dev)                     │
+│             ├── .ext  →  DeviceExt (pin/unpin memory)           │
+│             └── .*(other) → forwarded to raw device module      │
 │                  torch_device_type ("cuda"/"xpu"/"hpu"/"cpu")   │
 │                                                                 │
-│  [Monkey Patch Point]                                           │
 │  New hardware can be added by extending _detect_device()        │
 │  and providing a gpu_connector implementation.                  │
 └──────────────────────────────┬──────────────────────────────────┘
@@ -82,7 +84,7 @@
 
 | Layer | Device Reference | Notes |
 |-------|-----------------|-------|
-| **Entry** `__init__.py` | `_detect_device()` -> `torch_dev` | Monkey patch point. Detect once, reuse globally. |
+| **Entry** `__init__.py` | `_detect_device()` -> `_DeviceModule` wrapper -> `torch_dev` | Proxy wrapper owns `ext`. Detect once, reuse globally. |
 | **Middle** engine / storage / multiprocess | `from lmcache import torch_dev` | Hardware-agnostic unified code |
 | **Middle** CUDA-only APIs | `hasattr(torch_dev, 'xxx')` guard | Graceful runtime degradation |
 | **Bottom** GPU Connector | Direct `torch.cuda` / `torch.xpu` / `torch.hpu` | Per-hardware impl, no abstraction |
