@@ -75,6 +75,19 @@ steps:
                 volumes: *vols
         artifact_paths: ["*.log"]
 
+      # Engine-driven transfer mode correctness on GPU. Default CUDA dispatch
+      # is lmcache_driven (server-side IPC handle); this step forces
+      # engine_driven (worker-side gather/scatter) and verifies gsm8k outputs
+      # are still bit-exact across cache-population and cache-hit runs.
+      - label: ":compression: lm_eval_engine_driven"
+        command: .buildkite/k3_tests/multiprocess/run.sh lm_eval
+        timeout_in_minutes: 30
+        env:
+          LMCACHE_MP_TRANSFER_MODE: "engine_driven"
+        agents: { queue: "k8s" }
+        plugins: [{ kubernetes: { podSpec: *pod-1gpu } }]
+        artifact_paths: ["*.log"]
+
       # HMA correctness check on google/gemma-4-31B-it (a hybrid model whose KV
       # cache groups get different block sizes). Runs gsm8k, resets vLLM's prefix
       # cache (LMCache preserved), reruns served by LMCache, and asserts the two
