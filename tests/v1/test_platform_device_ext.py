@@ -33,6 +33,7 @@ class _FakeBuffer:
 
 @pytest.fixture(autouse=True)
 def restore_pin_memory_backends() -> Generator[None, None, None]:
+    """Restore the pin-memory backend registry after each test."""
     saved = dict(device_ext_module._PIN_MEMORY_BACKENDS)
     try:
         yield
@@ -42,6 +43,7 @@ def restore_pin_memory_backends() -> Generator[None, None, None]:
 
 
 def _make_config(buffer_device: str) -> LMCacheEngineConfig:
+    """Create a minimal config that exercises NIXL buffer allocation."""
     config = LMCacheEngineConfig.from_defaults(chunk_size=16)
     config.extra_config = {"enable_nixl_storage": True}
     config.nixl_buffer_device = buffer_device
@@ -50,6 +52,11 @@ def _make_config(buffer_device: str) -> LMCacheEngineConfig:
 
 
 def _make_metadata() -> LMCacheMetadata:
+    """Create minimal metadata for _Create_memory_allocator tests.
+
+    The values are intentionally small because these tests validate only
+    control-flow dispatch, not allocator sizing or tensor layout details.
+    """
     return LMCacheMetadata(
         model_name="device-ext-test",
         world_size=1,
@@ -61,7 +68,7 @@ def _make_metadata() -> LMCacheMetadata:
     )
 
 
-def test_device_ext_falls_back_to_base_backend_for_unknown_device() -> None:
+def test_unknown_device_uses_base_backend() -> None:
     ext = DeviceExt("custom-device")
 
     assert ext.pin_memory(1, 2, 3) is False
@@ -69,7 +76,7 @@ def test_device_ext_falls_back_to_base_backend_for_unknown_device() -> None:
     assert ext.is_pin_supported is False
 
 
-def test_register_pin_memory_backend_dispatches_through_registry() -> None:
+def test_pin_memory_backend_registry_dispatch() -> None:
     calls: list[tuple[str, tuple[int, ...]]] = []
 
     class _RecordingBackend(PinMemoryBackend):

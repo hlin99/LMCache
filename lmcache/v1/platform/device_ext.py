@@ -20,8 +20,25 @@ def register_pin_memory_backend(
 
     Args:
         device_type: The device type string (for example, ``"cuda"``).
-        cls: The backend class to instantiate for ``device_type``.
+        cls: A :class:`PinMemoryBackend` subclass (or the base class
+            itself) to instantiate for ``device_type``.
+
+    Notes:
+        Re-registering the same ``device_type`` overwrites the previous
+        backend class. Registration is expected to happen during module
+        import, so this helper does not add extra synchronization for
+        concurrent writes. Existing :class:`DeviceExt` instances keep the
+        backend object they already created; later registrations affect
+        only newly constructed instances.
+
+    Raises:
+        TypeError: If ``cls`` is not a :class:`PinMemoryBackend`
+            subclass.
     """
+    if not isinstance(cls, type) or not issubclass(cls, PinMemoryBackend):
+        raise TypeError(
+            "register_pin_memory_backend expects a PinMemoryBackend subclass"
+        )
     _PIN_MEMORY_BACKENDS[device_type] = cls
 
 

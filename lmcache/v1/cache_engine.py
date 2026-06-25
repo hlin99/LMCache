@@ -65,6 +65,11 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+# Default flags passed through torch_dev.ext.pin_memory. Keeping this at
+# 0 preserves the backend default across supported platforms (for CUDA,
+# cudaHostRegisterDefault); override only when a backend requires a
+# non-default registration mode.
+PIN_MEMORY_DEFAULT_FLAGS = 0
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -2032,7 +2037,9 @@ class LMCacheEngineBuilder:
 
             if buffer.device.type == "cpu":
                 if not torch_dev.ext.pin_memory(
-                    buffer.data_ptr(), config.nixl_buffer_size, 0
+                    buffer.data_ptr(),
+                    config.nixl_buffer_size,
+                    PIN_MEMORY_DEFAULT_FLAGS,
                 ):
                     raise RuntimeError("Failed to pin NIXL CPU buffer for DMA access")
             else:
