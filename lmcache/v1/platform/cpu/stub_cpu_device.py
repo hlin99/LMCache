@@ -308,9 +308,14 @@ class StubCPUDevice:
 
         Args:
             device: The device index or identifier to select.
-                Ignored in the stub.
+
+        Raises:
+            RuntimeError: CPU-only environments cannot select a GPU device.
         """
-        return None
+        raise RuntimeError(
+            "StubCPUDevice does not support set_device(). "
+            "CPU-only environments cannot select a GPU device."
+        )
 
     def get_device_properties(self, device: Any = 0) -> StubDeviceProperties:
         """Return device properties for the given device.

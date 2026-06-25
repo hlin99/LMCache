@@ -2030,9 +2030,9 @@ class LMCacheEngineBuilder:
                 device=corrected_device,
             )
 
-            if corrected_device == "cpu":
+            if buffer.device.type == "cpu":
                 if not torch_dev.ext.pin_memory(
-                    buffer.data_ptr(), config.nixl_buffer_size
+                    buffer.data_ptr(), config.nixl_buffer_size, 0
                 ):
                     raise RuntimeError("Failed to pin NIXL CPU buffer for DMA access")
             else:
