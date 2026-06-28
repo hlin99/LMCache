@@ -25,6 +25,8 @@ Worker adapter (vLLM MP adapter)
   └─ TransferContext (transfer_context/worker_transfer.py)
       ├─ LMCacheDrivenTransferContext  (IPC path via stream/event)
       └─ EngineDrivenTransferContext    (data path via data copying in adapter)
+          ├─ AsyncEngineDrivenTransferContext (async_engine_driven.py)
+          │    (store-only async: all three phases run in background thread pool)
           └─ EngineDrivenContext (transfer_context/base.py)
              ├─ EngineDrivenContextPickle (transfer_context/pickle.py)
              └─ EngineDrivenContextShm    (transfer_context/shm.py)
@@ -52,7 +54,9 @@ State machine overview (worker-side):
                  |                               |
                  v                               v
       LMCacheDrivenTransferContext    EngineDrivenTransferContext
-          (device == CUDA)            (device != CUDA)
+          (device == CUDA)            (device != CUDA, sync fallback)
+                 |                       AsyncEngineDrivenTransferContext
+                 |                       (device != CUDA, async primitives available)
                  |                               |
                  v                               v
               register()                      register()
@@ -66,7 +70,11 @@ State machine overview (worker-side):
                  |                                               |
                  v                                               v
     submit_store (lmcache-driven path)         submit_store (engine-driven path)
-    -> STORE request (async)                    -> prepare_store -> gather -> commit_store
+    -> STORE request (async)          sync:    -> prepare_store -> gather -> commit_store
+                                      async:   -> background thread:
+                                                    prepare_store -> gather (copy stream)
+                                                    -> commit_store
+                                                  returns unresolved future
                  |                                               |
                  +---------------+-------------------------------+
                                  |
@@ -106,10 +114,50 @@ four lifecycle and transfer operations.
   worker sends a handle and server performs direct GPU-side transfer.
 - **EngineDrivenTransferContext** is the engine-driven (non-CUDA) path:
   worker transfers actual data chunks through `EngineDrivenContext`.
+- **AsyncEngineDrivenTransferContext** extends `EngineDrivenTransferContext` to make
+  the store path fully asynchronous. `submit_retrieve` is unchanged (synchronous);
+  only `submit_store` becomes async.
 
 `EngineDrivenTransferContext` flows:
 - **submit_store**: `prepare_store` → `gather_paged_kv_to_cpu` → `commit_store`
 - **submit_retrieve**: `prepare_retrieve` → `scatter_cpu_to_paged_kv` → `commit_retrieve`
+
+`AsyncEngineDrivenTransferContext` async store flow:
+
+`submit_store` performs only O(1) work on the forward thread (registration check
+and block-id flattening), then submits all three phases to a background
+`ThreadPoolExecutor` (`commit_executor`) and returns an unresolved
+`MessagingFuture`:
+
+1. **prepare** (background thread): call `prepare_store()` — the costliest step in
+   pickle mode (synchronous RPC round-trip) runs off the forward thread.
+2. **gather** (background thread, copy stream): wait for the forward CUDA event on
+   the copy stream, then enqueue GPU→CPU copies. When SHM buffers are available,
+   gathers write directly into SHM views; otherwise gathers write into pinned
+   staging tensors from `_staging_pool`. A CUDA event is recorded after the
+   gather enqueue and added to `_inflight_gather_events`.
+3. **commit** (background thread): `gather_done.synchronize()` → `commit_store()`
+   under `_commit_lock` (ZMQ socket is not thread-safe; `commit_workers` defaults
+   to 4). On completion the future is resolved.
+
+Key internal state:
+
+- `_copy_stream`: dedicated CUDA stream for GPU→CPU copies.
+- `_commit_executor`: `ThreadPoolExecutor` with `commit_workers` threads
+  (default 4) so a slow gather for one store does not block the commit of another.
+- `_commit_lock`: serializes `commit_store` calls across threads.
+- `_staging_pool`: pool of pinned CPU tensors reused across gathers to avoid
+  repeated `pin_memory` allocations on the hot path (pickle path only).
+- `_inflight_gather_events`: set of recorded CUDA events for in-flight gathers.
+- `_pending_gathers`: set of `threading.Event` objects for tasks that have been
+  submitted but not yet recorded their CUDA event, closing the race window where
+  `flush_inflight_gathers` could return before a background gather has started.
+- `_is_closing`: flag set during `close()` to reject new store submissions.
+
+`flush_inflight_gathers()` is called at preemption/eviction time so that vLLM
+cannot overwrite paged KV blocks before a deferred gather has finished reading
+them. It first waits for all `_pending_gathers` to record their CUDA events, then
+synchronizes `_inflight_gather_events`.
 
 During `register`, worker receives `RegisterEngineDrivenContextResponse(shm_name, pool_size)`
 from server and then calls `create_engine_driven_context(...)` to construct
@@ -123,7 +171,15 @@ Why `prepare → data operation → commit`:
 - `commit_*`: finalize and notify server to consume or release transfer state.
 
 `create_transfer_context()` selects the implementation once based on device type
-(CUDA → `LMCacheDrivenTransferContext`, otherwise → `EngineDrivenTransferContext`).
+and async capability:
+- CUDA device → `LMCacheDrivenTransferContext`
+- Non-CUDA device → `_build_engine_driven_context()`, which probes async primitives:
+  - async primitives available (stream, event with record/synchronize/wait, pin_memory) →
+    `AsyncEngineDrivenTransferContext`
+  - otherwise → `EngineDrivenTransferContext` (synchronous fallback)
+
+The routing can be overridden via the `mode` argument or `LMCACHE_MP_TRANSFER_MODE`
+environment variable (`MPTransferMode.AUTO` / `LMCACHE_DRIVEN` / `ENGINE_DRIVEN`).
 It also validates that all KV cache tensors share one device type and rejects
 mixed-device configurations by raising an error.
 
@@ -131,6 +187,7 @@ mixed-device configurations by raising an error.
 |---|---|---|---|
 | LMCacheDrivenTransferContext | Device handle/reference | Server pulls/pushes via IPC | Async MQ future |
 | EngineDrivenTransferContext | Actual CPU chunk data | Worker gather/scatter + transport commit | Synchronous worker-side flow |
+| AsyncEngineDrivenTransferContext | Actual CPU chunk data | Worker gather/scatter (copy stream) + background commit | Async future (resolved in background thread) |
 
 ### 2.3 Server Side: LMCache-Driven Module vs Engine-Driven Module
 
@@ -182,7 +239,8 @@ It also computes `shm_pool_info` once from `StorageManagerConfig`:
 
 - `lmcache/v1/multiprocess/modules/engine_driven_transfer.py`: `EngineDrivenTransferModule`
 - `lmcache/v1/multiprocess/modules/server_transfer.py`: `TransferStrategy`, `PickleTransferStrategy`, `ShmTransferStrategy`
-- `lmcache/v1/multiprocess/transfer_context/worker_transfer.py`: `EngineDrivenTransferContext`, `LMCacheDrivenTransferContext`
+- `lmcache/v1/multiprocess/transfer_context/worker_transfer.py`: `EngineDrivenTransferContext`, `LMCacheDrivenTransferContext`, `create_transfer_context`, `MPTransferMode`
+- `lmcache/v1/multiprocess/transfer_context/async_engine_driven.py`: `AsyncEngineDrivenTransferContext`
 - `lmcache/v1/multiprocess/transfer_context/base.py`: `EngineDrivenContext`, `gather_paged_kv_to_cpu`, `scatter_cpu_to_paged_kv`, `compute_kv_layout`
 - `lmcache/v1/multiprocess/transfer_context/pickle.py`: `EngineDrivenContextPickle`
 - `lmcache/v1/multiprocess/transfer_context/shm.py`: `EngineDrivenContextShm`
