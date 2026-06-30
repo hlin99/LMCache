@@ -222,7 +222,14 @@ class TransferContext(ABC):
 
     @abstractmethod
     def flush_inflight_stores(self) -> None:
-        """Synchronize any in-flight gather operations."""
+        """Synchronize any in-flight gather operations.
+
+        Subclasses must implement this method. Contexts with no deferred
+        operations should implement it as a no-op. Async contexts that
+        defer GPU->CPU gather work must block until all in-flight gathers
+        have completed, so that vLLM cannot overwrite paged KV blocks
+        before they are read.
+        """
 
 
 class LMCacheDrivenTransferContext(TransferContext):
@@ -318,7 +325,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._send_request = None
 
     def flush_inflight_stores(self) -> None:
-        return None
+        pass
 
 
 class EngineDrivenTransferContext(TransferContext):
@@ -523,7 +530,7 @@ class EngineDrivenTransferContext(TransferContext):
             self._engine_driven_context = None
 
     def flush_inflight_stores(self) -> None:
-        return None
+        pass
 
 
 def create_transfer_context(
