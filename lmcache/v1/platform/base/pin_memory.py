@@ -4,7 +4,7 @@
 Concrete subclasses live in the device sub-packages (e.g.
 :class:`~lmcache.v1.platform.cuda.pin_memory.CudaPinMemoryBackend`).
 The universal registry discovers them automatically by scanning for
-subclasses that override :attr:`device_type`.
+subclasses that define a ``device_type`` ClassVar.
 """
 
 
