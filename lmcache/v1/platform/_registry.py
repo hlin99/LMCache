@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Universal platform registry.
 
-Scans ``platform/base/`` to discover all base classes, then scans device
-sub-packages for concrete subclasses of each.  The registry is indexed by
-``(base_class, device_type)`` pairs.
+Scans ``platform/base/`` to discover every class defined there that
+subclasses :class:`lmcache.v1.platform.base.PlatformBase`, then scans
+device sub-packages for concrete subclasses of each.  The registry is
+indexed by ``(base_class, device_type)`` pairs.
 
-The sole criterion for "is a base class" is *where the class is defined*:
-any class defined in a module directly under ``platform/base/`` is treated
-as a base class.  ``device_type`` is purely a *subclass* attribute naming
-the concrete device a given implementation serves (``"cuda"``/``"cpu"``).
+``device_type`` is purely a *subclass* attribute naming the concrete
+device a given implementation serves (``"cuda"``/``"cpu"``).
 
 Adding a new base class: drop a ``.py`` file in ``platform/base/`` that
-defines the class — done.  Adding a new device implementation: drop a
-subclass file in ``platform/<device>/`` whose class sets a ``device_type``
-ClassVar — done.  No other code changes needed in either case.
+defines a :class:`PlatformBase` subclass — done.  Adding a new device
+implementation: drop a subclass file in ``platform/<device>/`` whose
+class sets a ``device_type`` ClassVar — done.  No other code changes
+needed in either case.
 
 Thin convenience wrappers (:func:`get_kv_wrapper_factory`,
 :func:`register_availability`, :func:`is_available`) sit on top of the
@@ -32,6 +32,7 @@ import threading
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.platform.base import PlatformBase
 
 logger = init_logger(__name__)
 
@@ -51,16 +52,13 @@ _DISCOVERY_LOCK = threading.Lock()
 
 
 def _collect_base_classes() -> list[type]:
-    """Scan ``platform/base/`` and collect all base classes defined there.
+    """Scan ``platform/base/`` and collect marker-declared base classes.
 
-    A class qualifies as a base class purely by *location*: it must be
-    defined in a module directly under ``platform/base/`` (i.e.
-    ``cls.__module__`` equals that module's name, which filters out
-    re-exported imports).  No ``device_type`` attribute is required on the
-    base class itself — ``device_type`` is a subclass-only attribute.
+    A class qualifies as a base class iff both of these are true:
 
-    Classes whose names start with ``_`` are treated as private helpers
-    and are silently skipped.
+    * it is defined in a module directly under ``platform/base/`` (so
+      imported names are excluded), and
+    * it subclasses :class:`PlatformBase`.
 
     Returns:
         List of base classes discovered in ``platform/base/``.
@@ -87,8 +85,7 @@ def _collect_base_classes() -> list[type]:
             # Only classes actually defined in this module (not imports).
             if cls.__module__ != mod.__name__:
                 continue
-            # Skip private/internal helper classes (underscore-prefixed).
-            if cls.__name__.startswith("_"):
+            if not issubclass(cls, PlatformBase):
                 continue
             base_classes.append(cls)
             _REGISTRY.setdefault(cls, {})
@@ -192,8 +189,9 @@ def get_impl(base_class: type, device_type: str) -> type:
     table = _REGISTRY.get(base_class)
     if table is None:
         raise ValueError(
-            "Base class %r is not registered.  Make sure it is defined in "
-            "a module directly under platform/base/." % base_class
+            "Base class %r is not registered.  Make sure it subclasses "
+            "PlatformBase and is defined in a module directly under "
+            "platform/base/." % base_class
         )
     cls = table.get(device_type)
     if cls is None:

@@ -20,6 +20,7 @@ import array
 import torch
 
 # First Party
+from lmcache.v1.platform.base import PlatformBase
 from lmcache.v1.gpu_connector.utils import (
     get_attention_backend,
     get_concrete_engine_kv_shape_from_shape_desc,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     import lmcache.c_ops as lmc_ops
 
 
-class BaseCacheContext(ABC):
+class BaseCacheContext(PlatformBase, ABC):
     """Abstract base for GPU and CPU cache contexts.
 
     Subclasses call :meth:`__init__` after computing the common

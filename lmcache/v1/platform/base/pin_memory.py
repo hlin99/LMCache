@@ -7,8 +7,11 @@ The universal registry discovers them automatically by scanning for
 subclasses that define a ``device_type`` ClassVar.
 """
 
+# First Party
+from lmcache.v1.platform.base import PlatformBase
 
-class PinMemoryBackend:
+
+class PinMemoryBackend(PlatformBase):
     """Base class for host-memory pinning per platform.
 
     The default implementation is a no-op that always returns ``False``,

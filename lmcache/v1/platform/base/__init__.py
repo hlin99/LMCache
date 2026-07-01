@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Base-class package for the platform abstraction layer.
+"""Marker base for platform base classes.
 
-Each module in this package defines exactly one abstract base class.
-The universal registry (``lmcache.v1.platform._registry``) scans this
-package automatically: the *only* criterion for being a base class is
-living in a module directly under this package, so dropping a new
-``.py`` file here is all that is needed to register a new capability.
-``device_type`` is not required on the base class — it is a subclass-only
-attribute naming the concrete device each implementation serves.
-
-Import each base class directly from its submodule to avoid pulling in
-heavy dependencies (e.g. ``torch``) before they are needed::
-
-    from lmcache.v1.platform.base.cache_context import BaseCacheContext
-    from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
-    from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
+A class under ``platform/base/`` is treated as a platform base class iff
+it subclasses :class:`PlatformBase`.  This module intentionally contains
+no imports or logic beyond the marker class so importing it cannot create
+cycles or heavy side effects.
 """
+
+
+class PlatformBase:
+    """Empty marker base.
+
+    A class under ``platform/base/`` is treated as a platform base class
+    iff it subclasses :class:`PlatformBase`.  Carries no logic.
+    """
