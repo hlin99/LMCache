@@ -3,8 +3,7 @@
 
 :class:`~lmcache.v1.platform.cuda.ipc_wrapper.CudaIPCWrapper` carries
 a ``device_type`` ClassVar and a ``wrap`` factory classmethod, which
-the universal registry picks up at run-time -- no static
-``register_kv_wrapper`` needed.
+the universal registry picks up at run-time.
 
 :class:`~lmcache.v1.platform.cuda.pin_memory.CudaPinMemoryBackend`
 carries a ``device_type = "cuda"`` ClassVar, so the universal registry

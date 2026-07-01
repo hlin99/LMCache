@@ -3,9 +3,11 @@
 
 Each module in this package defines exactly one abstract base class.
 The universal registry (``lmcache.v1.platform._registry``) scans this
-package automatically, so dropping a new ``.py`` file here with a base
-class that declares a ``device_type: ClassVar[str] = ""`` attribute is
-all that is needed to register a new capability.
+package automatically: the *only* criterion for being a base class is
+living in a module directly under this package, so dropping a new
+``.py`` file here is all that is needed to register a new capability.
+``device_type`` is not required on the base class — it is a subclass-only
+attribute naming the concrete device each implementation serves.
 
 Import each base class directly from its submodule to avoid pulling in
 heavy dependencies (e.g. ``torch``) before they are needed::

@@ -5,15 +5,19 @@ Scans ``platform/base/`` to discover all base classes, then scans device
 sub-packages for concrete subclasses of each.  The registry is indexed by
 ``(base_class, device_type)`` pairs.
 
-Adding a new base class: drop a ``.py`` file in ``platform/base/`` that
-defines a class with a ``device_type: ClassVar[str] = ""`` attribute — done.
-Adding a new device implementation: drop a subclass file in
-``platform/<device>/`` with the matching ``device_type`` ClassVar — done.
-No other code changes needed in either case.
+The sole criterion for "is a base class" is *where the class is defined*:
+any class defined in a module directly under ``platform/base/`` is treated
+as a base class.  ``device_type`` is purely a *subclass* attribute naming
+the concrete device a given implementation serves (``"cuda"``/``"cpu"``).
 
-Backward-compatible APIs (:func:`get_kv_wrapper_factory`,
-:func:`register_kv_wrapper`, :func:`register_availability`,
-:func:`is_available`) are preserved as thin wrappers.
+Adding a new base class: drop a ``.py`` file in ``platform/base/`` that
+defines the class — done.  Adding a new device implementation: drop a
+subclass file in ``platform/<device>/`` whose class sets a ``device_type``
+ClassVar — done.  No other code changes needed in either case.
+
+Thin convenience wrappers (:func:`get_kv_wrapper_factory`,
+:func:`register_availability`, :func:`is_available`) sit on top of the
+core :func:`get_impl` / :func:`get_all_impls` lookups.
 """
 
 # Future
@@ -49,9 +53,11 @@ _DISCOVERY_LOCK = threading.Lock()
 def _collect_base_classes() -> list[type]:
     """Scan ``platform/base/`` and collect all base classes defined there.
 
-    A class qualifies as a base class when it is defined in a module
-    directly under ``platform/base/`` *and* has a ``device_type``
-    attribute (the ClassVar convention used by all platform base classes).
+    A class qualifies as a base class purely by *location*: it must be
+    defined in a module directly under ``platform/base/`` (i.e.
+    ``cls.__module__`` equals that module's name, which filters out
+    re-exported imports).  No ``device_type`` attribute is required on the
+    base class itself — ``device_type`` is a subclass-only attribute.
 
     Returns:
         List of base classes discovered in ``platform/base/``.
@@ -77,9 +83,6 @@ def _collect_base_classes() -> list[type]:
         for _, cls in inspect.getmembers(mod, inspect.isclass):
             # Only classes actually defined in this module (not imports).
             if cls.__module__ != mod.__name__:
-                continue
-            # Must have device_type ClassVar to participate in the registry.
-            if not hasattr(cls, "device_type"):
                 continue
             base_classes.append(cls)
             _REGISTRY.setdefault(cls, {})
@@ -184,7 +187,7 @@ def get_impl(base_class: type, device_type: str) -> type:
     if table is None:
         raise ValueError(
             "Base class %r is not registered.  Make sure it is defined in "
-            "platform/base/ and has a device_type ClassVar." % base_class
+            "a module directly under platform/base/." % base_class
         )
     cls = table.get(device_type)
     if cls is None:
@@ -209,7 +212,7 @@ def get_all_impls(base_class: type) -> Dict[str, type]:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatible APIs
+# Convenience wrappers
 # ---------------------------------------------------------------------------
 
 
@@ -268,33 +271,6 @@ def get_kv_wrapper_factory(device_type: str) -> Callable[..., Any]:
 
     cls = get_impl(DeviceIPCWrapper, device_type)
     return getattr(cls, "wrap", cls)
-
-
-def register_kv_wrapper(device_type: str, factory: Callable[..., Any]) -> None:
-    """Register a KV-cache IPC wrapper factory for ``device_type``.
-
-    This is the manual registration path kept for backward compatibility.
-    New backends should instead set ``device_type`` and ``wrap`` on their
-    :class:`~lmcache.v1.platform.base.ipc_wrapper.DeviceIPCWrapper`
-    subclass and let auto-discovery handle registration.
-
-    Args:
-        device_type: The device type string (e.g., ``"cuda"``).
-        factory: A callable that takes a single ``torch.Tensor`` and
-            returns a wrapper instance ready for the multiprocess wire.
-
-    Notes:
-        For backward compatibility this function accepts a plain
-        ``Callable`` rather than a concrete class, so the entry stored
-        for *device_type* may be either a class or an arbitrary callable.
-        :func:`get_kv_wrapper_factory` handles both via
-        ``getattr(cls, "wrap", cls)``.
-    """
-    # Imported lazily for the same reason as in get_kv_wrapper_factory.
-    # First Party
-    from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
-
-    _REGISTRY.setdefault(DeviceIPCWrapper, {})[device_type] = factory  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------

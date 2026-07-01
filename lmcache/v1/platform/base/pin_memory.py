@@ -4,11 +4,8 @@
 Concrete subclasses live in the device sub-packages (e.g.
 :class:`~lmcache.v1.platform.cuda.pin_memory.CudaPinMemoryBackend`).
 The universal registry discovers them automatically by scanning for
-subclasses that override :attr:`PinMemoryBackend.device_type`.
+subclasses that override :attr:`device_type`.
 """
-
-# Standard
-from typing import ClassVar
 
 
 class PinMemoryBackend:
@@ -17,15 +14,11 @@ class PinMemoryBackend:
     The default implementation is a no-op that always returns ``False``,
     so platforms that do not support pinning do not need to subclass this.
 
-    Concrete subclasses MUST set :attr:`device_type` to the
+    Concrete subclasses MUST set a ``device_type`` ClassVar to the
     ``torch.device.type`` string they handle (``"cuda"``, ...).  The
-    universal platform registry uses this attribute to discover and
+    universal platform registry uses that attribute to discover and
     index them automatically.
     """
-
-    #: ``torch.device.type`` string the subclass handles.  Concrete
-    #: subclasses MUST override this.
-    device_type: ClassVar[str] = ""
 
     def pin_memory(self, ptr: int, size: int, flags: int = 0) -> bool:
         """Pin a host memory region for DMA access.
