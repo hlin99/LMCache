@@ -9,48 +9,12 @@ torch device module.
 
 # First Party
 from lmcache.v1.platform._registry import get_impl
-from lmcache.v1.platform.base_pin_memory import PinMemoryBackend
-
-_PIN_MEMORY_BACKENDS: dict[str, type[PinMemoryBackend]] = {}
-
-
-def register_pin_memory_backend(device_type: str, cls: type[PinMemoryBackend]) -> None:
-    """Register a pin-memory backend implementation for a device type.
-
-    This is the manual registration path kept for backward compatibility.
-    New backends should instead set ``device_type`` on their
-    :class:`~lmcache.v1.platform.base.pin_memory.PinMemoryBackend`
-    subclass and let the universal registry discover them automatically.
-
-    Args:
-        device_type: The device type string (for example, ``"cuda"``).
-        cls: A :class:`PinMemoryBackend` subclass (or the base class
-            itself) to instantiate for ``device_type``.
-
-    Notes:
-        Re-registering the same ``device_type`` overwrites the previous
-        backend class. Registration is expected to happen during module
-        import, so this helper does not add extra synchronization for
-        concurrent writes. Existing :class:`DeviceExt` instances keep the
-        backend object they already created; later registrations affect
-        only newly constructed instances.
-
-    Raises:
-        TypeError: If ``cls`` is not a :class:`PinMemoryBackend`
-            subclass.
-    """
-    if not isinstance(cls, type) or not issubclass(cls, PinMemoryBackend):
-        raise TypeError(
-            "register_pin_memory_backend expects a PinMemoryBackend subclass"
-        )
-    _PIN_MEMORY_BACKENDS[device_type] = cls
-
+from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
 
 def _get_pin_memory_backend(device_type: str) -> type[PinMemoryBackend]:
     """Resolve the pin-memory backend class for *device_type*.
 
-    Checks the manual ``_PIN_MEMORY_BACKENDS`` table first (backward
-    compat), then falls back to the universal registry, then falls back
+    Looks up a concrete backend in the universal registry and falls back
     to the no-op base class.
 
     Args:
@@ -60,12 +24,6 @@ def _get_pin_memory_backend(device_type: str) -> type[PinMemoryBackend]:
         A :class:`PinMemoryBackend` subclass (or the base class itself as
         a no-op fallback).
     """
-    # Manual registration takes priority for backward compatibility.
-    cls = _PIN_MEMORY_BACKENDS.get(device_type)
-    if cls is not None:
-        return cls
-
-    # Fall back to the universal registry.
     try:
         return get_impl(PinMemoryBackend, device_type)  # type: ignore[return-value]
     except ValueError:
