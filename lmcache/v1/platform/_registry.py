@@ -70,8 +70,10 @@ def _collect_base_classes() -> list[type]:
         full_name = f"{base_pkg.__name__}.{module_name}"
         try:
             mod = importlib.import_module(full_name)
-        except Exception as exc:
-            logger.warning("Failed to import base module %s: %s", full_name, exc)
+        except Exception:
+            logger.warning(
+                "Failed to import base module %s", full_name, exc_info=True
+            )
             continue
 
         for _, cls in inspect.getmembers(mod, inspect.isclass):
@@ -281,12 +283,19 @@ def register_kv_wrapper(device_type: str, factory: Callable[..., Any]) -> None:
         device_type: The device type string (e.g., ``"cuda"``).
         factory: A callable that takes a single ``torch.Tensor`` and
             returns a wrapper instance ready for the multiprocess wire.
+
+    Notes:
+        For backward compatibility this function accepts a plain
+        ``Callable`` rather than a concrete class, so the entry stored
+        for *device_type* may be either a class or an arbitrary callable.
+        :func:`get_kv_wrapper_factory` handles both via
+        ``getattr(cls, "wrap", cls)``.
     """
     # Imported lazily for the same reason as in get_kv_wrapper_factory.
     # First Party
     from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 
-    _REGISTRY.setdefault(DeviceIPCWrapper, {})[device_type] = factory
+    _REGISTRY.setdefault(DeviceIPCWrapper, {})[device_type] = factory  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
