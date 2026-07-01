@@ -393,7 +393,7 @@ def test_create_transfer_context_handle_mode_unsupported_device_raises(
         # immediately re-register the auto-discovered backends and
         # defeat the empty-table fixture.
         platform_registry.restore(
-            {"kv_wrapper": {}, "availability": {}, "discovered": True}
+            {"registry": {}, "availability": {}, "discovered": True}
         )
         with pytest.raises(ValueError, match="not supported for device type"):
             create_transfer_context(

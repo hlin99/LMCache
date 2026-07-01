@@ -22,9 +22,10 @@ import torch
 
 # First Party
 from lmcache import torch_dev
+from lmcache.v1.platform.base import PlatformBase
 
 
-class DeviceIPCWrapper:
+class DeviceIPCWrapper(PlatformBase):
     """Base class for KV-cache IPC wrapper.
 
     Holds the device-agnostic mechanism shared by all transports: the
