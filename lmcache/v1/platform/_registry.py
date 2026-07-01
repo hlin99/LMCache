@@ -119,6 +119,7 @@ def _discover_all_once() -> None:
         base_classes = _collect_base_classes()
 
         for base_cls in base_classes:
+            sub_cls: type
             for sub_cls in discover_subclasses(
                 platform_pkg,
                 base_cls,

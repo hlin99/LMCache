@@ -11,6 +11,7 @@ torch device module.
 from lmcache.v1.platform._registry import get_impl
 from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
 
+
 def _get_pin_memory_backend(device_type: str) -> type[PinMemoryBackend]:
     """Resolve the pin-memory backend class for *device_type*.
 
