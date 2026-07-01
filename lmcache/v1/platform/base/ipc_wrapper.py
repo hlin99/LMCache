@@ -13,7 +13,7 @@ on the receiving side.
 from __future__ import annotations
 
 # Standard
-from typing import Any, Tuple
+from typing import Any, ClassVar, Tuple
 import pickle
 import threading
 
@@ -40,12 +40,24 @@ class DeviceIPCWrapper:
     Subclasses implement ``__init__`` (populate the interface fields from a
     tensor) and ``to_tensor`` (reconstruct the tensor from the handle).
 
+    Concrete subclasses MUST set :attr:`device_type` to the
+    ``torch.device.type`` string they handle (``"cuda"``, ``"cpu"``, ...)
+    so the universal platform registry can discover and index them.  The
+    base class declares ``device_type = ""`` (the same convention used by
+    the other platform base classes) so that
+    :func:`~lmcache.v1.platform._registry._collect_base_classes` treats
+    ``DeviceIPCWrapper`` as a registry anchor.
+
     Concrete subclasses set ``_is_default_wrapper = True`` (a ``ClassVar``)
     to mark themselves as the default factory for their ``device_type``;
     auto-discovery in :mod:`lmcache.v1.platform._registry` reads it via
     ``getattr(cls, "_is_default_wrapper", False)`` so the attribute is
     intentionally not declared on the base class.
     """
+
+    #: ``torch.device.type`` string the subclass handles.  Concrete
+    #: subclasses MUST override this.
+    device_type: ClassVar[str] = ""
 
     # Interface fields populated by each concrete subclass's
     # ``__init__``.  Declared here so the base-class ``__eq__`` (and

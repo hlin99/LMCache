@@ -71,9 +71,7 @@ def _collect_base_classes() -> list[type]:
         try:
             mod = importlib.import_module(full_name)
         except Exception:
-            logger.warning(
-                "Failed to import base module %s", full_name, exc_info=True
-            )
+            logger.warning("Failed to import base module %s", full_name, exc_info=True)
             continue
 
         for _, cls in inspect.getmembers(mod, inspect.isclass):
@@ -166,7 +164,7 @@ def get_impl(base_class: type, device_type: str) -> type:
     This is the primary lookup API.  Example::
 
         from lmcache.v1.platform._registry import get_impl
-        from lmcache.v1.platform.base import BaseCacheContext
+        from lmcache.v1.platform.base.cache_context import BaseCacheContext
 
         cls = get_impl(BaseCacheContext, "cuda")
 
