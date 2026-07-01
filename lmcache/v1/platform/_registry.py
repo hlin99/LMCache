@@ -59,6 +59,9 @@ def _collect_base_classes() -> list[type]:
     re-exported imports).  No ``device_type`` attribute is required on the
     base class itself — ``device_type`` is a subclass-only attribute.
 
+    Classes whose names start with ``_`` are treated as private helpers
+    and are silently skipped.
+
     Returns:
         List of base classes discovered in ``platform/base/``.
     """
@@ -83,6 +86,9 @@ def _collect_base_classes() -> list[type]:
         for _, cls in inspect.getmembers(mod, inspect.isclass):
             # Only classes actually defined in this module (not imports).
             if cls.__module__ != mod.__name__:
+                continue
+            # Skip private/internal helper classes (underscore-prefixed).
+            if cls.__name__.startswith("_"):
                 continue
             base_classes.append(cls)
             _REGISTRY.setdefault(cls, {})

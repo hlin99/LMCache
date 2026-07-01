@@ -61,7 +61,7 @@ needed:
 
 - Each concrete subclass sets a ``device_type`` ClassVar (e.g. ``"cuda"``)
   and exposes a ``wrap`` factory classmethod.
-- :func:`~lmcache.v1.platform._registry._discover_wrappers_once` scans
+- :func:`~lmcache.v1.platform._registry._discover_all_once` scans
   ``lmcache.v1.platform`` two levels deep for ``DeviceIPCWrapper`` subclasses
   on first use, indexes them by ``device_type``, and skips any subclass where
   ``_is_default_wrapper`` is ``False`` (so ``RawCudaIPCWrapper`` coexists with
