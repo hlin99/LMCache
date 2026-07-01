@@ -33,6 +33,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import KVCache
+from lmcache.v1.platform._registry import get_all_impls
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
 
 if TYPE_CHECKING:
@@ -65,9 +66,6 @@ def _discover_backends_once() -> None:
     global _BACKENDS_DISCOVERED
     if _BACKENDS_DISCOVERED:
         return
-
-    # First Party
-    from lmcache.v1.platform._registry import get_all_impls
 
     _BACKENDS.update(get_all_impls(BaseCacheContext))
     _BACKENDS_DISCOVERED = True

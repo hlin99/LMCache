@@ -8,6 +8,7 @@ torch device module.
 """
 
 # First Party
+from lmcache.v1.platform._registry import get_impl
 from lmcache.v1.platform.base_pin_memory import PinMemoryBackend
 
 _PIN_MEMORY_BACKENDS: dict[str, type[PinMemoryBackend]] = {}
@@ -66,9 +67,6 @@ def _get_pin_memory_backend(device_type: str) -> type[PinMemoryBackend]:
 
     # Fall back to the universal registry.
     try:
-        # First Party
-        from lmcache.v1.platform._registry import get_impl
-
         return get_impl(PinMemoryBackend, device_type)  # type: ignore[return-value]
     except ValueError:
         return PinMemoryBackend

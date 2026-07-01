@@ -258,6 +258,10 @@ def get_kv_wrapper_factory(device_type: str) -> Callable[..., Any]:
     Raises:
         ValueError: If no factory is registered for the device type.
     """
+    # Imported lazily: DeviceIPCWrapper's module imports torch at the top
+    # level, so a module-level import here would require torch even in
+    # environments that only use the registry for pin-memory or cache-context
+    # lookups.
     # First Party
     from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 
@@ -278,6 +282,7 @@ def register_kv_wrapper(device_type: str, factory: Callable[..., Any]) -> None:
         factory: A callable that takes a single ``torch.Tensor`` and
             returns a wrapper instance ready for the multiprocess wire.
     """
+    # Imported lazily for the same reason as in get_kv_wrapper_factory.
     # First Party
     from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 
