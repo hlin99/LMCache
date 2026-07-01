@@ -62,7 +62,9 @@ def test_collect_base_classes_uses_platformbase_marker(
         return fake_mod
 
     monkeypatch.setattr(platform_registry.pkgutil, "iter_modules", fake_iter_modules)
-    monkeypatch.setattr(platform_registry.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        platform_registry.importlib, "import_module", fake_import_module
+    )
 
     try:
         platform_registry.reset_for_tests()
@@ -104,7 +106,10 @@ def test_registry_discovers_real_context_and_wrapper_impls(
             "cpu": CPUCacheContext,
             "cuda": GPUCacheContext,
         }
-        assert platform_registry.get_impl(DeviceIPCWrapper, "cpu") is CpuShmTensorWrapper
+        assert (
+            platform_registry.get_impl(DeviceIPCWrapper, "cpu")
+            is CpuShmTensorWrapper
+        )
         assert platform_registry.get_impl(DeviceIPCWrapper, "cuda") is CudaIPCWrapper
         assert PlatformBase not in platform_registry.snapshot()["registry"]
     finally:
