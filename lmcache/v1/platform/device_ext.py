@@ -16,6 +16,11 @@ _PIN_MEMORY_BACKENDS: dict[str, type[PinMemoryBackend]] = {}
 def register_pin_memory_backend(device_type: str, cls: type[PinMemoryBackend]) -> None:
     """Register a pin-memory backend implementation for a device type.
 
+    This is the manual registration path kept for backward compatibility.
+    New backends should instead set ``device_type`` on their
+    :class:`~lmcache.v1.platform.base.pin_memory.PinMemoryBackend`
+    subclass and let the universal registry discover them automatically.
+
     Args:
         device_type: The device type string (for example, ``"cuda"``).
         cls: A :class:`PinMemoryBackend` subclass (or the base class
@@ -40,6 +45,35 @@ def register_pin_memory_backend(device_type: str, cls: type[PinMemoryBackend]) -
     _PIN_MEMORY_BACKENDS[device_type] = cls
 
 
+def _get_pin_memory_backend(device_type: str) -> type[PinMemoryBackend]:
+    """Resolve the pin-memory backend class for *device_type*.
+
+    Checks the manual ``_PIN_MEMORY_BACKENDS`` table first (backward
+    compat), then falls back to the universal registry, then falls back
+    to the no-op base class.
+
+    Args:
+        device_type: The ``torch.device.type`` string.
+
+    Returns:
+        A :class:`PinMemoryBackend` subclass (or the base class itself as
+        a no-op fallback).
+    """
+    # Manual registration takes priority for backward compatibility.
+    cls = _PIN_MEMORY_BACKENDS.get(device_type)
+    if cls is not None:
+        return cls
+
+    # Fall back to the universal registry.
+    try:
+        # First Party
+        from lmcache.v1.platform._registry import get_impl
+
+        return get_impl(PinMemoryBackend, device_type)  # type: ignore[return-value]
+    except ValueError:
+        return PinMemoryBackend
+
+
 class DeviceExt:
     """Extension namespace attached as ``torch_dev.ext``.
 
@@ -57,7 +91,7 @@ class DeviceExt:
     """
 
     def __init__(self, device_type: str) -> None:
-        backend_cls = _PIN_MEMORY_BACKENDS.get(device_type, PinMemoryBackend)
+        backend_cls = _get_pin_memory_backend(device_type)
         self._pin: PinMemoryBackend = backend_cls()
 
     def pin_memory(self, ptr: int, size: int, flags: int = 0) -> bool:
