@@ -32,7 +32,6 @@ import threading
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.platform.base import PlatformBase
 
 logger = init_logger(__name__)
 
@@ -64,6 +63,7 @@ def _collect_base_classes() -> list[type]:
         List of base classes discovered in ``platform/base/``.
     """
     # First Party
+    from lmcache.v1.platform.base import PlatformBase
     import lmcache.v1.platform.base as base_pkg
 
     base_classes: list[type] = []
