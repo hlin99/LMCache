@@ -72,7 +72,7 @@ steps:
   - group: ":compression: Multiprocess (1-GPU)"
     if: build.env("VERIFY_AND_PIN_VLLM") !~ /true/
     steps:
-      - label: ":compression: lm_eval"
+      - label: ":compression: lm_eval_lmcache_driven"
         command: .buildkite/k3_tests/multiprocess/run.sh lm_eval
         timeout_in_minutes: 30
         retry: *flaky-retry
@@ -104,6 +104,47 @@ steps:
         command: .buildkite/k3_tests/multiprocess/run.sh lm_eval
         timeout_in_minutes: 30
         env:
+          LMCACHE_MP_TRANSFER_MODE: "engine_driven"
+          L1_USE_LAZY: "false"
+          CPU_BUFFER_SIZE: "80"
+        agents: { queue: "k8s" }
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - name: container-0
+                    image: lmcache/ci-base:latest
+                    imagePullPolicy: Never
+                    resources: { limits: { "nvidia.com/gpu": "1" } }
+                    volumeMounts:
+                      - { name: hf-cache, mountPath: /root/.cache/huggingface }
+                      - { name: dshm, mountPath: /dev/shm }
+                volumes:
+                  - { name: hf-cache, hostPath: { path: /data/huggingface, type: DirectoryOrCreate } }
+                  - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 128Gi } }
+        artifact_paths: ["*.log"]
+
+      # Preemption correctness check (lmcache_driven transfer mode).
+      # GPU_MEMORY_UTILIZATION=0.5 shrinks the KV cache so high-concurrency
+      # requests force vLLM to preempt.  Runs gsm8k twice and asserts both runs
+      # produce preemption events and their scores stay within 1 pp of each other.
+      - label: ":compression: lm_eval_lmcache_driven_preemption"
+        command: .buildkite/k3_tests/multiprocess/run.sh lm_eval_lmcache_driven_preemption
+        timeout_in_minutes: 30
+        env:
+          GPU_MEMORY_UTILIZATION: "0.5"
+        agents: { queue: "k8s" }
+        plugins: [{ kubernetes: { podSpec: *pod-1gpu } }]
+        artifact_paths: ["*.log"]
+
+      # Preemption correctness check (engine_driven transfer mode + SHM).
+      # Same as lm_eval_lmcache_driven_preemption but forces engine_driven path
+      # with lazy allocation disabled (L1 backed by a POSIX SHM segment).
+      - label: ":compression: lm_eval_engine_driven_preemption"
+        command: .buildkite/k3_tests/multiprocess/run.sh lm_eval_engine_driven_preemption
+        timeout_in_minutes: 30
+        env:
+          GPU_MEMORY_UTILIZATION: "0.5"
           LMCACHE_MP_TRANSFER_MODE: "engine_driven"
           L1_USE_LAZY: "false"
           CPU_BUFFER_SIZE: "80"

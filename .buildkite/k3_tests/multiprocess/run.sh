@@ -3,12 +3,13 @@
 # Usage: run.sh <test_name>
 #   test_name: lm_eval | hma_lm_eval_gemma4 | vllm_bench | long_doc_qa
 #              | long_doc_qa_l2 | fault_tolerance | deadlock | restart_recovery
-#              | gds_smoke_test | p2p
+#              | gds_smoke_test | p2p | lm_eval_lmcache_driven_preemption
+#              | lm_eval_engine_driven_preemption
 # Thin wrapper: sets up environment, then delegates to scripts/.
 # No Docker -- all processes run natively in the pod.
 set -euo pipefail
 
-TEST_NAME="${1:?Usage: $0 <test_name>  (lm_eval|hma_lm_eval_gemma4|vllm_bench|long_doc_qa|long_doc_qa_l2|fault_tolerance|deadlock|restart_recovery|cache_stats|http_api|p2p)}"
+TEST_NAME="${1:?Usage: $0 <test_name>  (lm_eval|lm_eval_lmcache_driven_preemption|lm_eval_engine_driven_preemption|hma_lm_eval_gemma4|vllm_bench|long_doc_qa|long_doc_qa_l2|fault_tolerance|deadlock|restart_recovery|cache_stats|http_api|p2p)}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
