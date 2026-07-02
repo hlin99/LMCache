@@ -135,6 +135,7 @@ steps:
         env:
           GPU_MEMORY_UTILIZATION: "0.2"
           NUM_CONCURRENT: "256"
+          MAX_MODEL_LEN: "4096"
         agents: { queue: "k8s" }
         plugins: [{ kubernetes: { podSpec: *pod-1gpu } }]
         artifact_paths: ["*.log"]
@@ -145,6 +146,7 @@ steps:
         env:
           GPU_MEMORY_UTILIZATION: "0.2"
           NUM_CONCURRENT: "256"
+          MAX_MODEL_LEN: "4096"
           LMCACHE_MP_TRANSFER_MODE: "engine_driven"
           L1_USE_LAZY: "false"
         agents: { queue: "k8s" }
