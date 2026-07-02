@@ -78,10 +78,10 @@ run_lm_eval() {
 #   VLLM_LOG - path to the vLLM process log file.
 # Outputs:
 #   The integer count of lines containing "<preempted>" to stdout (0 if the
-#   log file does not exist yet).
+#   log file does not exist or contains no preemption lines).
 count_preemptions() {
     [ -f "$VLLM_LOG" ] || { echo 0; return; }
-    grep -c "<preempted>" "$VLLM_LOG" 2>/dev/null || true
+    grep -c "<preempted>" "$VLLM_LOG" 2>/dev/null || echo 0
 }
 
 # ── Run 1 ────────────────────────────────────────────────────
@@ -140,6 +140,9 @@ def gsm8k_score_and_stderr(results_dir: str) -> tuple[float, float]:
     Searches recursively for the newest results_*.json produced by lm_eval and
     extracts the exact_match score, preferring the strict-match variant.
 
+    Assumes the results JSON contains a "results" key with a "gsm8k" sub-key
+    (i.e., only a single gsm8k task variant is expected in the results).
+
     Args:
         results_dir: Directory passed to ``lm_eval --output_path``.
 
@@ -148,8 +151,9 @@ def gsm8k_score_and_stderr(results_dir: str) -> tuple[float, float]:
         ``[0.0, 1.0]`` and its reported sampling stderr (0.0 if absent).
 
     Raises:
-        SystemExit: If no ``results_*.json`` exists or no ``exact_match`` metric
-            is found for the gsm8k task.
+        SystemExit: If no ``results_*.json`` exists, the JSON lacks the
+            expected ``results.gsm8k`` structure, or no ``exact_match``
+            metric is found.
     """
     files = glob.glob(
         os.path.join(results_dir, "**", "results_*.json"), recursive=True
@@ -159,7 +163,12 @@ def gsm8k_score_and_stderr(results_dir: str) -> tuple[float, float]:
     latest = max(files, key=os.path.getmtime)
     with open(latest) as f:
         data = json.load(f)
-    metrics = data["results"]["gsm8k"]
+    try:
+        metrics = data["results"]["gsm8k"]
+    except KeyError as exc:
+        raise SystemExit(
+            f"results_*.json is missing expected gsm8k results structure in {latest}: {exc}"
+        ) from exc
     preferred = "exact_match,strict-match"
     if preferred in metrics:
         stderr = float(metrics.get("exact_match_stderr,strict-match", 0.0))
