@@ -133,7 +133,7 @@ steps:
         command: .buildkite/k3_tests/multiprocess/run.sh lm_eval_preemption
         timeout_in_minutes: 30
         env:
-          GPU_MEMORY_UTILIZATION: "0.2"
+          GPU_MEMORY_UTILIZATION: "0.45"
           NUM_CONCURRENT: "256"
           MAX_MODEL_LEN: "4096"
         agents: { queue: "k8s" }
@@ -144,7 +144,7 @@ steps:
         command: .buildkite/k3_tests/multiprocess/run.sh lm_eval_preemption
         timeout_in_minutes: 30
         env:
-          GPU_MEMORY_UTILIZATION: "0.2"
+          GPU_MEMORY_UTILIZATION: "0.45"
           NUM_CONCURRENT: "256"
           MAX_MODEL_LEN: "4096"
           LMCACHE_MP_TRANSFER_MODE: "engine_driven"
