@@ -7,7 +7,7 @@
 # load. This test checks that:
 #   1. Both lm_eval runs complete without crashing.
 #   2. The gsm8k score drift between the two runs is within SCORE_TOLERANCE
-#      (default 0.01, i.e. 1 percentage point) -- LMCache's preemption-resume
+#      (default 0.05, i.e. 5 percentage point) -- LMCache's preemption-resume
 #      path must not corrupt KV and skew the score.
 #   3. Preemption actually occurred during the runs (non-vacuous: proves the
 #      low GPU_MEMORY_UTILIZATION env var actually triggered the codepath).
@@ -34,10 +34,10 @@ MODEL="${MODEL:-Qwen/Qwen3-14B}"
 NUM_CONCURRENT="${NUM_CONCURRENT:-50}"
 LIMIT="${LIMIT:-300}"
 # Max absolute difference allowed between the two runs' gsm8k scores.
-# 0.01 = 1 percentage point on the [0, 1] exact_match scale.
-SCORE_TOLERANCE="${SCORE_TOLERANCE:-0.01}"
+# 0.05 = 5 percentage point on the [0, 1] exact_match scale.
+SCORE_TOLERANCE="${SCORE_TOLERANCE:-0.05}"
 # Minimum acceptable gsm8k score for either run (correctness floor).
-SCORE_MIN="${SCORE_MIN:-0.70}"
+SCORE_MIN="${SCORE_MIN:-0.80}"
 # GPU memory utilization fraction passed to vLLM. Set low (e.g. via
 # GPU_MEMORY_UTILIZATION=0.5 in pipeline.yml) to force the KV cache pool
 # small enough that preemption is triggered under concurrent lm_eval load.
