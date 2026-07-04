@@ -205,8 +205,8 @@ def test_create_transfer_context_musa_handle_allowed_when_available(
     snapshot = platform_registry.snapshot()
     try:
         platform_registry.reset_for_tests()
+        # Reload to trigger MUSA wrapper auto-registration after clearing registry state.
         importlib.reload(musa_platform)
-        # Re-import to trigger auto-registration after clearing the test registry.
         musa_factory = platform_registry.get_kv_wrapper_factory("musa")
         assert callable(musa_factory)
         platform_registry.register_availability("musa", lambda: True)
