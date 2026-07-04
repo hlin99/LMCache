@@ -12,10 +12,9 @@ Two independent registries live here:
 
     * :func:`get_impl` performs a strict lookup and raises ``ValueError``
       when nothing is registered for the requested triple.
-    * :func:`resolve_impl` calls :meth:`registry_fallback` on the base
-      class before re-raising, so optional capabilities (e.g.
-      :class:`~lmcache.v1.platform.base.pin_memory.PinMemoryBackend`)
-      can return a safe no-op instead of failing.
+    * :func:`resolve_impl` is the policy-aware lookup: it re-raises for
+      abstract base classes (required capabilities) and falls back to the
+      base class itself only when the base class is concrete.
 
 **IPC wrapper registry** (``get_kv_wrapper_factory``)
     Legacy path retained for backward compatibility.  Concrete
@@ -237,16 +236,16 @@ def get_impl(
 def resolve_impl(
     base_class: type, device_type: str, impl_key: str = "default"
 ) -> type:
-    """Return the implementation for the given triple, with fallback.
+    """Resolve an implementation class for callers using fallback policy.
 
-    Behaves identically to :func:`get_impl` when a concrete
-    implementation is registered.  When the lookup fails it calls
-    ``base_class.registry_fallback(device_type, impl_key)``; if that
-    returns a non-``None`` type it is returned instead of raising.
+    This API first performs strict lookup via :func:`get_impl`.
+    If strict lookup fails:
 
-    Base classes that do **not** define ``registry_fallback`` (or whose
-    fallback returns ``None``) propagate the ``ValueError`` from
-    :func:`get_impl`, making them behave as strict required capabilities.
+    * Abstract base classes (``inspect.isabstract(base_class)``) re-raise
+      the original ``ValueError`` to preserve fail-fast semantics for
+      required capabilities.
+    * Concrete base classes fall back to ``base_class`` itself, which
+      lets optional capabilities provide a built-in default implementation.
 
     Args:
         base_class: The registry base class.
@@ -254,23 +253,22 @@ def resolve_impl(
         impl_key: The implementation key (default: ``"default"``).
 
     Returns:
-        The concrete implementation class, or the fallback type when no
-        concrete implementation is registered and the base class provides
-        a fallback.
+        The concrete implementation class, or ``base_class`` when fallback
+        is allowed by the abstractness rule.
 
     Raises:
-        ValueError: If no implementation is registered and no fallback is
-            available.
+        ValueError: If no implementation is registered and ``base_class``
+            is abstract.
     """
     try:
         return get_impl(base_class, device_type, impl_key)
     except ValueError:
-        fallback_fn = getattr(base_class, "registry_fallback", None)
-        if fallback_fn is not None:
-            fallback = fallback_fn(device_type, impl_key)
-            if fallback is not None:
-                return fallback
-        raise
+        # Standard
+        import inspect
+
+        if inspect.isabstract(base_class):
+            raise
+        return base_class
 
 
 def reset_registry_for_tests() -> None:

@@ -9,9 +9,7 @@ when it scans the modules under ``lmcache/v1/platform/base/``.
 The class itself is also a **no-op fallback**: because pin memory is an
 optional capability, devices that do not provide a concrete
 implementation can still call ``pin_memory`` / ``unpin_memory`` /
-``is_pin_supported`` and get safe default responses.  The fallback is
-wired through :meth:`registry_fallback`, which :func:`resolve_impl` in
-``_registry.py`` consults before re-raising a ``ValueError``.
+``is_pin_supported`` and get safe default responses.
 """
 
 # Standard
@@ -61,26 +59,3 @@ class PinMemoryBackend(abc.ABC):  # noqa: B024
             True if pinning is supported, False otherwise.
         """
         return False
-
-    @classmethod
-    def registry_fallback(
-        cls, device_type: str, impl_key: str = "default"
-    ) -> "type[PinMemoryBackend]":
-        """Return the no-op fallback when no concrete backend is registered.
-
-        The universal :func:`~lmcache.v1.platform._registry.resolve_impl`
-        calls this classmethod when :func:`~lmcache.v1.platform._registry.get_impl`
-        raises ``ValueError`` (i.e. no implementation is registered for the
-        requested ``device_type`` / ``impl_key`` pair).  Returning ``cls``
-        causes the caller to receive a no-op :class:`PinMemoryBackend`
-        instance rather than an error, which is the correct behaviour for
-        an optional capability.
-
-        Args:
-            device_type: The device type that had no registered backend.
-            impl_key: The implementation key that had no registered backend.
-
-        Returns:
-            :class:`PinMemoryBackend` itself (the no-op implementation).
-        """
-        return cls
