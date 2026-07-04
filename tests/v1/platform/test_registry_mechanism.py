@@ -1,4 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Synthetic, definition-decoupled mechanism tests for the platform registry.
+
+This file holds the purely synthetic tests that exercise the registry's
+discovery and indexing *mechanism* without referencing any real production
+concrete or base class (beyond ``PlatformBase`` itself). It imports no
+``torch``, no ``lmcache.c_ops``, and no device sub-package module, so it stays
+collectable and runnable in a minimal environment.
+"""
 
 # Standard
 from collections.abc import Iterator
@@ -11,44 +19,11 @@ import pytest
 # First Party
 from lmcache.v1.platform import _registry as platform_registry
 from lmcache.v1.platform.base._base import PlatformBase
-
-# Real production classes used only in TEST 2 (real-wiring parametrize list).
-# Importing at module level is safe: lmcache/__init__.py sets up lmcache.c_ops
-# on first import, so these imports succeed in any environment.
-from lmcache.v1.platform.base.cache_context import BaseCacheContext
-from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
-from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
-from lmcache.v1.platform.cpu.cache_context import CPUCacheContext
-from lmcache.v1.platform.cpu.shm import CpuShmTensorWrapper
-from lmcache.v1.platform.cuda.cache_context import GPUCacheContext
-from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
-from lmcache.v1.platform.cuda.pin_memory import CudaPinMemoryBackend
 from lmcache.v1.utils.subclass_discovery import discover_subclasses
-
-
-class _EnumNamespace:
-    """Minimal attribute namespace for import-only enum lookups."""
-
-    def __getattr__(self, name: str) -> str:
-        return name
-
-
-class _StubCOpsModule(ModuleType):
-    EngineKVFormat: _EnumNamespace
-    PageBufferShapeDesc: type[object]
 
 
 class _FakeBaseModule(ModuleType):
     ImportedMarked: type[PlatformBase]
-
-
-@pytest.fixture
-def stub_c_ops(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Install a lightweight ``lmcache.c_ops`` stub for import-only tests."""
-    stub = _StubCOpsModule("lmcache.c_ops")
-    stub.EngineKVFormat = _EnumNamespace()
-    stub.PageBufferShapeDesc = type("PageBufferShapeDesc", (), {})
-    monkeypatch.setitem(sys.modules, "lmcache.c_ops", stub)
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +113,13 @@ def test_synthetic_discover_and_index_subclasses(
     registered via ``sys.modules`` and patches ``pkgutil.iter_modules`` to
     return synthetic module listings.
 
-    Synthetic package layout (``levels=[2, 2]`` mirrors the real registry scan;
-    only depth-2 leaf modules are scanned):
+    Synthetic package layout. With ``levels=[2, 2]`` the scan window is exactly
+    depth 2, so only the depth-2 leaf modules are scanned for classes; the
+    depth-1 sub-package ``__init__`` modules are NOT scanned for classes — they
+    are only traversed to reach the depth-2 leaves:
 
         synth_platform/
-            cpu/             <- sub-package at depth 1 (traversed, not scanned)
+            cpu/             <- depth-1 sub-package (traversed, not scanned)
                 cpu_a.py     <- depth-2 leaf: FakeCpuA (FakeBaseA subclass)
                 cpu_b.py     <- depth-2 leaf: FakeCpuB (FakeBaseB subclass)
             cuda/
@@ -240,20 +217,19 @@ def test_synthetic_discover_and_index_subclasses(
             # depth-2: leaf module under cuda/
             return iter([(None, "cuda_a", False)])
         # Real paths: delegate to the original implementation
-        return _real_iter_modules(path, prefix)  # type: ignore[arg-type]
+        return _real_iter_modules(path, prefix)  # type: ignore[arg-type, return-value]
 
     monkeypatch.setattr(platform_registry.pkgutil, "iter_modules", fake_iter_modules)
 
     # --- 5. Verify discover_subclasses directly -----------------------------
     # levels=[2, 2] mirrors the real registry: only depth-2 leaf modules are
     # scanned; sub-packages at depth 1 are traversed but not scanned directly.
-    found_a = set(
+    found_a: set[type] = set(
         discover_subclasses(synth_pkg, FakeBaseA, levels=[2, 2], include_abstract=False)
     )
-    found_b = set(
+    found_b: set[type] = set(
         discover_subclasses(synth_pkg, FakeBaseB, levels=[2, 2], include_abstract=False)
     )
-
     # FakeBaseA subclasses: FakeCpuA + FakeCudaA; FakeCpuB (FakeBaseB sub) excluded
     assert found_a == {FakeCpuA, FakeCudaA}
     assert FakeCpuB not in found_a
@@ -302,68 +278,6 @@ def test_synthetic_discover_and_index_subclasses(
         # Completely unregistered base raises ValueError
         with pytest.raises(ValueError):
             platform_registry.get_impl(PlatformBase, "cpu")
-
-    finally:
-        platform_registry.restore(saved)
-
-
-# ---------------------------------------------------------------------------
-# TEST 2 — Real-wiring discovery (parametrized per base chain)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "base_cls, expected",
-    [
-        pytest.param(
-            BaseCacheContext,
-            {"cpu": CPUCacheContext, "cuda": GPUCacheContext},
-            id="cache_context",
-        ),
-        pytest.param(
-            DeviceIPCWrapper,
-            {"cpu": CpuShmTensorWrapper, "cuda": CudaIPCWrapper},
-            id="ipc_wrapper",
-        ),
-        pytest.param(
-            PinMemoryBackend,
-            # pin_memory has only a CUDA concrete backend; the base class
-            # itself is the CPU no-op fallback and is not indexed.
-            {"cuda": CudaPinMemoryBackend},
-            id="pin_memory",
-        ),
-    ],
-)
-def test_real_wiring_discovery(
-    stub_c_ops: None,
-    base_cls: type,
-    expected: dict[str, type],
-) -> None:
-    """Verify the current real platform wiring: each production base class is
-    discovered and its concrete device subclasses are indexed precisely.
-
-    To add or remove a real chain edit the ``@pytest.mark.parametrize`` list
-    above — each entry is one ``(base_cls, {device_type: concrete_cls})`` pair.
-    Precise ``==`` equality is intentional: adding a new device implementation
-    requires updating the expected mapping so reviewers must confirm new wiring.
-
-    The ``stub_c_ops`` fixture ensures lmcache.c_ops is available on CPU-only
-    runners that have no compiled native extension.
-    """
-    saved = platform_registry.snapshot()
-    try:
-        # Force a clean real rescan from scratch
-        platform_registry.reset_for_tests()
-
-        # The base class must be discovered by the base-package scanner
-        assert base_cls in platform_registry._collect_base_classes()
-
-        # Precise equality: the indexed mapping must exactly match 'expected'.
-        assert platform_registry.get_all_impls(base_cls) == expected
-
-        # Per-device lookup via get_impl
-        for device_type, cls in expected.items():
-            assert platform_registry.get_impl(base_cls, device_type) is cls
 
     finally:
         platform_registry.restore(saved)
