@@ -20,7 +20,6 @@ import array
 import torch
 
 # First Party
-from lmcache.v1.platform.base import PlatformBase
 from lmcache.v1.gpu_connector.utils import (
     get_attention_backend,
     get_concrete_engine_kv_shape_from_shape_desc,
@@ -28,6 +27,7 @@ from lmcache.v1.gpu_connector.utils import (
     is_mla,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+from lmcache.v1.platform.base._base import PlatformBase
 
 if TYPE_CHECKING:
     # First Party

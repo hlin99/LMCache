@@ -2,9 +2,9 @@
 """Universal platform registry.
 
 Scans ``platform/base/`` to discover every class defined there that
-subclasses :class:`lmcache.v1.platform.base.PlatformBase`, then scans
-device sub-packages for concrete subclasses of each.  The registry is
-indexed by ``(base_class, device_type)`` pairs.
+subclasses :class:`lmcache.v1.platform.base._base.PlatformBase`, then
+scans device sub-packages for concrete subclasses of each.  The
+registry is indexed by ``(base_class, device_type)`` pairs.
 
 ``device_type`` is purely a *subclass* attribute naming the concrete
 device a given implementation serves (``"cuda"``/``"cpu"``).
@@ -63,7 +63,7 @@ def _collect_base_classes() -> list[type]:
         List of base classes discovered in ``platform/base/``.
     """
     # First Party
-    from lmcache.v1.platform.base import PlatformBase
+    from lmcache.v1.platform.base._base import PlatformBase
     import lmcache.v1.platform.base as base_pkg
 
     base_classes: list[type] = []
@@ -85,7 +85,7 @@ def _collect_base_classes() -> list[type]:
             # Only classes actually defined in this module (not imports).
             if cls.__module__ != mod.__name__:
                 continue
-            if not issubclass(cls, PlatformBase):
+            if cls is PlatformBase or not issubclass(cls, PlatformBase):
                 continue
             base_classes.append(cls)
             _REGISTRY.setdefault(cls, {})

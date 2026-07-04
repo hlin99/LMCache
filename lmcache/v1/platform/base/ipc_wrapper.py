@@ -22,7 +22,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev
-from lmcache.v1.platform.base import PlatformBase
+from lmcache.v1.platform.base._base import PlatformBase
 
 
 class DeviceIPCWrapper(PlatformBase):

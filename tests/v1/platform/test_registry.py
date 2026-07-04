@@ -3,6 +3,7 @@
 # Standard
 from collections.abc import Iterator
 from types import ModuleType
+from typing import Any, cast
 import sys
 import types
 
@@ -11,7 +12,7 @@ import pytest
 
 # First Party
 from lmcache.v1.platform import _registry as platform_registry
-from lmcache.v1.platform.base import PlatformBase
+from lmcache.v1.platform.base._base import PlatformBase
 
 
 class _EnumNamespace:
@@ -25,8 +26,9 @@ class _EnumNamespace:
 def stub_c_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     """Install a lightweight ``lmcache.c_ops`` stub for import-only tests."""
     stub = types.ModuleType("lmcache.c_ops")
-    stub.EngineKVFormat = _EnumNamespace()
-    stub.PageBufferShapeDesc = type("PageBufferShapeDesc", (), {})
+    stub_any = cast(Any, stub)
+    stub_any.EngineKVFormat = _EnumNamespace()
+    stub_any.PageBufferShapeDesc = type("PageBufferShapeDesc", (), {})
     monkeypatch.setitem(sys.modules, "lmcache.c_ops", stub)
 
 
@@ -39,7 +41,7 @@ def test_collect_base_classes_uses_platformbase_marker(
     exec(
         "\n".join(
             [
-                "from lmcache.v1.platform.base import PlatformBase",
+                "from lmcache.v1.platform.base._base import PlatformBase",
                 "class _MarkedBase(PlatformBase):",
                 "    pass",
                 "class MarkedBase(PlatformBase):",
@@ -51,7 +53,7 @@ def test_collect_base_classes_uses_platformbase_marker(
         fake_mod.__dict__,
     )
     imported_marked = type("ImportedMarked", (PlatformBase,), {})
-    fake_mod.ImportedMarked = imported_marked
+    cast(Any, fake_mod).ImportedMarked = imported_marked
 
     def fake_iter_modules(_: object) -> Iterator[tuple[None, str, bool]]:
         return iter([(None, "fake", False)])
@@ -107,8 +109,7 @@ def test_registry_discovers_real_context_and_wrapper_impls(
             "cuda": GPUCacheContext,
         }
         assert (
-            platform_registry.get_impl(DeviceIPCWrapper, "cpu")
-            is CpuShmTensorWrapper
+            platform_registry.get_impl(DeviceIPCWrapper, "cpu") is CpuShmTensorWrapper
         )
         assert platform_registry.get_impl(DeviceIPCWrapper, "cuda") is CudaIPCWrapper
         assert PlatformBase not in platform_registry.snapshot()["registry"]
