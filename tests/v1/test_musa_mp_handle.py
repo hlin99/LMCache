@@ -204,8 +204,9 @@ def test_create_transfer_context_musa_handle_allowed_when_available(
 
     snapshot = platform_registry.snapshot()
     try:
+        # reset_for_tests() clears wrapper registrations, so reload is needed
+        # to re-run lmcache.v1.platform.musa import-time auto-registration.
         platform_registry.reset_for_tests()
-        # Reload to trigger MUSA wrapper auto-registration after clearing registry state.
         importlib.reload(musa_platform)
         musa_factory = platform_registry.get_kv_wrapper_factory("musa")
         if not callable(musa_factory):
