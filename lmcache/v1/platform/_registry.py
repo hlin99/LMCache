@@ -1,21 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Platform backend registry.
+"""Universal platform registry.
 
-Each accelerator sub-package (``platform/cuda``, ``platform/cpu``,
-future ``platform/xpu`` ...) ships a concrete
-:class:`~lmcache.v1.platform.base_ipc_wrapper.DeviceIPCWrapper`
-subclass with a ``device_type`` ClassVar and a ``wrap`` factory
-classmethod.  :func:`_discover_wrappers_once` scans the ``platform``
-package for those subclasses at run-time and populates the factory
-table -- no static ``register_kv_wrapper`` calls needed.
+Scans ``platform/base/`` for ABC-based registry roots, then scans
+``platform/<device>/`` implementations and indexes them by
+``(base_class, device_type, impl_key)``.
 
-The :func:`get_kv_wrapper_factory` lookup keys on
-``tensor.device.type`` so the call site in
-:mod:`lmcache.integration.vllm.vllm_multi_process_adapter` stays free
-of any if/elif chain.  Adding a new accelerator therefore requires
-*zero* changes to the dispatcher; it only needs to ship its own
-sub-package with a ``DeviceIPCWrapper`` subclass that sets
-``device_type`` and ``wrap``.
+Only IPC wrappers are wired through convenience helpers in this port.
+Other base-class families will migrate in follow-up changes.
 """
 
 # Future
@@ -23,6 +14,10 @@ from __future__ import annotations
 
 # Standard
 from typing import Any, Callable, Dict
+import abc
+import importlib
+import inspect
+import pkgutil
 import threading
 
 # First Party
@@ -30,194 +25,242 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
-# Public sentinel used by callers who want the always-available
-# fall-back regardless of the running ``torch_device_type``.
 DEFAULT_BACKEND: str = "cpu"
+DEFAULT_IMPL_KEY: str = "default"
 
+# {base_class: {device_type: {impl_key: concrete_class}}}
+_REGISTRY: Dict[type, Dict[str, Dict[str, type]]] = {}
 
-# KV-cache IPC wrapper factory per device type.  Populated lazily on
-# first :func:`get_kv_wrapper_factory` call by scanning the
-# ``platform`` package for
-# :class:`~lmcache.v1.platform.base_ipc_wrapper.DeviceIPCWrapper`
-# subclasses.  Tests substitute entries via
-# :func:`snapshot` / :func:`restore`.
+# Backward-compatible manual override table used by tests/callers that
+# still use register_kv_wrapper().
 _KV_WRAPPER_FACTORIES: Dict[str, Callable[..., Any]] = {}
 
-# Guard so discovery only runs once (lazy init).  The lock plus the
-# double-checked flag below keep the first concurrent caller from
-# racing a second one through the scan and emitting duplicate
-# "multiple wrappers claim device_type=..." warnings.
-_WRAPPERS_DISCOVERED: bool = False
+_AVAILABILITY: Dict[str, Callable[[], bool]] = {}
+_DISCOVERED: bool = False
 _DISCOVERY_LOCK = threading.Lock()
 
 
-def _discover_wrappers_once() -> None:
-    """Populate :data:`_KV_WRAPPER_FACTORIES` on first use.
+def _collect_base_classes() -> list[type]:
+    """Collect base classes directly defined under ``platform/base``.
 
-    Walks ``lmcache.v1.platform`` two levels deep for
-    :class:`~lmcache.v1.platform.base_ipc_wrapper.DeviceIPCWrapper`
-    subclasses.  Each subclass is indexed by its *device_type*
-    ClassVar, and its *wrap* factory is stored as the KV-wrapper
-    factory — but only when ``_is_default_wrapper`` is ``True``
-    (so e.g. :class:`~lmcache.v1.platform.cuda.ipc_wrapper.RawCudaIPCWrapper`
-    is skipped in favour of
-    :class:`~lmcache.v1.platform.cuda.ipc_wrapper.CudaIPCWrapper`).
-
-    Subclasses with an empty *device_type* or ``_is_default_wrapper ==
-    False`` are skipped.  Multiple subclasses claiming the same
-    *device_type* trigger a warning; the first one wins.
+    A class qualifies iff:
+    - it is defined in a direct ``platform/base/*.py`` module;
+    - it subclasses :class:`abc.ABC`;
+    - it is not :class:`abc.ABC` itself.
     """
-    global _WRAPPERS_DISCOVERED
-    # Fast path: avoid the lock once discovery is done (the common case).
-    if _WRAPPERS_DISCOVERED:
+    # First Party
+    import lmcache.v1.platform.base as base_pkg
+
+    base_classes: list[type] = []
+    pkg_path = getattr(base_pkg, "__path__", None)
+    if pkg_path is None:
+        return base_classes
+
+    for _, module_name, is_pkg in pkgutil.iter_modules(pkg_path):
+        if is_pkg:
+            continue
+        full_name = f"{base_pkg.__name__}.{module_name}"
+        try:
+            mod = importlib.import_module(full_name)
+        except Exception:
+            logger.warning("Failed to import base module %s", full_name, exc_info=True)
+            continue
+
+        for _, cls in inspect.getmembers(mod, inspect.isclass):
+            if cls.__module__ != mod.__name__:
+                continue
+            if cls is abc.ABC or not issubclass(cls, abc.ABC):
+                continue
+            base_classes.append(cls)
+            _REGISTRY.setdefault(cls, {})
+
+    return base_classes
+
+
+def _discover_all_once() -> None:
+    """Populate :data:`_REGISTRY` on first use."""
+    global _DISCOVERED
+    if _DISCOVERED:
         return
 
     with _DISCOVERY_LOCK:
-        # Re-check under the lock: another thread may have run the
-        # scan while we were waiting.
-        if _WRAPPERS_DISCOVERED:
+        if _DISCOVERED:
             return
 
         # First Party
-        from lmcache.v1.platform.base_ipc_wrapper import DeviceIPCWrapper
         from lmcache.v1.utils.subclass_discovery import discover_subclasses
         import lmcache.v1.platform as platform_pkg
 
-        for cls in discover_subclasses(
-            platform_pkg,
-            DeviceIPCWrapper,  # type: ignore[type-abstract]
-            levels=[2, 2],
-        ):
-            _register_discovered_wrapper(cls)
+        for base_cls in _collect_base_classes():
+            for sub_cls in discover_subclasses(
+                platform_pkg,
+                base_cls,  # type: ignore[type-abstract]
+                levels=[2, 2],
+                include_abstract=False,
+            ):
+                device_type = getattr(sub_cls, "device_type", "")
+                if not device_type:
+                    logger.warning(
+                        "Skipping %s: empty device_type ClassVar; subclasses "
+                        "of %s must override device_type.",
+                        sub_cls.__name__,
+                        base_cls.__name__,
+                    )
+                    continue
 
-        _WRAPPERS_DISCOVERED = True
+                impl_key_is_explicit = "impl_key" in sub_cls.__dict__
+                if (
+                    not impl_key_is_explicit
+                    and getattr(sub_cls, "_is_default_wrapper", None) is False
+                ):
+                    continue
+
+                impl_key = getattr(sub_cls, "impl_key", DEFAULT_IMPL_KEY)
+                if not impl_key:
+                    logger.warning(
+                        "Skipping %s: empty impl_key ClassVar; subclasses "
+                        "of %s must set a non-empty impl_key.",
+                        sub_cls.__name__,
+                        base_cls.__name__,
+                    )
+                    continue
+
+                device_table = _REGISTRY[base_cls].setdefault(device_type, {})
+                existing = device_table.get(impl_key)
+                if existing is not None and existing is not sub_cls:
+                    logger.warning(
+                        "Multiple %s subclasses claim device_type=%r, impl_key=%r "
+                        "(%s vs %s); keeping the first.",
+                        base_cls.__name__,
+                        device_type,
+                        impl_key,
+                        existing.__name__,
+                        sub_cls.__name__,
+                    )
+                    continue
+                device_table[impl_key] = sub_cls
+
+        _DISCOVERED = True
 
 
-def _register_discovered_wrapper(cls: type) -> None:
-    """Index *cls* in :data:`_KV_WRAPPER_FACTORIES` by its device_type.
+def get_impl(
+    base_class: type,
+    device_type: str,
+    impl_key: str = DEFAULT_IMPL_KEY,
+) -> type:
+    """Get implementation for ``(base_class, device_type, impl_key)``."""
+    _discover_all_once()
+    by_device = _REGISTRY.get(base_class)
+    if by_device is None:
+        raise ValueError("Base class %r is not registered." % base_class)
 
-    Only registers when ``_is_default_wrapper`` is ``True`` so sibling
-    subclasses (e.g. ``RawCudaIPCWrapper`` vs ``CudaIPCWrapper``) can
-    share a ``device_type`` without colliding.
-    """
-    if not getattr(cls, "_is_default_wrapper", False):
-        return
-
-    device_type: str = getattr(cls, "device_type", "")
-    if not device_type:
-        logger.warning(
-            "Skipping %s: empty device_type ClassVar; concrete "
-            "DeviceIPCWrapper subclasses must override it.",
-            cls.__name__,
+    by_impl = by_device.get(device_type)
+    if by_impl is None:
+        raise ValueError(
+            "No %s implementation registered for device_type=%r"
+            % (base_class.__name__, device_type)
         )
-        return
 
-    factory = getattr(cls, "wrap", cls)
-    existing = _KV_WRAPPER_FACTORIES.get(device_type)
-    if existing is not None and existing is not factory:
-        logger.warning(
-            "Multiple KV-wrapper classes claim device_type=%r "
-            "(%s vs %s); keeping the first.",
-            device_type,
-            getattr(existing, "__name__", str(existing)),
-            cls.__name__,
+    impl = by_impl.get(impl_key)
+    if impl is None:
+        raise ValueError(
+            "No %s implementation registered for device_type=%r, impl_key=%r"
+            % (base_class.__name__, device_type, impl_key)
         )
-        return
+    return impl
 
-    _KV_WRAPPER_FACTORIES[device_type] = factory
+
+def get_all_impls(base_class: type) -> Dict[str, Dict[str, type]]:
+    """Return all implementations for ``base_class``."""
+    _discover_all_once()
+    return {
+        device: dict(impls) for device, impls in _REGISTRY.get(base_class, {}).items()
+    }
+
+
+def register_impl(
+    base_class: type,
+    device_type: str,
+    impl_key: str,
+    impl_class: type,
+) -> None:
+    """Register a concrete implementation in the universal registry."""
+    _REGISTRY.setdefault(base_class, {}).setdefault(device_type, {})[impl_key] = (
+        impl_class
+    )
+
+
+def register_availability(device_type: str, predicate: Callable[[], bool]) -> None:
+    """Register an availability predicate for a device type."""
+    _AVAILABILITY[device_type] = predicate
+
+
+def is_available(device_type: str) -> bool:
+    """Check whether a device type is available."""
+    pred = _AVAILABILITY.get(device_type)
+    if pred is None:
+        return True
+    try:
+        return bool(pred())
+    except Exception:
+        return False
 
 
 def register_kv_wrapper(device_type: str, factory: Callable[..., Any]) -> None:
-    """Register a KV-cache IPC wrapper factory for ``device_type``.
-
-    This is the manual registration path kept for backward
-    compatibility.  New backends should instead set ``device_type``
-    and ``wrap`` on their :class:`DeviceIPCWrapper` subclass and let
-    :func:`_discover_wrappers_once` handle registration.
-
-    Args:
-        device_type: The device type string (e.g., ``"cuda"``).
-        factory: A callable that takes a single ``torch.Tensor`` and
-            returns a wrapper instance ready for the multiprocess wire.
-    """
+    """Backward-compatible manual registration for KV wrapper factories."""
     _KV_WRAPPER_FACTORIES[device_type] = factory
 
 
 def get_kv_wrapper_factory(device_type: str) -> Callable[..., Any]:
-    """Pick the KV-cache wrapper factory for ``device_type``.
+    """Pick the default KV-cache wrapper factory for ``device_type``."""
+    manual = _KV_WRAPPER_FACTORIES.get(device_type)
+    if manual is not None:
+        return manual
 
-    Triggers lazy auto-discovery on first call (see
-    :func:`_discover_wrappers_once`).  A missing entry means no
-    :class:`~lmcache.v1.platform.base_ipc_wrapper.DeviceIPCWrapper`
-    subclass declared *device_type* for the requested backend.
+    # First Party
+    from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
 
-    Args:
-        device_type: The device type string (e.g., ``"cuda"``).
-
-    Returns:
-        The registered KV-cache wrapper factory for the device type.
-
-    Raises:
-        ValueError: If no factory is registered for the device type.
-    """
-    _discover_wrappers_once()
-    factory = _KV_WRAPPER_FACTORIES.get(device_type)
-    if factory is None:
-        raise ValueError(
-            "No KV-cache wrapper factory registered for device type %r" % device_type
-        )
-    return factory
+    cls = get_impl(DeviceIPCWrapper, device_type, DEFAULT_IMPL_KEY)
+    return getattr(cls, "wrap", cls)
 
 
 def snapshot() -> Dict[str, Any]:
-    """Return a deep-copy of the registry tables.
-
-    Test suites use this to install backend overrides without leaking
-    state across tests; pair with :func:`restore` in a ``finally`` /
-    fixture teardown clause.
-
-    The lazy-discovery flag is captured alongside the tables: if a test
-    snapshots *before* discovery runs and restores *after*, the next
-    caller still re-runs discovery and picks up the auto-registered
-    backends, instead of seeing a stale "already discovered, table is
-    empty" view.
-
-    Returns:
-        A dict with keys ``"kv_wrapper"``, and ``"discovered"``.
-    """
+    """Return a copy of registry state for tests."""
     return {
+        "registry": {
+            base: {
+                device_type: dict(impls)
+                for device_type, impls in by_device.items()
+            }
+            for base, by_device in _REGISTRY.items()
+        },
         "kv_wrapper": dict(_KV_WRAPPER_FACTORIES),
-        "discovered": _WRAPPERS_DISCOVERED,
+        "availability": dict(_AVAILABILITY),
+        "discovered": _DISCOVERED,
     }
 
 
 def restore(state: Dict[str, Any]) -> None:
-    """Restore registry tables to a previously :func:`snapshot`-ed state.
+    """Restore previously snapshotted registry state."""
+    global _DISCOVERED
+    _REGISTRY.clear()
+    for base, by_device in state.get("registry", {}).items():
+        _REGISTRY[base] = {
+            device_type: dict(impls) for device_type, impls in by_device.items()
+        }
 
-    Args:
-        state: A snapshot dict as returned by :func:`snapshot`.
-    """
-    global _WRAPPERS_DISCOVERED
     _KV_WRAPPER_FACTORIES.clear()
     _KV_WRAPPER_FACTORIES.update(state.get("kv_wrapper", {}))
-    _WRAPPERS_DISCOVERED = bool(state.get("discovered", False))
+
+    _AVAILABILITY.clear()
+    _AVAILABILITY.update(state.get("availability", {}))
+    _DISCOVERED = bool(state.get("discovered", False))
 
 
 def reset_for_tests() -> None:
-    """Wipe registry tables and force re-discovery on next access.
-
-    Intended **only** for test fixtures: clears every registered KV
-    wrapper and flips
-    :data:`_WRAPPERS_DISCOVERED` back to ``False`` so the next
-    :func:`get_kv_wrapper_factory` call re-runs the
-    :func:`_discover_wrappers_once` scan and re-populates the table
-    from the live ``platform`` sub-packages.
-
-    This is the recommended replacement for callers that previously
-    hand-mutated module-private globals; pair with an ``autouse``
-    pytest fixture to guarantee every test starts and ends with a
-    clean slate (see ``tests/v1/multiprocess/conftest.py``).
-    """
-    global _WRAPPERS_DISCOVERED
+    """Wipe registry tables and force re-discovery on next access."""
+    global _DISCOVERED
+    _REGISTRY.clear()
     _KV_WRAPPER_FACTORIES.clear()
-    _WRAPPERS_DISCOVERED = False
+    _AVAILABILITY.clear()
+    _DISCOVERED = False

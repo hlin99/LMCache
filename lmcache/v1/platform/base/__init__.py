@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Backward-compatible import shim for :mod:`lmcache.v1.platform.base`."""
+"""Platform base classes for auto-discovered registries."""
 
 # First Party
 from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
