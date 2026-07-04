@@ -8,7 +8,7 @@ subclasses that define a ``device_type`` ClassVar.
 """
 
 # First Party
-from lmcache.v1.platform.base import PlatformBase
+from lmcache.v1.platform.base._base import PlatformBase
 
 
 class PinMemoryBackend(PlatformBase):
