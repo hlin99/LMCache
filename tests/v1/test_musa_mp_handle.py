@@ -199,13 +199,14 @@ def test_create_transfer_context_musa_handle_allowed_when_available(
         LMCacheDrivenTransferContext,
         create_transfer_context,
     )
-    from lmcache.v1.platform import _registry as platform_registry
     import lmcache.v1.platform.musa as musa_platform
+    from lmcache.v1.platform import _registry as platform_registry
 
     snapshot = platform_registry.snapshot()
     try:
         platform_registry.reset_for_tests()
         importlib.reload(musa_platform)
+        platform_registry.get_kv_wrapper_factory("musa")
         platform_registry.register_availability("musa", lambda: True)
 
         context = create_transfer_context(
