@@ -208,7 +208,8 @@ def test_create_transfer_context_musa_handle_allowed_when_available(
         # Reload to trigger MUSA wrapper auto-registration after clearing registry state.
         importlib.reload(musa_platform)
         musa_factory = platform_registry.get_kv_wrapper_factory("musa")
-        assert callable(musa_factory)
+        if not callable(musa_factory):
+            pytest.fail("MUSA KV wrapper factory was not auto-registered")
         platform_registry.register_availability("musa", lambda: True)
 
         context = create_transfer_context(
