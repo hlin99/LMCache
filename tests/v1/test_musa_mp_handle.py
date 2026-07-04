@@ -206,7 +206,9 @@ def test_create_transfer_context_musa_handle_allowed_when_available(
     try:
         platform_registry.reset_for_tests()
         importlib.reload(musa_platform)
-        platform_registry.get_kv_wrapper_factory("musa")
+        # Re-import to trigger auto-registration after clearing the test registry.
+        musa_factory = platform_registry.get_kv_wrapper_factory("musa")
+        assert callable(musa_factory)
         platform_registry.register_availability("musa", lambda: True)
 
         context = create_transfer_context(
