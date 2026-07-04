@@ -2,7 +2,7 @@
 """Stable mechanism tests for the universal 3-D platform registry."""
 
 # Standard
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Generator
 import abc
 
 # Third Party
@@ -21,7 +21,7 @@ import lmcache.v1.platform._registry as _reg_module
 
 
 @pytest.fixture(autouse=True)
-def isolated_registry() -> None:
+def isolated_registry() -> Generator[None, None, None]:
     """Isolate universal registry state between tests."""
     state = snapshot_registry()
     reset_registry_for_tests()
