@@ -66,13 +66,13 @@ def _collect_base_classes() -> list[type]:
             logger.warning("Failed to import base module %s", full_name, exc_info=True)
             continue
 
-        for _, cls in inspect.getmembers(mod, inspect.isclass):
-            if cls.__module__ != mod.__name__:
+        for _, member_cls in inspect.getmembers(mod, inspect.isclass):
+            if member_cls.__module__ != mod.__name__:
                 continue
-            if cls is abc.ABC or not issubclass(cls, abc.ABC):
+            if member_cls is abc.ABC or not issubclass(member_cls, abc.ABC):
                 continue
-            base_classes.append(cls)
-            _REGISTRY.setdefault(cls, {})
+            base_classes.append(member_cls)
+            _REGISTRY.setdefault(member_cls, {})
 
     return base_classes
 
@@ -108,9 +108,13 @@ def _discover_all_once() -> None:
                     )
                     continue
 
-                impl_key_is_explicit = "impl_key" in sub_cls.__dict__
+                has_own_impl_key = "impl_key" in sub_cls.__dict__
+                # Keep compatibility with existing wrappers that use
+                # ``_is_default_wrapper`` but do not define ``impl_key``.
+                # Non-default siblings (e.g. RawCudaIPCWrapper) opt out
+                # unless they explicitly provide their own impl_key.
                 if (
-                    not impl_key_is_explicit
+                    not has_own_impl_key
                     and getattr(sub_cls, "_is_default_wrapper", None) is False
                 ):
                     continue
@@ -152,7 +156,7 @@ def get_impl(
     _discover_all_once()
     by_device = _REGISTRY.get(base_class)
     if by_device is None:
-        raise ValueError("Base class %r is not registered." % base_class)
+        raise ValueError("Base class %r is not registered." % base_class.__name__)
 
     by_impl = by_device.get(device_type)
     if by_impl is None:
@@ -185,9 +189,9 @@ def register_impl(
     impl_class: type,
 ) -> None:
     """Register a concrete implementation in the universal registry."""
-    _REGISTRY.setdefault(base_class, {}).setdefault(device_type, {})[impl_key] = (
-        impl_class
-    )
+    by_device = _REGISTRY.setdefault(base_class, {})
+    by_impl = by_device.setdefault(device_type, {})
+    by_impl[impl_key] = impl_class
 
 
 def register_availability(device_type: str, predicate: Callable[[], bool]) -> None:

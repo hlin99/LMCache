@@ -105,6 +105,7 @@ class DeviceIPCWrapper(abc.ABC):
             )
         return device_index
 
+    @abc.abstractmethod
     def to_tensor(self) -> torch.Tensor:
         """Reconstruct the tensor in this process from the IPC handle.
 

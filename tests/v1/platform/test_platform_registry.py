@@ -6,6 +6,7 @@ import abc
 # First Party
 from lmcache.v1.platform import _registry as platform_registry
 from lmcache.v1.platform.base.ipc_wrapper import DeviceIPCWrapper
+from lmcache.v1.platform.cpu.shm import CpuShmTensorWrapper
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper, RawCudaIPCWrapper
 
 
@@ -27,7 +28,7 @@ def test_registry_discovers_default_ipc_wrapper_impls() -> None:
         platform_registry.reset_for_tests()
         all_impls = platform_registry.get_all_impls(DeviceIPCWrapper)
 
-        assert all_impls["cpu"]["default"].__name__ == "CpuShmTensorWrapper"
+        assert all_impls["cpu"]["default"] is CpuShmTensorWrapper
         assert all_impls["cuda"]["default"] is CudaIPCWrapper
         assert RawCudaIPCWrapper not in all_impls["cuda"].values()
     finally:
