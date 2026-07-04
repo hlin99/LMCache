@@ -3,9 +3,7 @@
 # Standard
 from collections.abc import Iterator
 from types import ModuleType
-from typing import Any, cast
 import sys
-import types
 
 # Third Party
 import pytest
@@ -22,13 +20,21 @@ class _EnumNamespace:
         return name
 
 
+class _StubCOpsModule(ModuleType):
+    EngineKVFormat: _EnumNamespace
+    PageBufferShapeDesc: type[object]
+
+
+class _FakeBaseModule(ModuleType):
+    ImportedMarked: type[PlatformBase]
+
+
 @pytest.fixture
 def stub_c_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     """Install a lightweight ``lmcache.c_ops`` stub for import-only tests."""
-    stub = types.ModuleType("lmcache.c_ops")
-    stub_any = cast(Any, stub)
-    stub_any.EngineKVFormat = _EnumNamespace()
-    stub_any.PageBufferShapeDesc = type("PageBufferShapeDesc", (), {})
+    stub = _StubCOpsModule("lmcache.c_ops")
+    stub.EngineKVFormat = _EnumNamespace()
+    stub.PageBufferShapeDesc = type("PageBufferShapeDesc", (), {})
     monkeypatch.setitem(sys.modules, "lmcache.c_ops", stub)
 
 
@@ -37,7 +43,7 @@ def test_collect_base_classes_uses_platformbase_marker(
 ) -> None:
     """Only local ``PlatformBase`` subclasses qualify as platform bases."""
     saved = platform_registry.snapshot()
-    fake_mod = ModuleType("lmcache.v1.platform.base.fake")
+    fake_mod = _FakeBaseModule("lmcache.v1.platform.base.fake")
     exec(
         "\n".join(
             [
@@ -53,7 +59,7 @@ def test_collect_base_classes_uses_platformbase_marker(
         fake_mod.__dict__,
     )
     imported_marked = type("ImportedMarked", (PlatformBase,), {})
-    cast(Any, fake_mod).ImportedMarked = imported_marked
+    fake_mod.ImportedMarked = imported_marked
 
     def fake_iter_modules(_: object) -> Iterator[tuple[None, str, bool]]:
         return iter([(None, "fake", False)])
