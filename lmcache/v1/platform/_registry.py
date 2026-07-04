@@ -29,6 +29,7 @@ from __future__ import annotations
 
 # Standard
 from typing import Any, Callable, Dict
+import abc
 import threading
 
 # First Party
@@ -53,7 +54,7 @@ _ALL_DISCOVERED: bool = False
 _ALL_DISCOVERY_LOCK = threading.Lock()
 
 
-def _discover_base_classes() -> list[type]:
+def _discover_base_classes() -> list[type[abc.ABC]]:
     """Return all registry base classes from ``lmcache.v1.platform.base``.
 
     A class qualifies when it is **directly defined** in a non-private
@@ -61,16 +62,15 @@ def _discover_base_classes() -> list[type]:
     :class:`abc.ABC`.
 
     Returns:
-        List of discovered base classes.
+        List of discovered base classes (all subclass abc.ABC).
     """
     # Standard
-    import abc
     import importlib
     import inspect
     import pkgutil
 
     base_pkg = importlib.import_module("lmcache.v1.platform.base")
-    base_classes: list[type] = []
+    base_classes: list[type[abc.ABC]] = []
 
     for _, short_name, is_pkg in pkgutil.iter_modules(base_pkg.__path__):  # type: ignore[attr-defined]
         if is_pkg or short_name.startswith("_"):

@@ -30,7 +30,8 @@ class DeviceExt:
 
     def __init__(self, device_info: DeviceInfo | None) -> None:
         # Prefer the DeviceInfo override for backward compatibility with
-        # the current ww29 design.  Fall back to registry-based resolution
+        # existing device implementations that provide their own
+        # pin_memory_backend.  Fall back to registry-based resolution
         # when no override is present.
         if device_info is not None and device_info.pin_memory_backend is not None:
             backend_cls: type[PinMemoryBackend] = device_info.pin_memory_backend

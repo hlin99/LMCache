@@ -155,25 +155,34 @@ class TestRegisterImplAndGetImpl:
     def test_first_registration_wins_on_collision(self, caplog) -> None:
         """Duplicate (base, device_type, impl_key) keeps the first entry
         and emits a warning."""
+        # Standard
+        import logging
 
         class _ImplADuplicate(_SyntheticBase):
             device_type: ClassVar[str] = "alpha"
             impl_key: ClassVar[str] = "default"
 
-        _register_impl(_SyntheticBase, _ImplA)
-        _register_impl(_SyntheticBase, _ImplADuplicate)
+        with caplog.at_level(logging.WARNING, logger="lmcache.v1.platform._registry"):
+            _register_impl(_SyntheticBase, _ImplA)
+            _register_impl(_SyntheticBase, _ImplADuplicate)
         assert get_impl(_SyntheticBase, "alpha") is _ImplA
+        assert any("keeping the first" in r.message for r in caplog.records)
 
     def test_no_device_type_skipped(self, caplog) -> None:
-        """An implementation without device_type is not registered."""
+        """An implementation without device_type is not registered and a
+        warning is emitted."""
+        # Standard
+        import logging
 
         class _NoDeviceType(_SyntheticBase):
             pass
 
-        _register_impl(_SyntheticBase, _NoDeviceType)
+        with caplog.at_level(logging.WARNING, logger="lmcache.v1.platform._registry"):
+            _register_impl(_SyntheticBase, _NoDeviceType)
         # The base class entry may not even exist if nothing was registered.
         with pytest.raises(ValueError):
             get_impl(_SyntheticBase, "")
+        assert any("empty device_type" in r.message for r in caplog.records)
 
 
 class TestResolveImpl:
