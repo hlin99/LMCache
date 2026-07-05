@@ -26,6 +26,7 @@ class _FakeWrapper:
         self._device_type = device_type
 
     def to_tensor(self) -> torch.Tensor:
+        """Return an empty tensor on the configured device for dispatch tests."""
         return torch.empty(0, device=torch.device(self._device_type))
 
 
@@ -52,32 +53,39 @@ class _FakeContext(BaseCacheContext):
 
     @property
     def stream(self) -> Any:  # pragma: no cover - never invoked
+        """Return a required stub stream for abstract-method satisfaction."""
         return None
 
     @property
     def cupy_stream(self) -> Any:  # pragma: no cover - never invoked
+        """Return a required stub CuPy stream for abstract-method satisfaction."""
         return None
 
     @property
     def max_batch_size(self) -> int:  # pragma: no cover - never invoked
+        """Return a required stub batch limit for abstract-method satisfaction."""
         return 0
 
     def close(self) -> None:  # pragma: no cover - never invoked
+        """Provide a required stub close method for abstract-method satisfaction."""
         return None
 
     def get_kernel_group_kv_pointers(
         self, kernel_group_idx: int
     ) -> torch.Tensor:  # pragma: no cover
+        """Return a required stub tensor for abstract-method satisfaction."""
         return torch.empty(0)
 
     def get_temp_kernel_group_buffer(
         self, batch_idx: int, kernel_group_idx: int
     ) -> torch.Tensor:  # pragma: no cover
+        """Return a required stub tensor for abstract-method satisfaction."""
         return torch.empty(0)
 
     def get_temp_object_group_buffer(
         self, batch_idx: int, object_group_idx: int
     ) -> torch.Tensor:  # pragma: no cover
+        """Return a required stub tensor for abstract-method satisfaction."""
         return torch.empty(0)
 
     def get_kernel_group_shape_dtype(
@@ -85,9 +93,11 @@ class _FakeContext(BaseCacheContext):
         num_tokens: int,
         kernel_group_idx: int,
     ) -> tuple[torch.Size, torch.dtype]:  # pragma: no cover
+        """Return a required stub shape/dtype pair for abstract-method satisfaction."""
         return torch.Size(()), torch.float32
 
     def cache_size_per_token(self) -> int:  # pragma: no cover
+        """Return a required stub size value for abstract-method satisfaction."""
         return 0
 
 
