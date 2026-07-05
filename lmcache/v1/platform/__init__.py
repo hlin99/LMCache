@@ -30,7 +30,7 @@ import types
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.platform.base_device_info import DeviceInfo
+from lmcache.v1.platform.base.device_info import DeviceInfo
 from lmcache.v1.platform.event_notifier import HAS_EVENTFD as HAS_EVENTFD
 from lmcache.v1.platform.event_notifier import EventfdNotifier as EventfdNotifier
 from lmcache.v1.platform.event_notifier import EventNotifier as EventNotifier
