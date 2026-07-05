@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """MUSA-specific platform primitives."""
 
+# Standard
+from typing import ClassVar
+
 # First Party
-from lmcache.v1.platform.base_device_info import DeviceInfo
+from lmcache.v1.platform.base.device_info import DeviceInfo
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -12,9 +15,10 @@ from lmcache.v1.platform.base_device_info import DeviceInfo
 class MusaDeviceInfo(DeviceInfo):
     """MUSA device information for the detection registry."""
 
-    @property
-    def device_type(self) -> str:
-        return "musa"
+    #: ``torch.device.type`` this backend handles (used by auto-discovery).
+    device_type: ClassVar[str] = "musa"
+    #: Implementation key (used by the universal registry).
+    impl_key: ClassVar[str] = "default"
 
     @property
     def torch_module_name(self) -> str:

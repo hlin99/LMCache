@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """CUDA-specific platform primitives."""
 
+# Standard
+from typing import ClassVar
+
 # First Party
+from lmcache.v1.platform.base.device_info import DeviceInfo
 from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
-from lmcache.v1.platform.base_device_info import DeviceInfo
-from lmcache.v1.platform.cuda.pin_memory import CudaPinMemoryBackend
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -14,9 +16,10 @@ from lmcache.v1.platform.cuda.pin_memory import CudaPinMemoryBackend
 class CudaDeviceInfo(DeviceInfo):
     """CUDA device information for the detection registry."""
 
-    @property
-    def device_type(self) -> str:
-        return "cuda"
+    #: ``torch.device.type`` this backend handles (used by auto-discovery).
+    device_type: ClassVar[str] = "cuda"
+    #: Implementation key (used by the universal registry).
+    impl_key: ClassVar[str] = "default"
 
     @property
     def torch_module_name(self) -> str:
@@ -28,6 +31,9 @@ class CudaDeviceInfo(DeviceInfo):
 
     @property
     def pin_memory_backend(self) -> type[PinMemoryBackend] | None:
+        # First Party
+        from lmcache.v1.platform.cuda.pin_memory import CudaPinMemoryBackend
+
         return CudaPinMemoryBackend
 
     def is_available(self) -> bool:

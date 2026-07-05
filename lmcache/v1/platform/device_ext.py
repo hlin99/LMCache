@@ -8,8 +8,8 @@ torch device module.
 """
 
 # First Party
+from lmcache.v1.platform.base.device_info import DeviceInfo
 from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
-from lmcache.v1.platform.base_device_info import DeviceInfo
 
 
 class DeviceExt:
