@@ -7,9 +7,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from enum import IntEnum
 from multiprocessing import shared_memory
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 import ctypes
-import ctypes.util
 import os
 import threading
 import warnings
@@ -30,34 +29,13 @@ _shm_registry: dict[int, shared_memory.SharedMemory] = {}
 _buf_registry: dict[int, ctypes.Array] = {}
 _pinned_ptr_registry: dict[int, int] = {}  # ptr -> size, for cudaHostUnregister
 
-# Cached copy library for lmcache_memcpy_async (lazy-initialized)
-_copy_lib_NOT_LOADED = object()
-_copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
+def _get_copy_lib() -> ctypes.CDLL | None:
+    """Return the cached CUDA or ROCm runtime library used by fallback copies."""
+    # First Party
+    from lmcache.v1.platform.cuda.tensor_from_ptr import get_cuda_copy_lib
 
-def _get_copy_lib() -> Optional[ctypes.CDLL]:
-    """Lazily load and cache the CUDA/ROCm runtime library, or None for CPU fallback."""
-    global _copy_lib
-    if _copy_lib is _copy_lib_NOT_LOADED:
-        # Try to load GPU runtime libraries in priority order: CUDA first, then ROCm
-        # TODO: ROCm path to be validated on real device
-        for name, fallback in [
-            ("cudart", "libcudart.so"),  # NVIDIA CUDA Runtime
-            ("amdhip64", "libamdhip64.so"),  # AMD ROCm HIP Runtime
-        ]:
-            try:
-                path = ctypes.util.find_library(name)
-                if path:
-                    _copy_lib = ctypes.CDLL(path)
-                else:
-                    _copy_lib = ctypes.CDLL(fallback)
-                break  # Successfully loaded, stop trying
-            except OSError:
-                continue  # Current library not available, try next
-        else:
-            # All GPU libraries failed to load, fall back to CPU
-            _copy_lib = None
-    return _copy_lib
+    return get_cuda_copy_lib()
 
 
 def _tensor_from_ptr(
@@ -67,28 +45,21 @@ def _tensor_from_ptr(
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """
-    Create a tensor view over a raw pointer (zero-copy where possible).
-
-    Supports both CPU (pinned or regular) and CUDA device pointers.
+    Create a tensor view over a raw pointer via the platform registry.
 
     Args:
-        ptr:    Raw memory pointer as int (must be non-zero).
-        shape:  Desired tensor shape.
-        dtype:  Desired tensor dtype, must match the memory layout.
-        device: Where the pointer lives.
-                - None / "cpu" / torch.device("cpu")  → CPU pointer
-                - "cuda" / "cuda:N" / torch.device("cuda", N) → CUDA pointer
-                  If None and ptr looks like a CUDA ptr, pass device explicitly.
+        ptr: Raw memory pointer as int. Must be non-zero.
+        shape: Desired tensor shape.
+        dtype: Desired tensor dtype. It must match the pointed-to memory layout.
+        device: Device where the pointer lives. ``None`` defaults to CPU.
 
     Returns:
-        A tensor that shares memory with the original pointer.
-        For CPU: always zero-copy via ctypes + torch.frombuffer.
-        For CUDA: zero-copy via torch._C._construct_storage_from_data_pointer
-                  (PyTorch >= 2.0) or __cuda_array_interface__, with a
-                  cudaMemcpy D2D fallback.
+        A tensor reconstructed by the registered backend for ``device.type``.
 
     Raises:
-        ValueError: if ptr is 0.
+        ValueError: If ``ptr`` is zero, ``device`` cannot be normalized to a
+            :class:`torch.device`, or no backend is registered for
+            ``device.type``.
 
     Warning:
         The caller is responsible for keeping the underlying memory alive
@@ -105,129 +76,15 @@ def _tensor_from_ptr(
     elif not isinstance(device, torch.device):
         device = torch.device(device)
 
-    assert isinstance(device, torch.device)
-    # ------------------------------------------------------------------ #
-    # Compute size                                                       #
-    # ------------------------------------------------------------------ #
-    numel = 1
-    for dim in shape:
-        numel *= int(dim)
-    element_size = torch.empty((), dtype=dtype).element_size()
-    total_bytes = numel * element_size
+    if not isinstance(device, torch.device):
+        raise ValueError("device must be convertible to torch.device")
 
-    # ------------------------------------------------------------------ #
-    # CPU path                                                           #
-    # ------------------------------------------------------------------ #
-    if device.type == "cpu":
-        return _tensor_from_cpu_ptr(ptr, shape, dtype, numel, total_bytes)
+    # First Party
+    from lmcache.v1.platform._registry import resolve_impl
+    from lmcache.v1.platform.base.tensor_from_ptr import TensorFromPtrBackend
 
-    # ------------------------------------------------------------------ #
-    # CUDA path                                                          #
-    # ------------------------------------------------------------------ #
-    if device.type == "cuda":
-        return _tensor_from_cuda_ptr(ptr, shape, dtype, device, numel, total_bytes)
-
-    raise ValueError(
-        f"Unsupported device type: {device.type!r}. Expected 'cpu' or 'cuda'."
-    )
-
-
-# ====================================================================== #
-#  CPU implementation                                                    #
-# ====================================================================== #
-
-
-def _tensor_from_cpu_ptr(
-    ptr: int,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    numel: int,
-    total_bytes: int,
-) -> torch.Tensor:
-    """
-    Zero-copy CPU tensor from a raw host pointer via ctypes + torch.frombuffer.
-
-    """
-    buffer_type = ctypes.c_uint8 * total_bytes
-    buf = buffer_type.from_address(ptr)
-    # torch.frombuffer is zero-copy for contiguous byte buffers on CPU.
-    return torch.frombuffer(buf, dtype=dtype).view(*shape)
-
-
-# ====================================================================== #
-#  CUDA implementation                                                   #
-# ====================================================================== #
-def _tensor_from_cuda_ptr(
-    ptr: int,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-    numel: int,
-    total_bytes: int,
-) -> torch.Tensor:
-    """Zero-copy CUDA tensor from a raw device pointer."""
-
-    try:
-        _DTYPE_TO_TYPESTR = {
-            torch.float16: "<f2",
-            torch.float32: "<f4",
-            torch.float64: "<f8",
-            torch.int8: "|i1",
-            torch.int16: "<i2",
-            torch.int32: "<i4",
-            torch.int64: "<i8",
-            torch.uint8: "|u1",
-            torch.bool: "|b1",
-        }
-        is_bf16 = dtype == torch.bfloat16
-
-        # Determine the correct typestr, smuggle bfloat16 as int16
-        typestr = "<i2" if is_bf16 else _DTYPE_TO_TYPESTR.get(dtype, "|u1")
-
-        class _CudaArrayWrapper:
-            def __init__(self, ptr_int: int, shape_tuple: tuple, type_str: str):
-                self.__cuda_array_interface__ = {
-                    "data": (ptr_int, False),
-                    "shape": shape_tuple,
-                    "typestr": type_str,
-                    "version": 3,
-                }
-
-        t = torch.as_tensor(_CudaArrayWrapper(ptr, (numel,), typestr), device=device)
-        if is_bf16:
-            t = t.view(torch.bfloat16)
-
-        return t.view(*shape)
-    except Exception:
-        pass
-
-    # Strategy 2: cudaMemcpy Device-to-Device (Fallback)
-    libcudart = _get_copy_lib()
-    if libcudart is None:
-        raise RuntimeError("Failed to load libcudart/libamdhip")
-
-    cudaMemcpy = libcudart.cudaMemcpy
-    cudaMemcpy.restype = ctypes.c_int
-    cudaMemcpy.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-    ]
-    _MEMCPY_D2D = 3
-
-    dst = torch.empty(numel, dtype=dtype, device=device)
-
-    err = cudaMemcpy(
-        ctypes.c_void_p(dst.data_ptr()),
-        ctypes.c_void_p(ptr),
-        ctypes.c_size_t(total_bytes),
-        ctypes.c_int(_MEMCPY_D2D),
-    )
-    if err != 0:
-        raise RuntimeError(f"cudaMemcpy D2D failed with error code {err}.")
-
-    return dst.view(*shape)
+    backend_cls = resolve_impl(TensorFromPtrBackend, device.type)
+    return backend_cls().tensor_from_ptr(ptr, shape, dtype, device)
 
 
 def _copy_bytes_with_tensor(dst: int, src: int, num_bytes: int) -> None:
@@ -417,7 +274,7 @@ logger = init_logger(__name__)
 # present. Probed lazily on first allocation; if a pinned allocation ever
 # fails at runtime we flip this to False permanently and fall back to
 # pageable memory for all subsequent allocations.
-_use_pinned: Optional[bool] = None
+_use_pinned: bool | None = None
 
 
 def _alloc_page_aligned_pinned_view(size: int) -> Tuple[torch.Tensor, int]:
