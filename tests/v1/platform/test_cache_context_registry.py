@@ -12,8 +12,10 @@ import torch
 from lmcache.v1.platform import cache_context as cache_context_module
 from lmcache.v1.platform._registry import _discover_base_classes
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.platform.base_cache_context import (
+    BaseCacheContext as ShimBaseCacheContext,
+)
 from lmcache.v1.platform.cache_context import create_cache_context
-from lmcache.v1.platform.base_cache_context import BaseCacheContext as ShimBaseCacheContext
 
 
 class _FakeWrapper:
