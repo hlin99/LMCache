@@ -2,6 +2,7 @@
 """Registry wiring tests for ``BaseCacheContext``."""
 
 # Standard
+from collections.abc import Generator
 from typing import Any
 
 # Third Party
@@ -91,7 +92,7 @@ class _FakeContext(BaseCacheContext):
 
 
 @pytest.fixture
-def isolated_registry() -> Any:
+def isolated_registry() -> Generator[None, None, None]:
     """Snapshot the backend table so test-installed fakes do not leak."""
     saved = cache_context_module.snapshot_backends()
     cache_context_module.restore_backends({})
@@ -112,7 +113,7 @@ def test_base_cache_context_backward_compat_shim_reexports_same_class() -> None:
 
 
 def test_create_cache_context_dispatch_still_uses_registered_backend(
-    isolated_registry: None,
+    isolated_registry: Any,
 ) -> None:
     """create_cache_context still dispatches through the existing backend map."""
     cache_context_module.restore_backends({"cpu": _FakeContext})
