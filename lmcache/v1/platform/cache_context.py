@@ -11,7 +11,7 @@ The concrete implementations live in their respective sub-packages:
 :func:`create_cache_context` keeps the dispatch out of the call site
 in :mod:`lmcache.v1.multiprocess.server`. Selection is data-driven:
 each backend sub-package ships its own
-:class:`~lmcache.v1.platform.base_cache_context.BaseCacheContext`
+:class:`~lmcache.v1.platform.base.cache_context.BaseCacheContext`
 subclass under ``platform/<backend>/cache_context.py`` and declares
 the ``torch.device.type`` it handles via the
 :attr:`BaseCacheContext.device_type` ClassVar. The first
@@ -35,7 +35,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import KVCache
-from lmcache.v1.platform.base_cache_context import BaseCacheContext
+from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.utils.subclass_discovery import discover_subclasses
 
 if TYPE_CHECKING:
