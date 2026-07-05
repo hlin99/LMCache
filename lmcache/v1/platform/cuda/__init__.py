@@ -31,6 +31,7 @@ class CudaDeviceInfo(DeviceInfo):
 
     @property
     def pin_memory_backend(self) -> type[PinMemoryBackend] | None:
+        # Lazy import to avoid pulling in CUDA extension at class definition time.
         # First Party
         from lmcache.v1.platform.cuda.pin_memory import CudaPinMemoryBackend
 

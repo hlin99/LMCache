@@ -46,7 +46,16 @@ class DeviceInfo(abc.ABC):
     @property
     @abc.abstractmethod
     def device_type(self) -> str:
-        """Device type string (e.g. ``"cuda"``, ``"musa"``, ``"mlu"``)."""
+        """Device type string (e.g. ``"cuda"``, ``"musa"``, ``"mlu"``).
+
+        Concrete subclasses **must** satisfy this abstract property by
+        declaring a ``ClassVar[str]`` with the same name at the class level
+        (e.g. ``device_type: ClassVar[str] = "cuda"``).  Python's ABC
+        mechanism accepts a plain class attribute as a valid override for an
+        abstract property, so the ClassVar declaration simultaneously
+        satisfies the ABC contract and provides the class-level attribute that
+        the universal registry reads via ``getattr(cls, "device_type")``.
+        """
 
     @property
     @abc.abstractmethod

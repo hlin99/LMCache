@@ -58,8 +58,11 @@ def test_cuda_device_info_has_device_type_classvar() -> None:
 
     # The registry reads device_type via getattr on the class (not an instance).
     assert getattr(CudaDeviceInfo, "device_type", None) == "cuda"
-    # Instance access also works.
-    assert CudaDeviceInfo().device_type == "cuda"
+    # Instance access also works — ClassVar satisfies the abstract property.
+    instance = CudaDeviceInfo()
+    assert instance.device_type == "cuda"
+    # Verify the ABC contract is fully satisfied (no unimplemented abstract methods).
+    assert isinstance(instance, DeviceInfo)
 
 
 def test_musa_device_info_has_device_type_classvar() -> None:
@@ -68,7 +71,7 @@ def test_musa_device_info_has_device_type_classvar() -> None:
     from lmcache.v1.platform.musa import MusaDeviceInfo
 
     assert getattr(MusaDeviceInfo, "device_type", None) == "musa"
-    assert MusaDeviceInfo().device_type == "musa"
+    assert isinstance(MusaDeviceInfo(), DeviceInfo)
 
 
 def test_xpu_device_info_has_device_type_classvar() -> None:
@@ -77,7 +80,7 @@ def test_xpu_device_info_has_device_type_classvar() -> None:
     from lmcache.v1.platform.xpu import XpuDeviceInfo
 
     assert getattr(XpuDeviceInfo, "device_type", None) == "xpu"
-    assert XpuDeviceInfo().device_type == "xpu"
+    assert isinstance(XpuDeviceInfo(), DeviceInfo)
 
 
 def test_hpu_device_info_has_device_type_classvar() -> None:
@@ -86,7 +89,39 @@ def test_hpu_device_info_has_device_type_classvar() -> None:
     from lmcache.v1.platform.hpu import HpuDeviceInfo
 
     assert getattr(HpuDeviceInfo, "device_type", None) == "hpu"
-    assert HpuDeviceInfo().device_type == "hpu"
+    assert isinstance(HpuDeviceInfo(), DeviceInfo)
+
+
+def test_all_device_info_subclasses_can_be_registered() -> None:
+    """All built-in DeviceInfo subclasses can be registered in the universal registry.
+
+    Verifies that the ClassVar pattern works consistently across all
+    implementations, not just CUDA, by registering each subclass and
+    retrieving it by its declared device_type.
+    """
+    # First Party
+    from lmcache.v1.platform._registry import _register_impl, get_impl
+    from lmcache.v1.platform.cuda import CudaDeviceInfo
+    from lmcache.v1.platform.hpu import HpuDeviceInfo
+    from lmcache.v1.platform.musa import MusaDeviceInfo
+    from lmcache.v1.platform.xpu import XpuDeviceInfo
+
+    # Use explicit (cls, device_type) pairs to avoid mypy interpreting the
+    # abstract base-class property descriptor when accessed on the class object.
+    impls: list[tuple[type, str]] = [
+        (CudaDeviceInfo, "cuda"),
+        (MusaDeviceInfo, "musa"),
+        (XpuDeviceInfo, "xpu"),
+        (HpuDeviceInfo, "hpu"),
+    ]
+    for cls, expected_dt in impls:
+        _register_impl(DeviceInfo, cls)
+        result = get_impl(DeviceInfo, expected_dt, "default")
+        assert result is cls, "Expected %s for device_type=%r, got %s" % (
+            cls.__name__,
+            expected_dt,
+            result.__name__,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
