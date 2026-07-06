@@ -16,6 +16,8 @@ import pytest
 # First Party
 from lmcache.v1.distributed.api import AttnWindowDesc, MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.transfer_plan import (
+    KernelGroupBatchTransferPlan,
+    ObjectBatchTransferPlan,
     TransferDirection,
     TransferPlanBuilder,
     build_object_group_layout_desc,
@@ -51,6 +53,7 @@ def _make_mock_cache_context(
     kernel_groups: list[_KernelGroupSpec],
     object_group_kernel_indices: list[list[int]] | None = None,
     sw_size_chunks_per_object_group: list[int] | None = None,
+    max_batch_size: int = 4,
 ) -> MagicMock:
     """Build a MagicMock BaseCacheContext for testing.
 
@@ -64,6 +67,8 @@ def _make_mock_cache_context(
         sw_size_chunks_per_object_group: Cross-chunk SW sizes for each
             object group.  ``-1`` means full attention.  Defaults to all
             ``-1`` (full attention).
+        max_batch_size: Maximum number of concurrent batches returned by
+            ``cache_context.max_batch_size``.  Defaults to 4.
 
     Returns:
         A fully configured MagicMock that mirrors the public interface of
@@ -125,6 +130,7 @@ def _make_mock_cache_context(
     ctx.get_shape_desc.return_value = MagicMock(name="PageBufferShapeDesc")
     ctx.get_engine_kv_format.return_value = MagicMock(name="EngineKVFormat")
     ctx.get_slots_per_chunk_in_sw.return_value = chunk_size
+    ctx.max_batch_size = max_batch_size
 
     return ctx
 
@@ -389,14 +395,15 @@ class TestTransferPlanBuilderStore:
         assert plan.object_groups[0].object_keys == obj_keys[0]
 
     def test_skip_blocks_is_zero_for_store(self):
-        """Store operations always have skip_blocks == 0 for all groups."""
+        """Store operations always have skip_blocks == 0 in all batch plans."""
         ctx, obj_keys = self._make_ctx_and_keys(num_chunks=2, chunk_size=4)
         block_ids = [[0, 1, 2, 3, 4, 5, 6, 7]]
         plan = TransferPlanBuilder(ctx).build_store_plan("req", obj_keys, block_ids)
         assert plan is not None
         for og in plan.object_groups:
-            for kg in og.kernel_groups:
-                assert kg.skip_blocks == 0
+            for batch in og.batches:
+                for kg_batch in batch.kernel_groups:
+                    assert kg_batch.skip_blocks == 0
 
     def test_num_objects_to_skip_is_zero_for_store(self):
         ctx, obj_keys = self._make_ctx_and_keys(num_chunks=2, chunk_size=4)
@@ -482,7 +489,7 @@ class TestTransferPlanBuilderRetrieve:
         assert plan is None
 
     def test_skip_first_n_tokens_produces_skip_blocks(self):
-        """Non-zero skip_first_n_tokens sets skip_blocks on first batch."""
+        """Non-zero skip_first_n_tokens sets skip_blocks on the first batch."""
         ctx = _make_mock_cache_context(
             chunk_size=4,
             kernel_groups=[_KernelGroupSpec(block_size=1)],
@@ -494,8 +501,14 @@ class TestTransferPlanBuilderRetrieve:
             "req", obj_keys, block_ids, skip_first_n_tokens=2
         )
         assert plan is not None
-        kg = plan.object_groups[0].kernel_groups[0]
-        assert kg.skip_blocks == 2
+        og = plan.object_groups[0]
+        assert len(og.batches) > 0
+        first_batch = og.batches[0]
+        # First batch has skip_blocks=2; subsequent batches (if any) have 0.
+        assert first_batch.kernel_groups[0].skip_blocks == 2
+        for batch in og.batches[1:]:
+            for kg_batch in batch.kernel_groups:
+                assert kg_batch.skip_blocks == 0
 
     def test_zero_skip_produces_zero_skip_blocks(self):
         ctx, obj_keys = self._make_ctx_and_keys()
@@ -505,8 +518,9 @@ class TestTransferPlanBuilderRetrieve:
         )
         assert plan is not None
         for og in plan.object_groups:
-            for kg in og.kernel_groups:
-                assert kg.skip_blocks == 0
+            for batch in og.batches:
+                for kg_batch in batch.kernel_groups:
+                    assert kg_batch.skip_blocks == 0
 
     def test_full_attention_num_objects_to_skip_zero(self):
         """Full-attention groups have num_objects_to_skip == 0."""
@@ -547,3 +561,207 @@ class TestTransferPlanBuilderRetrieve:
         assert plan is not None
         # SW → last 2 per chunk: [2, 3, 6, 7]
         assert plan.selected_block_ids_per_kernel_group[0] == [2, 3, 6, 7]
+
+
+# ---------------------------------------------------------------------------
+# Batch-level plan: ObjectBatchTransferPlan / KernelGroupBatchTransferPlan
+# ---------------------------------------------------------------------------
+
+
+class TestBatchLevelPlan:
+    """Tests verifying that TransferPlanBuilder pre-computes correct batch-level
+    geometry so the executor can iterate plan batches without recalculation."""
+
+    # ---- Store batches -------------------------------------------------------
+
+    def test_store_batches_one_per_chunk(self):
+        """Store operations produce one batch per chunk (batch_size=1)."""
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+        )
+        obj_keys = [_make_object_keys("req", 3)]
+        block_ids = [list(range(12))]  # 3 chunks × 4 blocks
+        plan = TransferPlanBuilder(ctx).build_store_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        og = plan.object_groups[0]
+        assert len(og.batches) == 3
+        for idx, batch in enumerate(og.batches):
+            assert batch.start_object_idx == idx
+            assert batch.batch_len == 1
+            assert len(batch.kernel_groups) == 1
+
+    def test_store_batch_block_positions(self):
+        """Store batches carry correct start_block_pos and block_count."""
+        # chunk_size=4, block_size=1 → bpc=bpw=4
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+        )
+        obj_keys = [_make_object_keys("req", 2)]
+        block_ids = [list(range(8))]
+        plan = TransferPlanBuilder(ctx).build_store_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        batches = plan.object_groups[0].batches
+        # batch 0: object 0, bpw=4 → start=0, count=4
+        assert batches[0].kernel_groups[0].start_block_pos == 0
+        assert batches[0].kernel_groups[0].block_count == 4
+        # batch 1: object 1 → start=4, count=4
+        assert batches[1].kernel_groups[0].start_block_pos == 4
+        assert batches[1].kernel_groups[0].block_count == 4
+
+    def test_store_sw_batch_block_positions(self):
+        """Store batches with SW groups use blocks_per_window for positions."""
+        # chunk_size=4, block_size=1, sw=2 → bpc=4, bpw=2
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1, sw_size_tokens=2)],
+        )
+        obj_keys = [_make_object_keys("req", 3)]
+        block_ids = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]  # 3 chunks × 4
+        plan = TransferPlanBuilder(ctx).build_store_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        batches = plan.object_groups[0].batches
+        assert len(batches) == 3
+        # block positions indexed by window-frame (bpw=2)
+        assert batches[0].kernel_groups[0].start_block_pos == 0
+        assert batches[0].kernel_groups[0].block_count == 2
+        assert batches[1].kernel_groups[0].start_block_pos == 2
+        assert batches[1].kernel_groups[0].block_count == 2
+        assert batches[2].kernel_groups[0].start_block_pos == 4
+        assert batches[2].kernel_groups[0].block_count == 2
+
+    # ---- Retrieve batches ---------------------------------------------------
+
+    def test_retrieve_batches_limited_by_max_batch_size(self):
+        """Retrieve groups batches by max_batch_size chunks."""
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+            max_batch_size=2,
+        )
+        obj_keys = [_make_object_keys("req", 4)]
+        block_ids = [list(range(16))]  # 4 chunks × 4 blocks
+        plan = TransferPlanBuilder(ctx).build_retrieve_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        og = plan.object_groups[0]
+        # 4 chunks / batch_size=2 → 2 batches
+        assert len(og.batches) == 2
+        assert og.batches[0].start_object_idx == 0
+        assert og.batches[0].batch_len == 2
+        assert og.batches[1].start_object_idx == 2
+        assert og.batches[1].batch_len == 2
+
+    def test_retrieve_sw_skip_reflected_in_start_object_idx(self):
+        """SW retrieve: first batch's start_object_idx equals num_objects_to_skip."""
+        # 4 chunks, SW=2 → skip first 2
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+            sw_size_chunks_per_object_group=[2],
+            max_batch_size=4,
+        )
+        obj_keys = [_make_object_keys("req", 4)]
+        block_ids = [list(range(16))]
+        plan = TransferPlanBuilder(ctx).build_retrieve_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        og = plan.object_groups[0]
+        assert og.num_objects_to_skip == 2
+        assert len(og.batches) == 1  # 2 remaining chunks fit in one batch (max=4)
+        assert og.batches[0].start_object_idx == 2
+        assert og.batches[0].batch_len == 2
+
+    def test_retrieve_sw_batch_block_positions(self):
+        """Block positions in SW retrieve batches are offset by skipped objects."""
+        # 4 chunks, SW=2 chunks, bpw=bpc=4 (full-attn kernel group)
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+            sw_size_chunks_per_object_group=[2],
+            max_batch_size=4,
+        )
+        obj_keys = [_make_object_keys("req", 4)]
+        block_ids = [list(range(16))]
+        plan = TransferPlanBuilder(ctx).build_retrieve_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        og = plan.object_groups[0]
+        batch = og.batches[0]
+        kg_batch = batch.kernel_groups[0]
+        # start_object_idx=2, bpw=4 → start_block_pos=8; batch_len=2, block_count=8
+        assert kg_batch.start_block_pos == 8
+        assert kg_batch.block_count == 8
+
+    def test_retrieve_skip_first_n_tokens_first_batch_skip_blocks(self):
+        """skip_first_n_tokens produces correct skip_blocks only on first batch."""
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+            max_batch_size=1,
+        )
+        obj_keys = [_make_object_keys("req", 3)]
+        block_ids = [list(range(12))]
+        # Skip 2 tokens → first batch skip_blocks=2; subsequent batches skip_blocks=0
+        plan = TransferPlanBuilder(ctx).build_retrieve_plan(
+            "req", obj_keys, block_ids, skip_first_n_tokens=2
+        )
+        assert plan is not None
+        og = plan.object_groups[0]
+        assert og.batches[0].kernel_groups[0].skip_blocks == 2
+        for batch in og.batches[1:]:
+            for kg_batch in batch.kernel_groups:
+                assert kg_batch.skip_blocks == 0
+
+    def test_retrieve_skip_that_covers_entire_first_batch_drops_batch(self):
+        """A batch whose full token range is below skip_first_n_tokens is dropped."""
+        # chunk_size=4, max_batch_size=1 → each batch = 1 chunk = 4 tokens
+        # skip_first_n_tokens=5 → first batch [0,4) is fully covered → dropped
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+            max_batch_size=1,
+        )
+        obj_keys = [_make_object_keys("req", 3)]
+        block_ids = [list(range(12))]
+        plan = TransferPlanBuilder(ctx).build_retrieve_plan(
+            "req", obj_keys, block_ids, skip_first_n_tokens=5
+        )
+        assert plan is not None
+        og = plan.object_groups[0]
+        # Batch 0 (tokens 0-4) is dropped; remaining: batch 1 (tokens 4-8) and 2 (8-12)
+        assert len(og.batches) == 2
+        assert og.batches[0].start_object_idx == 1
+
+    def test_batch_plan_types(self):
+        """Plan batches use ObjectBatchTransferPlan / KernelGroupBatchTransferPlan."""
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[_KernelGroupSpec(block_size=1)],
+        )
+        obj_keys = [_make_object_keys("req", 1)]
+        block_ids = [list(range(4))]
+        plan = TransferPlanBuilder(ctx).build_store_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        og = plan.object_groups[0]
+        assert isinstance(og.batches[0], ObjectBatchTransferPlan)
+        assert isinstance(og.batches[0].kernel_groups[0], KernelGroupBatchTransferPlan)
+
+    def test_retrieve_multi_kernel_group_batch_has_entry_per_kg(self):
+        """Each batch includes one KernelGroupBatchTransferPlan per kernel group."""
+        ctx = _make_mock_cache_context(
+            chunk_size=4,
+            kernel_groups=[
+                _KernelGroupSpec(block_size=1),
+                _KernelGroupSpec(block_size=2),
+            ],
+            object_group_kernel_indices=[[0, 1]],
+        )
+        obj_keys = [_make_object_keys("req", 2)]
+        block_ids = [list(range(8)), list(range(4))]  # kg0: bpc=4; kg1: bpc=2
+        plan = TransferPlanBuilder(ctx).build_retrieve_plan("req", obj_keys, block_ids)
+        assert plan is not None
+        og = plan.object_groups[0]
+        for batch in og.batches:
+            # One entry per kernel group in the object group
+            assert len(batch.kernel_groups) == 2
+            kg_ids = {kgb.kernel_group_id for kgb in batch.kernel_groups}
+            assert kg_ids == {0, 1}

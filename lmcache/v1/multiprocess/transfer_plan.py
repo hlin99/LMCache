@@ -5,18 +5,21 @@ This module provides:
 
 - Data classes describing *what* a transfer consists of, with no CUDA or
   execution semantics:
-  ``TransferDirection``, ``KernelGroupTransferPlan``,
+  ``TransferDirection``, ``KernelGroupBatchTransferPlan``,
+  ``ObjectBatchTransferPlan``, ``KernelGroupTransferPlan``,
   ``ObjectGroupTransferPlan``, ``TransferPlan``.
 - Pure planning helpers:
   ``recalculate_blocks_to_skip``, ``downsample_block_ids``,
   ``validate_block_ids``, ``build_object_group_layout_desc``.
 - ``TransferPlanBuilder``: assembles all metadata into a ``TransferPlan``
   given a :class:`~lmcache.v1.platform.base_cache_context.BaseCacheContext`
-  and per-group object keys.
+  and per-group object keys.  The plan includes pre-computed batch-level
+  geometry (block positions, skip counts) so the executor iterates
+  :attr:`~ObjectGroupTransferPlan.batches` without recalculating anything.
 
 The builder answers:
 
-    What needs to be copied for this transfer?
+    What needs to be copied for this transfer, and in what batches?
 
 It does **not** answer:
 
@@ -66,6 +69,57 @@ class TransferDirection(Enum):
 
 
 @dataclass(frozen=True)
+class KernelGroupBatchTransferPlan:
+    """Batch-level transfer geometry for one kernel group within one batch.
+
+    Describes exactly which blocks to copy and how many to skip for a single
+    execution batch and kernel group.  Produced by
+    :class:`TransferPlanBuilder` so that the executor can iterate batches and
+    launch kernels without any geometry recalculation.
+
+    Attributes:
+        kernel_group_id: Index of the kernel group this plan belongs to.
+        start_block_pos: Starting index into the staged block-ID tensor for
+            this batch (``start_object_idx * blocks_per_window``).
+        block_count: Number of consecutive block IDs to read from the staged
+            tensor for this batch (``batch_len * blocks_per_window``).
+        skip_blocks: Number of blocks to skip at the start of the copy for
+            this batch.  Non-zero only for the first batch of a retrieve
+            operation when ``skip_first_n_tokens > 0``.  Accounts for both
+            the raw token skip and the window-frame re-mapping.
+    """
+
+    kernel_group_id: int
+    start_block_pos: int
+    block_count: int
+    skip_blocks: int
+
+
+@dataclass(frozen=True)
+class ObjectBatchTransferPlan:
+    """Batch-level transfer plan for one batch within one object group.
+
+    Pre-computed by :class:`TransferPlanBuilder` from the full object list,
+    the sliding-window skip count, and ``skip_first_n_tokens``.  The executor
+    iterates these batches and executes each without recalculating any
+    geometry.
+
+    Attributes:
+        start_object_idx: Index of the first object (chunk) in this batch
+            within the full object list supplied at execution time.  Already
+            accounts for ``num_objects_to_skip``; the first batch's
+            ``start_object_idx`` equals ``num_objects_to_skip``.
+        batch_len: Number of objects in this batch.
+        kernel_groups: Per-kernel-group geometry for this batch, in the same
+            order as :attr:`ObjectGroupTransferPlan.kernel_groups`.
+    """
+
+    start_object_idx: int
+    batch_len: int
+    kernel_groups: list[KernelGroupBatchTransferPlan]
+
+
+@dataclass(frozen=True)
 class KernelGroupTransferPlan:
     """Pure-metadata transfer plan for one kernel group.
 
@@ -85,10 +139,6 @@ class KernelGroupTransferPlan:
             sliding-window/subchunk groups this is shorter than the raw
             ``gpu_block_ids`` input because only the window's blocks are kept
             per chunk.  Indexed by window position across all chunks.
-        skip_blocks: Pre-computed skip-block count for the first written batch
-            of this kernel group, derived from ``skip_first_n_tokens``.  Zero
-            for subsequent batches (computed by the executor at execution time)
-            and for store operations.
         slots_per_chunk: Number of physical KV slots in one LMCache chunk for
             this group (forwarded to the transfer kernel at execution time).
         shape_desc: Physical page-buffer shape
@@ -105,7 +155,6 @@ class KernelGroupTransferPlan:
     blocks_per_chunk: int
     blocks_per_window: int
     selected_block_ids: list[int]
-    skip_blocks: int
     slots_per_chunk: int
     shape_desc: "lmc_ops.PageBufferShapeDesc"
     dtype: torch.dtype
@@ -116,8 +165,8 @@ class KernelGroupTransferPlan:
 class ObjectGroupTransferPlan:
     """Pure-metadata transfer plan for one object group.
 
-    Aggregates kernel-group plans and per-object-group metadata for one
-    LMCache object group.
+    Aggregates kernel-group plans, per-object-group metadata, and pre-computed
+    batch-level geometry for one LMCache object group.
 
     Attributes:
         object_group_id: Index of this object group.
@@ -133,6 +182,11 @@ class ObjectGroupTransferPlan:
             executing the transfer.  Zero for store operations and for
             full-attention retrieve operations; positive for sliding-window
             retrieve when the prefix exceeds the window size.
+        batches: Pre-computed batch-level transfer plans, ordered by
+            execution sequence.  Each entry covers one batch of consecutive
+            objects.  The executor iterates these directly without
+            recalculating any transfer geometry.  Batches that would be
+            entirely skipped due to ``skip_first_n_tokens`` are excluded.
     """
 
     object_group_id: int
@@ -141,6 +195,7 @@ class ObjectGroupTransferPlan:
     kernel_groups: list[KernelGroupTransferPlan]
     num_chunks: int
     num_objects_to_skip: int
+    batches: list[ObjectBatchTransferPlan]
 
 
 @dataclass(frozen=True)
@@ -382,10 +437,12 @@ class TransferPlanBuilder:
         kernel_group_id: int,
         object_group_id: int,
         downsampled_block_ids: list[int],
-        skip_first_n_tokens: int,
-        first_batch_start_token: int,
     ) -> KernelGroupTransferPlan:
         """Build a :class:`KernelGroupTransferPlan` for one kernel group.
+
+        Contains only the per-group invariants (geometry, format, block IDs).
+        Batch-level skip geometry is computed separately by
+        :meth:`_build_batch_plans`.
 
         Args:
             kernel_group_id: Index of the kernel group.
@@ -393,11 +450,6 @@ class TransferPlanBuilder:
                 belongs to.
             downsampled_block_ids: Already-downsampled block IDs for this
                 group (from :func:`downsample_block_ids`).
-            skip_first_n_tokens: Tokens to skip at the start of the retrieve
-                range.  Zero for store operations.
-            first_batch_start_token: The token offset of the first processed
-                batch (``num_objects_to_skip * chunk_size``), used to compute
-                ``skip_blocks`` for the first written batch.
 
         Returns:
             A :class:`KernelGroupTransferPlan` with all planning metadata.
@@ -417,19 +469,6 @@ class TransferPlanBuilder:
             tokens_per_window, kernel_group_id
         )
 
-        # Pre-compute skip_blocks for the first written batch only.
-        # Subsequent batches always have skip_blocks == 0, and the executor
-        # is responsible for applying that rule at runtime.
-        skip_tokens_in_first_chunk = max(
-            0, skip_first_n_tokens - first_batch_start_token
-        )
-        orig_skip_blocks = cache_context.calculate_num_blocks(
-            skip_tokens_in_first_chunk, kernel_group_id
-        )
-        skip_blocks = recalculate_blocks_to_skip(
-            blocks_per_chunk, blocks_per_window, orig_skip_blocks
-        )
-
         _, dtype = cache_context.get_kernel_group_shape_dtype(
             chunk_size, kernel_group_id
         )
@@ -440,22 +479,110 @@ class TransferPlanBuilder:
             blocks_per_chunk=blocks_per_chunk,
             blocks_per_window=blocks_per_window,
             selected_block_ids=downsampled_block_ids,
-            skip_blocks=skip_blocks,
             slots_per_chunk=cache_context.get_slots_per_chunk_in_sw(kernel_group_id),
             shape_desc=cache_context.get_shape_desc(kernel_group_id),
             dtype=dtype,
             engine_kv_format=cache_context.get_engine_kv_format(kernel_group_id),
         )
 
+    def _build_batch_plans(
+        self,
+        kernel_groups: list[KernelGroupTransferPlan],
+        num_objects_to_skip: int,
+        num_chunks: int,
+        batch_size: int,
+        skip_first_n_tokens: int,
+    ) -> list[ObjectBatchTransferPlan]:
+        """Compute the ordered list of batch-level transfer plans.
+
+        Iterates from ``num_objects_to_skip`` to ``num_chunks`` in steps of
+        ``batch_size``, computing per-kernel-group block positions and skip
+        counts for each batch.  Batches where the entire token range falls
+        below ``skip_first_n_tokens`` are dropped from the output so the
+        executor never sees them.
+
+        Args:
+            kernel_groups: Per-group invariant plans for the containing object
+                group (produced by :meth:`_build_kernel_group_plan`).
+            num_objects_to_skip: Number of leading chunks to skip (already
+                computed from sliding-window rules).
+            num_chunks: Total number of chunks in the object list.
+            batch_size: Maximum number of objects per execution batch.
+            skip_first_n_tokens: Tokens to skip writing at the start of the
+                retrieve range.  Zero for store operations.
+
+        Returns:
+            Ordered list of :class:`ObjectBatchTransferPlan` entries, one per
+            non-empty, non-entirely-skipped batch.
+        """
+        cache_context = self._cache_context
+        chunk_size = cache_context.lmcache_tokens_per_chunk
+
+        # Pre-index kg plans for O(1) lookup inside the batch loop.
+        kg_plan_by_id = {kgp.kernel_group_id: kgp for kgp in kernel_groups}
+
+        batches: list[ObjectBatchTransferPlan] = []
+        start = num_objects_to_skip
+        while start < num_chunks:
+            batch_len = min(batch_size, num_chunks - start)
+            batch_start_token = start * chunk_size
+            batch_end_token = batch_start_token + batch_len * chunk_size
+
+            effective_start = max(batch_start_token, skip_first_n_tokens)
+            if effective_start >= batch_end_token:
+                # Entire batch lies below skip threshold — omit from plan.
+                start += batch_len
+                continue
+
+            skip_tokens_in_chunk = effective_start - batch_start_token
+
+            kg_batch_plans: list[KernelGroupBatchTransferPlan] = []
+            for kgp in kernel_groups:
+                kg_id = kgp.kernel_group_id
+                bpc = kg_plan_by_id[kg_id].blocks_per_chunk
+                bpw = kg_plan_by_id[kg_id].blocks_per_window
+
+                orig_skip_blocks = cache_context.calculate_num_blocks(
+                    skip_tokens_in_chunk, kg_id
+                )
+                skip_blocks = recalculate_blocks_to_skip(
+                    bpc, bpw, orig_skip_blocks
+                )
+
+                kg_batch_plans.append(
+                    KernelGroupBatchTransferPlan(
+                        kernel_group_id=kg_id,
+                        start_block_pos=start * bpw,
+                        block_count=batch_len * bpw,
+                        skip_blocks=skip_blocks,
+                    )
+                )
+
+            batches.append(
+                ObjectBatchTransferPlan(
+                    start_object_idx=start,
+                    batch_len=batch_len,
+                    kernel_groups=kg_batch_plans,
+                )
+            )
+            start += batch_len
+
+        return batches
+
     def _build_object_group_plan(
         self,
         object_group_id: int,
         object_keys: list[ObjectKey],
         downsampled_block_ids: list[list[int]],
+        batch_size: int,
         skip_first_n_tokens: int,
         is_retrieve: bool,
     ) -> ObjectGroupTransferPlan:
         """Build an :class:`ObjectGroupTransferPlan` for one object group.
+
+        Computes per-group invariants (layout, kernel-group plans), the
+        sliding-window skip count, and all batch-level geometry via
+        :meth:`_build_batch_plans`.
 
         Args:
             object_group_id: Index of the object group.
@@ -463,13 +590,17 @@ class TransferPlanBuilder:
                 in chunk order.
             downsampled_block_ids: Downsampled block IDs indexed by kernel
                 group ID (from :func:`downsample_block_ids`).
+            batch_size: Maximum number of objects per execution batch.  Use
+                ``1`` for store operations and
+                ``cache_context.max_batch_size`` for retrieve operations.
             skip_first_n_tokens: Tokens to skip at the start of the range.
                 Zero for store operations.
             is_retrieve: ``True`` for retrieve operations (enables sliding-
                 window skip calculation); ``False`` for store.
 
         Returns:
-            A fully populated :class:`ObjectGroupTransferPlan`.
+            A fully populated :class:`ObjectGroupTransferPlan` including
+            pre-computed :attr:`~ObjectGroupTransferPlan.batches`.
         """
         cache_context = self._cache_context
         kv_groups_manager = cache_context.kv_layer_groups_manager
@@ -484,10 +615,6 @@ class TransferPlanBuilder:
                 sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
                 num_objects_to_skip = max(0, num_chunks - sw_size_chunks)
 
-        first_batch_start_token = (
-            num_objects_to_skip * cache_context.lmcache_tokens_per_chunk
-        )
-
         layout_desc = build_object_group_layout_desc(
             cache_context, cache_context.lmcache_tokens_per_chunk, object_group_id
         )
@@ -498,10 +625,16 @@ class TransferPlanBuilder:
                 kernel_group_id=kg_id,
                 object_group_id=object_group_id,
                 downsampled_block_ids=downsampled_block_ids[kg_id],
-                skip_first_n_tokens=skip_first_n_tokens,
-                first_batch_start_token=first_batch_start_token,
             )
             kernel_groups.append(kg_plan)
+
+        batches = self._build_batch_plans(
+            kernel_groups=kernel_groups,
+            num_objects_to_skip=num_objects_to_skip,
+            num_chunks=num_chunks,
+            batch_size=batch_size,
+            skip_first_n_tokens=skip_first_n_tokens,
+        )
 
         return ObjectGroupTransferPlan(
             object_group_id=object_group_id,
@@ -510,6 +643,7 @@ class TransferPlanBuilder:
             kernel_groups=kernel_groups,
             num_chunks=num_chunks,
             num_objects_to_skip=num_objects_to_skip,
+            batches=batches,
         )
 
     # ------------------------------------------------------------------
@@ -526,7 +660,8 @@ class TransferPlanBuilder:
 
         Validates that ``block_ids`` cover all chunks for every kernel group,
         downsamples block IDs for sliding-window/subchunk groups, and
-        assembles the full :class:`TransferPlan`.
+        assembles the full :class:`TransferPlan` including all batch-level
+        geometry.  Store operations always use a batch size of 1.
 
         Args:
             request_id: External request identifier.
@@ -558,6 +693,7 @@ class TransferPlanBuilder:
                 object_group_id=og_id,
                 object_keys=obj_keys_per_obj_group[og_id],
                 downsampled_block_ids=downsampled,
+                batch_size=1,
                 skip_first_n_tokens=0,
                 is_retrieve=False,
             )
@@ -582,7 +718,9 @@ class TransferPlanBuilder:
 
         Validates that ``block_ids`` cover all chunks for every kernel group,
         downsamples block IDs for sliding-window/subchunk groups, and
-        assembles the full :class:`TransferPlan`.
+        assembles the full :class:`TransferPlan` including all batch-level
+        geometry.  Retrieve operations use
+        ``cache_context.max_batch_size`` as the batch size.
 
         Args:
             request_id: External request identifier.
@@ -617,6 +755,7 @@ class TransferPlanBuilder:
                 object_group_id=og_id,
                 object_keys=obj_keys_per_obj_group[og_id],
                 downsampled_block_ids=downsampled,
+                batch_size=cache_context.max_batch_size,
                 skip_first_n_tokens=skip_first_n_tokens,
                 is_retrieve=True,
             )
