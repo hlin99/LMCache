@@ -511,7 +511,7 @@ class TestTransferPlanBuilderRetrieve:
     def test_full_attention_num_objects_to_skip_zero(self):
         """Full-attention groups have num_objects_to_skip == 0."""
         ctx, obj_keys = self._make_ctx_and_keys(num_chunks=4)
-        block_ids = [[list(range(16))[0:16][i] for i in range(16)]]
+        block_ids = [list(range(16))]
         plan = TransferPlanBuilder(ctx).build_retrieve_plan(
             "req-ret", obj_keys, block_ids
         )
@@ -528,7 +528,7 @@ class TestTransferPlanBuilderRetrieve:
             sw_size_chunks_per_object_group=[2],  # window = 2 chunks
         )
         obj_keys = [_make_object_keys("req", 4)]
-        block_ids = [[list(range(16))[i] for i in range(16)]]
+        block_ids = [list(range(16))]
         plan = TransferPlanBuilder(ctx).build_retrieve_plan("req", obj_keys, block_ids)
         assert plan is not None
         og = plan.object_groups[0]

@@ -91,11 +91,13 @@ class KernelGroupTransferPlan:
             and for store operations.
         slots_per_chunk: Number of physical KV slots in one LMCache chunk for
             this group (forwarded to the transfer kernel at execution time).
-        shape_desc: Physical page-buffer shape for this kernel group
-            (forwarded to the transfer kernel at execution time).
+        shape_desc: Physical page-buffer shape
+            (:class:`~lmcache.c_ops.PageBufferShapeDesc`) for this kernel
+            group (forwarded to the transfer kernel at execution time).
         dtype: Torch dtype of the KV data for this group.
-        engine_kv_format: Engine KV format for this group (forwarded to the
-            transfer kernel at execution time).
+        engine_kv_format: Engine KV format
+            (:class:`~lmcache.c_ops.EngineKVFormat`) for this group
+            (forwarded to the transfer kernel at execution time).
     """
 
     kernel_group_id: int
@@ -237,7 +239,9 @@ def downsample_block_ids(
             its ``blocks_per_chunk``.
     """
     num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
-    result: list[list[int]] = [list(bids) for bids in block_ids]
+    # Shallow copy: full-attention groups are referenced, not copied; only
+    # sliding-window/subchunk groups that need trimming get a new list.
+    result: list[list[int]] = list(block_ids)
 
     for kg_id in range(num_kernel_groups):
         subchunk_sw_size_tokens = (
