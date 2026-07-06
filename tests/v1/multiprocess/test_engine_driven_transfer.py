@@ -27,6 +27,7 @@ from lmcache.v1.multiprocess.protocols.engine import (
     PrepareStoreResponse,
     RegisterEngineDrivenContextResponse,
 )
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
     create_engine_driven_context,
@@ -176,6 +177,9 @@ def _make_storage_manager_config(
 
 def _default_register_payload(
     instance_id: int = 1,
+    *,
+    chunk_size: int = 0,
+    engine_group_infos: tuple[EngineGroupInfo, ...] = (),
 ) -> "RegisterEngineDrivenContextPayload":
     """Build a default non-GPU registration payload for server-side tests.
 
@@ -198,6 +202,8 @@ def _default_register_payload(
         hidden_dim_size=16,
         dtype_str="float32",
         use_mla=False,
+        chunk_size=chunk_size,
+        engine_group_infos=engine_group_infos,
     )
 
 
@@ -581,6 +587,140 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
 
     assert result is True
     assert "prefer_musa_native" not in captured_kwargs
+
+
+def test_engine_driven_register_sends_group_metadata_and_forces_pickle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid engine-group registration carries metadata and forces pickle mode."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        shm_name="lmcache_pool", pool_size=4096
+    )
+    send_request = MagicMock(return_value=future)
+    captured_create_kwargs: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **kwargs: captured_create_kwargs.update(kwargs) or MagicMock(),
+    )
+
+    engine_group_infos = (
+        EngineGroupInfo(engine_group_id=0, layer_indices=(0,), sw_size_tokens=-1),
+        EngineGroupInfo(engine_group_id=1, layer_indices=(1,), sw_size_tokens=8),
+    )
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=11,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=engine_group_infos,
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert payload.chunk_size == 8
+    assert payload.engine_group_infos == engine_group_infos
+    assert captured_create_kwargs["use_pickle"] is True
+
+
+def test_engine_driven_submit_store_uses_grouped_pickle_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid store path serializes grouped object-group payloads."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    class _FakeEngineContext:
+        def __init__(self) -> None:
+            self.last_chunks: Any = None
+
+        def prepare_store(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def commit_store(self, *_args: Any, **_kwargs: Any) -> bool:
+            self.last_chunks = _args[2]
+            return True
+
+        def close(self) -> None:
+            return None
+
+    fake_ctx = _FakeEngineContext()
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: fake_ctx,
+    )
+
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=12,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=(
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0,), sw_size_tokens=-1),
+            EngineGroupInfo(engine_group_id=1, layer_indices=(1,), sw_size_tokens=8),
+        ),
+    )
+
+    result = ctx.submit_store(
+        "req",
+        _default_key(),
+        12,
+        _make_kv_caches(),
+        [[0, 1], [0, 1]],
+        MagicMock(),
+        2,
+    ).result()
+
+    assert result is True
+    assert isinstance(fake_ctx.last_chunks, dict)
+    assert set(fake_ctx.last_chunks["object_groups"]) == {0, 1}
 
 
 def test_create_transfer_context_env_var_overrides_default(
@@ -1105,6 +1245,100 @@ def test_server_store_and_retrieve_cpu_chunks(
     recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     assert len(recovered_chunks) == 1
     assert torch.allclose(recovered_chunks[0], payload)
+
+
+def test_server_retrieve_partial_miss_fails_closed_for_multi_group(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Hybrid retrieve misses fail closed instead of returning partial payloads."""
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+
+    @contextmanager
+    def _read_prefetched_results(keys: list[str]) -> Any:
+        if keys == ["og0"]:
+            yield [memory_obj]
+        else:
+            yield []
+
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    module, _, _, _ = server_module_factory(mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(
+            instance_id=21,
+            engine_group_infos=(
+                EngineGroupInfo(
+                    engine_group_id=0,
+                    layer_indices=(0,),
+                    sw_size_tokens=-1,
+                ),
+                EngineGroupInfo(
+                    engine_group_id=1,
+                    layer_indices=(1,),
+                    sw_size_tokens=8,
+                ),
+            ),
+        )
+    )
+    module.context.resolve_obj_keys = MagicMock(
+        side_effect=lambda _key, object_group_ids: [
+            ["og0"] if object_group_ids[0] == 0 else ["og1"]
+        ]
+    )
+
+    response = module.prepare_retrieve(_default_key(), 21)
+
+    assert response.success is False
+    mock_storage.finish_read_prefetched.assert_called_once_with(["og0"])
+
+
+def test_server_store_partial_failure_fails_closed_for_multi_group(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Hybrid store does not report success when any object group write fails."""
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    mock_storage.reserve_write.side_effect = lambda obj_keys, *_args, **_kwargs: (
+        {"og0": memory_obj} if obj_keys == ["og0"] else {}
+    )
+
+    module, _, _, _ = server_module_factory(mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(
+            instance_id=22,
+            engine_group_infos=(
+                EngineGroupInfo(
+                    engine_group_id=0,
+                    layer_indices=(0,),
+                    sw_size_tokens=-1,
+                ),
+                EngineGroupInfo(
+                    engine_group_id=1,
+                    layer_indices=(1,),
+                    sw_size_tokens=8,
+                ),
+            ),
+        )
+    )
+    module.context.resolve_obj_keys = MagicMock(
+        side_effect=lambda _key, object_group_ids: [
+            ["og0"] if object_group_ids[0] == 0 else ["og1"]
+        ]
+    )
+    payload = {
+        "object_groups": {
+            0: {"chunk_indices": [0], "chunks": [torch.ones(2, 2, 8, 16)]},
+            1: {"chunk_indices": [0], "chunks": [torch.ones(2, 2, 8, 16)]},
+        }
+    }
+
+    store_ok = module.commit_store(_default_key(), 22, pickle.dumps(payload))
+
+    assert store_ok is False
 
 
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(

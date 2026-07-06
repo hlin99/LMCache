@@ -11,6 +11,7 @@ import torch
 from lmcache.v1.platform.base_ipc_wrapper import (  # noqa: E402,F401
     DeviceIPCWrapper,
 )
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
 """
 Defines the types and the customized encoder/decoders for inter-process
@@ -132,6 +133,9 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         hidden_dim_size: Flattened hidden dimension per token.
         dtype_str: Torch dtype name (e.g. ``"float16"``).
         use_mla: Whether the worker KV format is MLA.
+        chunk_size: Tokens per LMCache chunk on this worker.
+        engine_group_infos: Optional engine group metadata in LMCache kernel
+            group order. Empty means dense single-group registration.
     """
 
     instance_id: int
@@ -142,6 +146,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    chunk_size: int = 0
+    engine_group_infos: tuple[EngineGroupInfo, ...] = ()
 
 
 @dataclass

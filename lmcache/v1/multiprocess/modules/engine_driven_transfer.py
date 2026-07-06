@@ -36,6 +36,8 @@ from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMet
 
 # Local
 from .server_transfer import (
+    PickleTransferStrategy,
+    ShmTransferStrategy,
     TransferStrategy,
     create_transfer_strategy,
 )
@@ -292,10 +294,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> tuple[int, IPCCacheServerKey]:
         return (instance_id, key)
 
-    def _resolve_single_group_obj_keys(self, key: IPCCacheServerKey) -> list[ObjectKey]:
-        """Resolve object keys for the single object group used by
-        non-GPU transfers."""
-        return self._ctx.resolve_obj_keys(key, [0])[0]
+    def _resolve_obj_keys(
+        self, key: IPCCacheServerKey, object_group_ids: list[int]
+    ) -> list[list[ObjectKey]]:
+        """Resolve object keys for requested object groups."""
+        return self._ctx.resolve_obj_keys(key, object_group_ids)
 
     def register_kv_cache_engine_driven_context(
         self,
@@ -335,13 +338,14 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
             )
 
+        chunk_size = payload.chunk_size if payload.chunk_size > 0 else self._ctx.chunk_size
         shape = (
             torch.Size(
-                [payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
+                [payload.num_layers, chunk_size, payload.hidden_dim_size]
             )
             if payload.use_mla
             else torch.Size(
-                [2, payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
+                [2, payload.num_layers, chunk_size, payload.hidden_dim_size]
             )
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
@@ -349,6 +353,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             layout_desc=layout_desc,
             block_size=payload.block_size,
             use_mla=payload.use_mla,
+            chunk_size=chunk_size,
+            engine_group_infos=payload.engine_group_infos,
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
@@ -369,6 +375,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
         )
+        if (
+            metadata.engine_group_infos
+            and len(metadata.engine_group_infos) > 1
+            and isinstance(strategy, ShmTransferStrategy)
+        ):
+            strategy = PickleTransferStrategy(self._ctx.storage_manager)
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
@@ -427,7 +439,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             key=key,
             instance_id=instance_id,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=self._resolve_obj_keys,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
@@ -462,11 +474,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id=instance_id,
             cpu_data=cpu_data,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=self._resolve_obj_keys,
         )
         if st is not None and result:
             num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
+                len(self._resolve_obj_keys(key, [0])[0]) * self._ctx.chunk_size
             )
             logger.info(
                 "Stored %d tokens in %.3f seconds",
@@ -494,11 +506,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            context=entry.metadata,
+            resolve_obj_keys=self._resolve_obj_keys,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["retrieve_start_time"] = time.perf_counter()
@@ -524,9 +537,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         st = session.extras.pop("retrieve_start_time", None)
         result = strategy.commit_retrieve(key=key, instance_id=instance_id)
         if st is not None:
-            num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
-            )
+            num_tokens = len(self._resolve_obj_keys(key, [0])[0]) * self._ctx.chunk_size
             logger.info(
                 "Retrieved %d tokens in %.3f seconds",
                 num_tokens,

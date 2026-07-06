@@ -4,6 +4,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
@@ -30,6 +31,7 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from lmcache.v1.multiprocess.transfer_plan import TransferPlanBuilder
 from lmcache.v1.platform import _registry as platform_registry
 from lmcache.v1.platform import get_device_info
 
@@ -108,13 +110,148 @@ class IPCEvent(Protocol):
 SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], MessagingFuture]
 
 
-def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
-    """Return the flat block-id list for transports without HMA support."""
-    if len(block_ids) != 1:
-        raise RuntimeError(
-            "engine-driven transfer does not support hybrid KV cache groups"
+@dataclass(frozen=True)
+class _EngineDrivenKernelGroupPlanMeta:
+    """Per-kernel-group metadata needed to build engine-driven transfer plans."""
+
+    kernel_group_id: int
+    object_group_id: int
+    tokens_per_block: int
+    slots_per_block: int
+    sw_size_tokens: int
+    num_layers: int
+    dtype: torch.dtype
+
+
+def _build_engine_driven_kernel_groups(
+    *,
+    num_layers: int,
+    block_size: int,
+    dtype: torch.dtype,
+    engine_group_infos: Sequence[EngineGroupInfo],
+) -> list[_EngineDrivenKernelGroupPlanMeta]:
+    """Build engine-driven per-kernel-group planning metadata."""
+    if not engine_group_infos:
+        return [
+            _EngineDrivenKernelGroupPlanMeta(
+                kernel_group_id=0,
+                object_group_id=0,
+                tokens_per_block=block_size,
+                slots_per_block=block_size,
+                sw_size_tokens=-1,
+                num_layers=num_layers,
+                dtype=dtype,
+            )
+        ]
+
+    object_group_id_by_sw: dict[int, int] = {}
+    next_object_group_id = 0
+    metas: list[_EngineDrivenKernelGroupPlanMeta] = []
+    for kg_id, info in enumerate(engine_group_infos):
+        sw_size_tokens = info.sw_size_tokens
+        if sw_size_tokens not in object_group_id_by_sw:
+            object_group_id_by_sw[sw_size_tokens] = next_object_group_id
+            next_object_group_id += 1
+        metas.append(
+            _EngineDrivenKernelGroupPlanMeta(
+                kernel_group_id=kg_id,
+                object_group_id=object_group_id_by_sw[sw_size_tokens],
+                tokens_per_block=(
+                    info.tokens_per_block if info.tokens_per_block > 0 else block_size
+                ),
+                slots_per_block=block_size,
+                sw_size_tokens=sw_size_tokens,
+                num_layers=max(1, len(info.layer_indices)),
+                dtype=dtype,
+            )
         )
-    return block_ids[0]
+    return metas
+
+
+class _EngineDrivenPlanKVGroupsManager:
+    """Minimal kv-layer-groups-manager view required by TransferPlanBuilder."""
+
+    def __init__(self, groups: Sequence[_EngineDrivenKernelGroupPlanMeta]) -> None:
+        object_group_map: dict[int, list[int]] = {}
+        for group in groups:
+            object_group_map.setdefault(group.object_group_id, []).append(
+                group.kernel_group_id
+            )
+        self.object_groups = [
+            type(
+                "_ObjectGroup",
+                (),
+                {"kernel_group_indices": list(kernel_group_ids)},
+            )()
+            for _object_group_id, kernel_group_ids in sorted(object_group_map.items())
+        ]
+        self.num_kernel_groups = len(groups)
+        self.num_object_groups = len(self.object_groups)
+        self._groups_by_kg_id = {group.kernel_group_id: group for group in groups}
+
+    def get_subchunk_sw_size_tokens(self, kernel_group_id: int) -> int:
+        group = self._groups_by_kg_id[kernel_group_id]
+        return group.sw_size_tokens if group.sw_size_tokens > 0 else 1 << 30
+
+    def get_attn_desc(self) -> Any:
+        # First Party
+        from lmcache.v1.distributed.api import AttnWindowDesc
+
+        sw_chunks = []
+        for object_group in self.object_groups:
+            first_kg_id = object_group.kernel_group_indices[0]
+            sw_size_tokens = self._groups_by_kg_id[first_kg_id].sw_size_tokens
+            sw_chunks.append(-1 if sw_size_tokens <= 0 else 1)
+        return AttnWindowDesc(num_chunks_in_sw=sw_chunks)
+
+
+class _EngineDrivenPlanCacheContext:
+    """Minimal cache-context adapter required by TransferPlanBuilder."""
+
+    def __init__(
+        self,
+        *,
+        chunk_size: int,
+        groups: Sequence[_EngineDrivenKernelGroupPlanMeta],
+    ) -> None:
+        self.lmcache_tokens_per_chunk = chunk_size
+        self.max_batch_size = 1
+        self.kv_layer_groups_manager = _EngineDrivenPlanKVGroupsManager(groups)
+        self._groups_by_kg_id = {group.kernel_group_id: group for group in groups}
+
+    def calculate_num_blocks(self, num_tokens: int, kernel_group_id: int) -> int:
+        group = self._groups_by_kg_id[kernel_group_id]
+        if num_tokens <= 0:
+            return 0
+        return (num_tokens + group.tokens_per_block - 1) // group.tokens_per_block
+
+    def get_kernel_group_shape_dtype(
+        self, num_tokens: int, kernel_group_id: int
+    ) -> tuple[torch.Size, torch.dtype]:
+        group = self._groups_by_kg_id[kernel_group_id]
+        num_blocks = self.calculate_num_blocks(num_tokens, kernel_group_id)
+        if group.num_layers <= 1:
+            return (torch.Size([num_blocks, group.slots_per_block]), group.dtype)
+        return (
+            torch.Size([2, group.num_layers, num_blocks * group.slots_per_block]),
+            group.dtype,
+        )
+
+    def get_slots_per_chunk_in_sw(self, kernel_group_id: int) -> int:
+        group = self._groups_by_kg_id[kernel_group_id]
+        sw_tokens = self.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
+            kernel_group_id
+        )
+        if sw_tokens > self.lmcache_tokens_per_chunk:
+            sw_tokens = self.lmcache_tokens_per_chunk
+        num_blocks = self.calculate_num_blocks(sw_tokens, kernel_group_id)
+        return num_blocks * group.slots_per_block
+
+    def get_shape_desc(self, _kernel_group_id: int) -> Any:
+        return "engine_driven_pickle_shape_desc"
+
+    def get_engine_kv_format(self, _kernel_group_id: int) -> Any:
+        return "engine_driven_pickle_kv_format"
 
 
 class TransferContext(ABC):
@@ -331,6 +468,8 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        self._engine_kernel_groups: list[_EngineDrivenKernelGroupPlanMeta] = []
+        self._engine_chunk_size: int = 0
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -360,10 +499,8 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` is accepted to satisfy the base interface but
-        is currently a no-op: the non-GPU transfer path does not support
-        hybrid KV cache groups and rejects multi-group transfers at store /
-        retrieve time (see ``_single_group_block_ids``).
+        ``engine_group_infos`` is used to construct a transfer-plan metadata
+        view so the non-GPU path can execute grouped pickle transfers.
         """
         # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
         # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
@@ -379,14 +516,22 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_kv_format = engine_kv_format
 
         use_mla_flag = is_mla(engine_kv_format)
+        chunk_size = blocks_in_chunk * block_size
+        dtype = getattr(torch, dtype_str)
+        self._engine_kernel_groups = _build_engine_driven_kernel_groups(
+            num_layers=num_layers,
+            block_size=block_size,
+            dtype=dtype,
+            engine_group_infos=engine_group_infos,
+        )
+        self._engine_chunk_size = chunk_size
         shape = (
-            torch.Size([num_layers, blocks_in_chunk * block_size, hidden_dim_size])
+            torch.Size([num_layers, chunk_size, hidden_dim_size])
             if use_mla_flag
             else torch.Size(
-                [2, num_layers, blocks_in_chunk * block_size, hidden_dim_size]
+                [2, num_layers, chunk_size, hidden_dim_size]
             )
         )
-        dtype = getattr(torch, dtype_str)
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
 
         future = send_request(
@@ -402,6 +547,8 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    chunk_size=chunk_size,
+                    engine_group_infos=tuple(engine_group_infos),
                 )
             ],
         )
@@ -416,15 +563,23 @@ class EngineDrivenTransferContext(TransferContext):
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
+            chunk_size=chunk_size,
+            engine_group_infos=tuple(engine_group_infos),
         )
+        use_pickle = len(self._engine_kernel_groups) > 1
         self._engine_driven_context = create_engine_driven_context(
             metadata,
             mq_client,
             mq_timeout,
             shm_name=shm_name,
             pool_size=pool_size,
+            use_pickle=use_pickle,
         )
-        supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
+        supported_transfer_mode = (
+            "pickle"
+            if use_pickle
+            else ("SHM" if shm_name and pool_size > 0 else "pickle")
+        )
         logger.info(
             "Worker non-GPU transfer context registered (instance_id=%d, mode=%s)",
             instance_id,
@@ -439,13 +594,19 @@ class EngineDrivenTransferContext(TransferContext):
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
         _event: IPCEvent,
-        blocks_in_chunk: int,
+        _blocks_in_chunk: int,
     ) -> MessagingFuture:
         if self._engine_driven_context is None:
             raise RuntimeError(
                 "Engine-driven transfer context is not registered. "
                 "Call register() before submit_store()."
             )
+
+        store_plan = self._build_transfer_plan(key.request_id, block_ids, is_retrieve=False)
+        if store_plan is None:
+            future: MessagingFuture[bool] = MessagingFuture()
+            future.set_result(False)
+            return future
 
         torch_dev.synchronize()
         result = self._engine_driven_context.prepare_store(key, instance_id)
@@ -455,15 +616,18 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
+        if out_buffers is not None:
+            cpu_chunks: list[torch.Tensor] | dict[str, Any] = gather_paged_kv_to_cpu(
+                kv_caches,
+                store_plan.selected_block_ids_per_kernel_group[0],
+                store_plan.object_groups[0].kernel_groups[0].blocks_per_window,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
+        else:
+            cpu_chunks = self._gather_payload_by_plan(kv_caches, store_plan)
         if out_buffers is not None:
             # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
@@ -481,7 +645,7 @@ class EngineDrivenTransferContext(TransferContext):
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
         _event: IPCEvent,
-        blocks_in_chunk: int,
+        _blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
     ) -> MessagingFuture:
         if self._engine_driven_context is None:
@@ -490,18 +654,26 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
+        retrieve_plan = self._build_transfer_plan(
+            key.request_id,
+            block_ids,
+            is_retrieve=True,
+            skip_first_n_tokens=skip_first_n_tokens,
+        )
+        if retrieve_plan is None:
+            future: MessagingFuture[bool] = MessagingFuture()
+            future.set_result(False)
+            return future
+
         src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
+                self._scatter_payload_by_plan(
                     kv_caches,
-                    _single_group_block_ids(block_ids),
+                    retrieve_plan,
                     src_buffers,
-                    blocks_in_chunk,
                     skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
                 )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
@@ -519,6 +691,132 @@ class EngineDrivenTransferContext(TransferContext):
         if self._engine_driven_context is not None:
             self._engine_driven_context.close()
             self._engine_driven_context = None
+
+    def _object_group_ids(self) -> list[int]:
+        return sorted({group.object_group_id for group in self._engine_kernel_groups})
+
+    def _build_transfer_plan(
+        self,
+        request_id: str,
+        block_ids: list[list[int]],
+        *,
+        is_retrieve: bool,
+        skip_first_n_tokens: int = 0,
+    ) -> Any:
+        if not self._engine_kernel_groups:
+            return None
+        cache_context = _EngineDrivenPlanCacheContext(
+            chunk_size=self._engine_chunk_size,
+            groups=self._engine_kernel_groups,
+        )
+        builder = TransferPlanBuilder(cache_context)
+        object_keys_per_group: list[list[Any]] = []
+        for object_group_id in self._object_group_ids():
+            kernel_group_id = next(
+                group.kernel_group_id
+                for group in self._engine_kernel_groups
+                if group.object_group_id == object_group_id
+            )
+            blocks_per_chunk = cache_context.calculate_num_blocks(
+                cache_context.lmcache_tokens_per_chunk, kernel_group_id
+            )
+            if blocks_per_chunk <= 0:
+                return None
+            num_chunks = len(block_ids[kernel_group_id]) // blocks_per_chunk
+            object_keys_per_group.append([f"chunk_{idx}" for idx in range(num_chunks)])
+        if is_retrieve:
+            return builder.build_retrieve_plan(
+                request_id,
+                object_keys_per_group,
+                block_ids,
+                skip_first_n_tokens=skip_first_n_tokens,
+            )
+        return builder.build_store_plan(request_id, object_keys_per_group, block_ids)
+
+    def _gather_payload_by_plan(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        transfer_plan: Any,
+    ) -> list[torch.Tensor] | dict[str, Any]:
+        selected_block_ids = transfer_plan.selected_block_ids_per_kernel_group
+        if len(transfer_plan.object_groups) == 1 and len(selected_block_ids) == 1:
+            return gather_paged_kv_to_cpu(
+                kv_caches,
+                selected_block_ids[0],
+                transfer_plan.object_groups[0].kernel_groups[0].blocks_per_window,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+            )
+
+        payload: dict[str, Any] = {"object_groups": {}}
+        for object_group_plan in transfer_plan.object_groups:
+            grouped_chunks: list[list[torch.Tensor]] = []
+            for kernel_group_plan in object_group_plan.kernel_groups:
+                grouped_chunks.append(
+                    gather_paged_kv_to_cpu(
+                        kv_caches,
+                        kernel_group_plan.selected_block_ids,
+                        kernel_group_plan.blocks_per_window,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
+                )
+            num_chunks = (
+                len(grouped_chunks[0]) if grouped_chunks else len(object_group_plan.object_keys)
+            )
+            chunks = [
+                [grouped_chunks[group_idx][chunk_idx] for group_idx in range(len(grouped_chunks))]
+                for chunk_idx in range(num_chunks)
+            ]
+            payload["object_groups"][object_group_plan.object_group_id] = {
+                "chunk_indices": list(range(num_chunks)),
+                "kernel_group_ids": [
+                    kg.kernel_group_id for kg in object_group_plan.kernel_groups
+                ],
+                "chunks": chunks,
+            }
+        return payload
+
+    def _scatter_payload_by_plan(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        transfer_plan: Any,
+        payload: list[torch.Tensor] | dict[str, Any],
+        *,
+        skip_first_n_tokens: int,
+    ) -> None:
+        if isinstance(payload, list):
+            scatter_cpu_to_paged_kv(
+                kv_caches,
+                transfer_plan.selected_block_ids_per_kernel_group[0],
+                payload,
+                transfer_plan.object_groups[0].kernel_groups[0].blocks_per_window,
+                skip_first_n_tokens=skip_first_n_tokens,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+            )
+            return
+
+        object_groups_payload = payload.get("object_groups", {})
+        for object_group_plan in transfer_plan.object_groups:
+            object_group_payload = object_groups_payload.get(
+                object_group_plan.object_group_id
+            )
+            if object_group_payload is None:
+                raise ValueError("missing object group payload")
+            chunks = object_group_payload.get("chunks", [])
+            for kernel_group_idx, kernel_group_plan in enumerate(
+                object_group_plan.kernel_groups
+            ):
+                scatter_cpu_to_paged_kv(
+                    kv_caches,
+                    kernel_group_plan.selected_block_ids,
+                    [chunk[kernel_group_idx] for chunk in chunks],
+                    kernel_group_plan.blocks_per_window,
+                    skip_first_n_tokens=skip_first_n_tokens,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=self._engine_kv_format,
+                )
 
 
 def create_transfer_context(
