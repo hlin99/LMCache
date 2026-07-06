@@ -120,6 +120,33 @@ class IPCCacheServerKey:
 KVCache = list[DeviceIPCWrapper]
 
 
+class EngineKernelGroupSpec(msgspec.Struct, frozen=True):
+    """Per-kernel-group metadata for engine-driven multi-group registration.
+
+    Each instance describes one kernel group (a set of model layers that share
+    the same paged-block address space and KV format).
+
+    Attributes:
+        engine_group_id: Engine group this kernel group belongs to (dense from 0).
+        layer_indices: Tensor indices of the registered KV layers in this group.
+        tokens_per_block: Logical tokens covered by one paged block for this group.
+        num_layers_in_group: Number of KV layers in this group.
+        hidden_dim_size: Flattened hidden dimension size per token.
+        dtype_str: Torch dtype name (e.g. ``"float16"``).
+        use_mla: Whether this group uses the MLA KV format.
+        sw_size_tokens: Sliding-window size in tokens. ``-1`` = full attention.
+    """
+
+    engine_group_id: int
+    layer_indices: tuple[int, ...]
+    tokens_per_block: int
+    num_layers_in_group: int
+    hidden_dim_size: int
+    dtype_str: str
+    use_mla: bool
+    sw_size_tokens: int = -1
+
+
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
     """Payload for the REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT protocol message.
 
@@ -127,11 +154,15 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         instance_id: Worker instance identifier (typically PID).
         model_name: Model name associated with this worker.
         world_size: Worker world size used in cache keys.
-        block_size: Tokens per paged block.
-        num_layers: Number of model layers.
-        hidden_dim_size: Flattened hidden dimension per token.
+        block_size: Tokens per paged block (single-group / backward-compat field).
+        num_layers: Number of model layers (single-group / backward-compat field).
+        hidden_dim_size: Flattened hidden dimension per token
+            (single-group / backward-compat field).
         dtype_str: Torch dtype name (e.g. ``"float16"``).
         use_mla: Whether the worker KV format is MLA.
+        engine_group_specs: Optional per-kernel-group specs for multi-group
+            models.  When non-empty, these override the flat single-group fields
+            above.  Each entry describes one kernel group.
     """
 
     instance_id: int
@@ -142,6 +173,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    engine_group_specs: list[EngineKernelGroupSpec] = []
 
 
 @dataclass

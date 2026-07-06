@@ -438,6 +438,39 @@ class KVLayerGroupsManager:
         # Detect the object groups
         self._object_groups = self._detect_object_groups(engine_group_infos)
 
+    @classmethod
+    def from_kernel_group_infos(
+        cls,
+        kernel_groups: list[KernelGroupInfo],
+        lmcache_tokens_per_chunk: int = 256,
+        separate_object_groups: bool = True,
+    ) -> "KVLayerGroupsManager":
+        """Create a :class:`KVLayerGroupsManager` from pre-built
+        :class:`KernelGroupInfo` objects, without requiring actual KV-cache
+        tensors.
+
+        This factory is intended for the engine-driven server side, where the
+        server reconstructs group metadata from
+        :class:`~lmcache.v1.multiprocess.custom_types.EngineKernelGroupSpec`
+        received from a worker — actual GPU tensors are not available there.
+
+        Args:
+            kernel_groups: Pre-built kernel group descriptors, one per group.
+            lmcache_tokens_per_chunk: LMCache logical chunk size in tokens.
+            separate_object_groups: When ``True`` (default), split kernel groups
+                into one object group per sliding-window size.
+
+        Returns:
+            A fully initialised :class:`KVLayerGroupsManager` with
+            ``kernel_groups`` and ``object_groups`` populated.
+        """
+        instance = cls.__new__(cls)
+        instance._kernel_groups = list(kernel_groups)
+        instance._lmcache_tokens_per_chunk = lmcache_tokens_per_chunk
+        instance._separate_object_groups = separate_object_groups
+        instance._object_groups = instance._detect_object_groups([])
+        return instance
+
     @property
     def kernel_groups(self) -> list[KernelGroupInfo]:
         """List of :class:`KernelGroupInfo`, one per kernel group."""

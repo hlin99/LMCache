@@ -17,6 +17,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 import inspect
@@ -37,6 +38,7 @@ from lmcache.v1.multiprocess.mq import MessageQueueClient
 if TYPE_CHECKING:
     # First Party
     import lmcache.c_ops as lmc_ops
+    from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 
 logger = init_logger(__name__)
 
@@ -110,14 +112,26 @@ class EngineDrivenContextMetadata:
     """Non-GPU context layout metadata for non-CUDA workers.
 
     Attributes:
-        layout_desc: Memory layout descriptor used to interpret chunk payloads.
+        layout_desc: Memory layout descriptor used to interpret chunk payloads
+            (single-group / backward-compat; used when ``layout_descs_by_og``
+            is empty).
         block_size: Number of tokens per paged block.
         use_mla: Whether the worker KV format is MLA.
+        layout_descs_by_og: Per-object-group layout descriptors for multi-group
+            models. Keyed by object group ID.  When non-empty, individual group
+            layouts take precedence over the flat ``layout_desc``.
+        kv_groups_manager: Optional :class:`KVLayerGroupsManager` populated by
+            the server when the worker sends multi-group registration specs.
+            Used by :class:`TransferPlanBuilder` to build per-group plans.
     """
 
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
+    layout_descs_by_og: dict[int, MemoryLayoutDesc] = dataclasses.field(
+        default_factory=dict
+    )
+    kv_groups_manager: "KVLayerGroupsManager | None" = dataclasses.field(default=None)
 
 
 class EngineDrivenContext(ABC):

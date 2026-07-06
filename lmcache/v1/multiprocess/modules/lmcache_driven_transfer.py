@@ -48,6 +48,11 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.v1.multiprocess.transfer_plan import (
+    TransferDirection,
+    TransferPlanBuilder,
+    recalculate_blocks_to_skip,
+)
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
 from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.c_ops as lmc_ops
@@ -71,6 +76,11 @@ def get_layout_desc(
     ``object_group_id``: one (shape, dtype) entry per kernel group in that
     object group, in the kernel groups' declared layout order. Kernel groups
     may have different shapes and dtypes.
+
+    .. deprecated::
+        Prefer building a :class:`TransferPlan` via
+        :meth:`TransferPlanBuilder.build_from_cache_context` which computes
+        per-object-group layout descs automatically.
 
     Args:
         cache_context: The cache context containing the KV cache information.
@@ -130,81 +140,26 @@ def batched_iteration_with_skip(
         batch_start_idx += len(batch)
 
 
-def downsample_and_stage_block_ids(
+def stage_block_ids(
     cache_context: BaseCacheContext,
-    block_ids: list[list[int]],
+    selected_block_ids_per_group: list[list[int]],
 ) -> list[torch.Tensor]:
-    """Cut the block id lists to skip the unneeded blocks in a chunk and
-    stage it into GPU tensors for later use.
+    """Stage pre-selected block IDs into GPU tensors.
 
-    This mainly targets the case where a portion of the blocks are not
-    needed for every chunk, such as deepseek v4's swa cache.
-
-    Note that the we do NOT do any object-level skipping here.
+    This is the GPU-staging half of the former ``downsample_and_stage_block_ids``
+    function.  Block-ID selection (SWA downsampling) is now handled by
+    :class:`TransferPlanBuilder`; this function only handles the GPU staging.
 
     Args:
-        cache_context: The cache context containing the KV cache information.
-        block_ids: The original block id lists, indexed by LMCache KV group index.
+        cache_context: The GPU cache context used for staging.
+        selected_block_ids_per_group: Already-downsampled block IDs,
+            indexed by kernel-group ID (produced by
+            :meth:`TransferPlan.selected_block_ids_by_group`).
 
     Returns:
-        The cut block id lists, indexed by LMCache KV group index.
-
-    Note:
-        This function has some coupled logic with transfer_kv_per_object_group below.
-        The caller need to make sure that the block ids seen by
-        transfer_kv_per_object_group are produced by this function.
-
-    Example:
-        If a model have 2 kernel groups, one is full attention with block size 32,
-        one is swa attention with block size 32 and sliding window size 64, and
-        LMCache has a chunk size of 128. And there are 2 chunks in total (256 tokens).
-
-        The input will be:
-        [
-          [1, 2, 3, 4, 5, 6, 7, 8],  # block ids for the full attention group
-          [11, 12, 13, 14, 15, 16, 17, 18], # block ids for the swa attention group
-        ]
-
-        The output will be
-        [
-          [1, 2, 3, 4, 5, 6, 7, 8],  # full attention group still needs all block ids
-          [13, 14, 17, 18], # swa attention group only needs the last 2 block per chunk
-        ]
+        GPU tensors with staged block IDs, indexed by kernel-group ID.
     """
-    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
-    for kernel_group_id in range(num_kernel_groups):
-        subchunk_sw_size_tokens = (
-            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
-                kernel_group_id
-            )
-        )
-        tokens_per_chunk = min(
-            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
-        )
-        keep_blocks_per_chunk = cache_context.calculate_num_blocks(
-            tokens_per_chunk, kernel_group_id
-        )
-        total_blocks_per_chunk = cache_context.calculate_num_blocks(
-            cache_context.lmcache_tokens_per_chunk, kernel_group_id
-        )
-
-        new_block_ids = []
-        old_block_ids = block_ids[kernel_group_id]
-        assert len(old_block_ids) % total_blocks_per_chunk == 0, (
-            f"len(block_ids[{kernel_group_id}]) should be a multiple "
-            f"of total_blocks_per_chunk ({total_blocks_per_chunk}), but got "
-            f"{len(old_block_ids)}"
-        )
-
-        for i in range(0, len(old_block_ids), total_blocks_per_chunk):
-            chunk_block_ids = old_block_ids[i : i + total_blocks_per_chunk]
-            new_block_ids.extend(chunk_block_ids[-keep_blocks_per_chunk:])
-
-        block_ids[kernel_group_id] = new_block_ids
-
-    # Stage the cut block ids into GPU tensors
-    block_ids_gpu = cache_context.stage_block_ids(block_ids)
-    return block_ids_gpu
+    return cache_context.stage_block_ids(selected_block_ids_per_group)
 
 
 def _recalculate_blocks_to_skip(
@@ -212,29 +167,12 @@ def _recalculate_blocks_to_skip(
     blocks_per_window: int,
     blocks_to_skip: int,
 ) -> int:
-    """Re-calculate the number of blocks to skip for a batch of chunks based
-    on the blocks per chunk and blocks per sliding window WHEN the window
-    size is smaller than the lmcache chunk size.
+    """Alias for :func:`recalculate_blocks_to_skip` from ``transfer_plan``.
 
-    Args:
-        blocks_per_chunk: The total number of blocks in one chunk for the
-            current group.
-        blocks_per_window: The number of blocks in the sliding window
-            for the current group. Should be less than or equal to
-            blocks_per_chunk.
-        blocks_to_skip: The number of blocks to skip.
-
-    Returns:
-        The re-calculated number of blocks to skip for the current batch of
-        chunks.
+    Retained for backward compatibility.  New code should call the public
+    function imported from :mod:`lmcache.v1.multiprocess.transfer_plan`.
     """
-    if blocks_per_chunk == blocks_per_window:
-        return blocks_to_skip
-
-    full_windows_to_skip = blocks_to_skip // blocks_per_chunk
-    tail_blocks = blocks_to_skip % blocks_per_chunk
-    tail_blocks_to_skip = tail_blocks - (blocks_per_chunk - blocks_per_window)
-    return full_windows_to_skip * blocks_per_window + max(0, tail_blocks_to_skip)
+    return recalculate_blocks_to_skip(blocks_per_chunk, blocks_per_window, blocks_to_skip)
 
 
 def _run_object_group_transfer_plan(
@@ -952,17 +890,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
             key, list(range(num_object_groups))
         )
-        num_chunks = len(obj_keys_per_obj_group[0])
 
-        # NOTE: different engine groups may have different block sizes, so
-        # ``blocks_per_chunk[i]`` is the number of blocks in one chunk for
-        # group ``i``.
-        blocks_per_chunk = [
-            cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
-            for group_idx in range(
-                cache_context.kv_layer_groups_manager.num_kernel_groups
-            )
-        ]
+        # Build a path-agnostic transfer plan (validates block-ID coverage,
+        # downsamples SWA block IDs, resolves per-group layout descs).
+        transfer_plan = TransferPlanBuilder.build_from_cache_context(
+            cache_context=cache_context,
+            block_ids=gpu_block_ids,
+            obj_keys_per_obj_group=obj_keys_per_obj_group,
+            direction=TransferDirection.STORE,
+        )
+        num_chunks = transfer_plan.num_chunks
 
         with (
             torch_dev.device(cache_context.device),
@@ -971,32 +908,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             check_interprocess_event_support()
             event = torch_dev.Event(interprocess=True)
 
-            # Fail closed: every LMCache group must have block IDs covering all
-            # chunks. A short list (e.g. a caller/protocol bug) would otherwise
-            # drive the transfer kernel to read out-of-bounds GPU memory, so skip
-            # the whole store and commit nothing rather than caching a partial or
-            # garbage entry. A later request can store it once the block IDs are
-            # complete. Checked on the raw block ids, before cutting drops the
-            # per-chunk blocks that sliding-window groups do not need.
-            if any(
-                len(group_block_ids) < num_chunks * bpc
-                for group_block_ids, bpc in zip(
-                    gpu_block_ids, blocks_per_chunk, strict=True
-                )
-            ):
+            # Fail closed: the plan underflow flag captures the check that
+            # every group's block IDs cover all chunks.
+            if transfer_plan.underflow:
                 logger.warning(
-                    "STORE block ID underflow for request_id=%s: each group needs "
-                    "num_chunks * blocks_per_chunk block IDs for %d chunks "
-                    "(per-group blocks_per_chunk=%s); skipping the store.",
+                    "STORE block ID underflow for request_id=%s: "
+                    "failing closed (see TransferPlanBuilder log above).",
                     key.request_id,
-                    num_chunks,
-                    blocks_per_chunk,
                 )
                 event.record()
                 return event.ipc_handle(), False
 
-            block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
+            # Stage the pre-downsampled block IDs to GPU once before the loop.
+            block_ids_per_group_gpu = stage_block_ids(
+                cache_context, transfer_plan.selected_block_ids_by_group()
             )
 
             if not hasattr(torch_dev.Event, "from_ipc_handle"):
@@ -1039,15 +964,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             total_bytes: int = 0
             store_succeeded = False
             try:
-                for obj_group_id in range(num_object_groups):
-                    obj_keys = obj_keys_per_obj_group[obj_group_id]
-                    layout_desc = get_layout_desc(
-                        cache_context,
-                        self._ctx.chunk_size,
-                        object_group_id=obj_group_id,
-                    )
+                for og_plan in transfer_plan.object_groups:
+                    obj_group_id = og_plan.object_group_id
+                    obj_keys = og_plan.object_keys
+                    # layout_desc is pre-computed by the transfer plan builder.
                     reserved_dict = self._ctx.storage_manager.reserve_write(
-                        obj_keys, layout_desc, "new"
+                        obj_keys, og_plan.layout_desc, "new"
                     )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
@@ -1156,7 +1078,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
             key, list(range(num_object_groups))
         )
-        num_chunks = len(obj_keys_per_obj_group[0])
+
+        # Build a path-agnostic transfer plan (validates block-ID coverage,
+        # downsamples SWA block IDs, computes num_objects_to_skip).
+        transfer_plan = TransferPlanBuilder.build_from_cache_context(
+            cache_context=cache_context,
+            block_ids=gpu_block_ids,
+            obj_keys_per_obj_group=obj_keys_per_obj_group,
+            direction=TransferDirection.RETRIEVE,
+            skip_first_n_tokens=skip_first_n_tokens,
+        )
+        num_chunks = transfer_plan.num_chunks
 
         # CPU-synchronous sentinel: a GPU retrieve is about to be enqueued.
         # Must be published via publish() (not publish_on_stream) so the
@@ -1182,13 +1114,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ),
         )
 
-        blocks_per_chunk = [
-            cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
-            for group_idx in range(
-                cache_context.kv_layer_groups_manager.num_kernel_groups
-            )
-        ]
-
         with (
             torch_dev.device(cache_context.device),
             torch_dev.stream(cache_context.stream),
@@ -1196,38 +1121,28 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             check_interprocess_event_support()
             event = torch_dev.Event(interprocess=True)
 
-            # Fail closed: a short block-id list would drive the transfer
-            # kernel to write out-of-bounds GPU memory. Checked on the raw
-            # block ids, before cutting drops the per-chunk blocks that
-            # sliding-window groups do not need.
-            if any(
-                len(group_block_ids) < num_chunks * bpc
-                for group_block_ids, bpc in zip(
-                    gpu_block_ids, blocks_per_chunk, strict=True
-                )
-            ):
+            # Fail closed: the plan underflow flag captures the check that
+            # every group's block IDs cover all chunks.
+            if transfer_plan.underflow:
                 logger.error(
-                    "RETRIEVE block ID underflow for request_id=%s: each group "
-                    "needs num_chunks * blocks_per_chunk block IDs for %d "
-                    "chunks (per-group blocks_per_chunk=%s); skipping the "
-                    "retrieve.",
+                    "RETRIEVE block ID underflow for request_id=%s: "
+                    "failing closed (see TransferPlanBuilder log above).",
                     key.request_id,
-                    num_chunks,
-                    blocks_per_chunk,
                 )
                 event.record()
                 return event.ipc_handle(), False
 
-            # Cut and stage all block_ids to GPU once before the transfer
-            block_ids_per_group_gpu = downsample_and_stage_block_ids(
-                cache_context, gpu_block_ids
+            # Stage the pre-downsampled block IDs to GPU once before the loop.
+            block_ids_per_group_gpu = stage_block_ids(
+                cache_context, transfer_plan.selected_block_ids_by_group()
             )
 
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             try:
-                for obj_group_id in range(num_object_groups):
-                    obj_keys = obj_keys_per_obj_group[obj_group_id]
+                for og_plan in transfer_plan.object_groups:
+                    obj_group_id = og_plan.object_group_id
+                    obj_keys = og_plan.object_keys
                     with self._ctx.storage_manager.read_prefetched_results(
                         obj_keys
                     ) as memory_objs:

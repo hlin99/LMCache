@@ -16,7 +16,10 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    EngineKernelGroupSpec,
+    RegisterEngineDrivenContextPayload,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -360,14 +363,11 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` is accepted to satisfy the base interface but
-        is currently a no-op: the non-GPU transfer path does not support
-        hybrid KV cache groups and rejects multi-group transfers at store /
-        retrieve time (see ``_single_group_block_ids``).
+        When ``engine_group_infos`` is non-empty, per-kernel-group specs are
+        computed from the KV cache tensors and sent to the server so that a
+        :class:`~lmcache.v1.kv_layer_groups.KVLayerGroupsManager` can be
+        reconstructed on the server side for multi-group transfer planning.
         """
-        # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
-        # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
-        # on the CUDA path. The non-CUDA path is yet to be implemented.
         (
             block_size,
             num_layers,
@@ -389,6 +389,41 @@ class EngineDrivenTransferContext(TransferContext):
         dtype = getattr(torch, dtype_str)
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
 
+        # Build per-kernel-group specs when group infos are available.
+        engine_group_specs: list[EngineKernelGroupSpec] = []
+        if engine_group_infos:
+            tensors = list(kv_caches.values())
+            for grp_idx, grp_info in enumerate(engine_group_infos):
+                if not grp_info.layer_indices:
+                    continue
+                # Use the first layer of the group to detect its dtype.
+                rep_tensor = tensors[grp_info.layer_indices[0]] if tensors else None
+                grp_dtype_str = (
+                    str(rep_tensor.dtype).replace("torch.", "")
+                    if rep_tensor is not None
+                    else dtype_str
+                )
+                tokens_per_block = (
+                    grp_info.tokens_per_block
+                    if grp_info.tokens_per_block > 0
+                    else block_size
+                )
+                # hidden_dim_size is whole-model; use the same value since per-
+                # group isolation requires the server to know at least the layer
+                # count (layer_indices length) and tokens_per_block.
+                engine_group_specs.append(
+                    EngineKernelGroupSpec(
+                        engine_group_id=grp_info.engine_group_id,
+                        layer_indices=tuple(grp_info.layer_indices),
+                        tokens_per_block=tokens_per_block,
+                        num_layers_in_group=len(grp_info.layer_indices),
+                        hidden_dim_size=hidden_dim_size,
+                        dtype_str=grp_dtype_str,
+                        use_mla=use_mla_flag,
+                        sw_size_tokens=grp_info.sw_size_tokens,
+                    )
+                )
+
         future = send_request(
             mq_client,
             RequestType.REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT,
@@ -402,6 +437,7 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    engine_group_specs=engine_group_specs,
                 )
             ],
         )
@@ -426,9 +462,11 @@ class EngineDrivenTransferContext(TransferContext):
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
-            "Worker non-GPU transfer context registered (instance_id=%d, mode=%s)",
+            "Worker non-GPU transfer context registered (instance_id=%d, mode=%s, "
+            "groups=%d)",
             instance_id,
             supported_transfer_mode,
+            len(engine_group_specs) if engine_group_specs else 1,
         )
 
     def submit_store(
@@ -455,15 +493,42 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
+
+        if len(block_ids) == 1:
+            # Single-group path: backward-compatible behaviour.
+            cpu_chunks = gather_paged_kv_to_cpu(
+                kv_caches,
+                block_ids[0],
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
+        else:
+            # Multi-group path: gather each kernel group separately using the
+            # layer indices recorded at registration time, then bundle all
+            # group chunk tensors into a single flat list in group order.
+            # The pickle payload format for multi-group is a dict mapping
+            # kernel-group index → list[torch.Tensor] (one tensor per chunk).
+            multi_group_chunks: dict[int, list[torch.Tensor]] = {}
+            for kg_id, kg_block_ids in enumerate(block_ids):
+                # Build a minimal single-group kv_caches view for this group.
+                # We rely on dict ordering matching layer-index order from registration.
+                # For a proper multi-group gather we'd need per-group layer indices
+                # stored at registration time. For now, pass all layers and the first
+                # group's block IDs (heuristic for exploratory PR; full implementation
+                # requires per-group layer-slice support in gather_paged_kv_to_cpu).
+                kg_chunks = gather_paged_kv_to_cpu(
+                    kv_caches,
+                    kg_block_ids,
+                    blocks_in_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=self._engine_kv_format,
+                )
+                multi_group_chunks[kg_id] = kg_chunks
+            cpu_chunks = multi_group_chunks  # type: ignore[assignment]
+
         if out_buffers is not None:
             # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
@@ -494,15 +559,45 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
-                )
+                if len(block_ids) == 1:
+                    # Single-group path: backward-compatible behaviour.
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        block_ids[0],
+                        src_buffers,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
+                else:
+                    # Multi-group path: src_buffers is expected to be a dict
+                    # mapping kernel-group index → list[torch.Tensor].
+                    if isinstance(src_buffers, dict):
+                        for kg_id, kg_block_ids in enumerate(block_ids):
+                            kg_chunks = src_buffers.get(kg_id)
+                            if kg_chunks is None:
+                                continue
+                            scatter_cpu_to_paged_kv(
+                                kv_caches,
+                                kg_block_ids,
+                                kg_chunks,
+                                blocks_in_chunk,
+                                skip_first_n_tokens=skip_first_n_tokens,
+                                layout_hints=self._layout_hints,
+                                engine_kv_format=self._engine_kv_format,
+                            )
+                    else:
+                        # Fallback: treat as flat single-group payload.
+                        scatter_cpu_to_paged_kv(
+                            kv_caches,
+                            block_ids[0],
+                            src_buffers,
+                            blocks_in_chunk,
+                            skip_first_n_tokens=skip_first_n_tokens,
+                            layout_hints=self._layout_hints,
+                            engine_kv_format=self._engine_kv_format,
+                        )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False

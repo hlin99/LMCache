@@ -16,7 +16,12 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.kv_layer_groups import (
+    KernelGroupInfo,
+    KVLayerGroupsManager,
+)
 from lmcache.v1.multiprocess.custom_types import (
+    EngineKernelGroupSpec,
     IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
 )
@@ -41,6 +46,97 @@ from .server_transfer import (
 )
 
 logger = init_logger(__name__)
+
+
+def _build_kernel_group_info_from_spec(
+    spec: EngineKernelGroupSpec,
+    group_idx: int,
+) -> KernelGroupInfo:
+    """Build a :class:`KernelGroupInfo` from a serialised
+    :class:`EngineKernelGroupSpec`.
+
+    The server does not have access to the worker's KV cache tensors, so
+    ``shape_desc`` is constructed from the scalar geometry fields sent by the
+    worker.  This is sufficient for :class:`TransferPlanBuilder` which only
+    needs ``slots_per_block`` (= ``shape_desc.bs``) and ``tokens_per_block``.
+
+    Args:
+        spec: Serialised kernel-group metadata received from the worker.
+        group_idx: Ordinal index of this kernel group (for logging).
+
+    Returns:
+        A :class:`KernelGroupInfo` whose ``shape_desc.bs`` equals
+        ``spec.tokens_per_block`` and whose ``tokens_per_block`` and
+        ``sw_size_tokens`` mirror the spec.
+
+    Raises:
+        ImportError: If ``lmcache.c_ops`` is not available in the current
+            environment.
+    """
+    import lmcache.c_ops as lmc_ops
+
+    dtype = getattr(torch, spec.dtype_str, None)
+    if dtype is None or not isinstance(dtype, torch.dtype):
+        raise ValueError(f"group {group_idx}: invalid dtype_str '{spec.dtype_str}'")
+
+    engine_kv_format = (
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_HS
+        if spec.use_mla
+        else lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+    )
+
+    tokens_per_block = spec.tokens_per_block
+    # Construct a minimal PageBufferShapeDesc; nb/nh/hs/block_stride are
+    # unknown but are not used by TransferPlanBuilder — only bs and
+    # tokens_per_block matter for block-count calculations.
+    shape_desc = lmc_ops.PageBufferShapeDesc()
+    shape_desc.kv_size = 1 if spec.use_mla else 2
+    shape_desc.nl = spec.num_layers_in_group
+    shape_desc.nb = 0  # unknown on server side
+    shape_desc.bs = tokens_per_block
+    shape_desc.nh = spec.hidden_dim_size  # placeholder: nh * hs = hidden_dim_size
+    shape_desc.hs = 1
+    shape_desc.element_size = (
+        torch.finfo(dtype).bits // 8
+        if dtype.is_floating_point
+        else torch.iinfo(dtype).bits // 8
+    )
+    shape_desc.block_stride_elems = 0  # not used for planning
+
+    return KernelGroupInfo(
+        layer_indices=list(spec.layer_indices),
+        shape_desc=shape_desc,
+        dtype=dtype,
+        engine_kv_format=engine_kv_format,
+        tokens_per_block=tokens_per_block,
+        engine_group_idx=spec.engine_group_id,
+        sw_size_tokens=spec.sw_size_tokens,
+    )
+
+
+def _build_kv_groups_manager_from_specs(
+    specs: list[EngineKernelGroupSpec],
+    lmcache_tokens_per_chunk: int,
+) -> KVLayerGroupsManager:
+    """Reconstruct a :class:`KVLayerGroupsManager` from serialised
+    engine kernel-group specs.
+
+    Args:
+        specs: Per-kernel-group specs received from the worker during
+            registration.
+        lmcache_tokens_per_chunk: LMCache chunk size in tokens.
+
+    Returns:
+        A :class:`KVLayerGroupsManager` usable by
+        :class:`~lmcache.v1.multiprocess.transfer_plan.TransferPlanBuilder`.
+    """
+    kernel_groups = [
+        _build_kernel_group_info_from_spec(spec, idx) for idx, spec in enumerate(specs)
+    ]
+    return KVLayerGroupsManager.from_kernel_group_infos(
+        kernel_groups=kernel_groups,
+        lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+    )
 
 
 @dataclass
@@ -303,10 +399,17 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> RegisterEngineDrivenContextResponse:
         """Register non-CUDA KV layout metadata for non-GPU context mode.
 
+        When ``payload.engine_group_specs`` is non-empty, a full
+        :class:`~lmcache.v1.kv_layer_groups.KVLayerGroupsManager` is
+        reconstructed from the per-group specs and stored in the context
+        metadata, enabling :class:`TransferPlanBuilder` to produce multi-group
+        transfer plans on the engine-driven path.
+
         Args:
             payload: Struct containing all registration fields
                 (instance_id, model_name, world_size, block_size,
-                num_layers, hidden_dim_size, dtype_str, use_mla).
+                num_layers, hidden_dim_size, dtype_str, use_mla,
+                engine_group_specs).
 
         Raises:
             ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
@@ -345,10 +448,56 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+
+        # Optionally reconstruct KVLayerGroupsManager from multi-group specs.
+        kv_groups_manager: KVLayerGroupsManager | None = None
+        layout_descs_by_og: dict[int, MemoryLayoutDesc] = {}
+        if payload.engine_group_specs:
+            try:
+                kv_groups_manager = _build_kv_groups_manager_from_specs(
+                    payload.engine_group_specs,
+                    lmcache_tokens_per_chunk=self._ctx.chunk_size,
+                )
+                # Build per-object-group layout descs from the manager.
+                for og_id, og_info in enumerate(kv_groups_manager.object_groups):
+                    shapes_and_dtypes = []
+                    for kg_id in og_info.kernel_group_indices:
+                        kg = kv_groups_manager.kernel_groups[kg_id]
+                        is_mla_kg = kg.shape_desc.kv_size == 1
+                        n = kg.num_layers
+                        c = self._ctx.chunk_size
+                        h = kg.hidden_dim_size
+                        if is_mla_kg:
+                            shape = torch.Size([n, c, h])
+                        else:
+                            shape = torch.Size([2, n, c, h])
+                        shapes_and_dtypes.append((shape, kg.dtype))
+                    og_shapes, og_dtypes = zip(*shapes_and_dtypes, strict=False)
+                    layout_descs_by_og[og_id] = MemoryLayoutDesc(
+                        shapes=list(og_shapes), dtypes=list(og_dtypes)
+                    )
+                logger.info(
+                    "Multi-group registration for instance %d: %d kernel groups, "
+                    "%d object groups",
+                    payload.instance_id,
+                    kv_groups_manager.num_kernel_groups,
+                    kv_groups_manager.num_object_groups,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to build KVLayerGroupsManager from engine_group_specs "
+                    "for instance %d; falling back to single-group mode",
+                    payload.instance_id,
+                )
+                kv_groups_manager = None
+                layout_descs_by_og = {}
+
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=payload.block_size,
             use_mla=payload.use_mla,
+            layout_descs_by_og=layout_descs_by_og,
+            kv_groups_manager=kv_groups_manager,
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the

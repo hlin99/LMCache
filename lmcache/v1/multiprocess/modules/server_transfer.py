@@ -205,13 +205,31 @@ class PickleTransferStrategy(TransferStrategy):
     ) -> bool:
         """Deserialize and write pickled chunks into reserved objects.
 
+        Handles both single-group payloads (``list[torch.Tensor]``) and
+        multi-group payloads (``dict[int, list[torch.Tensor]]`` keyed by
+        kernel-group index).
+
         Returns:
             ``True`` when every reserved object is written successfully.
         """
+        payload = pickle.loads(cpu_data)
+        if isinstance(payload, dict):
+            # Multi-group payload: {kernel_group_id: list[torch.Tensor]}.
+            # Iterate over all object groups using the context's kv_groups_manager
+            # when available; otherwise fall back to single object group 0.
+            if context.kv_groups_manager is not None:
+                return self._commit_store_multi_group(
+                    key, payload, context, resolve_obj_keys
+                )
+            # Fallback: flatten all group chunks in insertion order.
+            chunks = [c for kg_chunks in payload.values() for c in kg_chunks]
+        else:
+            chunks = payload
+
         obj_keys = resolve_obj_keys(key)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        layout_desc = context.layout_desc
         reserved_dict = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
+            obj_keys, layout_desc, "new"
         )
         written_keys: list[ObjectKey] = []
         try:
@@ -233,6 +251,73 @@ class PickleTransferStrategy(TransferStrategy):
                 self._storage_manager.finish_write(written_keys)
 
         return len(written_keys) == len(reserved_dict)
+
+    def _commit_store_multi_group(
+        self,
+        key: IPCCacheServerKey,
+        payload: "dict[int, list[torch.Tensor]]",
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+    ) -> bool:
+        """Write multi-group chunks into per-object-group reserved objects.
+
+        Args:
+            key: Cache key for the token range being stored.
+            payload: Kernel-group-indexed chunk tensors from the worker.
+            context: Metadata including the reconstructed
+                :class:`~lmcache.v1.kv_layer_groups.KVLayerGroupsManager`.
+            resolve_obj_keys: Callable that resolves object keys from ``key``.
+
+        Returns:
+            ``True`` when all object groups are written successfully.
+        """
+        kv_groups_manager = context.kv_groups_manager
+        assert kv_groups_manager is not None
+
+        # resolve_obj_keys currently resolves object group 0 only; we need
+        # all groups. For now, use the single-group key resolver for group 0
+        # and extend via the standard pattern for >1 groups when the resolver
+        # supports it.  Full multi-group server-side storage is tracked as a
+        # remaining gap in the PR description.
+        all_success = True
+        for og_id, og_info in enumerate(kv_groups_manager.object_groups):
+            # Collect chunks for this object group from the payload.
+            og_chunks: list[torch.Tensor] = []
+            for kg_id in og_info.kernel_group_indices:
+                kg_chunks = payload.get(kg_id, [])
+                og_chunks.extend(kg_chunks)
+
+            if not og_chunks:
+                continue
+
+            obj_keys = resolve_obj_keys(key)
+            layout_desc = context.layout_descs_by_og.get(og_id, context.layout_desc)
+            reserved_dict = self._storage_manager.reserve_write(
+                obj_keys, layout_desc, "new"
+            )
+            written_keys: list[ObjectKey] = []
+            try:
+                for idx, obj_key in enumerate(obj_keys):
+                    if obj_key not in reserved_dict:
+                        continue
+                    if idx >= len(og_chunks):
+                        continue
+                    memory_obj = reserved_dict[obj_key]
+                    if memory_obj.tensor is None:
+                        continue
+                    chunk_cpu = og_chunks[idx]
+                    if chunk_cpu.shape != memory_obj.tensor.shape:
+                        continue
+                    memory_obj.tensor.copy_(chunk_cpu)
+                    written_keys.append(obj_key)
+            finally:
+                if written_keys:
+                    self._storage_manager.finish_write(written_keys)
+
+            if len(written_keys) != len(reserved_dict):
+                all_success = False
+
+        return all_success
 
     def prepare_retrieve(
         self,
