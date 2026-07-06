@@ -414,20 +414,19 @@ def transfer_kv_per_object_group(
                     "perform H2D copy. memory_object_batch: "
                     f"{memory_object_batch}"
                 )
-            # For D2H with None entries, we skip this batch.  The executor
-            # will still call copy_kernel_group_batch and after_object_batch,
-            # but those will be guarded by the same None check.
+            # D2H: skip this batch silently.  copy_kernel_group_batch and
+            # after_object_batch each re-check for None and return early.
+            return
 
         # For H2D, copy from CPU to GPU tmp buffers before the kernel launch
         if is_h2d:
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                if memory_obj is not None:
-                    lmcache_memcpy_async_h2d(
-                        memory_obj,
-                        cache_context.get_temp_object_group_buffer(
-                            chunk_idx, og_plan.object_group_id
-                        ),
-                    )
+                lmcache_memcpy_async_h2d(
+                    memory_obj,
+                    cache_context.get_temp_object_group_buffer(
+                        chunk_idx, og_plan.object_group_id
+                    ),
+                )
 
     def _copy_kernel_group_batch(
         og_plan: ObjectGroupTransferPlan,
