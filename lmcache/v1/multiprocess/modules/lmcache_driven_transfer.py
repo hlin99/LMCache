@@ -49,11 +49,18 @@ from lmcache.v1.multiprocess.native_completion import (
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.multiprocess.transfer_plan import (
+    KernelGroupBatchTransferPlan,
+    KernelGroupTransferPlan,
+    ObjectBatchTransferPlan,
     ObjectGroupTransferPlan,
+    TransferDirection,
     TransferPlanBuilder,
     build_object_group_layout_desc,
     downsample_block_ids,
     recalculate_blocks_to_skip,
+)
+from lmcache.v1.multiprocess.transfer_plan_executor import (
+    execute_transfer_plan_copy,
 )
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
 from lmcache.v1.platform.cache_context import create_cache_context
@@ -386,9 +393,18 @@ def transfer_kv_per_object_group(
             object_group_plan.num_objects_to_skip,
         )
 
-    for batch in object_group_plan.batches:
+    # Map lmc_ops direction to the plan-level TransferDirection for the
+    # executor callback signatures.
+    plan_direction = TransferDirection.RETRIEVE if is_h2d else TransferDirection.STORE
+
+    def _before_object_batch(
+        og_plan: ObjectGroupTransferPlan,
+        batch_plan: ObjectBatchTransferPlan,
+        _direction: TransferDirection,
+    ) -> None:
         memory_object_batch = memory_objs[
-            batch.start_object_idx : batch.start_object_idx + batch.batch_len
+            batch_plan.start_object_idx : batch_plan.start_object_idx
+            + batch_plan.batch_len
         ]
 
         if any(mo is None for mo in memory_object_batch):
@@ -398,58 +414,90 @@ def transfer_kv_per_object_group(
                     "perform H2D copy. memory_object_batch: "
                     f"{memory_object_batch}"
                 )
-            else:
-                continue
+            # For D2H with None entries, we skip this batch.  The executor
+            # will still call copy_kernel_group_batch and after_object_batch,
+            # but those will be guarded by the same None check.
 
         # For H2D, copy from CPU to GPU tmp buffers before the kernel launch
         if is_h2d:
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                lmcache_memcpy_async_h2d(
-                    memory_obj,
-                    cache_context.get_temp_object_group_buffer(
-                        chunk_idx, object_group_id
-                    ),
-                )
+                if memory_obj is not None:
+                    lmcache_memcpy_async_h2d(
+                        memory_obj,
+                        cache_context.get_temp_object_group_buffer(
+                            chunk_idx, og_plan.object_group_id
+                        ),
+                    )
 
-        # Do paged KV copy
-        kg_plans = {kgp.kernel_group_id: kgp for kgp in object_group_plan.kernel_groups}
-        for kg_batch in batch.kernel_groups:
-            kg_id = kg_batch.kernel_group_id
-            kg_plan = kg_plans[kg_id]
+    def _copy_kernel_group_batch(
+        og_plan: ObjectGroupTransferPlan,
+        batch_plan: ObjectBatchTransferPlan,
+        kg_plan: KernelGroupTransferPlan,
+        kg_batch: KernelGroupBatchTransferPlan,
+        _direction: TransferDirection,
+    ) -> None:
+        memory_object_batch = memory_objs[
+            batch_plan.start_object_idx : batch_plan.start_object_idx
+            + batch_plan.batch_len
+        ]
 
-            block_ids_curr_batch = block_ids_gpu[kg_id][
-                kg_batch.start_block_pos : kg_batch.start_block_pos
-                + kg_batch.block_count
-            ]
+        # Skip if any memory object is None (D2H case)
+        if any(mo is None for mo in memory_object_batch):
+            return
 
-            group_kv_pointers = cache_context.get_kernel_group_kv_pointers(kg_id)
-            tmp_gpu_buffers_batched = [
-                cache_context.get_temp_kernel_group_buffer(
-                    i, kg_id
-                ).data_ptr()
-                for i in range(batch.batch_len)
-            ]
-            lmc_ops.multi_layer_block_kv_transfer(
-                group_kv_pointers,
-                tmp_gpu_buffers_batched,
-                block_ids_curr_batch,
-                cache_context.device,
-                direction,
-                kg_plan.shape_desc,
-                kg_plan.slots_per_chunk,
-                kg_plan.engine_kv_format,
-                kg_batch.skip_blocks,
-            )
+        kg_id = kg_batch.kernel_group_id
+        block_ids_curr_batch = block_ids_gpu[kg_id][
+            kg_batch.start_block_pos : kg_batch.start_block_pos + kg_batch.block_count
+        ]
+
+        group_kv_pointers = cache_context.get_kernel_group_kv_pointers(kg_id)
+        tmp_gpu_buffers_batched = [
+            cache_context.get_temp_kernel_group_buffer(i, kg_id).data_ptr()
+            for i in range(batch_plan.batch_len)
+        ]
+        lmc_ops.multi_layer_block_kv_transfer(
+            group_kv_pointers,
+            tmp_gpu_buffers_batched,
+            block_ids_curr_batch,
+            cache_context.device,
+            direction,
+            kg_plan.shape_desc,
+            kg_plan.slots_per_chunk,
+            kg_plan.engine_kv_format,
+            kg_batch.skip_blocks,
+        )
+
+    def _after_object_batch(
+        og_plan: ObjectGroupTransferPlan,
+        batch_plan: ObjectBatchTransferPlan,
+        _direction: TransferDirection,
+    ) -> None:
+        memory_object_batch = memory_objs[
+            batch_plan.start_object_idx : batch_plan.start_object_idx
+            + batch_plan.batch_len
+        ]
+
+        # Skip if any memory object is None (D2H case)
+        if any(mo is None for mo in memory_object_batch):
+            return
 
         # For D2H, copy from GPU tmp buffers to CPU after the kernel launch
         if not is_h2d:
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
                 lmcache_memcpy_async_d2h(
                     cache_context.get_temp_object_group_buffer(
-                        chunk_idx, object_group_id
+                        chunk_idx, og_plan.object_group_id
                     ),
                     memory_obj,
                 )
+
+    execute_transfer_plan_copy(
+        object_group_plan,
+        plan_direction,
+        before_object_batch=_before_object_batch,
+        copy_kernel_group_batch=_copy_kernel_group_batch,
+        after_object_batch=_after_object_batch,
+    )
 
 
 @dataclass
@@ -855,9 +903,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # per-chunk blocks that sliding-window groups do not need.
             if plan is None:
                 blocks_per_chunk = [
-                    cache_context.calculate_num_blocks(
-                        self._ctx.chunk_size, group_idx
-                    )
+                    cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
                     for group_idx in range(
                         cache_context.kv_layer_groups_manager.num_kernel_groups
                     )
@@ -1076,9 +1122,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # sliding-window groups do not need.
             if plan is None:
                 blocks_per_chunk = [
-                    cache_context.calculate_num_blocks(
-                        self._ctx.chunk_size, group_idx
-                    )
+                    cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
                     for group_idx in range(
                         cache_context.kv_layer_groups_manager.num_kernel_groups
                     )
