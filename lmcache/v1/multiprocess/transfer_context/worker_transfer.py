@@ -17,7 +17,10 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    EngineDrivenKernelGroupMetadata,
+    RegisterEngineDrivenContextPayload,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -116,18 +119,96 @@ class _EngineDrivenKernelGroupPlanMeta:
 
     kernel_group_id: int
     object_group_id: int
+    engine_group_id: int
+    layer_indices: tuple[int, ...]
     tokens_per_block: int
     slots_per_block: int
     sw_size_tokens: int
     num_layers: int
     dtype: torch.dtype
+    hidden_dim_size: int
+    engine_kv_format: Any
+
+
+def _sw_size_chunks(sw_size_tokens: int, chunk_size: int) -> int:
+    """Return the object-group sliding-window size in LMCache chunks."""
+    if sw_size_tokens <= 0:
+        return -1
+    return (sw_size_tokens + chunk_size - 1) // chunk_size
+
+
+def _shape_for_kernel_group(
+    group: _EngineDrivenKernelGroupPlanMeta,
+    num_tokens: int,
+    *,
+    use_mla: bool,
+) -> torch.Size:
+    """Build the CPU chunk shape for one engine-driven kernel group."""
+    num_slots = (
+        0
+        if num_tokens <= 0
+        else num_tokens * group.slots_per_block // group.tokens_per_block
+    )
+    if use_mla:
+        return torch.Size([group.num_layers, num_slots, group.hidden_dim_size])
+    return torch.Size([2, group.num_layers, num_slots, group.hidden_dim_size])
+
+
+def _layout_descs_by_object_group(
+    groups: Sequence[_EngineDrivenKernelGroupPlanMeta],
+    *,
+    chunk_size: int,
+    use_mla: bool,
+) -> dict[int, MemoryLayoutDesc]:
+    """Build per-object-group layout descriptors from kernel group metadata."""
+    shapes_by_group: dict[int, list[torch.Size]] = {}
+    dtypes_by_group: dict[int, list[torch.dtype]] = {}
+    for group in groups:
+        shapes_by_group.setdefault(group.object_group_id, []).append(
+            _shape_for_kernel_group(group, chunk_size, use_mla=use_mla)
+        )
+        dtypes_by_group.setdefault(group.object_group_id, []).append(group.dtype)
+    return {
+        object_group_id: MemoryLayoutDesc(
+            shapes=shapes_by_group[object_group_id],
+            dtypes=dtypes_by_group[object_group_id],
+        )
+        for object_group_id in shapes_by_group
+    }
+
+
+def _kernel_group_metadata(
+    groups: Sequence[_EngineDrivenKernelGroupPlanMeta],
+    *,
+    chunk_size: int,
+    use_mla: bool,
+) -> tuple[EngineDrivenKernelGroupMetadata, ...]:
+    """Convert worker planning metadata into wire-safe registration metadata."""
+    return tuple(
+        EngineDrivenKernelGroupMetadata(
+            kernel_group_id=group.kernel_group_id,
+            object_group_id=group.object_group_id,
+            engine_group_id=group.engine_group_id,
+            layer_indices=group.layer_indices,
+            tokens_per_block=group.tokens_per_block,
+            slots_per_block=group.slots_per_block,
+            dtype_str=str(group.dtype).replace("torch.", ""),
+            engine_kv_format=str(group.engine_kv_format),
+            sw_size_tokens=group.sw_size_tokens,
+            shape=tuple(_shape_for_kernel_group(group, chunk_size, use_mla=use_mla)),
+        )
+        for group in groups
+    )
 
 
 def _build_engine_driven_kernel_groups(
     *,
     num_layers: int,
     block_size: int,
+    chunk_size: int,
     dtype: torch.dtype,
+    hidden_dim_size: int,
+    engine_kv_format: Any,
     engine_group_infos: Sequence[EngineGroupInfo],
 ) -> list[_EngineDrivenKernelGroupPlanMeta]:
     """Build engine-driven per-kernel-group planning metadata."""
@@ -136,33 +217,43 @@ def _build_engine_driven_kernel_groups(
             _EngineDrivenKernelGroupPlanMeta(
                 kernel_group_id=0,
                 object_group_id=0,
+                engine_group_id=0,
+                layer_indices=tuple(range(num_layers)),
                 tokens_per_block=block_size,
                 slots_per_block=block_size,
                 sw_size_tokens=-1,
                 num_layers=num_layers,
                 dtype=dtype,
+                hidden_dim_size=hidden_dim_size,
+                engine_kv_format=engine_kv_format,
             )
         ]
 
-    object_group_id_by_sw: dict[int, int] = {}
+    object_group_id_by_sw_chunks: dict[int, int] = {}
     next_object_group_id = 0
     metas: list[_EngineDrivenKernelGroupPlanMeta] = []
     for kg_id, info in enumerate(engine_group_infos):
         sw_size_tokens = info.sw_size_tokens
-        if sw_size_tokens not in object_group_id_by_sw:
-            object_group_id_by_sw[sw_size_tokens] = next_object_group_id
+        sw_size_chunks = _sw_size_chunks(sw_size_tokens, chunk_size)
+        if sw_size_chunks not in object_group_id_by_sw_chunks:
+            object_group_id_by_sw_chunks[sw_size_chunks] = next_object_group_id
             next_object_group_id += 1
+        layer_indices = tuple(info.layer_indices)
         metas.append(
             _EngineDrivenKernelGroupPlanMeta(
                 kernel_group_id=kg_id,
-                object_group_id=object_group_id_by_sw[sw_size_tokens],
+                object_group_id=object_group_id_by_sw_chunks[sw_size_chunks],
+                engine_group_id=info.engine_group_id,
+                layer_indices=layer_indices,
                 tokens_per_block=(
                     info.tokens_per_block if info.tokens_per_block > 0 else block_size
                 ),
                 slots_per_block=block_size,
                 sw_size_tokens=sw_size_tokens,
-                num_layers=max(1, len(info.layer_indices)),
+                num_layers=max(1, len(layer_indices)),
                 dtype=dtype,
+                hidden_dim_size=hidden_dim_size,
+                engine_kv_format=engine_kv_format,
             )
         )
     return metas
@@ -171,7 +262,9 @@ def _build_engine_driven_kernel_groups(
 class _EngineDrivenPlanKVGroupsManager:
     """Minimal kv-layer-groups-manager view required by TransferPlanBuilder."""
 
-    def __init__(self, groups: Sequence[_EngineDrivenKernelGroupPlanMeta]) -> None:
+    def __init__(
+        self, groups: Sequence[_EngineDrivenKernelGroupPlanMeta], chunk_size: int
+    ) -> None:
         object_group_map: dict[int, list[int]] = {}
         for group in groups:
             object_group_map.setdefault(group.object_group_id, []).append(
@@ -188,10 +281,13 @@ class _EngineDrivenPlanKVGroupsManager:
         self.num_kernel_groups = len(groups)
         self.num_object_groups = len(self.object_groups)
         self._groups_by_kg_id = {group.kernel_group_id: group for group in groups}
+        self._chunk_size = chunk_size
 
     def get_subchunk_sw_size_tokens(self, kernel_group_id: int) -> int:
         group = self._groups_by_kg_id[kernel_group_id]
-        return group.sw_size_tokens if group.sw_size_tokens > 0 else 1 << 30
+        if group.sw_size_tokens <= 0 or group.sw_size_tokens >= self._chunk_size:
+            return self._chunk_size
+        return group.sw_size_tokens
 
     def get_attn_desc(self) -> Any:
         # First Party
@@ -201,7 +297,7 @@ class _EngineDrivenPlanKVGroupsManager:
         for object_group in self.object_groups:
             first_kg_id = object_group.kernel_group_indices[0]
             sw_size_tokens = self._groups_by_kg_id[first_kg_id].sw_size_tokens
-            sw_chunks.append(-1 if sw_size_tokens <= 0 else 1)
+            sw_chunks.append(_sw_size_chunks(sw_size_tokens, self._chunk_size))
         return AttnWindowDesc(num_chunks_in_sw=sw_chunks)
 
 
@@ -213,27 +309,31 @@ class _EngineDrivenPlanCacheContext:
         *,
         chunk_size: int,
         groups: Sequence[_EngineDrivenKernelGroupPlanMeta],
+        use_mla: bool,
     ) -> None:
         self.lmcache_tokens_per_chunk = chunk_size
         self.max_batch_size = 1
-        self.kv_layer_groups_manager = _EngineDrivenPlanKVGroupsManager(groups)
+        self.kv_layer_groups_manager = _EngineDrivenPlanKVGroupsManager(
+            groups, chunk_size
+        )
         self._groups_by_kg_id = {group.kernel_group_id: group for group in groups}
+        self._use_mla = use_mla
 
     def calculate_num_blocks(self, num_tokens: int, kernel_group_id: int) -> int:
         group = self._groups_by_kg_id[kernel_group_id]
         if num_tokens <= 0:
             return 0
-        return (num_tokens + group.tokens_per_block - 1) // group.tokens_per_block
+        num_physical_slots = (
+            num_tokens * group.slots_per_block // group.tokens_per_block
+        )
+        return num_physical_slots // group.slots_per_block
 
     def get_kernel_group_shape_dtype(
         self, num_tokens: int, kernel_group_id: int
     ) -> tuple[torch.Size, torch.dtype]:
         group = self._groups_by_kg_id[kernel_group_id]
-        num_blocks = self.calculate_num_blocks(num_tokens, kernel_group_id)
-        if group.num_layers <= 1:
-            return (torch.Size([num_blocks, group.slots_per_block]), group.dtype)
         return (
-            torch.Size([2, group.num_layers, num_blocks * group.slots_per_block]),
+            _shape_for_kernel_group(group, num_tokens, use_mla=self._use_mla),
             group.dtype,
         )
 
@@ -250,8 +350,8 @@ class _EngineDrivenPlanCacheContext:
     def get_shape_desc(self, _kernel_group_id: int) -> Any:
         return "engine_driven_pickle_shape_desc"
 
-    def get_engine_kv_format(self, _kernel_group_id: int) -> Any:
-        return "engine_driven_pickle_kv_format"
+    def get_engine_kv_format(self, kernel_group_id: int) -> Any:
+        return self._groups_by_kg_id[kernel_group_id].engine_kv_format
 
 
 class TransferContext(ABC):
@@ -470,6 +570,7 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_kv_format: Any = None
         self._engine_kernel_groups: list[_EngineDrivenKernelGroupPlanMeta] = []
         self._engine_chunk_size: int = 0
+        self._use_mla: bool = False
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -516,12 +617,16 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_kv_format = engine_kv_format
 
         use_mla_flag = is_mla(engine_kv_format)
+        self._use_mla = use_mla_flag
         chunk_size = blocks_in_chunk * block_size
         dtype = getattr(torch, dtype_str)
         self._engine_kernel_groups = _build_engine_driven_kernel_groups(
             num_layers=num_layers,
             block_size=block_size,
+            chunk_size=chunk_size,
             dtype=dtype,
+            hidden_dim_size=hidden_dim_size,
+            engine_kv_format=engine_kv_format,
             engine_group_infos=engine_group_infos,
         )
         self._engine_chunk_size = chunk_size
@@ -549,6 +654,11 @@ class EngineDrivenTransferContext(TransferContext):
                     use_mla=use_mla_flag,
                     chunk_size=chunk_size,
                     engine_group_infos=tuple(engine_group_infos),
+                    kernel_group_metadata=_kernel_group_metadata(
+                        self._engine_kernel_groups,
+                        chunk_size=chunk_size,
+                        use_mla=use_mla_flag,
+                    ),
                 )
             ],
         )
@@ -565,8 +675,23 @@ class EngineDrivenTransferContext(TransferContext):
             use_mla=use_mla_flag,
             chunk_size=chunk_size,
             engine_group_infos=tuple(engine_group_infos),
+            kernel_group_metadata=_kernel_group_metadata(
+                self._engine_kernel_groups,
+                chunk_size=chunk_size,
+                use_mla=use_mla_flag,
+            ),
+            layout_descs_by_object_group=_layout_descs_by_object_group(
+                self._engine_kernel_groups,
+                chunk_size=chunk_size,
+                use_mla=use_mla_flag,
+            ),
         )
         use_pickle = len(self._engine_kernel_groups) > 1
+        if use_pickle and shm_name and pool_size > 0:
+            logger.info(
+                "Engine-driven multi-group SHM is not implemented; "
+                "forcing pickle transport."
+            )
         self._engine_driven_context = create_engine_driven_context(
             metadata,
             mq_client,
@@ -602,7 +727,9 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
-        store_plan = self._build_transfer_plan(key.request_id, block_ids, is_retrieve=False)
+        store_plan = self._build_transfer_plan(
+            key.request_id, block_ids, is_retrieve=False
+        )
         if store_plan is None:
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(False)
@@ -695,6 +822,30 @@ class EngineDrivenTransferContext(TransferContext):
     def _object_group_ids(self) -> list[int]:
         return sorted({group.object_group_id for group in self._engine_kernel_groups})
 
+    def _kernel_group_meta(
+        self, kernel_group_id: int
+    ) -> _EngineDrivenKernelGroupPlanMeta:
+        return self._engine_kernel_groups[kernel_group_id]
+
+    def _slice_kv_caches_for_kernel_group(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        group: _EngineDrivenKernelGroupPlanMeta,
+    ) -> dict[str, torch.Tensor]:
+        layer_items = list(kv_caches.items())
+        if not group.layer_indices:
+            return kv_caches
+        try:
+            return {
+                layer_items[layer_idx][0]: layer_items[layer_idx][1]
+                for layer_idx in group.layer_indices
+            }
+        except IndexError as exc:
+            raise ValueError(
+                "engine-driven kernel group references a layer index outside "
+                "the registered KV cache"
+            ) from exc
+
     def _build_transfer_plan(
         self,
         request_id: str,
@@ -708,6 +859,7 @@ class EngineDrivenTransferContext(TransferContext):
         cache_context = _EngineDrivenPlanCacheContext(
             chunk_size=self._engine_chunk_size,
             groups=self._engine_kernel_groups,
+            use_mla=self._use_mla,
         )
         builder = TransferPlanBuilder(cache_context)
         object_keys_per_group: list[list[Any]] = []
@@ -740,32 +892,40 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> list[torch.Tensor] | dict[str, Any]:
         selected_block_ids = transfer_plan.selected_block_ids_per_kernel_group
         if len(transfer_plan.object_groups) == 1 and len(selected_block_ids) == 1:
+            kernel_group_plan = transfer_plan.object_groups[0].kernel_groups[0]
+            group_meta = self._kernel_group_meta(kernel_group_plan.kernel_group_id)
             return gather_paged_kv_to_cpu(
-                kv_caches,
+                self._slice_kv_caches_for_kernel_group(kv_caches, group_meta),
                 selected_block_ids[0],
-                transfer_plan.object_groups[0].kernel_groups[0].blocks_per_window,
+                kernel_group_plan.blocks_per_window,
                 layout_hints=self._layout_hints,
-                engine_kv_format=self._engine_kv_format,
+                engine_kv_format=group_meta.engine_kv_format,
             )
 
         payload: dict[str, Any] = {"object_groups": {}}
         for object_group_plan in transfer_plan.object_groups:
             grouped_chunks: list[list[torch.Tensor]] = []
             for kernel_group_plan in object_group_plan.kernel_groups:
+                group_meta = self._kernel_group_meta(kernel_group_plan.kernel_group_id)
                 grouped_chunks.append(
                     gather_paged_kv_to_cpu(
-                        kv_caches,
+                        self._slice_kv_caches_for_kernel_group(kv_caches, group_meta),
                         kernel_group_plan.selected_block_ids,
                         kernel_group_plan.blocks_per_window,
                         layout_hints=self._layout_hints,
-                        engine_kv_format=self._engine_kv_format,
+                        engine_kv_format=group_meta.engine_kv_format,
                     )
                 )
             num_chunks = (
-                len(grouped_chunks[0]) if grouped_chunks else len(object_group_plan.object_keys)
+                len(grouped_chunks[0])
+                if grouped_chunks
+                else len(object_group_plan.object_keys)
             )
             chunks = [
-                [grouped_chunks[group_idx][chunk_idx] for group_idx in range(len(grouped_chunks))]
+                [
+                    grouped_chunks[group_idx][chunk_idx]
+                    for group_idx in range(len(grouped_chunks))
+                ]
                 for chunk_idx in range(num_chunks)
             ]
             payload["object_groups"][object_group_plan.object_group_id] = {
@@ -786,14 +946,16 @@ class EngineDrivenTransferContext(TransferContext):
         skip_first_n_tokens: int,
     ) -> None:
         if isinstance(payload, list):
+            kernel_group_plan = transfer_plan.object_groups[0].kernel_groups[0]
+            group_meta = self._kernel_group_meta(kernel_group_plan.kernel_group_id)
             scatter_cpu_to_paged_kv(
-                kv_caches,
+                self._slice_kv_caches_for_kernel_group(kv_caches, group_meta),
                 transfer_plan.selected_block_ids_per_kernel_group[0],
                 payload,
-                transfer_plan.object_groups[0].kernel_groups[0].blocks_per_window,
+                kernel_group_plan.blocks_per_window,
                 skip_first_n_tokens=skip_first_n_tokens,
                 layout_hints=self._layout_hints,
-                engine_kv_format=self._engine_kv_format,
+                engine_kv_format=group_meta.engine_kv_format,
             )
             return
 
@@ -808,14 +970,15 @@ class EngineDrivenTransferContext(TransferContext):
             for kernel_group_idx, kernel_group_plan in enumerate(
                 object_group_plan.kernel_groups
             ):
+                group_meta = self._kernel_group_meta(kernel_group_plan.kernel_group_id)
                 scatter_cpu_to_paged_kv(
-                    kv_caches,
+                    self._slice_kv_caches_for_kernel_group(kv_caches, group_meta),
                     kernel_group_plan.selected_block_ids,
                     [chunk[kernel_group_idx] for chunk in chunks],
                     kernel_group_plan.blocks_per_window,
                     skip_first_n_tokens=skip_first_n_tokens,
                     layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
+                    engine_kv_format=group_meta.engine_kv_format,
                 )
 
 

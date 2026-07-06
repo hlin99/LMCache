@@ -17,6 +17,7 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
 )
 from lmcache.v1.multiprocess.custom_types import (
+    EngineDrivenKernelGroupMetadata,
     IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
 )
@@ -43,6 +44,31 @@ from .server_transfer import (
 )
 
 logger = init_logger(__name__)
+
+
+def _layout_descs_by_object_group(
+    kernel_group_metadata: tuple[EngineDrivenKernelGroupMetadata, ...],
+) -> dict[int, MemoryLayoutDesc]:
+    """Build per-object-group layouts from engine-driven registration metadata."""
+    grouped_shapes: dict[int, list[torch.Size]] = {}
+    grouped_dtypes: dict[int, list[torch.dtype]] = {}
+    for group in kernel_group_metadata:
+        dtype = getattr(torch, group.dtype_str, None)
+        if dtype is None or not isinstance(dtype, torch.dtype):
+            raise ValueError(
+                f"Invalid dtype_str '{group.dtype_str}' in kernel group metadata"
+            )
+        grouped_shapes.setdefault(group.object_group_id, []).append(
+            torch.Size(group.shape)
+        )
+        grouped_dtypes.setdefault(group.object_group_id, []).append(dtype)
+    return {
+        object_group_id: MemoryLayoutDesc(
+            shapes=grouped_shapes[object_group_id],
+            dtypes=grouped_dtypes[object_group_id],
+        )
+        for object_group_id in grouped_shapes
+    }
 
 
 @dataclass
@@ -338,7 +364,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
             )
 
-        chunk_size = payload.chunk_size if payload.chunk_size > 0 else self._ctx.chunk_size
+        chunk_size = (
+            payload.chunk_size if payload.chunk_size > 0 else self._ctx.chunk_size
+        )
         shape = (
             torch.Size(
                 [payload.num_layers, chunk_size, payload.hidden_dim_size]
@@ -349,12 +377,19 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        layout_descs_by_object_group = (
+            _layout_descs_by_object_group(payload.kernel_group_metadata)
+            if payload.kernel_group_metadata
+            else {0: layout_desc}
+        )
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=payload.block_size,
             use_mla=payload.use_mla,
             chunk_size=chunk_size,
             engine_group_infos=payload.engine_group_infos,
+            kernel_group_metadata=payload.kernel_group_metadata,
+            layout_descs_by_object_group=layout_descs_by_object_group,
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
@@ -376,10 +411,16 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             transfer_key_factory=self._make_transfer_key,
         )
         if (
-            metadata.engine_group_infos
-            and len(metadata.engine_group_infos) > 1
+            (
+                len(metadata.kernel_group_metadata) > 1
+                or len(metadata.engine_group_infos) > 1
+            )
             and isinstance(strategy, ShmTransferStrategy)
         ):
+            logger.info(
+                "Engine-driven multi-group SHM is not implemented; "
+                "forcing pickle transport."
+            )
             strategy = PickleTransferStrategy(self._ctx.storage_manager)
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry

@@ -31,7 +31,10 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    EngineDrivenKernelGroupMetadata,
+    IPCCacheServerKey,
+)
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 
@@ -116,6 +119,10 @@ class EngineDrivenContextMetadata:
         use_mla: Whether the worker KV format is MLA.
         chunk_size: Tokens per LMCache chunk.
         engine_group_infos: Optional engine group metadata for hybrid models.
+        kernel_group_metadata: Per-kernel-group shape and layout metadata for
+            engine-driven grouped pickle transfers.
+        layout_descs_by_object_group: Per-object-group layout descriptors built
+            from ``kernel_group_metadata``.
     """
 
     layout_desc: MemoryLayoutDesc
@@ -123,6 +130,8 @@ class EngineDrivenContextMetadata:
     use_mla: bool
     chunk_size: int = 0
     engine_group_infos: tuple[EngineGroupInfo, ...] = ()
+    kernel_group_metadata: tuple[EngineDrivenKernelGroupMetadata, ...] = ()
+    layout_descs_by_object_group: dict[int, MemoryLayoutDesc] | None = None
 
 
 class EngineDrivenContext(ABC):

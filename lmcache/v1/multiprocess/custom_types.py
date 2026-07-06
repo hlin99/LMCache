@@ -121,6 +121,21 @@ class IPCCacheServerKey:
 KVCache = list[DeviceIPCWrapper]
 
 
+class EngineDrivenKernelGroupMetadata(msgspec.Struct, frozen=True):
+    """Per-kernel-group metadata for engine-driven pickle transfer planning."""
+
+    kernel_group_id: int
+    object_group_id: int
+    engine_group_id: int
+    layer_indices: tuple[int, ...]
+    tokens_per_block: int
+    slots_per_block: int
+    dtype_str: str
+    engine_kv_format: str
+    sw_size_tokens: int
+    shape: tuple[int, ...]
+
+
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
     """Payload for the REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT protocol message.
 
@@ -136,6 +151,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         chunk_size: Tokens per LMCache chunk on this worker.
         engine_group_infos: Optional engine group metadata in LMCache kernel
             group order. Empty means dense single-group registration.
+        kernel_group_metadata: Optional per-kernel-group layout metadata used by
+            engine-driven pickle multi-group transfers.
     """
 
     instance_id: int
@@ -148,6 +165,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     use_mla: bool
     chunk_size: int = 0
     engine_group_infos: tuple[EngineGroupInfo, ...] = ()
+    kernel_group_metadata: tuple[EngineDrivenKernelGroupMetadata, ...] = ()
 
 
 @dataclass

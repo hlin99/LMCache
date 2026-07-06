@@ -230,6 +230,7 @@ class PickleTransferStrategy(TransferStrategy):
         layout_desc_by_group = self._get_layout_desc_by_group(context)
         written_keys: list[ObjectKey] = []
         success = True
+        commit_success = False
         try:
             for object_group_id_raw in sorted(object_groups):
                 object_group_id = int(object_group_id_raw)
@@ -241,37 +242,55 @@ class PickleTransferStrategy(TransferStrategy):
                 if not isinstance(chunks, list):
                     success = False
                     break
+                chunk_indices = object_group_payload.get("chunk_indices")
+                if chunk_indices is None:
+                    chunk_indices = list(range(len(chunks)))
+                if (
+                    not isinstance(chunk_indices, list)
+                    or len(chunk_indices) != len(chunks)
+                    or not all(isinstance(idx, int) for idx in chunk_indices)
+                ):
+                    success = False
+                    break
                 obj_keys = resolve_obj_keys(key, [object_group_id])[0]
-                layout_desc = layout_desc_by_group.get(object_group_id, context.layout_desc)
-                reserved = self._storage_manager.reserve_write(obj_keys, layout_desc, "new")
+                layout_desc = layout_desc_by_group.get(
+                    object_group_id, context.layout_desc
+                )
+                selected_obj_keys: list[ObjectKey] = []
+                for chunk_idx in chunk_indices:
+                    if chunk_idx < 0 or chunk_idx >= len(obj_keys):
+                        success = False
+                    else:
+                        selected_obj_keys.append(obj_keys[chunk_idx])
+                if not success:
+                    break
+                reserved = self._storage_manager.reserve_write(
+                    selected_obj_keys, layout_desc, "new"
+                )
                 reserved_by_group[object_group_id] = reserved
-                for chunk_idx, obj_key in enumerate(obj_keys):
+                for payload_idx, obj_key in enumerate(selected_obj_keys):
                     memory_obj = reserved.get(obj_key)
                     if memory_obj is None or memory_obj.tensor is None:
                         success = False
                         continue
-                    if chunk_idx >= len(chunks):
-                        success = False
-                        continue
-                    if not self._copy_chunk_to_memory(chunks[chunk_idx], memory_obj.tensor):
+                    if not self._copy_chunk_to_memory(
+                        chunks[payload_idx], memory_obj.tensor
+                    ):
                         success = False
                         continue
                     written_keys.append(obj_key)
             if not success:
                 return False
-            expected_writes = sum(len(reserved) for reserved in reserved_by_group.values())
-            return len(written_keys) == expected_writes
+            expected_writes = sum(
+                len(object_group_payload.get("chunks", []))
+                for object_group_payload in object_groups.values()
+                if isinstance(object_group_payload, dict)
+            )
+            commit_success = len(written_keys) == expected_writes
+            return commit_success
         finally:
-            if written_keys:
+            if commit_success and written_keys:
                 self._storage_manager.finish_write(written_keys)
-            if not success:
-                written_set = set(written_keys)
-                for reserved in reserved_by_group.values():
-                    rollback_keys = [
-                        obj_key for obj_key in reserved if obj_key not in written_set
-                    ]
-                    if rollback_keys:
-                        self._storage_manager.finish_write(rollback_keys)
 
     def prepare_retrieve(
         self,
@@ -357,20 +376,52 @@ class PickleTransferStrategy(TransferStrategy):
     def _get_layout_desc_by_group(
         context: EngineDrivenContextMetadata,
     ) -> dict[int, MemoryLayoutDesc]:
+        if context.layout_descs_by_object_group is not None:
+            return context.layout_descs_by_object_group
         if not context.engine_group_infos:
             return {0: context.layout_desc}
-        object_group_id_by_sw: dict[int, int] = {}
+        if context.kernel_group_metadata:
+            grouped_shapes: dict[int, list[torch.Size]] = {}
+            grouped_dtypes: dict[int, list[torch.dtype]] = {}
+            for group in context.kernel_group_metadata:
+                dtype = getattr(torch, group.dtype_str)
+                grouped_shapes.setdefault(group.object_group_id, []).append(
+                    torch.Size(group.shape)
+                )
+                grouped_dtypes.setdefault(group.object_group_id, []).append(dtype)
+            return {
+                object_group_id: MemoryLayoutDesc(
+                    shapes=grouped_shapes[object_group_id],
+                    dtypes=grouped_dtypes[object_group_id],
+                )
+                for object_group_id in grouped_shapes
+            }
+        object_group_id_by_sw_chunks: dict[int, int] = {}
         grouped_shapes: dict[int, list[torch.Size]] = {}
         grouped_dtypes: dict[int, list[torch.dtype]] = {}
         next_object_group_id = 0
         for info in context.engine_group_infos:
             sw_size_tokens = info.sw_size_tokens
-            if sw_size_tokens not in object_group_id_by_sw:
-                object_group_id_by_sw[sw_size_tokens] = next_object_group_id
+            sw_size_chunks = (
+                -1
+                if sw_size_tokens <= 0
+                else (sw_size_tokens + context.chunk_size - 1) // context.chunk_size
+            )
+            if sw_size_chunks not in object_group_id_by_sw_chunks:
+                object_group_id_by_sw_chunks[sw_size_chunks] = next_object_group_id
                 next_object_group_id += 1
-            object_group_id = object_group_id_by_sw[sw_size_tokens]
-            grouped_shapes.setdefault(object_group_id, []).append(context.layout_desc.shapes[0])
-            grouped_dtypes.setdefault(object_group_id, []).append(context.layout_desc.dtypes[0])
+            object_group_id = object_group_id_by_sw_chunks[sw_size_chunks]
+            base_shape = context.layout_desc.shapes[0]
+            group_num_layers = max(1, len(info.layer_indices))
+            group_shape = (
+                torch.Size([group_num_layers, *base_shape[1:]])
+                if context.use_mla
+                else torch.Size([base_shape[0], group_num_layers, *base_shape[2:]])
+            )
+            grouped_shapes.setdefault(object_group_id, []).append(group_shape)
+            grouped_dtypes.setdefault(object_group_id, []).append(
+                context.layout_desc.dtypes[0]
+            )
         return {
             object_group_id: MemoryLayoutDesc(
                 shapes=grouped_shapes[object_group_id],
