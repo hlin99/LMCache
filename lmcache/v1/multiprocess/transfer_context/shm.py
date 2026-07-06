@@ -184,7 +184,10 @@ class EngineDrivenContextShm(EngineDrivenContext):
         return self._build_slot_tensors(slots), chunk_indices
 
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, _chunks: list[torch.Tensor]
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        _chunks: list[torch.Tensor] | dict[str, Any],
     ) -> bool:
         future = self.mq_client.submit_request(
             RequestType.COMMIT_STORE,

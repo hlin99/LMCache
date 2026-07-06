@@ -15,6 +15,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.multiprocess.custom_types import EngineDrivenKernelGroupMetadata
 from lmcache.v1.multiprocess.posix_shm import (
     shm_create_readwrite,
     shm_munmap,
@@ -27,6 +28,7 @@ from lmcache.v1.multiprocess.protocols.engine import (
     PrepareStoreResponse,
     RegisterEngineDrivenContextResponse,
 )
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
     create_engine_driven_context,
@@ -176,6 +178,10 @@ def _make_storage_manager_config(
 
 def _default_register_payload(
     instance_id: int = 1,
+    *,
+    chunk_size: int = 0,
+    engine_group_infos: tuple[EngineGroupInfo, ...] = (),
+    kernel_group_metadata: tuple[EngineDrivenKernelGroupMetadata, ...] = (),
 ) -> "RegisterEngineDrivenContextPayload":
     """Build a default non-GPU registration payload for server-side tests.
 
@@ -198,6 +204,9 @@ def _default_register_payload(
         hidden_dim_size=16,
         dtype_str="float32",
         use_mla=False,
+        chunk_size=chunk_size,
+        engine_group_infos=engine_group_infos,
+        kernel_group_metadata=kernel_group_metadata,
     )
 
 
@@ -222,6 +231,36 @@ def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
         start=0,
         end=tokens,
         request_id="req",
+    )
+
+
+def _two_group_kernel_metadata() -> tuple[EngineDrivenKernelGroupMetadata, ...]:
+    """Build two distinct object-group layouts for server-side hybrid tests."""
+    return (
+        EngineDrivenKernelGroupMetadata(
+            kernel_group_id=0,
+            object_group_id=0,
+            engine_group_id=0,
+            layer_indices=(0,),
+            tokens_per_block=4,
+            slots_per_block=4,
+            dtype_str="float32",
+            engine_kv_format="test_format_0",
+            sw_size_tokens=-1,
+            shape=(2, 1, 8, 16),
+        ),
+        EngineDrivenKernelGroupMetadata(
+            kernel_group_id=1,
+            object_group_id=1,
+            engine_group_id=1,
+            layer_indices=(1,),
+            tokens_per_block=4,
+            slots_per_block=4,
+            dtype_str="float32",
+            engine_kv_format="test_format_1",
+            sw_size_tokens=8,
+            shape=(2, 1, 8, 16),
+        ),
     )
 
 
@@ -581,6 +620,305 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
 
     assert result is True
     assert "prefer_musa_native" not in captured_kwargs
+
+
+def test_engine_driven_register_sends_group_metadata_and_forces_pickle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid engine-group registration carries metadata and forces pickle mode."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        shm_name="lmcache_pool", pool_size=4096
+    )
+    send_request = MagicMock(return_value=future)
+    captured_create_kwargs: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **kwargs: captured_create_kwargs.update(kwargs) or MagicMock(),
+    )
+
+    engine_group_infos = (
+        EngineGroupInfo(engine_group_id=0, layer_indices=(0,), sw_size_tokens=-1),
+        EngineGroupInfo(engine_group_id=1, layer_indices=(1,), sw_size_tokens=8),
+    )
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=11,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=engine_group_infos,
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert payload.chunk_size == 8
+    assert payload.engine_group_infos == engine_group_infos
+    assert len(payload.kernel_group_metadata) == 2
+    assert payload.kernel_group_metadata[0].layer_indices == (0,)
+    assert payload.kernel_group_metadata[1].object_group_id == 1
+    assert captured_create_kwargs["use_pickle"] is True
+
+
+def test_engine_driven_submit_store_uses_grouped_pickle_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid store path serializes grouped object-group payloads."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    class _FakeEngineContext:
+        def __init__(self) -> None:
+            self.last_chunks: Any = None
+
+        def prepare_store(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def commit_store(self, *_args: Any, **_kwargs: Any) -> bool:
+            self.last_chunks = _args[2]
+            return True
+
+        def close(self) -> None:
+            return None
+
+    fake_ctx = _FakeEngineContext()
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: fake_ctx,
+    )
+
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=12,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=(
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0,), sw_size_tokens=-1),
+            EngineGroupInfo(engine_group_id=1, layer_indices=(1,), sw_size_tokens=8),
+        ),
+    )
+
+    result = ctx.submit_store(
+        "req",
+        _default_key(),
+        12,
+        _make_kv_caches(),
+        [[0, 1], [0, 1]],
+        MagicMock(),
+        2,
+    ).result()
+
+    assert result is True
+    assert isinstance(fake_ctx.last_chunks, dict)
+    assert set(fake_ctx.last_chunks["object_groups"]) == {0, 1}
+
+
+def test_engine_driven_submit_store_gathers_kernel_group_layer_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid store gathers only the KV tensors for each kernel group."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    class _FakeEngineContext:
+        def prepare_store(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def commit_store(self, *_args: Any, **_kwargs: Any) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    captured_layer_keys: list[list[str]] = []
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            3,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: _FakeEngineContext(),
+    )
+
+    def _fake_gather(
+        kv_caches: dict[str, torch.Tensor], *_args: Any, **_kwargs: Any
+    ) -> list[torch.Tensor]:
+        captured_layer_keys.append(list(kv_caches))
+        return [torch.zeros(2, 1, 8, 16)]
+
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _fake_gather)
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=13,
+        kv_caches=_make_kv_caches(num_layers=3),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=(
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0,), sw_size_tokens=-1),
+            EngineGroupInfo(engine_group_id=1, layer_indices=(2,), sw_size_tokens=8),
+        ),
+    )
+
+    result = ctx.submit_store(
+        "req",
+        _default_key(),
+        13,
+        _make_kv_caches(num_layers=3),
+        [[0, 1], [0, 1]],
+        MagicMock(),
+        2,
+    ).result()
+
+    assert result is True
+    assert captured_layer_keys == [["layer_0"], ["layer_2"]]
+
+
+def test_engine_driven_submit_retrieve_scatters_kernel_group_layer_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid retrieve scatters only into each kernel group's KV tensors."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    class _FakeEngineContext:
+        def prepare_retrieve(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            chunk0 = torch.zeros(2, 1, 8, 16)
+            chunk1 = torch.ones(2, 1, 8, 16)
+            return {
+                "object_groups": {
+                    0: {"chunk_indices": [0], "chunks": [[chunk0]]},
+                    1: {"chunk_indices": [0], "chunks": [[chunk1]]},
+                }
+            }
+
+        def commit_retrieve(self, *_args: Any, **_kwargs: Any) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    captured_layer_keys: list[list[str]] = []
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            3,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: _FakeEngineContext(),
+    )
+
+    def _fake_scatter(
+        kv_caches: dict[str, torch.Tensor], *_args: Any, **_kwargs: Any
+    ) -> None:
+        captured_layer_keys.append(list(kv_caches))
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", _fake_scatter)
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=14,
+        kv_caches=_make_kv_caches(num_layers=3),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=(
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0,), sw_size_tokens=-1),
+            EngineGroupInfo(engine_group_id=1, layer_indices=(2,), sw_size_tokens=8),
+        ),
+    )
+
+    result = ctx.submit_retrieve(
+        "req",
+        _default_key(),
+        14,
+        _make_kv_caches(num_layers=3),
+        [[0, 1], [0, 1]],
+        MagicMock(),
+        2,
+    ).result()
+
+    assert result is True
+    assert captured_layer_keys == [["layer_0"], ["layer_2"]]
 
 
 def test_create_transfer_context_env_var_overrides_default(
@@ -1105,6 +1443,193 @@ def test_server_store_and_retrieve_cpu_chunks(
     recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     assert len(recovered_chunks) == 1
     assert torch.allclose(recovered_chunks[0], payload)
+
+
+def test_server_register_builds_distinct_object_group_layouts(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Server registration preserves per-object-group layout descriptors."""
+    kernel_metadata = (
+        _two_group_kernel_metadata()[0],
+        EngineDrivenKernelGroupMetadata(
+            kernel_group_id=1,
+            object_group_id=1,
+            engine_group_id=1,
+            layer_indices=(1,),
+            tokens_per_block=4,
+            slots_per_block=4,
+            dtype_str="float32",
+            engine_kv_format="test_format_1",
+            sw_size_tokens=8,
+            shape=(2, 1, 4, 16),
+        ),
+    )
+    module, _, _, _ = server_module_factory(chunk_size=8)
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(
+            instance_id=20,
+            engine_group_infos=(
+                EngineGroupInfo(
+                    engine_group_id=0,
+                    layer_indices=(0,),
+                    sw_size_tokens=-1,
+                ),
+                EngineGroupInfo(
+                    engine_group_id=1,
+                    layer_indices=(1,),
+                    sw_size_tokens=8,
+                ),
+            ),
+            kernel_group_metadata=kernel_metadata,
+        )
+    )
+
+    metadata = module._engine_driven_contexts[20].metadata
+
+    assert metadata.layout_descs_by_object_group is not None
+    assert metadata.layout_descs_by_object_group[0].shapes == [
+        torch.Size([2, 1, 8, 16])
+    ]
+    assert metadata.layout_descs_by_object_group[1].shapes == [
+        torch.Size([2, 1, 4, 16])
+    ]
+    assert metadata.layout_descs_by_object_group[0] is not metadata.layout_desc
+
+
+def test_server_retrieve_partial_miss_fails_closed_for_multi_group(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Hybrid retrieve misses fail closed instead of returning partial payloads."""
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 1, 8, 16)
+
+    @contextmanager
+    def _read_prefetched_results(keys: list[str]) -> Any:
+        if keys == ["og0"]:
+            yield [memory_obj]
+        else:
+            yield []
+
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    module, _, _, _ = server_module_factory(mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(
+            instance_id=21,
+            engine_group_infos=(
+                EngineGroupInfo(
+                    engine_group_id=0,
+                    layer_indices=(0,),
+                    sw_size_tokens=-1,
+                ),
+                EngineGroupInfo(
+                    engine_group_id=1,
+                    layer_indices=(1,),
+                    sw_size_tokens=8,
+                ),
+            ),
+            kernel_group_metadata=_two_group_kernel_metadata(),
+        )
+    )
+    module.context.resolve_obj_keys = MagicMock(
+        side_effect=lambda _key, object_group_ids: [
+            ["og0"] if object_group_ids[0] == 0 else ["og1"]
+        ]
+    )
+
+    response = module.prepare_retrieve(_default_key(), 21)
+
+    assert response.success is False
+    mock_storage.finish_read_prefetched.assert_called_once_with(["og0"])
+
+
+def test_server_store_partial_failure_fails_closed_for_multi_group(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Hybrid store does not report success when any object group write fails."""
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 1, 8, 16)
+    mock_storage.reserve_write.side_effect = lambda obj_keys, *_args, **_kwargs: (
+        {"og0": memory_obj} if obj_keys == ["og0"] else {}
+    )
+
+    module, _, _, _ = server_module_factory(mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(
+            instance_id=22,
+            engine_group_infos=(
+                EngineGroupInfo(
+                    engine_group_id=0,
+                    layer_indices=(0,),
+                    sw_size_tokens=-1,
+                ),
+                EngineGroupInfo(
+                    engine_group_id=1,
+                    layer_indices=(1,),
+                    sw_size_tokens=8,
+                ),
+            ),
+            kernel_group_metadata=_two_group_kernel_metadata(),
+        )
+    )
+    module.context.resolve_obj_keys = MagicMock(
+        side_effect=lambda _key, object_group_ids: [
+            ["og0"] if object_group_ids[0] == 0 else ["og1"]
+        ]
+    )
+    payload = {
+        "object_groups": {
+            0: {"chunk_indices": [0], "chunks": [torch.ones(2, 1, 8, 16)]},
+            1: {"chunk_indices": [0], "chunks": [torch.ones(2, 1, 8, 16)]},
+        }
+    }
+
+    store_ok = module.commit_store(_default_key(), 22, pickle.dumps(payload))
+
+    assert store_ok is False
+    mock_storage.finish_write.assert_not_called()
+
+
+def test_server_store_respects_grouped_payload_chunk_indices(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Grouped pickle store maps payload chunks through explicit chunk indices."""
+    mock_storage = MagicMock()
+    target_first = MagicMock()
+    target_first.tensor = torch.zeros(2, 1, 8, 16)
+    target_second = MagicMock()
+    target_second.tensor = torch.zeros(2, 1, 8, 16)
+    mock_storage.reserve_write.side_effect = lambda obj_keys, *_args, **_kwargs: {
+        "obj0": target_first,
+        "obj1": target_second,
+    }
+
+    module, _, _, _ = server_module_factory(mock_storage=mock_storage)
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=23)
+    )
+    module.context.resolve_obj_keys = MagicMock(return_value=[["obj0", "obj1"]])
+    payload = {
+        "object_groups": {
+            0: {
+                "chunk_indices": [1],
+                "chunks": [torch.ones(2, 1, 8, 16)],
+            }
+        }
+    }
+
+    store_ok = module.commit_store(_default_key(tokens=16), 23, pickle.dumps(payload))
+
+    assert store_ok is True
+    assert torch.all(target_first.tensor == 0)
+    assert torch.all(target_second.tensor == 1)
+    mock_storage.reserve_write.assert_called_once()
+    assert mock_storage.reserve_write.call_args.args[0] == ["obj1"]
 
 
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(

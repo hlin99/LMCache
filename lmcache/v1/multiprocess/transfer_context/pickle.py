@@ -2,6 +2,7 @@
 """Pickle-based EngineDrivenContext implementation for multiprocess mode."""
 
 # Standard
+from typing import Any
 import pickle
 
 # Third Party
@@ -53,7 +54,10 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         return None
 
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, chunks: list[torch.Tensor]
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: list[torch.Tensor] | dict[str, Any],
     ) -> bool:
         """Serialize chunks and send via COMMIT_STORE.
 
@@ -73,7 +77,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
 
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[torch.Tensor] | dict[str, Any] | None:
         """Send PREPARE_RETRIEVE and deserialize the response data.
 
         Returns:
@@ -90,7 +94,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
             return None
         if not response.success or not response.data:
             return None
-        chunks: list[torch.Tensor] = pickle.loads(response.data)
+        chunks: list[torch.Tensor] | dict[str, Any] = pickle.loads(response.data)
         return chunks
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:

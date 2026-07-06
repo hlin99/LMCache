@@ -18,7 +18,7 @@ from __future__ import annotations
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 import inspect
 
 # Third Party
@@ -31,7 +31,11 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    EngineDrivenKernelGroupMetadata,
+    IPCCacheServerKey,
+)
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 
 if TYPE_CHECKING:
@@ -113,11 +117,21 @@ class EngineDrivenContextMetadata:
         layout_desc: Memory layout descriptor used to interpret chunk payloads.
         block_size: Number of tokens per paged block.
         use_mla: Whether the worker KV format is MLA.
+        chunk_size: Tokens per LMCache chunk.
+        engine_group_infos: Optional engine group metadata for hybrid models.
+        kernel_group_metadata: Per-kernel-group shape and layout metadata for
+            engine-driven grouped pickle transfers.
+        layout_descs_by_object_group: Per-object-group layout descriptors built
+            from ``kernel_group_metadata``.
     """
 
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
+    chunk_size: int = 0
+    engine_group_infos: tuple[EngineGroupInfo, ...] = ()
+    kernel_group_metadata: tuple[EngineDrivenKernelGroupMetadata, ...] = ()
+    layout_descs_by_object_group: dict[int, MemoryLayoutDesc] | None = None
 
 
 class EngineDrivenContext(ABC):
@@ -172,7 +186,10 @@ class EngineDrivenContext(ABC):
 
     @abstractmethod
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, chunks: list[torch.Tensor]
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: list[torch.Tensor] | dict[str, Any],
     ) -> bool:
         """Commit store. Pickle: serialize and send. Shm: notify server."""
         ...
@@ -180,7 +197,7 @@ class EngineDrivenContext(ABC):
     @abstractmethod
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[torch.Tensor] | dict[str, Any] | None:
         """Prepare retrieve. Returns chunks or shm views, or None on miss."""
         ...
 
