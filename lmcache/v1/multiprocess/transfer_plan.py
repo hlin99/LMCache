@@ -518,9 +518,6 @@ class TransferPlanBuilder:
         cache_context = self._cache_context
         chunk_size = cache_context.lmcache_tokens_per_chunk
 
-        # Pre-index kg plans for O(1) lookup inside the batch loop.
-        kg_plan_by_id = {kgp.kernel_group_id: kgp for kgp in kernel_groups}
-
         batches: list[ObjectBatchTransferPlan] = []
         start = num_objects_to_skip
         while start < num_chunks:
@@ -539,8 +536,8 @@ class TransferPlanBuilder:
             kg_batch_plans: list[KernelGroupBatchTransferPlan] = []
             for kgp in kernel_groups:
                 kg_id = kgp.kernel_group_id
-                bpc = kg_plan_by_id[kg_id].blocks_per_chunk
-                bpw = kg_plan_by_id[kg_id].blocks_per_window
+                bpc = kgp.blocks_per_chunk
+                bpw = kgp.blocks_per_window
 
                 orig_skip_blocks = cache_context.calculate_num_blocks(
                     skip_tokens_in_chunk, kg_id
