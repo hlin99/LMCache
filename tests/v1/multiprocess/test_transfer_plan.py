@@ -27,9 +27,8 @@ from lmcache.v1.multiprocess.transfer_plan import (
 # ---------------------------------------------------------------------------
 
 
-def _make_object_key(chunk_idx: int, group_id: int = 0) -> ObjectKey:
+def _make_object_key(_chunk_idx: int = 0, _group_id: int = 0) -> ObjectKey:
     """Create a minimal ObjectKey for testing."""
-    del chunk_idx, group_id  # Parameters kept for call-site readability.
     return MagicMock(spec=ObjectKey)
 
 
@@ -673,3 +672,42 @@ class TestBuildFromCacheContext:
         cache_context.get_kernel_group_shape_dtype.assert_called_once_with(
             chunk_size, 0
         )
+
+    def test_multi_kernel_group_calls_shape_dtype_for_each_group(self) -> None:
+        """build_from_cache_context calls get_kernel_group_shape_dtype per group."""
+        chunk_size = 16
+        blocks_per_chunk = 2
+        num_chunks = 3
+        num_kg = 3
+
+        manager = _mock_manager(
+            kernel_groups=[{"blocks_per_chunk": blocks_per_chunk}] * num_kg,
+            chunk_size=chunk_size,
+        )
+        shape = _flat_shape()
+        dtype = torch.float16
+
+        cache_context = MagicMock()
+        cache_context.kv_layer_groups_manager = manager
+        cache_context.lmcache_tokens_per_chunk = chunk_size
+        # Return same shape/dtype for all groups.
+        cache_context.get_kernel_group_shape_dtype.return_value = (shape, dtype)
+
+        block_ids = [list(range(num_chunks * blocks_per_chunk))] * num_kg
+        obj_keys = _make_obj_keys(num_chunks)
+
+        plan = TransferPlanBuilder.build_from_cache_context(
+            cache_context=cache_context,
+            block_ids=block_ids,
+            obj_keys_per_obj_group=obj_keys,
+            direction=TransferDirection.STORE,
+        )
+
+        assert not plan.underflow
+        assert plan.num_chunks == num_chunks
+        # Should be called once per kernel group.
+        assert cache_context.get_kernel_group_shape_dtype.call_count == num_kg
+        for kg_id in range(num_kg):
+            cache_context.get_kernel_group_shape_dtype.assert_any_call(
+                chunk_size, kg_id
+            )

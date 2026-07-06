@@ -251,7 +251,6 @@ class TransferPlanBuilder:
         """
         num_kernel_groups = kv_groups_manager.num_kernel_groups
         num_object_groups = kv_groups_manager.num_object_groups
-        num_chunks = len(obj_keys_per_obj_group[0]) if obj_keys_per_obj_group else 0
 
         if len(block_ids) != num_kernel_groups:
             raise ValueError(
@@ -268,6 +267,9 @@ class TransferPlanBuilder:
                 f"obj_keys_per_obj_group has {len(obj_keys_per_obj_group)} entries "
                 f"but kv_groups_manager has {num_object_groups} object groups"
             )
+
+        # num_chunks is consistent across object groups (each OG has one key per chunk).
+        num_chunks = len(obj_keys_per_obj_group[0]) if num_object_groups > 0 else 0
 
         # ------------------------------------------------------------------
         # Per-kernel-group geometry

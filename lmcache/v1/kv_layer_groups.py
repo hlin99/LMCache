@@ -463,16 +463,20 @@ class KVLayerGroupsManager:
         Returns:
             A fully initialised :class:`KVLayerGroupsManager` with
             ``kernel_groups`` and ``object_groups`` populated.
+
+        Implementation notes:
+            We bypass ``__init__`` (which requires real KV-cache tensors) via
+            ``cls.__new__(cls)`` and set the internal fields directly.
+            ``_detect_object_groups`` is called with an empty list because it
+            reads ``sw_size_tokens`` directly from ``self._kernel_groups``; the
+            ``engine_group_infos`` argument is only used in the normal
+            ``__init__`` path to back-fill ``sw_size_tokens`` before the
+            kernel-group objects exist.
         """
         instance = cls.__new__(cls)
         instance._kernel_groups = list(kernel_groups)
         instance._lmcache_tokens_per_chunk = lmcache_tokens_per_chunk
         instance._separate_object_groups = separate_object_groups
-        # Pass an empty engine_group_infos list: _detect_object_groups uses it
-        # only to extract sw_size_tokens per group, which is already embedded in
-        # each KernelGroupInfo.sw_size_tokens. The empty list is safe here because
-        # _detect_object_groups falls back to reading sw_size_tokens directly from
-        # self._kernel_groups when engine_group_infos is absent/empty.
         instance._object_groups = instance._detect_object_groups([])
         return instance
 

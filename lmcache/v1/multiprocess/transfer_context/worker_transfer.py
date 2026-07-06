@@ -479,6 +479,31 @@ class EngineDrivenTransferContext(TransferContext):
         _event: IPCEvent,
         blocks_in_chunk: int,
     ) -> MessagingFuture:
+        """Gather KV blocks from device and commit them to the transfer context.
+
+        Args:
+            _request_id: Unused request identifier.
+            key: Cache key identifying the token range.
+            instance_id: Worker instance identifier.
+            kv_caches: Device KV cache tensors keyed by layer name.
+            block_ids: Per-kernel-group block ID lists. For single-group models
+                ``len(block_ids) == 1``; for multi-group models ``len(block_ids)``
+                equals the number of kernel groups.
+            _event: Unused IPC event (engine-driven path does not use CUDA IPC).
+            blocks_in_chunk: Number of KV blocks per storage chunk.
+
+        Returns:
+            A :class:`MessagingFuture` that resolves to ``True`` on success.
+
+        Known limitation:
+            For multi-group models (``len(block_ids) > 1``) the current
+            implementation passes *all* layers of ``kv_caches`` to
+            ``gather_paged_kv_to_cpu`` for every kernel group instead of
+            filtering to only the layers belonging to that group. Full
+            per-group layer-slice support requires storing per-group layer
+            indices at registration time; this is tracked as a remaining gap
+            for the engine-driven multi-group path.
+        """
         if self._engine_driven_context is None:
             raise RuntimeError(
                 "Engine-driven transfer context is not registered. "
@@ -507,15 +532,9 @@ class EngineDrivenTransferContext(TransferContext):
                 chunk_indices=chunk_indices,
             )
         else:
-            # Multi-group path: gather each kernel group separately.
-            # The pickle payload format for multi-group is a dict mapping
-            # kernel-group index → list[torch.Tensor] (one tensor per chunk).
-            # NOTE: For a full implementation, each kernel group should be
-            # gathered using only its own layer indices (subset of kv_caches).
-            # The current implementation passes all layers for each group,
-            # which is a known limitation: full per-group layer-slice support
-            # requires storing per-group layer indices at registration time
-            # (tracked as a remaining gap in this PR).
+            # Multi-group path: pickle payload format is
+            # dict[kernel_group_id, list[torch.Tensor]].
+            # See docstring for the known layer-slice limitation.
             multi_group_chunks: dict[int, list[torch.Tensor]] = {}
             for kg_id, kg_block_ids in enumerate(block_ids):
                 kg_chunks = gather_paged_kv_to_cpu(

@@ -213,19 +213,22 @@ class PickleTransferStrategy(TransferStrategy):
             ``True`` when every reserved object is written successfully.
         """
         payload = pickle.loads(cpu_data)
-        if isinstance(payload, dict):
-            # Multi-group payload: {kernel_group_id: list[torch.Tensor]}.
-            # The dict shape reliably distinguishes multi-group from single-group
-            # because single-group payloads are always list[torch.Tensor].
-            # We additionally check kv_groups_manager to use the structured path.
-            if context.kv_groups_manager is not None:
-                return self._commit_store_multi_group(
-                    key, payload, context, resolve_obj_keys
-                )
-            # Fallback: flatten all group chunks in insertion order.
-            chunks = [c for kg_chunks in payload.values() for c in kg_chunks]
-        else:
-            chunks = payload
+        # Primary discriminator: kv_groups_manager presence indicates a
+        # multi-group registration. When set, the payload is expected to be a
+        # dict[int, list[torch.Tensor]] (one entry per kernel group). The
+        # isinstance guard is a belt-and-suspenders check: if for any reason
+        # a non-dict payload arrives for a multi-group context (e.g., a
+        # legacy client), we fall through to the single-group code path.
+        if context.kv_groups_manager is not None and isinstance(payload, dict):
+            return self._commit_store_multi_group(
+                key, payload, context, resolve_obj_keys
+            )
+
+        chunks: list[torch.Tensor] = (
+            payload
+            if isinstance(payload, list)
+            else [c for kg_chunks in payload.values() for c in kg_chunks]
+        )
 
         obj_keys = resolve_obj_keys(key)
         layout_desc = context.layout_desc

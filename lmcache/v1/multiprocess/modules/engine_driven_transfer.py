@@ -476,7 +476,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                         else:
                             shape = torch.Size([2, n, c, h])
                         shapes_and_dtypes.append((shape, kg.dtype))
-                    og_shapes, og_dtypes = zip(*shapes_and_dtypes, strict=False)
+                    og_shapes, og_dtypes = zip(*shapes_and_dtypes, strict=True)
                     layout_descs_by_og[og_id] = MemoryLayoutDesc(
                         shapes=list(og_shapes), dtypes=list(og_dtypes)
                     )
