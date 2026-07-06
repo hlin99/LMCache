@@ -53,7 +53,10 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         return None
 
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, chunks: list[torch.Tensor]
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: "list[torch.Tensor] | dict[int, list[torch.Tensor]]",
     ) -> bool:
         """Serialize chunks and send via COMMIT_STORE.
 

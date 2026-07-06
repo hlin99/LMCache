@@ -77,7 +77,11 @@ def _build_kernel_group_info_from_spec(
 
     dtype = getattr(torch, spec.dtype_str, None)
     if dtype is None or not isinstance(dtype, torch.dtype):
-        raise ValueError(f"group {group_idx}: invalid dtype_str '{spec.dtype_str}'")
+        raise ValueError(
+            f"group {group_idx}: invalid dtype_str '{spec.dtype_str}' — "
+            "must be a valid torch dtype attribute name "
+            "(e.g. 'float16' for torch.float16)"
+        )
 
     engine_kv_format = (
         lmc_ops.EngineKVFormat.NL_X_NB_BS_HS

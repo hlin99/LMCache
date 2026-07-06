@@ -354,7 +354,7 @@ class TransferPlanBuilder:
             shapes_and_dtypes = [
                 kernel_group_shape_dtypes[kg_id] for kg_id in kg_ids_in_og
             ]
-            shapes, dtypes = zip(*shapes_and_dtypes, strict=False)
+            shapes, dtypes = zip(*shapes_and_dtypes, strict=True)
             layout_desc = MemoryLayoutDesc(shapes=list(shapes), dtypes=list(dtypes))
 
             # Sliding-window retrieve skip.

@@ -494,9 +494,10 @@ class EngineDrivenTransferContext(TransferContext):
             future.set_result(True)
             return future
 
+        chunks: list[torch.Tensor] | dict[int, list[torch.Tensor]]
         if len(block_ids) == 1:
             # Single-group path: backward-compatible behaviour.
-            cpu_chunks = gather_paged_kv_to_cpu(
+            chunks = gather_paged_kv_to_cpu(
                 kv_caches,
                 block_ids[0],
                 blocks_in_chunk,
@@ -506,19 +507,17 @@ class EngineDrivenTransferContext(TransferContext):
                 chunk_indices=chunk_indices,
             )
         else:
-            # Multi-group path: gather each kernel group separately using the
-            # layer indices recorded at registration time, then bundle all
-            # group chunk tensors into a single flat list in group order.
+            # Multi-group path: gather each kernel group separately.
             # The pickle payload format for multi-group is a dict mapping
             # kernel-group index → list[torch.Tensor] (one tensor per chunk).
+            # NOTE: For a full implementation, each kernel group should be
+            # gathered using only its own layer indices (subset of kv_caches).
+            # The current implementation passes all layers for each group,
+            # which is a known limitation: full per-group layer-slice support
+            # requires storing per-group layer indices at registration time
+            # (tracked as a remaining gap in this PR).
             multi_group_chunks: dict[int, list[torch.Tensor]] = {}
             for kg_id, kg_block_ids in enumerate(block_ids):
-                # Build a minimal single-group kv_caches view for this group.
-                # We rely on dict ordering matching layer-index order from registration.
-                # For a proper multi-group gather we'd need per-group layer indices
-                # stored at registration time. For now, pass all layers and the first
-                # group's block IDs (heuristic for exploratory PR; full implementation
-                # requires per-group layer-slice support in gather_paged_kv_to_cpu).
                 kg_chunks = gather_paged_kv_to_cpu(
                     kv_caches,
                     kg_block_ids,
@@ -527,12 +526,12 @@ class EngineDrivenTransferContext(TransferContext):
                     engine_kv_format=self._engine_kv_format,
                 )
                 multi_group_chunks[kg_id] = kg_chunks
-            cpu_chunks = multi_group_chunks  # type: ignore[assignment]
+            chunks = multi_group_chunks
 
         if out_buffers is not None:
             # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
-        ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+        ok = self._engine_driven_context.commit_store(key, instance_id, chunks)
 
         future = MessagingFuture()
         future.set_result(ok)

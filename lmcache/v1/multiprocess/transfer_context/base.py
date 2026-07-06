@@ -186,9 +186,21 @@ class EngineDrivenContext(ABC):
 
     @abstractmethod
     def commit_store(
-        self, key: IPCCacheServerKey, instance_id: int, chunks: list[torch.Tensor]
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: "list[torch.Tensor] | dict[int, list[torch.Tensor]]",
     ) -> bool:
-        """Commit store. Pickle: serialize and send. Shm: notify server."""
+        """Commit store. Pickle: serialize and send. Shm: notify server.
+
+        Args:
+            key: Cache key for the token range being stored.
+            instance_id: Worker instance identifier.
+            chunks: For single-group transfers, a flat ``list[torch.Tensor]``
+                (one tensor per chunk). For multi-group transfers, a
+                ``dict[int, list[torch.Tensor]]`` mapping kernel-group ID to
+                per-chunk tensors.
+        """
         ...
 
     @abstractmethod

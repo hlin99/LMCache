@@ -29,6 +29,7 @@ from lmcache.v1.multiprocess.transfer_plan import (
 
 def _make_object_key(chunk_idx: int, group_id: int = 0) -> ObjectKey:
     """Create a minimal ObjectKey for testing."""
+    del chunk_idx, group_id  # Parameters kept for call-site readability.
     return MagicMock(spec=ObjectKey)
 
 

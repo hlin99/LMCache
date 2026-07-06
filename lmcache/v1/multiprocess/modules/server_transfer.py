@@ -215,8 +215,9 @@ class PickleTransferStrategy(TransferStrategy):
         payload = pickle.loads(cpu_data)
         if isinstance(payload, dict):
             # Multi-group payload: {kernel_group_id: list[torch.Tensor]}.
-            # Iterate over all object groups using the context's kv_groups_manager
-            # when available; otherwise fall back to single object group 0.
+            # The dict shape reliably distinguishes multi-group from single-group
+            # because single-group payloads are always list[torch.Tensor].
+            # We additionally check kv_groups_manager to use the structured path.
             if context.kv_groups_manager is not None:
                 return self._commit_store_multi_group(
                     key, payload, context, resolve_obj_keys
