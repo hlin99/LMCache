@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, cast
 import os
 
 # Third Party
@@ -18,6 +18,7 @@ from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
+    get_device,
     get_group_data_ptrs,
     is_mla,
     normalize_and_discover_per_layer_formats,
@@ -26,8 +27,10 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-from lmcache.v1.multiprocess.group_view import engine_group_layer_indices
+from lmcache.v1.multiprocess.group_view import (
+    EngineGroupInfo,
+    engine_group_layer_indices,
+)
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.object_group_utils import (
     execute_prepared_object_group_transfer,
@@ -45,9 +48,9 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
-from lmcache.v1.platform.base_cache_context import BaseCacheContext
 from lmcache.v1.platform import _registry as platform_registry
 from lmcache.v1.platform import get_device_info
+from lmcache.v1.platform.base_cache_context import BaseCacheContext
 import lmcache.c_ops as lmc_ops
 import lmcache.python_ops_fallback as _python_ops_fallback
 
@@ -180,7 +183,8 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
             EngineType.VLLM,
             layout_hints,
         )
-        device = kv_caches_norm[0].device
+        kv_caches_norm = cast(list[torch.Tensor], kv_caches_norm)
+        device = get_device(kv_caches_norm)
         kv_layer_groups_manager = KVLayerGroupsManager(
             kv_caches_norm,
             engine_kv_formats=engine_kv_formats,
@@ -653,12 +657,7 @@ def _flatten_transport_objects(
         chunks for object group 0, then all non-skipped chunks for object group
         1, and so on.
     """
-    return [
-        obj
-        for objects in objects_by_group
-        for obj in objects
-        if obj is not None
-    ]
+    return [obj for objects in objects_by_group for obj in objects if obj is not None]
 
 
 def _build_sparse_transport_objects(
@@ -1091,9 +1090,7 @@ class EngineDrivenTransferContext(TransferContext):
                         for layout in metadata.object_group_layout_descs
                     ],
                     attn_window_num_chunks=(
-                        self._object_group_transfer_state.cache_context
-                        .kv_layer_groups_manager.get_attn_desc()
-                        .num_chunks_in_sw
+                        self._object_group_transfer_state.cache_context.kv_layer_groups_manager.get_attn_desc().num_chunks_in_sw
                         if self._object_group_transfer_state is not None
                         else []
                     ),

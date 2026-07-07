@@ -24,8 +24,8 @@ from lmcache.v1.multiprocess.transfer_context.shm import ShmSlotDescriptor
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.memory_management import MemoryObj
     from lmcache.v1.distributed.storage_manager import StorageManager
+    from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
 
@@ -511,9 +511,7 @@ class ShmTransferStrategy(TransferStrategy):
         for object_group_id in range(context.num_object_groups):
             obj_keys = resolve_obj_keys(key, object_group_id)
             layout_desc = context.layout_desc_for_object_group(object_group_id)
-            reserved = self._storage_manager.reserve_write(
-                obj_keys, layout_desc, "new"
-            )
+            reserved = self._storage_manager.reserve_write(obj_keys, layout_desc, "new")
             try:
                 for idx, obj_key in enumerate(obj_keys):
                     memory_obj = reserved.get(obj_key)

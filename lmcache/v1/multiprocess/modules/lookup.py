@@ -323,11 +323,6 @@ class LookupModule:
             extra_count=extra_count,
             external_request_id=key.request_id,
             attn_desc=attn_desc,
-            object_group_layout_descs=(
-                self._ctx.layout_desc_registry.find_object_group_layout_descs(
-                    model_name, world_size
-                )
-            ),
         )
         self._register_prefetch_job(
             _PrefetchJob(

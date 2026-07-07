@@ -439,7 +439,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload.world_size,
             metadata.layout_desc,
             attn_desc if attn_desc is not None else AttnWindowDesc([-1]),
-            object_group_layout_descs=metadata.object_group_layout_descs,
         )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size

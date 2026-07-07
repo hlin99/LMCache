@@ -2,7 +2,7 @@
 # Standard
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, cast
 from unittest.mock import MagicMock, patch
 import os
 import pickle
@@ -626,15 +626,16 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
+        def get_attn_desc(self) -> MagicMock:
+            return MagicMock(num_chunks_in_sw=[-1])
+
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
         kv_layer_groups_manager = FakeManager()
         device = torch.device("cuda")
         max_batch_size = 4
 
-        def calculate_num_blocks(
-            self, num_tokens: int, _kernel_group_id: int
-        ) -> int:
+        def calculate_num_blocks(self, num_tokens: int, _kernel_group_id: int) -> int:
             return num_tokens // 4
 
         def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
@@ -715,7 +716,9 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         concrete_objects = [obj for obj in objects if obj is not None]
         assert concrete_objects
         staging_copy_builder(
-            concrete_objects, [torch.empty_like(concrete_objects[0])], False
+            concrete_objects,
+            [torch.empty_like(obj) for obj in concrete_objects],
+            False,
         )
         captured["prepare"] = {
             "batch_size": batch_size,
@@ -793,15 +796,16 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
+        def get_attn_desc(self) -> MagicMock:
+            return MagicMock(num_chunks_in_sw=[-1])
+
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
         kv_layer_groups_manager = FakeManager()
         device = torch.device("cuda")
         max_batch_size = 4
 
-        def calculate_num_blocks(
-            self, num_tokens: int, _kernel_group_id: int
-        ) -> int:
+        def calculate_num_blocks(self, num_tokens: int, _kernel_group_id: int) -> int:
             return num_tokens // 4
 
         def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
@@ -877,7 +881,9 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         concrete_objects = [obj for obj in objects if obj is not None]
         assert concrete_objects
         staging_copy_builder(
-            concrete_objects, [torch.empty_like(concrete_objects[0])], True
+            concrete_objects,
+            [torch.empty_like(obj) for obj in concrete_objects],
+            True,
         )
         captured["prepare"] = {
             "batch_size": batch_size,
@@ -960,15 +966,16 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         ]
         num_kernel_groups = 2
 
+        def get_attn_desc(self) -> MagicMock:
+            return MagicMock(num_chunks_in_sw=[-1, 2])
+
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
         kv_layer_groups_manager = FakeManager()
         device = torch.device("cuda")
         max_batch_size = 4
 
-        def calculate_num_blocks(
-            self, _num_tokens: int, _kernel_group_id: int
-        ) -> int:
+        def calculate_num_blocks(self, _num_tokens: int, _kernel_group_id: int) -> int:
             return 2
 
         def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
@@ -1047,7 +1054,7 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         concrete_objects = [obj for obj in objects if obj is not None]
         staging_copy_builder(
             concrete_objects,
-            [torch.empty_like(concrete_objects[0])],
+            [torch.empty_like(obj) for obj in concrete_objects],
             False,
         )
         captured["prepare_calls"].append(
@@ -1133,15 +1140,16 @@ def test_engine_driven_shm_retrieve_plans_all_object_groups(
         ]
         num_kernel_groups = 2
 
+        def get_attn_desc(self) -> MagicMock:
+            return MagicMock(num_chunks_in_sw=[-1, 2])
+
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
         kv_layer_groups_manager = FakeManager()
         device = torch.device("cuda")
         max_batch_size = 4
 
-        def calculate_num_blocks(
-            self, _num_tokens: int, _kernel_group_id: int
-        ) -> int:
+        def calculate_num_blocks(self, _num_tokens: int, _kernel_group_id: int) -> int:
             return 2
 
         def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
@@ -1220,7 +1228,7 @@ def test_engine_driven_shm_retrieve_plans_all_object_groups(
         concrete_objects = [obj for obj in objects if obj is not None]
         staging_copy_builder(
             concrete_objects,
-            [torch.empty_like(concrete_objects[0])],
+            [torch.empty_like(obj) for obj in concrete_objects],
             True,
         )
         captured["prepare_calls"].append(
@@ -1676,11 +1684,12 @@ def server_module_factory(
         stack.enter_context(
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus")
         )
-        resolved_object_keys = object_keys or ["obj"]
-        if not resolved_object_keys or (
-            resolved_object_keys and not isinstance(resolved_object_keys[0], list)
-        ):
-            resolved_object_keys = [resolved_object_keys]
+        if object_keys is None:
+            resolved_object_keys: list[list[TestObjectKey]] = [["obj"]]
+        elif object_keys and isinstance(object_keys[0], list):
+            resolved_object_keys = cast(list[list[TestObjectKey]], object_keys)
+        else:
+            resolved_object_keys = [cast(list[TestObjectKey], object_keys)]
 
         def _resolve_object_keys(
             _key: Any, _chunk_hashes: list[bytes], object_group_ids: list[int]
@@ -2069,7 +2078,7 @@ def test_server_prepare_store_includes_chunk_indices(
         storage_manager_config=_make_storage_manager_config(
             shm_name="lmcache_test_pool", pool_size=4096
         ),
-        object_keys=[obj1, obj2],
+        object_keys=cast(list[TestObjectKey], [obj1, obj2]),
         mock_storage=mock_storage,
         mock_session=mock_session,
     )
@@ -2139,91 +2148,6 @@ def test_server_register_validates_hybrid_metadata(
         module.register_kv_cache_engine_driven_context(payload)
 
 
-def test_lookup_prefetch_receives_hybrid_object_group_layouts(
-    stub_native_storage_ops: Any,
-    server_module_factory: ServerModuleFactory,
-) -> None:
-    """Lookup forwards per-object-group layouts for L2-to-L1 allocation."""
-    # First Party
-    from lmcache.v1.distributed.api import PrefetchHandle
-    from lmcache.v1.multiprocess.modules.lookup import LookupModule
-
-    module, mock_storage, _, ctx = server_module_factory()
-    module.register_kv_cache_engine_driven_context(_hybrid_register_payload())
-    ctx.token_hasher.compute_chunk_hashes.return_value = [b"h0", b"h1"]
-    ctx.event_bus.has_subscribers.return_value = False
-    mock_storage.submit_prefetch_task.return_value = PrefetchHandle(
-        prefetch_request_id=-1,
-        external_request_id="req",
-        l1_found_indices=(),
-        total_requested_keys=4,
-        submit_time=0.0,
-    )
-
-    LookupModule(ctx).lookup(_default_key(tokens=2), tp_size=1)
-
-    _, kwargs = mock_storage.submit_prefetch_task.call_args
-    layouts = kwargs["object_group_layout_descs"]
-    assert [layout.shapes[0] for layout in layouts] == [
-        torch.Size([16]),
-        torch.Size([24]),
-    ]
-    keys = mock_storage.submit_prefetch_task.call_args.args[0]
-    assert [key.object_group_id for key in keys] == [0, 1, 0, 1]
-
-
-def test_l2_prefetch_reserves_each_object_group_with_matching_layout(
-    stub_native_storage_ops: Any,
-) -> None:
-    """L2 load planning reserves L1 objects with each key's group layout."""
-    # First Party
-    from lmcache.v1.distributed.error import L1Error
-    from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
-        reserve_write_by_object_group_layout,
-    )
-
-    object_keys = [key for group in _hybrid_object_keys() for key in group]
-    layouts = [
-        MemoryLayoutDesc(shapes=[torch.Size([16])], dtypes=[torch.uint8]),
-        MemoryLayoutDesc(shapes=[torch.Size([24])], dtypes=[torch.uint8]),
-    ]
-    captured: list[tuple[list[int], int]] = []
-
-    class FakeL1Manager:
-        def reserve_write(
-            self,
-            keys: list[TestObjectKey],
-            is_temporary: list[bool],
-            layout_desc: MemoryLayoutDesc,
-            mode: str,
-        ) -> dict[TestObjectKey, tuple[object, _TensorMemoryObj]]:
-            captured.append(
-                ([key.object_group_id for key in keys], layout_desc.shapes[0].numel())
-            )
-            assert is_temporary == [False] * len(keys)
-            assert mode == "new"
-            return {
-                key: (
-                    L1Error.SUCCESS,
-                    _TensorMemoryObj(
-                        torch.zeros(layout_desc.shapes[0], dtype=layout_desc.dtypes[0])
-                    ),
-                )
-                for key in keys
-            }
-
-    results = reserve_write_by_object_group_layout(
-        FakeL1Manager(),
-        object_keys,
-        [True] * len(object_keys),
-        layouts[0],
-        layouts,
-    )
-
-    assert captured == [([0, 0], 16), ([1, 1], 24)]
-    assert list(results) == object_keys
-
-
 def test_server_hybrid_pickle_store_and_retrieve_use_group_layouts(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
@@ -2248,7 +2172,9 @@ def test_server_hybrid_pickle_store_and_retrieve_use_group_layouts(
         return result
 
     @contextmanager
-    def _read_prefetched_results(obj_keys: list[TestObjectKey]) -> Iterator[list[_TensorMemoryObj]]:
+    def _read_prefetched_results(
+        obj_keys: list[TestObjectKey],
+    ) -> Iterator[list[_TensorMemoryObj]]:
         yield [stored[obj_key] for obj_key in obj_keys]
 
     mock_storage = MagicMock()
@@ -2347,7 +2273,7 @@ def test_memory_obj_tensor_view_returns_none_for_non_tensor_backing(
         def tensor(self) -> torch.Tensor:
             raise NotImplementedError
 
-    assert _memory_obj_tensor_view(NonTensorMemoryObj()) is None
+    assert _memory_obj_tensor_view(cast(Any, NonTensorMemoryObj())) is None
 
 
 class _CompletedFuture:

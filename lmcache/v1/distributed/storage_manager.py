@@ -406,7 +406,6 @@ class StorageManager:
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         skip_l2: bool = False,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
-        object_group_layout_descs: list[MemoryLayoutDesc] | None = None,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -429,9 +428,6 @@ class StorageManager:
             mode: The prefetch intent (see :class:`PrefetchMode`).  ``WARM``
                 retains loaded keys and pins none; ``LOOKUP`` (default) pins
                 them for an imminent reader and follows the policy.
-            object_group_layout_descs: Optional per-object-group layouts. When
-                provided, L2-to-L1 loads reserve each object key with the layout
-                matching ``ObjectKey.object_group_id``.
 
         Returns:
             PrefetchHandle to track the task.
@@ -446,7 +442,6 @@ class StorageManager:
                     extra_count=extra_count,
                     policy=policy,
                     mode=mode,
-                    object_group_layout_descs=object_group_layout_descs,
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,
@@ -501,7 +496,6 @@ class StorageManager:
                     policy=TrimPolicy.SPARSE,
                     attn_desc=attn_desc,
                     mode=mode,
-                    object_group_layout_descs=object_group_layout_descs,
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,
@@ -568,7 +562,6 @@ class StorageManager:
                 attn_desc=attn_desc,
                 policy=policy,
                 mode=mode,
-                object_group_layout_descs=object_group_layout_descs,
             )
             # The controller indexes its result bitmap over remaining_keys
             # (0-based); map those local indices back to original positions.

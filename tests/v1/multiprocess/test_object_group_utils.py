@@ -15,7 +15,7 @@ These tests cover:
 
 # Standard
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 # Third Party
@@ -265,7 +265,9 @@ class TestSelectBlockIdsForCacheContext:
 
         block_ids = [[0, 1, 2, 3, 4, 5, 6, 7], [10, 11, 12, 13, 20, 21, 22, 23]]
 
-        result = select_block_ids_for_cache_context(FakeCacheContext(), block_ids)
+        result = select_block_ids_for_cache_context(
+            cast(Any, FakeCacheContext()), block_ids
+        )
 
         assert result == [[0, 1, 2, 3, 4, 5, 6, 7], [12, 13, 22, 23]]
         assert block_ids == [

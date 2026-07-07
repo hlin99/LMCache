@@ -2,7 +2,7 @@
 """Shared context and layout descriptor registry for engine modules."""
 
 # Standard
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TypedDict
 import threading
 
@@ -45,8 +45,6 @@ class _LayoutDescEntry:
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     """Cross-chunk attention windows of all object groups, in object-group
     order. Defaults to a single full-attention group."""
-    object_group_layout_descs: list[MemoryLayoutDesc] = field(default_factory=list)
-    """Per-object-group layouts. Empty means all object groups use layout_desc."""
 
 
 class LayoutDescRegistry:
@@ -70,7 +68,6 @@ class LayoutDescRegistry:
         world_size: int,
         layout_desc: MemoryLayoutDesc,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
-        object_group_layout_descs: list[MemoryLayoutDesc] | None = None,
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
@@ -83,12 +80,8 @@ class LayoutDescRegistry:
             layout_desc: The memory layout descriptor.
             attn_desc: Cross-chunk attention windows of all object groups, in
                 object-group order. Defaults to a single full-attention group.
-            object_group_layout_descs: Optional per-object-group layouts used
-                by hybrid lookups and L2 prefetch loads. Empty values preserve
-                the legacy single-layout behavior.
         """
         key = (model_name, world_size)
-        layouts = list(object_group_layout_descs or [])
         with self._lock:
             entry = self._registry.get(key)
             if entry is None:
@@ -96,13 +89,11 @@ class LayoutDescRegistry:
                     layout_desc=layout_desc,
                     ref_count=1,
                     attn_desc=attn_desc,
-                    object_group_layout_descs=layouts,
                 )
                 return
 
             entry.layout_desc = layout_desc
             entry.attn_desc = attn_desc
-            entry.object_group_layout_descs = layouts
             entry.ref_count += 1
 
     def unregister(self, model_name: str, world_size: int) -> None:
@@ -166,25 +157,6 @@ class LayoutDescRegistry:
                     f"{model_name!r} with world size {world_size}"
                 )
             return entry.attn_desc
-
-    def find_object_group_layout_descs(
-        self, model_name: str, world_size: int
-    ) -> list[MemoryLayoutDesc]:
-        """Look up per-object-group layouts by (model_name, world_size).
-
-        Args:
-            model_name: The model name.
-            world_size: The world size.
-
-        Returns:
-            A copy of the registered per-object-group layouts. Empty means the
-            registry entry uses the legacy single ``layout_desc`` for all keys.
-        """
-        with self._lock:
-            entry = self._registry.get((model_name, world_size))
-            if entry is None:
-                return []
-            return list(entry.object_group_layout_descs)
 
 
 class MPCacheServerContext:

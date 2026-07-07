@@ -3,7 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Sequence, cast
 import threading
 import time
 
@@ -41,7 +41,12 @@ from lmcache.v1.multiprocess.engine_module import (
     ThreadPoolType,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.native_completion import (
+    DeviceHostFuncDispatcher,
+    submit_callback_to_stream,
+)
 from lmcache.v1.multiprocess.object_group_utils import (
+    StagingBuilder,
     batched_iteration_with_skip,
     compute_num_objects_to_skip,
     execute_prepared_object_group_transfer,
@@ -49,10 +54,6 @@ from lmcache.v1.multiprocess.object_group_utils import (
     prepare_object_group_transfer,
     recalculate_blocks_to_skip,
     select_block_ids_for_cache_context,
-)
-from lmcache.v1.multiprocess.native_completion import (
-    DeviceHostFuncDispatcher,
-    submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
@@ -192,7 +193,7 @@ def _run_object_group_transfer_plan(
         batch_size,
         skip_first_n_tokens,
         direction,
-        build_staging_copies,
+        cast(StagingBuilder[MemoryObj], build_staging_copies),
     )
     execute_prepared_object_group_transfer(
         direction,
@@ -661,16 +662,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         kv_groups_manager = cache_context.kv_layer_groups_manager
         attn_desc = kv_groups_manager.get_attn_desc()
-        object_group_layout_descs = [
-            get_layout_desc(cache_context, self._ctx.chunk_size, object_group_id)
-            for object_group_id in range(attn_desc.num_object_groups)
-        ]
         self._ctx.layout_desc_registry.register(
             model_name,
             world_size,
             layout_desc,
             attn_desc,
-            object_group_layout_descs=object_group_layout_descs,
         )
 
         with self._lock:
