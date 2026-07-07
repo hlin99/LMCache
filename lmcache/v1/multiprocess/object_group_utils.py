@@ -16,23 +16,21 @@ This module provides reusable logic shared between LMCache-driven and
 
 Ownership contract
 ------------------
-Source/destination buffer ownership is **path-specific**.  The common helpers
-receive already-prepared :class:`~lmcache.v1.memory_management.MemoryObj`
-instances from the caller; they do not allocate or release storage.
+Source/destination object ownership is **path-specific**.  The common helpers
+receive caller-owned objects and a caller-provided staging builder; they do not
+allocate, release, or interpret transfer storage.
 """
 
 # Standard
 from itertools import islice
-from typing import TYPE_CHECKING, Generator, Sequence
+from typing import TYPE_CHECKING, Callable, Generator, Sequence, TypeAlias, cast
 
 # Third Party
 import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.gpu_connector.gpu_ops import build_staging_copies
 from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
-from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
 import lmcache.c_ops as lmc_ops
 
@@ -41,6 +39,11 @@ if TYPE_CHECKING:
     from lmcache.v1.distributed.api import AttnWindowDesc
 
 logger = init_logger(__name__)
+
+StagingBuilder: TypeAlias = Callable[
+    [Sequence[object], Sequence[torch.Tensor], bool],
+    list["lmc_ops.StagingCopy"],
+]
 
 
 # ---------------------------------------------------------------------------
@@ -230,11 +233,12 @@ def compute_num_objects_to_skip(
 def prepare_object_group_transfer(
     cache_context: BaseCacheContext,
     block_ids_gpu: list[torch.Tensor],
-    memory_objs: Sequence[MemoryObj | None],
+    objects: Sequence[object | None],
     object_group_id: int,
     batch_size: int,
     skip_first_n_tokens: int,
     direction: "lmc_ops.TransferDirection",
+    staging_builder: StagingBuilder,
 ) -> tuple[list["lmc_ops.KernelGroupSpec"], list["lmc_ops.BatchStep"]]:
     """Build the ``KernelGroupSpec`` and ``BatchStep`` plan for one object group.
 
@@ -244,30 +248,34 @@ def prepare_object_group_transfer(
     :func:`execute_prepared_object_group_transfer` passes directly to
     ``lmc_ops.execute_object_group_transfer``.
 
-    Callers are responsible for providing ``memory_objs``; this function does
-    not allocate or release storage.
+    Callers are responsible for providing ``objects`` and ``staging_builder``.
+    Source/destination object ownership and staging semantics are path-specific:
+    this function does not allocate, release, or interpret storage objects.
 
     Args:
         cache_context: GPU cache context for the registered worker instance.
         block_ids_gpu: GPU block-ID tensors, indexed by LMCache KV group index.
             Produced by
             :func:`~lmcache.v1.multiprocess.modules.lmcache_driven_transfer.downsample_and_stage_block_ids`.
-        memory_objs: Memory objects to transfer, one per chunk.  ``None``
-            entries are allowed only for D2H (the batch is skipped); H2D with
-            a ``None`` entry raises :class:`ValueError`.
+        objects: Path-owned transfer objects, one per chunk.  ``None`` entries
+            are allowed only for D2H (the batch is skipped); H2D with a
+            ``None`` entry raises :class:`ValueError`.
         object_group_id: Index of the object group being transferred.
         batch_size: Number of memory objects per batched copy step.
         skip_first_n_tokens: Tokens to skip at the start of the retrieve range
             (APC-shared prefix protection).
         direction: H2D (retrieve) or D2H (store).
+        staging_builder: Caller-provided function that converts a batch of
+            non-``None`` path-owned objects and object-group staging buffers
+            into native ``StagingCopy`` descriptors.
 
     Returns:
         A ``(kernel_group_specs, batch_steps)`` tuple ready for
         :func:`execute_prepared_object_group_transfer`.
 
     Raises:
-        ValueError: If a ``None`` entry is found in a batch when
-            ``direction`` is H2D.
+        ValueError: If a ``None`` entry is found in a batch when ``direction``
+            is H2D.
     """
     lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
     kv_groups_manager = cache_context.kv_layer_groups_manager
@@ -324,7 +332,7 @@ def prepare_object_group_transfer(
     # Compute how many leading objects to skip for sliding-window retrieval.
     attn_desc = kv_groups_manager.get_attn_desc()
     num_objects_to_skip = compute_num_objects_to_skip(
-        attn_desc, object_group_id, len(memory_objs), is_h2d
+        attn_desc, object_group_id, len(objects), is_h2d
     )
     if num_objects_to_skip > 0:
         logger.debug(
@@ -336,20 +344,19 @@ def prepare_object_group_transfer(
 
     # --- Walk the batches, building staging + launch descriptors ---
     batch_steps: list["lmc_ops.BatchStep"] = []
-    for start_object_idx, memory_object_batch in batched_iteration_with_skip(
-        memory_objs, batch_size, skip_count=num_objects_to_skip
+    for start_object_idx, object_batch in batched_iteration_with_skip(
+        objects, batch_size, skip_count=num_objects_to_skip
     ):
-        if any(mo is None for mo in memory_object_batch):
+        if any(obj is None for obj in object_batch):
             if is_h2d:
                 raise ValueError(
-                    "MemoryObj is None for some objects in the batch, cannot "
-                    "perform H2D copy. memory_object_batch: "
-                    f"{memory_object_batch}"
+                    "Object is None for some objects in the batch, cannot "
+                    f"perform H2D copy. object_batch: {object_batch}"
                 )
             else:
                 continue
 
-        batch_len = len(memory_object_batch)
+        batch_len = len(object_batch)
         batch_start_token = start_object_idx * lmcache_chunk_size
         batch_end_token = batch_start_token + batch_len * lmcache_chunk_size
 
@@ -359,8 +366,8 @@ def prepare_object_group_transfer(
 
         skip_tokens_in_chunk = effective_start - batch_start_token
 
-        staging = build_staging_copies(
-            memory_object_batch,
+        staging = staging_builder(
+            cast(Sequence[object], object_batch),
             object_group_buffers[:batch_len],
             is_h2d,
         )
@@ -407,6 +414,7 @@ def execute_prepared_object_group_transfer(
     device: object,
     kernel_group_specs: list["lmc_ops.KernelGroupSpec"],
     batch_steps: list["lmc_ops.BatchStep"],
+    host_buffer_alignment: int = LazyMemoryAllocator.PIN_CHUNK_SIZE,
 ) -> None:
     """Execute a prepared object-group transfer plan via the native backend.
 
@@ -420,6 +428,8 @@ def execute_prepared_object_group_transfer(
             as returned by :func:`prepare_object_group_transfer`.
         batch_steps: Per-batch staging and launch descriptors, as returned by
             :func:`prepare_object_group_transfer`.
+        host_buffer_alignment: Host-buffer alignment to pass to the native
+            executor.
 
     Returns:
         None.
@@ -430,7 +440,7 @@ def execute_prepared_object_group_transfer(
     lmc_ops.execute_object_group_transfer(
         direction,
         device,
-        LazyMemoryAllocator.PIN_CHUNK_SIZE,
+        host_buffer_alignment,
         kernel_group_specs,
         batch_steps,
     )

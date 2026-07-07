@@ -23,6 +23,7 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
 )
 from lmcache.v1.gpu_connector.gpu_ops import (
+    build_staging_copies,
     lmcache_memcpy_async_d2h,
     lmcache_memcpy_async_h2d,
 )
@@ -40,7 +41,7 @@ from lmcache.v1.multiprocess.engine_module import (
     ThreadPoolType,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+from lmcache.v1.multiprocess.object_group_utils import (
     batched_iteration_with_skip,
     compute_num_objects_to_skip,
     execute_prepared_object_group_transfer,
@@ -165,7 +166,7 @@ def downsample_and_stage_block_ids(
 
 
 # Backward-compatible alias: the implementation now lives in
-# object_group_transfer_helpers as recalculate_blocks_to_skip.
+# object_group_utils as recalculate_blocks_to_skip.
 _recalculate_blocks_to_skip = recalculate_blocks_to_skip
 
 
@@ -212,6 +213,7 @@ def _run_object_group_transfer_plan(
         batch_size,
         skip_first_n_tokens,
         direction,
+        build_staging_copies,
     )
     execute_prepared_object_group_transfer(
         direction,

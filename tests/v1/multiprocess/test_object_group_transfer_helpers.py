@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ``object_group_transfer_helpers``.
+"""Unit tests for ``object_group_utils``.
 
 These tests cover:
 
@@ -44,7 +44,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_full_window_returns_all_blocks(self) -> None:
         """When keep == total, every block is returned unchanged."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -56,7 +56,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_trailing_two_per_chunk(self) -> None:
         """Keep last 2 of every 4-block chunk."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -68,7 +68,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_one_per_chunk(self) -> None:
         """Keep only the last block of each chunk."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -80,7 +80,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_single_chunk(self) -> None:
         """Single-chunk input with partial keep."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -92,7 +92,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_empty_input(self) -> None:
         """Empty input returns empty output."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -103,7 +103,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_invalid_total_blocks(self) -> None:
         """total_blocks_per_chunk < 1 raises ValueError."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -114,7 +114,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_exceeds_total_raises(self) -> None:
         """keep_blocks_per_chunk > total_blocks_per_chunk raises ValueError."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -125,7 +125,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_zero_raises(self) -> None:
         """keep_blocks_per_chunk < 1 raises ValueError."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -136,7 +136,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_len_not_multiple_raises(self) -> None:
         """len(block_ids) not a multiple of total_blocks_per_chunk raises ValueError."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -159,7 +159,7 @@ class TestSelectBlockIdsForWindow:
         self, total: int, keep: int, ids: list, expected: list
     ) -> None:
         """Parametrized spot-checks for various (total, keep) combinations."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
@@ -176,7 +176,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_equal_window_and_chunk_is_identity(self) -> None:
         """When blocks_per_window == blocks_per_chunk, return unchanged."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
 
@@ -185,7 +185,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_zero_skip_always_zero(self) -> None:
         """Zero blocks_to_skip always returns zero."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
 
@@ -193,7 +193,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_skip_less_than_chunk_tail(self) -> None:
         """Skip falls entirely within the discarded prefix of the first chunk."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
 
@@ -204,7 +204,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_skip_exactly_one_full_chunk(self) -> None:
         """Skip exactly one full-chunk's worth maps to one window."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
 
@@ -214,7 +214,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_skip_extends_into_window_region(self) -> None:
         """Skip that extends into the kept window region is mapped correctly."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
 
@@ -224,7 +224,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_example_from_docstring(self) -> None:
         """Verify the example in the docstring."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
 
@@ -235,7 +235,7 @@ class TestRecalculateBlocksToSkip:
     @pytest.mark.parametrize("skip", [0, 1, 2, 3, 4, 5, 8, 12])
     def test_result_never_negative(self, skip: int) -> None:
         """Result is always >= 0."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
 
@@ -252,7 +252,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_d2h_always_zero(self) -> None:
         """D2H (store) never skips any objects."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
 
@@ -261,7 +261,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_full_attention_h2d_zero(self) -> None:
         """Full-attention groups never skip objects, even for H2D."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
 
@@ -270,7 +270,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_sliding_window_h2d_skips_prefix(self) -> None:
         """H2D with a sliding window skips objects before the window."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
 
@@ -280,7 +280,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_sliding_window_num_objects_less_than_sw_skip_zero(self) -> None:
         """When fewer objects than the window size, skip nothing."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
 
@@ -289,7 +289,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_sliding_window_num_objects_equals_sw_skip_zero(self) -> None:
         """Exactly sw_size objects → skip zero."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
 
@@ -298,7 +298,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_multiple_object_groups_correct_group_selected(self) -> None:
         """The correct group's window size is used."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
 
@@ -318,7 +318,7 @@ class TestBatchedIterationWithSkipViaHelpers:
 
     def test_skip_and_batch(self) -> None:
         """Import from helpers module returns correct results."""
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             batched_iteration_with_skip,
         )
 
@@ -341,7 +341,7 @@ class TestExecutePreparedObjectGroupTransfer:
     def test_noop_on_empty_batch_steps(self) -> None:
         """No call to lmc_ops when batch_steps is empty."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
         )
 
@@ -354,7 +354,7 @@ class TestExecutePreparedObjectGroupTransfer:
         """When batch_steps is non-empty, execute_object_group_transfer is called."""
         import lmcache.c_ops as lmc_ops
         from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
         )
 
@@ -378,7 +378,7 @@ class TestExecutePreparedObjectGroupTransfer:
     def test_multiple_batch_steps_calls_execute_once(self) -> None:
         """Multiple batch steps still result in a single execute call."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
         )
 
@@ -391,6 +391,34 @@ class TestExecutePreparedObjectGroupTransfer:
                 direction, "cuda:1", fake_specs, fake_steps
             )
             assert mock_exec.call_count == 1
+
+    def test_custom_host_buffer_alignment_is_forwarded(self) -> None:
+        """Caller-provided host buffer alignment is forwarded to lmc_ops."""
+        import lmcache.c_ops as lmc_ops
+        from lmcache.v1.multiprocess.object_group_utils import (
+            execute_prepared_object_group_transfer,
+        )
+
+        direction = lmc_ops.TransferDirection.H2D
+        fake_specs = [MagicMock(name="spec0")]
+        fake_steps = [MagicMock(name="step0")]
+        host_buffer_alignment = 4096
+
+        with patch.object(lmc_ops, "execute_object_group_transfer") as mock_exec:
+            execute_prepared_object_group_transfer(
+                direction,
+                "cuda:0",
+                fake_specs,
+                fake_steps,
+                host_buffer_alignment=host_buffer_alignment,
+            )
+            mock_exec.assert_called_once_with(
+                direction,
+                "cuda:0",
+                host_buffer_alignment,
+                fake_specs,
+                fake_steps,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +512,7 @@ def _make_mock_cache_context(
 
 
 def _make_mock_memory_obj(size: int = 4) -> MagicMock:
-    """Create a minimal MemoryObj mock with the fields needed by build_staging_copies.
+    """Create a minimal path object mock for transfer-plan tests.
 
     Args:
         size: Byte size returned by ``get_size()`` and ``meta.address``.
@@ -500,18 +528,18 @@ def _make_mock_memory_obj(size: int = 4) -> MagicMock:
     return mo
 
 
-_HELPERS_MOD = "lmcache.v1.multiprocess.modules.object_group_transfer_helpers"
-
-
 @contextmanager
 def _patch_native_types_and_staging():
-    """Patch native lmc_ops plan types and build_staging_copies for CPU-only runs.
+    """Patch native lmc_ops plan types and provide fake staging for CPU-only runs.
 
-    Patches ``lmc_ops.KernelGroupSpec``, ``.LaunchVar``, ``.BatchStep``, and
-    ``build_staging_copies`` inside the helpers module so tests can run without
-    the compiled C extension.
+    Patches ``lmc_ops.KernelGroupSpec``, ``.LaunchVar``, and ``.BatchStep`` so
+    tests can run without the compiled C extension.  The yielded
+    ``staging`` mock is passed directly to ``prepare_object_group_transfer`` as
+    its caller-provided staging builder.
 
-    Yields a dict ``{"spec": mock_spec_cls, "step": mock_step_cls, "lv": mock_lv_cls}``.
+    Yields:
+        A dict containing the patched native type mocks and the fake staging
+        builder mock.
     """
     import lmcache.c_ops as lmc_ops
 
@@ -520,12 +548,16 @@ def _patch_native_types_and_staging():
         patch.object(lmc_ops, "KernelGroupSpec") as mock_spec_cls,
         patch.object(lmc_ops, "BatchStep") as mock_step_cls,
         patch.object(lmc_ops, "LaunchVar") as mock_lv_cls,
-        patch(f"{_HELPERS_MOD}.build_staging_copies", mock_staging),
     ):
         mock_spec_cls.return_value = MagicMock(name="spec")
         mock_step_cls.return_value = MagicMock(name="step")
         mock_lv_cls.return_value = MagicMock(name="lv")
-        yield {"spec": mock_spec_cls, "step": mock_step_cls, "lv": mock_lv_cls}
+        yield {
+            "spec": mock_spec_cls,
+            "step": mock_step_cls,
+            "lv": mock_lv_cls,
+            "staging": mock_staging,
+        }
 
 
 class TestPrepareObjectGroupTransfer:
@@ -534,7 +566,7 @@ class TestPrepareObjectGroupTransfer:
     def test_builds_one_kernel_group_spec(self) -> None:
         """prepare_object_group_transfer creates one KernelGroupSpec per group."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -551,6 +583,7 @@ class TestPrepareObjectGroupTransfer:
                 batch_size=4,
                 skip_first_n_tokens=0,
                 direction=lmc_ops.TransferDirection.D2H,
+                staging_builder=mocks["staging"],
             )
 
         assert len(specs) == 1
@@ -559,7 +592,7 @@ class TestPrepareObjectGroupTransfer:
     def test_builds_batch_steps(self) -> None:
         """One batch step is created when memory_objs fits in one batch."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -572,7 +605,7 @@ class TestPrepareObjectGroupTransfer:
         block_ids_gpu = [torch.tensor([0, 1, 2], dtype=torch.int32)]
         mem_objs = [_make_mock_memory_obj() for _ in range(3)]
 
-        with _patch_native_types_and_staging():
+        with _patch_native_types_and_staging() as mocks:
             specs, steps = prepare_object_group_transfer(
                 ctx,
                 block_ids_gpu,
@@ -581,6 +614,7 @@ class TestPrepareObjectGroupTransfer:
                 batch_size=4,
                 skip_first_n_tokens=0,
                 direction=lmc_ops.TransferDirection.D2H,
+                staging_builder=mocks["staging"],
             )
 
         # All 3 objects fit in one batch.
@@ -589,7 +623,7 @@ class TestPrepareObjectGroupTransfer:
     def test_batches_objects_by_batch_size(self) -> None:
         """Multiple batch steps are created when mem_objs exceed batch_size."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -602,7 +636,7 @@ class TestPrepareObjectGroupTransfer:
         block_ids_gpu = [torch.tensor([0, 1, 2, 3], dtype=torch.int32)]
         mem_objs = [_make_mock_memory_obj() for _ in range(4)]
 
-        with _patch_native_types_and_staging():
+        with _patch_native_types_and_staging() as mocks:
             _, steps = prepare_object_group_transfer(
                 ctx,
                 block_ids_gpu,
@@ -611,6 +645,7 @@ class TestPrepareObjectGroupTransfer:
                 batch_size=2,  # force 2 batches
                 skip_first_n_tokens=0,
                 direction=lmc_ops.TransferDirection.D2H,
+                staging_builder=mocks["staging"],
             )
 
         assert len(steps) == 2
@@ -618,7 +653,7 @@ class TestPrepareObjectGroupTransfer:
     def test_sliding_window_h2d_skips_leading_objects(self) -> None:
         """Sliding-window H2D skips objects outside the window."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -633,7 +668,7 @@ class TestPrepareObjectGroupTransfer:
         block_ids_gpu = [torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)]
         mem_objs = [_make_mock_memory_obj() for _ in range(5)]
 
-        with _patch_native_types_and_staging():
+        with _patch_native_types_and_staging() as mocks:
             _, steps = prepare_object_group_transfer(
                 ctx,
                 block_ids_gpu,
@@ -642,6 +677,7 @@ class TestPrepareObjectGroupTransfer:
                 batch_size=5,
                 skip_first_n_tokens=0,
                 direction=lmc_ops.TransferDirection.H2D,
+                staging_builder=mocks["staging"],
             )
 
         # Only 2 objects (the window) are transferred → 1 batch step.
@@ -650,7 +686,7 @@ class TestPrepareObjectGroupTransfer:
     def test_none_in_d2h_batch_is_skipped(self) -> None:
         """None entries in D2H batches are silently skipped."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -664,7 +700,7 @@ class TestPrepareObjectGroupTransfer:
         # Second object is None (D2H skip); must not raise.
         mem_objs: list = [_make_mock_memory_obj(), None, _make_mock_memory_obj()]
 
-        with _patch_native_types_and_staging():
+        with _patch_native_types_and_staging() as mocks:
             # Must not raise for D2H with None entries.
             prepare_object_group_transfer(
                 ctx,
@@ -674,12 +710,13 @@ class TestPrepareObjectGroupTransfer:
                 batch_size=4,
                 skip_first_n_tokens=0,
                 direction=lmc_ops.TransferDirection.D2H,
+                staging_builder=mocks["staging"],
             )
 
     def test_none_in_h2d_batch_raises(self) -> None:
         """None entries in H2D batches raise ValueError."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -692,8 +729,8 @@ class TestPrepareObjectGroupTransfer:
         block_ids_gpu = [torch.tensor([0, 1, 2], dtype=torch.int32)]
         mem_objs: list = [_make_mock_memory_obj(), None, _make_mock_memory_obj()]
 
-        with _patch_native_types_and_staging():
-            with pytest.raises(ValueError, match="MemoryObj is None"):
+        with _patch_native_types_and_staging() as mocks:
+            with pytest.raises(ValueError, match="Object is None"):
                 prepare_object_group_transfer(
                     ctx,
                     block_ids_gpu,
@@ -702,12 +739,13 @@ class TestPrepareObjectGroupTransfer:
                     batch_size=4,
                     skip_first_n_tokens=0,
                     direction=lmc_ops.TransferDirection.H2D,
+                    staging_builder=mocks["staging"],
                 )
 
     def test_skip_first_n_tokens_skips_all_batches(self) -> None:
         """skip_first_n_tokens >= total tokens produces no batch steps."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -722,7 +760,7 @@ class TestPrepareObjectGroupTransfer:
         block_ids_gpu = [torch.tensor([0, 1, 2], dtype=torch.int32)]
         mem_objs = [_make_mock_memory_obj() for _ in range(3)]
 
-        with _patch_native_types_and_staging():
+        with _patch_native_types_and_staging() as mocks:
             _, steps = prepare_object_group_transfer(
                 ctx,
                 block_ids_gpu,
@@ -731,6 +769,7 @@ class TestPrepareObjectGroupTransfer:
                 batch_size=4,
                 skip_first_n_tokens=chunk_size * 3,  # skip all
                 direction=lmc_ops.TransferDirection.H2D,
+                staging_builder=mocks["staging"],
             )
 
         # All batches fully skipped → no steps
@@ -739,7 +778,7 @@ class TestPrepareObjectGroupTransfer:
     def test_empty_batch_steps_when_all_none_d2h(self) -> None:
         """All-None D2H batch produces no batch steps."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
 
@@ -752,7 +791,7 @@ class TestPrepareObjectGroupTransfer:
         block_ids_gpu = [torch.tensor([0, 1, 2], dtype=torch.int32)]
         mem_objs: list = [None, None, None]
 
-        with _patch_native_types_and_staging():
+        with _patch_native_types_and_staging() as mocks:
             _, steps = prepare_object_group_transfer(
                 ctx,
                 block_ids_gpu,
@@ -761,6 +800,7 @@ class TestPrepareObjectGroupTransfer:
                 batch_size=4,
                 skip_first_n_tokens=0,
                 direction=lmc_ops.TransferDirection.D2H,
+                staging_builder=mocks["staging"],
             )
 
         assert len(steps) == 0
@@ -779,7 +819,7 @@ class TestPrepareAndExecutePipeline:
     def test_execute_called_when_batch_steps_non_empty(self) -> None:
         """When prepare returns non-empty batch_steps, execute forwards them."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
             prepare_object_group_transfer,
         )
@@ -795,7 +835,7 @@ class TestPrepareAndExecutePipeline:
         direction = lmc_ops.TransferDirection.D2H
 
         with (
-            _patch_native_types_and_staging(),
+            _patch_native_types_and_staging() as mocks,
             patch.object(lmc_ops, "execute_object_group_transfer") as mock_exec,
         ):
             specs, steps = prepare_object_group_transfer(
@@ -806,6 +846,7 @@ class TestPrepareAndExecutePipeline:
                 batch_size=4,
                 skip_first_n_tokens=0,
                 direction=direction,
+                staging_builder=mocks["staging"],
             )
             assert len(steps) > 0, (
                 "expected non-empty batch_steps for valid memory objects"
@@ -816,7 +857,7 @@ class TestPrepareAndExecutePipeline:
     def test_execute_not_called_when_batch_steps_empty(self) -> None:
         """Empty batch_steps (all-None D2H) → execute is never invoked."""
         import lmcache.c_ops as lmc_ops
-        from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+        from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
             prepare_object_group_transfer,
         )
@@ -832,7 +873,7 @@ class TestPrepareAndExecutePipeline:
         direction = lmc_ops.TransferDirection.D2H
 
         with (
-            _patch_native_types_and_staging(),
+            _patch_native_types_and_staging() as mocks,
             patch.object(lmc_ops, "execute_object_group_transfer") as mock_exec,
         ):
             specs, steps = prepare_object_group_transfer(
@@ -843,6 +884,7 @@ class TestPrepareAndExecutePipeline:
                 batch_size=4,
                 skip_first_n_tokens=0,
                 direction=direction,
+                staging_builder=mocks["staging"],
             )
             execute_prepared_object_group_transfer(direction, ctx.device, specs, steps)
 

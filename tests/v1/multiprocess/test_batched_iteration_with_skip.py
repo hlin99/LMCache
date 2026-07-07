@@ -5,7 +5,7 @@
 import pytest
 
 # First Party
-from lmcache.v1.multiprocess.modules.object_group_transfer_helpers import (
+from lmcache.v1.multiprocess.object_group_utils import (
     batched_iteration_with_skip,
 )
 
