@@ -122,6 +122,8 @@ def reserve_write_by_object_group_layout(
     write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
     group_to_items: dict[int, list[tuple[ObjectKey, bool]]] = defaultdict(list)
     for key, retention in zip(keys, retentions, strict=True):
+        # Validate that every object-group id has a registered layout before
+        # issuing any partial reserve_write calls.
         _layout_for_object_key(key, default_layout_desc, object_group_layout_descs)
         group_to_items[key.object_group_id].append((key, retention))
 
@@ -1082,7 +1084,8 @@ class PrefetchController(StorageControllerInterface):
             )
             request.pending_load_tasks[adapter_idx] = task_id
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
-            # events. Hybrid object groups can have different sizes.
+            # events. Sum actual object sizes because hybrid layouts can mix
+            # object groups with different per-object byte sizes.
             total_bytes = sum(obj.get_size() for obj in per_adapter_objs)
             request.load_bytes_by_adapter[adapter_idx] = total_bytes
 

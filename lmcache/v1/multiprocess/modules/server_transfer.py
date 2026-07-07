@@ -66,6 +66,25 @@ def _memory_obj_size(memory_obj: "MemoryObj", tensor: torch.Tensor) -> int:
     return size if isinstance(size, int) else tensor.nbytes
 
 
+def _safe_memory_obj_attr(memory_obj: "MemoryObj", attr_name: str) -> Any:
+    """Return a MemoryObj attribute, or None if the backend does not support it."""
+    try:
+        return getattr(memory_obj, attr_name)
+    except (AttributeError, NotImplementedError):
+        return None
+
+
+def _safe_memory_obj_call(memory_obj: "MemoryObj", method_name: str) -> Any:
+    """Call a MemoryObj method, or return None if the backend does not support it."""
+    method = _safe_memory_obj_attr(memory_obj, method_name)
+    if not callable(method):
+        return None
+    try:
+        return method()
+    except (AttributeError, NotImplementedError):
+        return None
+
+
 def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
     """Return a tensor view suitable for engine-driven CPU transport.
 
@@ -81,25 +100,13 @@ def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
         legacy tensor view for single-shape objects or a flat uint8 view for
         multi-shape objects.
     """
-    try:
-        shapes = memory_obj.get_shapes()
-    except (AttributeError, NotImplementedError):
-        shapes = []
-    try:
-        raw_tensor = memory_obj.raw_tensor
-    except (AttributeError, NotImplementedError):
-        raw_tensor = None
+    shapes = _safe_memory_obj_call(memory_obj, "get_shapes") or []
+    raw_tensor = _safe_memory_obj_attr(memory_obj, "raw_tensor")
     if not isinstance(raw_tensor, torch.Tensor):
-        try:
-            tensor = memory_obj.tensor
-        except (AttributeError, NotImplementedError):
-            return None
+        tensor = _safe_memory_obj_attr(memory_obj, "tensor")
         return tensor if isinstance(tensor, torch.Tensor) else None
     if len(shapes) <= 1:
-        try:
-            tensor = memory_obj.tensor
-        except (AttributeError, NotImplementedError):
-            return None
+        tensor = _safe_memory_obj_attr(memory_obj, "tensor")
         return tensor if isinstance(tensor, torch.Tensor) else None
     return _flat_uint8_tensor(raw_tensor, _memory_obj_size(memory_obj, raw_tensor))
 

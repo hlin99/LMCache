@@ -390,12 +390,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     f"{len(object_group_layout_descs)}"
                 )
         if object_group_layout_descs and not payload.attn_window_num_chunks:
-            attn_window_num_chunks = [-1] * len(object_group_layout_descs)
+            resolved_attn_window_num_chunks = [-1] * len(object_group_layout_descs)
         else:
-            attn_window_num_chunks = payload.attn_window_num_chunks
+            resolved_attn_window_num_chunks = payload.attn_window_num_chunks
         attn_desc = (
-            AttnWindowDesc(attn_window_num_chunks)
-            if attn_window_num_chunks
+            AttnWindowDesc(resolved_attn_window_num_chunks)
+            if resolved_attn_window_num_chunks
             else None
         )
         metadata = EngineDrivenContextMetadata(

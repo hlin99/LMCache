@@ -226,7 +226,13 @@ def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
 
 
 class _TensorMemoryObj:
-    """Minimal tensor-backed MemoryObj test double."""
+    """Minimal tensor-backed MemoryObj test double.
+
+    Implements the tensor, raw_tensor, SHM offset/length, get_shapes(), and
+    get_size() surface used by server-side engine-driven transfer code so tests
+    can verify layout/order behavior without constructing full L1 MemoryObj
+    implementations.
+    """
 
     def __init__(self, tensor: torch.Tensor, offset: int = 0) -> None:
         self.tensor = tensor
