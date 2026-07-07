@@ -46,8 +46,10 @@ class StagingBuilder(Protocol):
 
     Implementations are path-specific: they interpret caller-owned transfer
     ``objects`` and pair them with object-group staging buffers according to the
-    transfer direction.  The helper only consumes the returned native
-    ``StagingCopy`` descriptors.
+    transfer direction.  For example, the LMCache-driven path passes
+    ``MemoryObj`` instances, while future engine-driven paths may pass their
+    own source/destination object type.  The helper only consumes the returned
+    native ``StagingCopy`` descriptors.
     """
 
     def __call__(
@@ -59,7 +61,9 @@ class StagingBuilder(Protocol):
         """Build staging descriptors for a non-``None`` object batch.
 
         Args:
-            objects: Caller-owned source/destination objects for one batch.
+            objects: Caller-owned source/destination objects for one batch
+                (for example, ``MemoryObj`` instances in the LMCache-driven
+                path).
             staging_buffers: Object-group staging buffers aligned with
                 ``objects``.
             is_h2d: True for host-to-device/retrieve, False for
