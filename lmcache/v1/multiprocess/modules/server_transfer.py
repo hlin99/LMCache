@@ -36,7 +36,15 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 
 
 def _flat_uint8_tensor(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
-    """Return a flat uint8 view over the first ``num_bytes`` of ``tensor``."""
+    """Return a flat uint8 view over the first bytes of a tensor.
+
+    Args:
+        tensor: Source tensor with any dtype or shape.
+        num_bytes: Number of bytes to expose from the start of ``tensor``.
+
+    Returns:
+        A one-dimensional ``torch.uint8`` view of length ``num_bytes``.
+    """
     return tensor.view(torch.uint8)[:num_bytes]
 
 
@@ -46,6 +54,14 @@ def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
     Multi-shape object groups cannot be represented by ``MemoryObj.tensor``
     because that legacy property reshapes to the first shape only. For those
     objects, return a flat uint8 view over the full logical object bytes.
+
+    Args:
+        memory_obj: Storage memory object reserved or prefetched for one chunk.
+
+    Returns:
+        ``None`` when the memory object has no backing tensor; otherwise the
+        legacy tensor view for single-shape objects or a flat uint8 view for
+        multi-shape objects.
     """
     shapes = memory_obj.get_shapes()
     raw_tensor = memory_obj.raw_tensor
@@ -57,7 +73,16 @@ def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
 
 
 def _copy_tensor_to_memory_obj(src: torch.Tensor, memory_obj: "MemoryObj") -> bool:
-    """Copy ``src`` bytes into ``memory_obj`` when sizes are compatible."""
+    """Copy ``src`` bytes into ``memory_obj`` when sizes are compatible.
+
+    Args:
+        src: CPU tensor containing the serialized object-group bytes.
+        memory_obj: Destination storage memory object.
+
+    Returns:
+        True when ``src.nbytes`` equals ``memory_obj.get_size()`` and the copy
+        is performed; otherwise False.
+    """
     dst = _memory_obj_tensor_view(memory_obj)
     if dst is None or src.nbytes != memory_obj.get_size():
         return False
@@ -68,7 +93,15 @@ def _copy_tensor_to_memory_obj(src: torch.Tensor, memory_obj: "MemoryObj") -> bo
 def _slot_descriptor_from_memory_obj(
     memory_obj: "MemoryObj",
 ) -> dict[str, Any] | None:
-    """Build an SHM slot descriptor for a reserved memory object."""
+    """Build an SHM slot descriptor for a reserved memory object.
+
+    Args:
+        memory_obj: Storage memory object backed by the SHM pool.
+
+    Returns:
+        ``None`` when the object has no tensor view; otherwise a dict with the
+        slot byte offset, byte length, shape, and dtype for worker-side mapping.
+    """
     tensor = _memory_obj_tensor_view(memory_obj)
     if tensor is None:
         return None
@@ -85,7 +118,18 @@ def _flatten_object_keys(
     context: EngineDrivenContextMetadata,
     resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
 ) -> list[ObjectKey]:
-    """Resolve object keys in object-group-major order."""
+    """Resolve object keys in object-group-major order.
+
+    Args:
+        key: IPC cache key for the transfer.
+        context: Registered engine-driven metadata that determines the object
+            group count.
+        resolve_obj_keys: Callable that resolves one object group's keys.
+
+    Returns:
+        All chunks for object group 0, then all chunks for object group 1, and
+        so on.
+    """
     obj_keys: list[ObjectKey] = []
     for object_group_id in range(context.num_object_groups):
         obj_keys.extend(resolve_obj_keys(key, object_group_id))

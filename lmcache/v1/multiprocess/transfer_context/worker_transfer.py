@@ -350,7 +350,15 @@ class _EngineObjectGroupTransferState:
 def _get_object_group_layout_descs(
     cache_context: BaseCacheContext,
 ) -> list[MemoryLayoutDesc]:
-    """Return per-object-group CPU transport layouts for a cache context."""
+    """Return per-object-group CPU transport layouts for a cache context.
+
+    Args:
+        cache_context: Engine-driven cache context with object-group metadata.
+
+    Returns:
+        A list indexed by object group. Each ``MemoryLayoutDesc`` contains one
+        shape/dtype entry for every kernel group in that object group.
+    """
     layouts: list[MemoryLayoutDesc] = []
     for object_group in cache_context.kv_layer_groups_manager.object_groups:
         shapes_and_dtypes = [
@@ -552,7 +560,22 @@ def _get_num_chunks_from_block_ids(
     state: _EngineObjectGroupTransferState,
     block_ids: list[list[int]],
 ) -> int:
-    """Return the transfer chunk count implied by the first kernel group."""
+    """Return the transfer chunk count implied by the first kernel group.
+
+    All kernel groups in one engine-driven request cover the same number of
+    LMCache chunks; only the number of raw blocks per chunk may differ. The
+    first kernel group therefore determines the chunk count, and the shared
+    sufficiency check later validates every kernel group's raw block IDs
+    against that count.
+
+    Args:
+        state: Prepared engine-driven object-group transfer state.
+        block_ids: Raw block IDs indexed by kernel group.
+
+    Returns:
+        Number of LMCache chunks represented by the first kernel group's block
+        IDs, or zero when no block IDs are present.
+    """
     if not block_ids:
         return 0
     blocks_per_chunk = state.cache_context.calculate_num_blocks(
@@ -566,7 +589,22 @@ def _group_flat_transport_objects(
     num_object_groups: int,
     num_chunks: int,
 ) -> list[list[torch.Tensor]]:
-    """Split object-group-major flat transport objects into per-group lists."""
+    """Split object-group-major flat transport objects into per-group lists.
+
+    Args:
+        flat_objects: Transport tensors ordered as all chunks for object group
+            0, then all chunks for object group 1, and so on.
+        num_object_groups: Number of object groups in the transfer.
+        num_chunks: Number of chunks per object group.
+
+    Returns:
+        Nested object list whose outer index is object group and inner index is
+        chunk.
+
+    Raises:
+        ValueError: If ``flat_objects`` length is not
+            ``num_object_groups * num_chunks``.
+    """
     expected = num_object_groups * num_chunks
     if len(flat_objects) != expected:
         raise ValueError(
@@ -582,7 +620,15 @@ def _group_flat_transport_objects(
 def _flatten_transport_objects(
     objects_by_group: Sequence[Sequence[torch.Tensor | None]],
 ) -> list[torch.Tensor]:
-    """Flatten object-group-major transport objects after dropping skipped slots."""
+    """Flatten object-group-major transport objects after dropping skipped slots.
+
+    Args:
+        objects_by_group: Nested transport objects indexed by object group and
+            then chunk. ``None`` entries represent skipped SHM store chunks.
+
+    Returns:
+        Non-``None`` tensors in object-group-major order.
+    """
     return [
         obj
         for objects in objects_by_group
@@ -597,7 +643,23 @@ def _build_sparse_transport_objects(
     num_object_groups: int,
     num_chunks: int,
 ) -> list[list[torch.Tensor | None]]:
-    """Build sparse per-group object lists from SHM flat chunk indices."""
+    """Build sparse per-group object lists from SHM flat chunk indices.
+
+    Args:
+        buffers: SHM-backed tensors returned by prepare-store.
+        flat_chunk_indices: Object-group-major positions for ``buffers``. A
+            flat index maps to ``object_group_id = idx // num_chunks`` and
+            ``chunk_idx = idx % num_chunks``.
+        num_object_groups: Number of object groups in the transfer.
+        num_chunks: Number of chunks per object group.
+
+    Returns:
+        Nested object list indexed by object group and chunk. Missing chunks
+        are represented as ``None``.
+
+    Raises:
+        ValueError: If any flat index is outside the transfer range.
+    """
     objects_by_group: list[list[torch.Tensor | None]] = [
         [None] * num_chunks for _ in range(num_object_groups)
     ]

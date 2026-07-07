@@ -146,6 +146,11 @@ class EngineDrivenContextMetadata:
                     "single-layout engine-driven metadata"
                 )
             return self.layout_desc
+        if object_group_id >= len(self.object_group_layout_descs):
+            raise IndexError(
+                f"object_group_id {object_group_id} out of range for "
+                f"{len(self.object_group_layout_descs)} engine-driven object groups"
+            )
         return self.object_group_layout_descs[object_group_id]
 
 
