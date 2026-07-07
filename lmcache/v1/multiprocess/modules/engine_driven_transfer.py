@@ -354,14 +354,17 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     "object_group_shapes and object_group_dtypes must have the "
                     "same length"
                 )
-            for shapes, dtypes in zip(
-                payload.object_group_shapes,
-                payload.object_group_dtypes,
-                strict=True,
+            for object_group_id, (shapes, dtypes) in enumerate(
+                zip(
+                    payload.object_group_shapes,
+                    payload.object_group_dtypes,
+                    strict=True,
+                )
             ):
                 if len(shapes) != len(dtypes):
                     raise ValueError(
-                        "Each object-group shape list must match its dtype list"
+                        f"Object group {object_group_id}: shape list length "
+                        f"{len(shapes)} must match dtype list length {len(dtypes)}"
                     )
                 object_group_layout_descs.append(
                     MemoryLayoutDesc(

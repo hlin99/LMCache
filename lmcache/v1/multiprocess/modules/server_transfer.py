@@ -44,7 +44,14 @@ def _flat_uint8_tensor(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
 
     Returns:
         A one-dimensional ``torch.uint8`` view of length ``num_bytes``.
+
+    Raises:
+        ValueError: If ``num_bytes`` is negative or exceeds ``tensor.nbytes``.
     """
+    if num_bytes < 0 or num_bytes > tensor.nbytes:
+        raise ValueError(
+            f"num_bytes must be in [0, {tensor.nbytes}], got {num_bytes}"
+        )
     return tensor.view(torch.uint8)[:num_bytes]
 
 
@@ -86,7 +93,9 @@ def _copy_tensor_to_memory_obj(src: torch.Tensor, memory_obj: "MemoryObj") -> bo
     dst = _memory_obj_tensor_view(memory_obj)
     if dst is None or src.nbytes != memory_obj.get_size():
         return False
-    _flat_uint8_tensor(dst, dst.nbytes).copy_(_flat_uint8_tensor(src, src.nbytes))
+    dst_view = _flat_uint8_tensor(dst, dst.nbytes)
+    src_view = _flat_uint8_tensor(src, src.nbytes)
+    dst_view.copy_(src_view)
     return True
 
 

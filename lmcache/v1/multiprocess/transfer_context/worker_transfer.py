@@ -357,7 +357,8 @@ def _get_object_group_layout_descs(
 
     Returns:
         A list indexed by object group. Each ``MemoryLayoutDesc`` contains one
-        shape/dtype entry for every kernel group in that object group.
+        shape/dtype entry for every kernel group in that object group. If the
+        cache context has no object groups, the returned list is empty.
     """
     layouts: list[MemoryLayoutDesc] = []
     for object_group in cache_context.kv_layer_groups_manager.object_groups:
@@ -370,6 +371,21 @@ def _get_object_group_layout_descs(
         shapes, dtypes = zip(*shapes_and_dtypes, strict=True)
         layouts.append(MemoryLayoutDesc(shapes=list(shapes), dtypes=list(dtypes)))
     return layouts
+
+
+def _layout_desc_nbytes(layout_desc: MemoryLayoutDesc) -> int:
+    """Return the total byte size described by a memory layout descriptor.
+
+    Args:
+        layout_desc: Object-group layout descriptor with aligned shapes/dtypes.
+
+    Returns:
+        Sum of ``shape.numel() * dtype.itemsize`` for each shape/dtype entry.
+    """
+    return sum(
+        shape.numel() * dtype.itemsize
+        for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True)
+    )
 
 
 def _build_engine_object_group_transfer_state(
@@ -541,10 +557,7 @@ def _allocate_pickle_transfer_tensors(
         CPU tensors suitable for pickle commit payloads.
 
     """
-    nbytes = sum(
-        shape.numel() * dtype.itemsize
-        for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True)
-    )
+    nbytes = _layout_desc_nbytes(layout_desc)
     return [
         torch.empty(
             (nbytes,),
@@ -576,7 +589,7 @@ def _get_num_chunks_from_block_ids(
         Number of LMCache chunks represented by the first kernel group's block
         IDs, or zero when no block IDs are present.
     """
-    if not block_ids:
+    if not block_ids or not block_ids[0]:
         return 0
     blocks_per_chunk = state.cache_context.calculate_num_blocks(
         state.cache_context.lmcache_tokens_per_chunk, 0
@@ -666,7 +679,7 @@ def _build_sparse_transport_objects(
     for buffer, flat_idx in zip(buffers, flat_chunk_indices, strict=True):
         if flat_idx < 0 or flat_idx >= num_object_groups * num_chunks:
             raise ValueError(
-                f"chunk_idx {flat_idx} out of range "
+                f"flat chunk index {flat_idx} out of range "
                 f"[0, {num_object_groups * num_chunks})"
             )
         object_group_id = flat_idx // num_chunks
