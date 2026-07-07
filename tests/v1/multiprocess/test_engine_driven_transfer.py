@@ -52,6 +52,17 @@ def _distinct_empty_buffers_like(objects: Sequence[torch.Tensor]) -> list[torch.
     return buffers
 
 
+def test_distinct_empty_buffers_like_returns_one_buffer_per_object() -> None:
+    """Verify test staging buffers are distinct and aligned with inputs."""
+    objects = [torch.zeros(2), torch.ones(3)]
+
+    buffers = _distinct_empty_buffers_like(objects)
+
+    assert len(buffers) == len(objects)
+    assert [tuple(buffer.shape) for buffer in buffers] == [(2,), (3,)]
+    assert len({id(buffer) for buffer in buffers}) == len(objects)
+
+
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.config import StorageManagerConfig
@@ -1702,7 +1713,9 @@ def server_module_factory(
         )
         if object_keys is None:
             resolved_object_keys: list[list[TestObjectKey]] = [["obj"]]
-        elif object_keys and isinstance(object_keys[0], list):
+        elif not object_keys:
+            resolved_object_keys = [[]]
+        elif isinstance(object_keys[0], list):
             resolved_object_keys = cast(list[list[TestObjectKey]], object_keys)
         else:
             resolved_object_keys = [cast(list[TestObjectKey], object_keys)]

@@ -183,6 +183,13 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
             EngineType.VLLM,
             layout_hints,
         )
+        if not isinstance(kv_caches_norm, list) or not all(
+            isinstance(tensor, torch.Tensor) for tensor in kv_caches_norm
+        ):
+            raise ValueError(
+                "engine-driven object-group transfer requires normalized "
+                "per-layer tensor KV caches"
+            )
         kv_caches_norm = cast(list[torch.Tensor], kv_caches_norm)
         device = get_device(kv_caches_norm)
         kv_layer_groups_manager = KVLayerGroupsManager(
