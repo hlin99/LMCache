@@ -310,6 +310,16 @@ def gather_paged_kv_to_cpu(
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
 
+    Engine-driven transfer note
+    ---------------------------
+    This function is the engine-driven store copy path.  The full
+    ``prepare_object_group_transfer`` / ``execute_prepared_object_group_transfer``
+    pipeline from ``object_group_utils`` cannot be used here because the
+    engine-driven path does not have a ``BaseCacheContext`` (GPU-specific KV
+    group structure, temp staging buffers, and ``KernelGroupSpec`` /
+    ``BatchStep`` descriptors).  Instead, this function transfers CPU tensors
+    directly via ``lmc_ops.multi_layer_block_kv_transfer``.
+
     Args:
         kv_caches: Per-layer KV tensor mapping.
         block_ids: Flattened block IDs for all chunks.
@@ -549,6 +559,21 @@ def scatter_cpu_to_paged_kv(
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
+    Engine-driven transfer note
+    ---------------------------
+    This function is the engine-driven retrieve copy path.  It uses
+    :func:`~lmcache.v1.multiprocess.object_group_utils.has_sufficient_block_ids`
+    from ``object_group_utils`` to validate that ``block_ids`` covers all
+    requested chunks before any transfer work begins (fail-closed).
+
+    The full ``prepare_object_group_transfer`` /
+    ``execute_prepared_object_group_transfer`` pipeline from
+    ``object_group_utils`` cannot be used here because the engine-driven path
+    does not have a ``BaseCacheContext`` (GPU-specific KV group structure, temp
+    staging buffers, and ``KernelGroupSpec`` / ``BatchStep`` descriptors).
+    Instead, this function transfers CPU tensors directly via
+    ``lmc_ops.multi_layer_block_kv_transfer``.
+
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
         block_ids: Flattened destination block IDs for all chunks.  Length
@@ -576,14 +601,17 @@ def scatter_cpu_to_paged_kv(
         make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
     )
+    from lmcache.v1.multiprocess.object_group_utils import has_sufficient_block_ids
     import lmcache.c_ops as lmc_ops
 
     if not chunks:
         return
-    # Require enough block IDs to cover every chunk. Extra trailing block IDs
-    # are ignored by the per-chunk slicing below, mirroring the gather-side
-    # ``out`` length check for consistency.
-    if len(block_ids) < len(chunks) * blocks_per_chunk:
+    # Fail-closed: require enough block IDs to cover every chunk before
+    # starting any copy work.  Extra trailing block IDs are ignored by the
+    # per-chunk slicing below, mirroring the gather-side ``out`` length check.
+    # Uses the shared has_sufficient_block_ids helper from object_group_utils
+    # (the same helper used by the LMCache-driven path for consistency).
+    if not has_sufficient_block_ids([block_ids], [blocks_per_chunk], len(chunks)):
         raise ValueError(
             f"block_ids length ({len(block_ids)}) must be at least "
             f"len(chunks) ({len(chunks)}) * blocks_per_chunk "

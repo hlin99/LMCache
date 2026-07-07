@@ -1578,3 +1578,72 @@ def test_engine_driven_context_shm_close_is_idempotent() -> None:
     finally:
         shm_munmap(addr, 4096)
         shm_unlink(shm_name)
+
+
+# ---------------------------------------------------------------------------
+# Engine-driven block-ID validation integration (uses has_sufficient_block_ids)
+# ---------------------------------------------------------------------------
+
+
+def test_scatter_raises_value_error_on_insufficient_block_ids() -> None:
+    """scatter_cpu_to_paged_kv raises ValueError when block_ids is too short.
+
+    The engine-driven retrieve path uses :func:`has_sufficient_block_ids` from
+    ``object_group_utils`` as a fail-closed guard before any copy work begins.
+    This mirrors the same fail-closed behaviour in the LMCache-driven path.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    source = {
+        k: v.to(torch_device_type)
+        for k, v in _make_kv_caches(
+            num_layers=2, num_blocks=4, block_size=4, num_heads=2, head_size=8
+        ).items()
+    }
+    blocks_per_chunk = 2
+    # Gather one chunk using block IDs [0, 1].
+    gathered = gather_paged_kv_to_cpu(source, [0, 1], blocks_per_chunk)
+
+    destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
+    # Supply only 1 block ID but we need 2 (blocks_per_chunk) for 1 chunk.
+    with pytest.raises(ValueError, match="block_ids length"):
+        scatter_cpu_to_paged_kv(destination, [0], gathered, blocks_per_chunk)
+
+
+def test_scatter_succeeds_with_exact_block_id_count() -> None:
+    """scatter_cpu_to_paged_kv accepts block_ids with exactly the needed count.
+
+    Verifies that the has_sufficient_block_ids guard does not reject a valid
+    exact-match input.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.base import (
+        gather_paged_kv_to_cpu,
+        scatter_cpu_to_paged_kv,
+    )
+
+    source = {
+        k: v.to(torch_device_type)
+        for k, v in _make_kv_caches(
+            num_layers=2, num_blocks=4, block_size=4, num_heads=2, head_size=8
+        ).items()
+    }
+    blocks_per_chunk = 2
+    gathered = gather_paged_kv_to_cpu(source, [0, 1], blocks_per_chunk)
+
+    destination = {name: torch.zeros_like(tensor) for name, tensor in source.items()}
+    # Exact match: 2 block IDs for 1 chunk with blocks_per_chunk=2.
+    scatter_cpu_to_paged_kv(destination, [2, 3], gathered, blocks_per_chunk)
+
+    # Verify that the data from source blocks 0,1 was written to dest blocks 2,3.
+    for name in source:
+        if source[name].dim() == 5:
+            assert torch.allclose(source[name][:, 0], destination[name][:, 2])
+            assert torch.allclose(source[name][:, 1], destination[name][:, 3])
+        else:
+            assert torch.allclose(source[name][0], destination[name][2])
+            assert torch.allclose(source[name][1], destination[name][3])
