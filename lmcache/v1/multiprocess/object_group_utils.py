@@ -59,7 +59,7 @@ class StagingBuilder(Protocol):
             device-to-host/store.
 
     Returns:
-        Native ``StagingCopy`` descriptors consumed by ``lmc_ops.BatchStep``.
+        A ``list["lmc_ops.StagingCopy"]`` consumed by ``lmc_ops.BatchStep``.
     """
 
     def __call__(

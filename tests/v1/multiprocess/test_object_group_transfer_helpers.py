@@ -512,13 +512,14 @@ def _make_mock_cache_context(
 
 
 def _make_mock_memory_obj(size: int = 4) -> MagicMock:
-    """Create a minimal transfer source/destination mock for plan tests.
+    """Create a MemoryObj-like mock with fields used by staging builders.
 
     Args:
         size: Byte size returned by ``get_size()`` and ``meta.address``.
 
     Returns:
-        Configured MagicMock.
+        Configured MagicMock with ``raw_tensor``, ``get_size()``,
+        ``data_ptr``, and ``meta.address``.
     """
     mo = MagicMock(name="memory_obj")
     mo.raw_tensor = torch.zeros(size, dtype=torch.uint8)
@@ -538,8 +539,9 @@ def _patch_native_types_and_staging():
     its caller-provided staging builder.
 
     Yields:
-        A dict containing the patched native type mocks and the fake staging
-        builder mock.
+        A dict with ``"spec"`` (patched ``KernelGroupSpec``), ``"step"``
+        (patched ``BatchStep``), ``"lv"`` (patched ``LaunchVar``), and
+        ``"staging"`` (fake staging builder) mocks.
     """
     import lmcache.c_ops as lmc_ops
 
