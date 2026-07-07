@@ -23,7 +23,7 @@ allocate, release, or interpret transfer storage.
 
 # Standard
 from itertools import islice
-from typing import TYPE_CHECKING, Callable, Generator, Sequence, TypeAlias, cast
+from typing import TYPE_CHECKING, Generator, Protocol, Sequence, cast
 
 # Third Party
 import torch
@@ -40,10 +40,36 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-StagingBuilder: TypeAlias = Callable[
-    [Sequence[object], Sequence[torch.Tensor], bool],
-    list["lmc_ops.StagingCopy"],
-]
+
+class StagingBuilder(Protocol):
+    """Callable that builds native staging descriptors for a transfer batch.
+
+    Implementations are path-specific: they interpret caller-owned transfer
+    ``objects`` and pair them with object-group staging buffers according to the
+    transfer direction.  The helper only consumes the returned native
+    ``StagingCopy`` descriptors.
+    """
+
+    def __call__(
+        self,
+        objects: Sequence[object],
+        staging_buffers: Sequence[torch.Tensor],
+        is_h2d: bool,
+    ) -> list["lmc_ops.StagingCopy"]:
+        """Build staging descriptors for a non-``None`` object batch.
+
+        Args:
+            objects: Caller-owned source/destination objects for one batch.
+            staging_buffers: Object-group staging buffers aligned with
+                ``objects``.
+            is_h2d: True for host-to-device/retrieve, False for
+                device-to-host/store.
+
+        Returns:
+            Native ``StagingCopy`` descriptors consumed by
+            ``lmc_ops.BatchStep``.
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------

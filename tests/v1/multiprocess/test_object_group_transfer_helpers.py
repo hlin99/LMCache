@@ -512,7 +512,7 @@ def _make_mock_cache_context(
 
 
 def _make_mock_memory_obj(size: int = 4) -> MagicMock:
-    """Create a minimal path object mock for transfer-plan tests.
+    """Create a minimal transfer source/destination mock for plan tests.
 
     Args:
         size: Byte size returned by ``get_size()`` and ``meta.address``.
@@ -730,7 +730,9 @@ class TestPrepareObjectGroupTransfer:
         mem_objs: list = [_make_mock_memory_obj(), None, _make_mock_memory_obj()]
 
         with _patch_native_types_and_staging() as mocks:
-            with pytest.raises(ValueError, match="Object is None"):
+            with pytest.raises(
+                ValueError, match="Object is None for some objects in the batch"
+            ):
                 prepare_object_group_transfer(
                     ctx,
                     block_ids_gpu,
