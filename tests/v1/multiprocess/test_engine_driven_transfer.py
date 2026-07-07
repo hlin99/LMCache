@@ -1677,7 +1677,9 @@ def server_module_factory(
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus")
         )
         resolved_object_keys = object_keys or ["obj"]
-        if not resolved_object_keys or not isinstance(resolved_object_keys[0], list):
+        if not resolved_object_keys or (
+            resolved_object_keys and not isinstance(resolved_object_keys[0], list)
+        ):
             resolved_object_keys = [resolved_object_keys]
 
         def _resolve_object_keys(

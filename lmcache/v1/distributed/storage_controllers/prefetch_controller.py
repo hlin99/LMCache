@@ -154,11 +154,19 @@ def reserve_write_by_object_group_layout(
 
     write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
     group_to_items: dict[int, list[tuple[ObjectKey, bool]]] = defaultdict(list)
-    for key in keys:
-        # Validate that every object-group id has a registered layout before
-        # issuing any partial reserve_write calls.
-        _layout_for_object_key(key, default_layout_desc, object_group_layout_descs)
-    for key, retention in zip(keys, retentions, strict=True):
+    validated_items = [
+        (
+            key,
+            retention,
+            _layout_for_object_key(
+                key,
+                default_layout_desc,
+                object_group_layout_descs,
+            ),
+        )
+        for key, retention in zip(keys, retentions, strict=True)
+    ]
+    for key, retention, _ in validated_items:
         group_to_items[key.object_group_id].append((key, retention))
 
     for object_group_id, items in group_to_items.items():

@@ -105,7 +105,7 @@ def _safe_memory_obj_call(memory_obj: "MemoryObj", method_name: str) -> object |
         callable, or raises ``AttributeError`` or ``NotImplementedError``.
     """
     method = _safe_memory_obj_attr(memory_obj, method_name)
-    if not callable(method):
+    if method is None or not callable(method):
         return None
     try:
         return method()
@@ -134,7 +134,7 @@ def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
     if not isinstance(raw_tensor, torch.Tensor):
         tensor = _safe_memory_obj_attr(memory_obj, "tensor")
         return tensor if isinstance(tensor, torch.Tensor) else None
-    if len(shapes) <= 1:
+    if len(shapes) == 1:
         tensor = _safe_memory_obj_attr(memory_obj, "tensor")
         return tensor if isinstance(tensor, torch.Tensor) else None
     return _flat_uint8_tensor(raw_tensor, _memory_obj_size(memory_obj, raw_tensor))
