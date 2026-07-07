@@ -186,27 +186,27 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
         )
 
-        self.group_kv_pointers_: list[torch.Tensor] = []
+        self._group_kv_pointers: list[torch.Tensor] = []
         for idx, group in enumerate(self.kv_layer_groups_manager_.kv_layer_groups):
             ptrs = get_group_data_ptrs(
                 self.kv_caches_, self.get_engine_kv_format(idx), group.layer_indices
             )
-            self.group_kv_pointers_.append(
+            self._group_kv_pointers.append(
                 torch.tensor(ptrs, dtype=torch.long, device=device)
             )
         self._max_batch_size = _ENGINE_OBJECT_GROUP_MAX_BATCH_SIZE
-        self.tmp_chunk_group_offsets_: list[int] = [0]
+        self._tmp_chunk_group_offsets: list[int] = [0]
         for group_idx, group in enumerate(
             self.kv_layer_groups_manager_.kv_layer_groups
         ):
             shape = self.get_kv_buffer_shape(lmcache_tokens_per_chunk, group_idx)
             byte_size = shape.numel() * group.dtype.itemsize
-            self.tmp_chunk_group_offsets_.append(
-                self.tmp_chunk_group_offsets_[-1] + byte_size
+            self._tmp_chunk_group_offsets.append(
+                self._tmp_chunk_group_offsets[-1] + byte_size
             )
-        self.tmp_chunk_bytes_ = self.tmp_chunk_group_offsets_[-1]
-        self.tmp_buffer_ = torch.empty(
-            self.tmp_chunk_bytes_ * self.max_batch_size,
+        self._tmp_chunk_bytes = self._tmp_chunk_group_offsets[-1]
+        self._tmp_buffer = torch.empty(
+            self._tmp_chunk_bytes * self.max_batch_size,
             dtype=torch.uint8,
             device=device,
         )
@@ -227,11 +227,11 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
         return self._max_batch_size
 
     def close(self) -> None:
-        """Release resources held by this raw-tensor context."""
+        """No-op: raw engine tensors and temporary buffers are Python-owned."""
 
     def get_kernel_group_kv_pointers(self, kernel_group_idx: int) -> torch.Tensor:
         """Return the pointer tensor for a kernel group."""
-        return self.group_kv_pointers_[kernel_group_idx]
+        return self._group_kv_pointers[kernel_group_idx]
 
     def get_temp_kernel_group_buffer(
         self, batch_idx: int, kernel_group_idx: int
@@ -245,11 +245,11 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
         shape = self.get_kv_buffer_shape(
             self.lmcache_tokens_per_chunk, kernel_group_idx
         )
-        group_start = self.tmp_chunk_group_offsets_[kernel_group_idx]
-        group_end = self.tmp_chunk_group_offsets_[kernel_group_idx + 1]
-        chunk = self.tmp_chunk_bytes_
+        group_start = self._tmp_chunk_group_offsets[kernel_group_idx]
+        group_end = self._tmp_chunk_group_offsets[kernel_group_idx + 1]
+        chunk = self._tmp_chunk_bytes
         return (
-            self.tmp_buffer_[
+            self._tmp_buffer[
                 batch_idx * chunk + group_start : batch_idx * chunk + group_end
             ]
             .view(group.dtype)
@@ -266,10 +266,10 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
             )
         object_group = self.kv_layer_groups_manager_.object_groups[object_group_idx]
         kg_indices = object_group.kernel_group_indices
-        group_start = self.tmp_chunk_group_offsets_[kg_indices[0]]
-        group_end = self.tmp_chunk_group_offsets_[kg_indices[-1] + 1]
-        chunk = self.tmp_chunk_bytes_
-        return self.tmp_buffer_[
+        group_start = self._tmp_chunk_group_offsets[kg_indices[0]]
+        group_end = self._tmp_chunk_group_offsets[kg_indices[-1] + 1]
+        chunk = self._tmp_chunk_bytes
+        return self._tmp_buffer[
             batch_idx * chunk + group_start : batch_idx * chunk + group_end
         ]
 
@@ -332,7 +332,18 @@ def _build_engine_object_group_transfer_state(
     layout_hints: LayoutHints | None,
     engine_group_infos: Sequence[EngineGroupInfo],
 ) -> _EngineObjectGroupTransferState | None:
-    """Build object-group state when the native engine-driven path can use it."""
+    """Build object-group state when the native engine-driven path can use it.
+
+    Args:
+        kv_caches: Worker KV tensors keyed by layer name.
+        lmcache_tokens_per_chunk: Number of logical tokens in one LMCache chunk.
+        layout_hints: Optional engine layout hints.
+        engine_group_infos: Engine-provided KV group metadata.
+
+    Returns:
+        Prepared raw-tensor object-group transfer state when the native helper
+        can run for this engine-driven context; otherwise ``None``.
+    """
     tensors = list(kv_caches.values())
     if (
         not tensors
@@ -355,7 +366,21 @@ def _build_tensor_staging_copies(
     staging_buffers: Sequence[torch.Tensor],
     is_h2d: bool,
 ) -> list["lmc_ops.StagingCopy"]:
-    """Build native staging descriptors for tensor-backed transport objects."""
+    """Build native staging descriptors for tensor-backed transport objects.
+
+    Args:
+        objects: CPU tensor transfer objects for one batch.
+        staging_buffers: Object-group temporary buffers aligned with
+            ``objects``.
+        is_h2d: True for retrieve (host-to-device), False for store
+            (device-to-host).
+
+    Returns:
+        Native staging-copy descriptors consumed by ``BatchStep``.
+
+    Raises:
+        ValueError: If a transfer tensor and staging buffer differ in size.
+    """
     copies: list["lmc_ops.StagingCopy"] = []
     for tensor, staging_buffer in zip(objects, staging_buffers, strict=True):
         if tensor.nbytes != staging_buffer.nbytes:
@@ -365,6 +390,8 @@ def _build_tensor_staging_copies(
             )
         host_ptr = tensor.data_ptr()
         device_ptr = staging_buffer.data_ptr()
+        # The native copy helper splits pageable host buffers at alignment
+        # boundaries, so it needs the host pointer's offset within that window.
         host_offset = host_ptr % LazyMemoryAllocator.PIN_CHUNK_SIZE
         if is_h2d:
             copies.append(
@@ -382,7 +409,20 @@ def _build_pickle_tensor_staging_copies(
     staging_buffers: Sequence[torch.Tensor],
     is_h2d: bool,
 ) -> list["lmc_ops.StagingCopy"]:
-    """Build staging descriptors for pickle tensor payloads."""
+    """Build staging descriptors for pickle tensor payloads.
+
+    Args:
+        objects: Pickle payload tensors for one batch.
+        staging_buffers: Object-group temporary buffers aligned with
+            ``objects``.
+        is_h2d: True for retrieve, False for store.
+
+    Returns:
+        Native staging-copy descriptors.
+
+    Raises:
+        ValueError: If a payload tensor and staging buffer differ in size.
+    """
     return _build_tensor_staging_copies(objects, staging_buffers, is_h2d)
 
 
@@ -391,12 +431,32 @@ def _build_shm_tensor_staging_copies(
     staging_buffers: Sequence[torch.Tensor],
     is_h2d: bool,
 ) -> list["lmc_ops.StagingCopy"]:
-    """Build staging descriptors for SHM tensor views."""
+    """Build staging descriptors for SHM tensor views.
+
+    Args:
+        objects: SHM-backed tensor views for one batch.
+        staging_buffers: Object-group temporary buffers aligned with
+            ``objects``.
+        is_h2d: True for retrieve, False for store.
+
+    Returns:
+        Native staging-copy descriptors.
+
+    Raises:
+        ValueError: If a SHM tensor view and staging buffer differ in size.
+    """
     return _build_tensor_staging_copies(objects, staging_buffers, is_h2d)
 
 
 def _is_shm_engine_context(context: EngineDrivenContext) -> bool:
-    """Return whether an engine-driven context uses SHM transport."""
+    """Return whether an engine-driven context uses SHM transport.
+
+    Args:
+        context: Engine-driven transport context to inspect.
+
+    Returns:
+        True when ``context`` is the SHM transport implementation.
+    """
     # Local
     from .shm import EngineDrivenContextShm
 
@@ -407,7 +467,18 @@ def _allocate_pickle_transfer_tensors(
     layout_desc: MemoryLayoutDesc,
     count: int,
 ) -> list[torch.Tensor]:
-    """Allocate pickle transport tensors matching the registered layout."""
+    """Allocate pickle transport tensors matching the registered layout.
+
+    Args:
+        layout_desc: Registered engine-driven object layout.
+        count: Number of tensors to allocate.
+
+    Returns:
+        CPU tensors suitable for pickle commit payloads.
+
+    Raises:
+        ValueError: If the layout does not describe exactly one tensor object.
+    """
     if len(layout_desc.shapes) != 1 or len(layout_desc.dtypes) != 1:
         raise ValueError(
             "engine-driven pickle object-group transfer expects exactly one "
@@ -428,7 +499,16 @@ def _supports_single_engine_object_group(
     state: _EngineObjectGroupTransferState,
     block_ids: list[list[int]],
 ) -> bool:
-    """Return whether the current engine-driven request maps to one object group."""
+    """Return whether the request maps to the current single-group contract.
+
+    Args:
+        state: Prepared object-group transfer state.
+        block_ids: Request block IDs indexed by kernel group.
+
+    Returns:
+        True when the current engine-driven transport can use the shared
+        object-group helper path for this request.
+    """
     manager = state.cache_context.kv_layer_groups_manager
     if len(manager.object_groups) != 1:
         return False
@@ -447,7 +527,21 @@ def _execute_engine_object_group_transfer(
     ],
     batch_size: int,
 ) -> None:
-    """Plan and execute an engine-driven object-group transfer."""
+    """Plan and execute an engine-driven object-group transfer.
+
+    Args:
+        state: Prepared object-group transfer state.
+        block_ids: Raw block IDs indexed by kernel group.
+        objects: Tensor transport objects, with ``None`` entries allowed for
+            skipped D2H store chunks.
+        skip_first_n_tokens: Retrieve prefix to preserve.
+        direction: Native transfer direction.
+        staging_copy_builder: Builder for native staging-copy descriptors.
+        batch_size: Number of objects per planned batch.
+
+    Raises:
+        ValueError: If ``block_ids`` do not cover every requested object.
+    """
     cache_context = state.cache_context
     raw_blocks_per_chunk = [
         cache_context.calculate_num_blocks(

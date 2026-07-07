@@ -238,6 +238,42 @@ class TestSelectBlockIdsForWindow:
         assert select_block_ids_for_window(ids, total, keep) == expected
 
 
+class TestSelectBlockIdsForCacheContext:
+    """Tests for :func:`select_block_ids_for_cache_context`."""
+
+    def test_selects_per_kernel_group_windows_without_mutating_input(self) -> None:
+        """Each kernel group uses its own subchunk window geometry."""
+        # First Party
+        from lmcache.v1.multiprocess.object_group_utils import (
+            select_block_ids_for_cache_context,
+        )
+
+        class _FakeGroupsManager:
+            num_kernel_groups = 2
+
+            def get_subchunk_sw_size_tokens(self, kernel_group_id: int) -> int:
+                return [8, 4][kernel_group_id]
+
+        class _FakeCacheContext:
+            lmcache_tokens_per_chunk = 8
+            kv_layer_groups_manager = _FakeGroupsManager()
+
+            def calculate_num_blocks(
+                self, num_tokens: int, _kernel_group_id: int
+            ) -> int:
+                return num_tokens // 2
+
+        block_ids = [[0, 1, 2, 3, 4, 5, 6, 7], [10, 11, 12, 13, 20, 21, 22, 23]]
+
+        result = select_block_ids_for_cache_context(_FakeCacheContext(), block_ids)
+
+        assert result == [[0, 1, 2, 3, 4, 5, 6, 7], [12, 13, 22, 23]]
+        assert block_ids == [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [10, 11, 12, 13, 20, 21, 22, 23],
+        ]
+
+
 # ---------------------------------------------------------------------------
 # recalculate_blocks_to_skip
 # ---------------------------------------------------------------------------
