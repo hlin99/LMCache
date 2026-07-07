@@ -451,7 +451,7 @@ def test_musa_data_context_store_uses_device_agnostic_gather(
     )
     import lmcache.c_ops as lmc_ops
 
-    class _FakeEngineDrivenContext:
+    class FakeEngineDrivenContext:
         def prepare_store(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
@@ -478,7 +478,7 @@ def test_musa_data_context_store_uses_device_agnostic_gather(
     monkeypatch.setattr(
         worker_transfer,
         "create_engine_driven_context",
-        lambda *_args, **_kwargs: _FakeEngineDrivenContext(),
+        lambda *_args, **_kwargs: FakeEngineDrivenContext(),
     )
 
     def _fake_gather(*_args: Any, **kwargs: Any) -> list[torch.Tensor]:
@@ -523,7 +523,7 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
     )
     import lmcache.c_ops as lmc_ops
 
-    class _FakeEngineDrivenContext:
+    class FakeEngineDrivenContext:
         def prepare_retrieve(self, *_args: Any, **_kwargs: Any) -> list[torch.Tensor]:
             return [torch.zeros(2, 2, 8, 16)]
 
@@ -550,7 +550,7 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
     monkeypatch.setattr(
         worker_transfer,
         "create_engine_driven_context",
-        lambda *_args, **_kwargs: _FakeEngineDrivenContext(),
+        lambda *_args, **_kwargs: FakeEngineDrivenContext(),
     )
 
     def _fake_scatter(*_args: Any, **kwargs: Any) -> None:
@@ -594,16 +594,16 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
     )
     import lmcache.c_ops as lmc_ops
 
-    class _FakeManager:
+    class FakeManager:
         object_groups = [MagicMock(kernel_group_indices=[0])]
         num_kernel_groups = 1
 
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
-    class _FakeCacheContext:
+    class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
-        kv_layer_groups_manager = _FakeManager()
+        kv_layer_groups_manager = FakeManager()
         device = torch.device("cuda")
         max_batch_size = 4
 
@@ -615,15 +615,15 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
             return [torch.tensor(block_ids[0], dtype=torch.long)]
 
-    class _FakeState:
-        cache_context = _FakeCacheContext()
+    class FakeState:
+        cache_context = FakeCacheContext()
         object_group_id = 0
         host_buffer_alignment = 4096
 
         def close(self) -> None:
             return None
 
-    class _FakeEngineDrivenContext:
+    class FakeEngineDrivenContext:
         layout_desc = MemoryLayoutDesc(
             shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
         )
@@ -657,12 +657,12 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
     monkeypatch.setattr(
         worker_transfer,
         "create_engine_driven_context",
-        lambda *_args, **_kwargs: _FakeEngineDrivenContext(),
+        lambda *_args, **_kwargs: FakeEngineDrivenContext(),
     )
     monkeypatch.setattr(
         worker_transfer,
         "_build_engine_object_group_transfer_state",
-        lambda *_args, **_kwargs: _FakeState(),
+        lambda *_args, **_kwargs: FakeState(),
     )
     monkeypatch.setattr(
         worker_transfer,
@@ -759,16 +759,16 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
     )
     import lmcache.c_ops as lmc_ops
 
-    class _FakeManager:
+    class FakeManager:
         object_groups = [MagicMock(kernel_group_indices=[0])]
         num_kernel_groups = 1
 
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
-    class _FakeCacheContext:
+    class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
-        kv_layer_groups_manager = _FakeManager()
+        kv_layer_groups_manager = FakeManager()
         device = torch.device("cuda")
         max_batch_size = 4
 
@@ -780,15 +780,15 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
             return [torch.tensor(block_ids[0], dtype=torch.long)]
 
-    class _FakeState:
-        cache_context = _FakeCacheContext()
+    class FakeState:
+        cache_context = FakeCacheContext()
         object_group_id = 0
         host_buffer_alignment = 8192
 
         def close(self) -> None:
             return None
 
-    class _FakeEngineDrivenContext:
+    class FakeEngineDrivenContext:
         def prepare_retrieve(self, *_args: Any, **_kwargs: Any) -> list[torch.Tensor]:
             return [torch.empty(2, 2, 8, 16)]
 
@@ -816,12 +816,12 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
     monkeypatch.setattr(
         worker_transfer,
         "create_engine_driven_context",
-        lambda *_args, **_kwargs: _FakeEngineDrivenContext(),
+        lambda *_args, **_kwargs: FakeEngineDrivenContext(),
     )
     monkeypatch.setattr(
         worker_transfer,
         "_build_engine_object_group_transfer_state",
-        lambda *_args, **_kwargs: _FakeState(),
+        lambda *_args, **_kwargs: FakeState(),
     )
     monkeypatch.setattr(
         worker_transfer,

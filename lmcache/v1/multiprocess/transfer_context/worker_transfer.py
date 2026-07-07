@@ -154,6 +154,12 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
     ID staging, and temporary buffers directly from those tensors.  Temporary
     buffers are Python-owned and require no explicit cleanup.
 
+    Key responsibilities:
+    - ``_group_kv_pointers`` stores native pointer tensors for each kernel group.
+    - ``_tmp_buffer`` owns the contiguous temporary staging area used by the
+      object-group plan.
+    - ``_tmp_chunk_group_offsets`` maps each kernel group into that staging area.
+
     Instances are created during engine-driven registration only when the native
     object-group executor is available for the active CUDA-backed context.
     """
@@ -390,7 +396,8 @@ def _build_tensor_staging_copies(
             (device-to-host).
 
     Returns:
-        Native staging-copy descriptors consumed by ``BatchStep``.
+        Native staging-copy descriptors consumed by the ``lmc_ops.BatchStep``
+        plan structs passed to the native object-group executor.
         ``host_offset`` is computed as the CPU tensor pointer offset within
         ``PIN_CHUNK_SIZE`` because the native copy helper splits pageable host
         buffers at alignment boundaries and needs the offset within that window.
@@ -428,6 +435,10 @@ def _build_pickle_tensor_staging_copies(
 ) -> list["lmc_ops.StagingCopy"]:
     """Build staging descriptors for pickle tensor payloads.
 
+    This thin wrapper is intentionally separate from the SHM wrapper so call
+    sites and tests can assert which transport-specific ownership path is being
+    planned, even though both currently share the same tensor descriptor logic.
+
     Args:
         objects: Pickle payload tensors for one batch.
         staging_buffers: Object-group temporary buffers aligned with
@@ -449,6 +460,10 @@ def _build_shm_tensor_staging_copies(
     is_h2d: bool,
 ) -> list["lmc_ops.StagingCopy"]:
     """Build staging descriptors for SHM tensor views.
+
+    This thin wrapper is intentionally separate from the pickle wrapper so call
+    sites and tests can assert which transport-specific ownership path is being
+    planned, even though both currently share the same tensor descriptor logic.
 
     Args:
         objects: SHM-backed tensor views for one batch.
@@ -521,7 +536,9 @@ def _supports_single_engine_object_group(
     The optimized engine-driven path currently supports exactly one object
     group containing exactly one kernel group, with ``block_ids`` supplied as a
     single kernel-group list.  Other layouts remain on the fallback path instead
-    of risking a mismatched transport object layout.
+    of risking a mismatched transport object layout.  Store fallback uses
+    :func:`gather_paged_kv_to_cpu`; retrieve fallback uses
+    :func:`scatter_cpu_to_paged_kv`.
 
     Args:
         state: Prepared object-group transfer state.

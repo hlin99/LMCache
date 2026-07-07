@@ -185,8 +185,10 @@ def select_block_ids_for_cache_context(
             :func:`select_block_ids_for_window`.
 
     Example:
-        With two chunks, kernel group 0 keeping all four blocks per chunk, and
-        kernel group 1 keeping the trailing two blocks per chunk:
+        With ``lmcache_tokens_per_chunk=8`` and two tokens per block, each chunk
+        spans four raw blocks.  If kernel group 0 keeps all four blocks per
+        chunk, while kernel group 1 keeps only the trailing two blocks per
+        chunk:
 
         >>> select_block_ids_for_cache_context(ctx, [
         ...     [0, 1, 2, 3, 4, 5, 6, 7],
