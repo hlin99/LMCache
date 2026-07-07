@@ -51,7 +51,8 @@ def _flat_uint8_tensor(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
     """
     if num_bytes < 0 or num_bytes > tensor.nbytes:
         raise ValueError(
-            f"num_bytes must be in [0, {tensor.nbytes}], got {num_bytes}"
+            f"num_bytes must be in inclusive range [0, {tensor.nbytes}], "
+            f"got {num_bytes}"
         )
     return tensor.view(torch.uint8)[:num_bytes]
 
@@ -337,6 +338,7 @@ class PickleTransferStrategy(TransferStrategy):
             )
             reserved_count += len(reserved_dict)
             try:
+                group_written: list[ObjectKey] = []
                 for chunk_idx, obj_key in enumerate(obj_keys):
                     if obj_key not in reserved_dict:
                         continue
@@ -346,11 +348,8 @@ class PickleTransferStrategy(TransferStrategy):
                     memory_obj = reserved_dict[obj_key]
                     if _copy_tensor_to_memory_obj(chunks[flat_idx], memory_obj):
                         written_keys.append(obj_key)
+                        group_written.append(obj_key)
             finally:
-                obj_keys_set = set(obj_keys)
-                group_written = [
-                    obj_key for obj_key in written_keys if obj_key in obj_keys_set
-                ]
                 if group_written:
                     self._storage_manager.finish_write(group_written)
             chunk_offset += len(obj_keys)

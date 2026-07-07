@@ -374,7 +374,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 )
         attn_desc = (
             AttnWindowDesc(payload.attn_window_num_chunks)
-            if len(payload.attn_window_num_chunks) > 0
+            if payload.attn_window_num_chunks
             else None
         )
         metadata = EngineDrivenContextMetadata(

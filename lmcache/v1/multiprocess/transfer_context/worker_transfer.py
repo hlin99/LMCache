@@ -369,6 +369,8 @@ def _get_object_group_layout_descs(
     """
     layouts: list[MemoryLayoutDesc] = []
     for object_group in cache_context.kv_layer_groups_manager.object_groups:
+        if not object_group.kernel_group_indices:
+            raise ValueError("engine-driven object groups must not be empty")
         shapes_and_dtypes = [
             cache_context.get_kernel_group_shape_dtype(
                 cache_context.lmcache_tokens_per_chunk, kernel_group_id
@@ -682,15 +684,19 @@ def _build_sparse_transport_objects(
     Raises:
         ValueError: If any flat index is outside the transfer range.
     """
+    max_flat_idx = num_object_groups * num_chunks
+    invalid_indices = [
+        idx for idx in flat_chunk_indices if idx < 0 or idx >= max_flat_idx
+    ]
+    if invalid_indices:
+        raise ValueError(
+            f"flat chunk indices {invalid_indices} out of range [0, {max_flat_idx})"
+        )
+
     objects_by_group: list[list[torch.Tensor | None]] = [
         [None] * num_chunks for _ in range(num_object_groups)
     ]
     for buffer, flat_idx in zip(buffers, flat_chunk_indices, strict=True):
-        if flat_idx < 0 or flat_idx >= num_object_groups * num_chunks:
-            raise ValueError(
-                f"flat chunk index {flat_idx} out of range "
-                f"[0, {num_object_groups * num_chunks})"
-            )
         object_group_id = flat_idx // num_chunks
         chunk_idx = flat_idx % num_chunks
         objects_by_group[object_group_id][chunk_idx] = buffer
@@ -730,6 +736,8 @@ def _execute_engine_object_group_transfer(
         ValueError: If ``block_ids`` do not cover every requested object.
     """
     cache_context = state.cache_context
+    if not objects_by_group:
+        raise ValueError("objects_by_group must contain at least one object group")
     if len(objects_by_group) != len(
         cache_context.kv_layer_groups_manager.object_groups
     ):
