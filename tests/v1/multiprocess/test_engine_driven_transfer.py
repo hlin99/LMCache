@@ -67,7 +67,7 @@ class ServerModuleFactory(Protocol):
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[str] | None = None,
+        object_keys: list[Any] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -223,6 +223,22 @@ def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
         end=tokens,
         request_id="req",
     )
+
+
+class _TensorMemoryObj:
+    """Minimal tensor-backed MemoryObj test double."""
+
+    def __init__(self, tensor: torch.Tensor, offset: int = 0) -> None:
+        self.tensor = tensor
+        self.raw_tensor = tensor.reshape(-1).view(torch.uint8)
+        self.shm_offset = offset
+        self.shm_byte_length = tensor.nbytes
+
+    def get_shapes(self) -> list[torch.Size]:
+        return [self.tensor.shape]
+
+    def get_size(self) -> int:
+        return self.tensor.nbytes
 
 
 def test_wrap_kv_caches_wraps_all_tensors() -> None:
@@ -1615,7 +1631,7 @@ def server_module_factory(
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[str] | None = None,
+        object_keys: list[Any] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1650,10 +1666,22 @@ def server_module_factory(
         stack.enter_context(
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus")
         )
+        resolved_object_keys = object_keys or ["obj"]
+        if not resolved_object_keys or not isinstance(resolved_object_keys[0], list):
+            resolved_object_keys = [resolved_object_keys]
+
+        def _resolve_object_keys(
+            _key: Any, _chunk_hashes: list[bytes], object_group_ids: list[int]
+        ) -> list[list[Any]]:
+            return [
+                resolved_object_keys[object_group_id]
+                for object_group_id in object_group_ids
+            ]
+
         stack.enter_context(
             patch(
                 "lmcache.v1.multiprocess.engine_context.ipc_key_to_object_keys",
-                return_value=[object_keys or ["obj"]],
+                side_effect=_resolve_object_keys,
             )
         )
 
@@ -2044,6 +2072,268 @@ def test_server_prepare_store_includes_chunk_indices(
     assert len(response_context.get("slots", [])) == 1
     # chunk_indices should be [1] (position of obj2 in [obj1, obj2])
     assert response_context.get("chunk_indices") == [1]
+
+
+def _hybrid_object_keys() -> list[list[Any]]:
+    """Return two object groups with two chunks each for server hybrid tests."""
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    return [
+        [
+            ObjectKey(chunk_hash=b"h0", model_name="m", kv_rank=0, object_group_id=0),
+            ObjectKey(chunk_hash=b"h1", model_name="m", kv_rank=0, object_group_id=0),
+        ],
+        [
+            ObjectKey(chunk_hash=b"h0", model_name="m", kv_rank=0, object_group_id=1),
+            ObjectKey(chunk_hash=b"h1", model_name="m", kv_rank=0, object_group_id=1),
+        ],
+    ]
+
+
+def _hybrid_register_payload(
+    instance_id: int = 11,
+) -> "RegisterEngineDrivenContextPayload":
+    """Return a hybrid registration payload with different group byte sizes."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+
+    return RegisterEngineDrivenContextPayload(
+        instance_id=instance_id,
+        model_name="m",
+        world_size=1,
+        block_size=1,
+        num_layers=1,
+        hidden_dim_size=4,
+        dtype_str="uint8",
+        use_mla=True,
+        object_group_shapes=[[[16]], [[24]]],
+        object_group_dtypes=[["uint8"], ["uint8"]],
+        attn_window_num_chunks=[-1, 2],
+    )
+
+
+def test_server_register_validates_hybrid_metadata(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Reject inconsistent object-group registration metadata early."""
+    module, _, _, _ = server_module_factory()
+    payload = _hybrid_register_payload()
+    payload.attn_window_num_chunks = [-1]
+    with pytest.raises(ValueError, match="attn_window_num_chunks length"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+    payload = _hybrid_register_payload()
+    payload.object_group_dtypes = [["uint8"], ["not_a_dtype"]]
+    with pytest.raises(ValueError, match="Object group 1, kernel group 0"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_lookup_prefetch_receives_hybrid_object_group_layouts(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Lookup forwards per-object-group layouts for L2-to-L1 allocation."""
+    # First Party
+    from lmcache.v1.distributed.api import PrefetchHandle
+    from lmcache.v1.multiprocess.modules.lookup import LookupModule
+
+    module, mock_storage, _, ctx = server_module_factory()
+    module.register_kv_cache_engine_driven_context(_hybrid_register_payload())
+    ctx.token_hasher.compute_chunk_hashes.return_value = [b"h0", b"h1"]
+    ctx.event_bus.has_subscribers.return_value = False
+    mock_storage.submit_prefetch_task.return_value = PrefetchHandle(
+        prefetch_request_id=-1,
+        external_request_id="req",
+        l1_found_indices=(),
+        total_requested_keys=4,
+        submit_time=0.0,
+    )
+
+    LookupModule(ctx).lookup(_default_key(tokens=2), tp_size=1)
+
+    _, kwargs = mock_storage.submit_prefetch_task.call_args
+    layouts = kwargs["object_group_layout_descs"]
+    assert [layout.shapes[0] for layout in layouts] == [
+        torch.Size([16]),
+        torch.Size([24]),
+    ]
+    keys = mock_storage.submit_prefetch_task.call_args.args[0]
+    assert [key.object_group_id for key in keys] == [0, 1, 0, 1]
+
+
+def test_l2_prefetch_reserves_each_object_group_with_matching_layout(
+    stub_native_storage_ops: Any,
+) -> None:
+    """L2 load planning reserves L1 objects with each key's group layout."""
+    # First Party
+    from lmcache.v1.distributed.error import L1Error
+    from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+        reserve_write_by_object_group_layout,
+    )
+
+    object_keys = [key for group in _hybrid_object_keys() for key in group]
+    layouts = [
+        MemoryLayoutDesc(shapes=[torch.Size([16])], dtypes=[torch.uint8]),
+        MemoryLayoutDesc(shapes=[torch.Size([24])], dtypes=[torch.uint8]),
+    ]
+    captured: list[tuple[list[int], int]] = []
+
+    class FakeL1Manager:
+        def reserve_write(
+            self,
+            keys: list[Any],
+            is_temporary: list[bool],
+            layout_desc: MemoryLayoutDesc,
+            mode: str,
+        ) -> dict[Any, tuple[Any, _TensorMemoryObj]]:
+            captured.append(
+                ([key.object_group_id for key in keys], layout_desc.shapes[0].numel())
+            )
+            assert is_temporary == [False] * len(keys)
+            assert mode == "new"
+            return {
+                key: (
+                    L1Error.SUCCESS,
+                    _TensorMemoryObj(
+                        torch.zeros(layout_desc.shapes[0], dtype=layout_desc.dtypes[0])
+                    ),
+                )
+                for key in keys
+            }
+
+    results = reserve_write_by_object_group_layout(
+        FakeL1Manager(),
+        object_keys,
+        [True] * len(object_keys),
+        layouts[0],
+        layouts,
+    )
+
+    assert captured == [([0, 0], 16), ([1, 1], 24)]
+    assert list(results) == object_keys
+
+
+def test_server_hybrid_pickle_store_and_retrieve_use_group_layouts(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Pickle store/retrieve handles object-group-major hybrid layouts."""
+    object_keys = _hybrid_object_keys()
+    stored: dict[Any, _TensorMemoryObj] = {}
+    reserve_layout_sizes: list[int] = []
+
+    def _reserve_write(obj_keys: list[Any], layout: MemoryLayoutDesc, *_args: Any) -> Any:
+        reserve_layout_sizes.append(layout.shapes[0].numel())
+        result = {}
+        for obj_key in obj_keys:
+            tensor = torch.zeros(layout.shapes[0], dtype=layout.dtypes[0])
+            memory_obj = _TensorMemoryObj(tensor)
+            stored[obj_key] = memory_obj
+            result[obj_key] = memory_obj
+        return result
+
+    @contextmanager
+    def _read_prefetched_results(obj_keys: list[Any]) -> Any:
+        yield [stored[obj_key] for obj_key in obj_keys]
+
+    mock_storage = MagicMock()
+    mock_storage.reserve_write.side_effect = _reserve_write
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    module, _, _, _ = server_module_factory(
+        object_keys=object_keys,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(_hybrid_register_payload())
+    chunks = [
+        torch.arange(16, dtype=torch.uint8),
+        torch.arange(16, dtype=torch.uint8) + 1,
+        torch.arange(24, dtype=torch.uint8) + 2,
+        torch.arange(24, dtype=torch.uint8) + 3,
+    ]
+
+    assert module.commit_store(_default_key(tokens=2), 11, pickle.dumps(chunks))
+    response = module.prepare_retrieve(_default_key(tokens=2), 11)
+
+    assert reserve_layout_sizes == [16, 24]
+    assert response.success is True
+    recovered = pickle.loads(response.data)
+    assert [tensor.numel() for tensor in recovered] == [16, 16, 24, 24]
+    for actual, expected in zip(recovered, chunks, strict=True):
+        assert torch.equal(actual, expected)
+
+
+def test_server_hybrid_shm_prepare_store_and_retrieve_order(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """SHM prepare paths expose object-group-major hybrid slot layouts."""
+    object_keys = _hybrid_object_keys()
+
+    def _memory_obj_for_key(obj_key: Any) -> _TensorMemoryObj:
+        size = 16 if obj_key.object_group_id == 0 else 24
+        return _TensorMemoryObj(torch.zeros(size, dtype=torch.uint8), offset=size)
+
+    mock_storage = MagicMock()
+    mock_storage.reserve_write.side_effect = lambda obj_keys, *_args, **_kwargs: {
+        obj_key: _memory_obj_for_key(obj_key) for obj_key in obj_keys
+    }
+    mock_storage.unsafe_read.side_effect = lambda obj_keys: (
+        obj_keys,
+        [_memory_obj_for_key(obj_key) for obj_key in obj_keys],
+    )
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=4096
+        ),
+        object_keys=object_keys,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(_hybrid_register_payload())
+    key = _default_key(tokens=2)
+
+    store_response = module.prepare_store(key, 11)
+    retrieve_response = module.prepare_retrieve(key, 11)
+
+    assert store_response.context["chunk_indices"] == [0, 1, 2, 3]
+    assert [slot["length"] for slot in store_response.context["slots"]] == [
+        16,
+        16,
+        24,
+        24,
+    ]
+    assert retrieve_response.success is True
+    assert [slot["length"] for slot in retrieve_response.context["slots"]] == [
+        16,
+        16,
+        24,
+        24,
+    ]
+
+
+def test_memory_obj_tensor_view_returns_none_for_non_tensor_backing(
+    stub_native_storage_ops: Any,
+) -> None:
+    """Unsupported non-tensor MemoryObj implementations fail closed."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import (
+        _memory_obj_tensor_view,
+    )
+
+    class NonTensorMemoryObj:
+        def get_shapes(self) -> list[torch.Size]:
+            raise NotImplementedError
+
+        @property
+        def raw_tensor(self) -> torch.Tensor:
+            raise NotImplementedError
+
+        @property
+        def tensor(self) -> torch.Tensor:
+            raise NotImplementedError
+
+    assert _memory_obj_tensor_view(NonTensorMemoryObj()) is None
 
 
 class _CompletedFuture:

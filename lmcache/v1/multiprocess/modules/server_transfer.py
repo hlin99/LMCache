@@ -57,6 +57,15 @@ def _flat_uint8_tensor(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
     return tensor.view(torch.uint8)[:num_bytes]
 
 
+def _memory_obj_size(memory_obj: "MemoryObj", tensor: torch.Tensor) -> int:
+    """Return a memory object's logical byte size, falling back to tensor bytes."""
+    try:
+        size = memory_obj.get_size()
+    except (AttributeError, NotImplementedError):
+        return tensor.nbytes
+    return size if isinstance(size, int) else tensor.nbytes
+
+
 def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
     """Return a tensor view suitable for engine-driven CPU transport.
 
@@ -72,13 +81,27 @@ def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
         legacy tensor view for single-shape objects or a flat uint8 view for
         multi-shape objects.
     """
-    shapes = memory_obj.get_shapes()
-    raw_tensor = memory_obj.raw_tensor
-    if raw_tensor is None:
-        return None
-    if len(shapes) == 1:
-        return memory_obj.tensor
-    return _flat_uint8_tensor(raw_tensor, memory_obj.get_size())
+    try:
+        shapes = memory_obj.get_shapes()
+    except (AttributeError, NotImplementedError):
+        shapes = []
+    try:
+        raw_tensor = memory_obj.raw_tensor
+    except (AttributeError, NotImplementedError):
+        raw_tensor = None
+    if not isinstance(raw_tensor, torch.Tensor):
+        try:
+            tensor = memory_obj.tensor
+        except (AttributeError, NotImplementedError):
+            return None
+        return tensor if isinstance(tensor, torch.Tensor) else None
+    if len(shapes) <= 1:
+        try:
+            tensor = memory_obj.tensor
+        except (AttributeError, NotImplementedError):
+            return None
+        return tensor if isinstance(tensor, torch.Tensor) else None
+    return _flat_uint8_tensor(raw_tensor, _memory_obj_size(memory_obj, raw_tensor))
 
 
 def _copy_tensor_to_memory_obj(src: torch.Tensor, memory_obj: "MemoryObj") -> bool:
@@ -93,7 +116,7 @@ def _copy_tensor_to_memory_obj(src: torch.Tensor, memory_obj: "MemoryObj") -> bo
         is performed; otherwise False.
     """
     dst = _memory_obj_tensor_view(memory_obj)
-    if dst is None or src.nbytes != memory_obj.get_size():
+    if dst is None or src.nbytes != _memory_obj_size(memory_obj, dst):
         return False
     dst_view = _flat_uint8_tensor(dst, dst.nbytes)
     src_view = _flat_uint8_tensor(src, src.nbytes)

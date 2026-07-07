@@ -70,6 +70,75 @@ def merge_bitmaps(bitmaps: Iterable[Bitmap], num_keys: int) -> Bitmap:
     return merged
 
 
+def _layout_for_object_key(
+    key: ObjectKey,
+    default_layout_desc: MemoryLayoutDesc,
+    object_group_layout_descs: list[MemoryLayoutDesc],
+) -> MemoryLayoutDesc:
+    """Return the L1 allocation layout for an object key."""
+    if object_group_layout_descs:
+        if key.object_group_id >= len(object_group_layout_descs):
+            raise ValueError(
+                f"object_group_id {key.object_group_id} has no registered layout "
+                f"(registered {len(object_group_layout_descs)} object groups)"
+            )
+        return object_group_layout_descs[key.object_group_id]
+    return default_layout_desc
+
+
+def reserve_write_by_object_group_layout(
+    l1_mgr: L1Manager,
+    keys: list[ObjectKey],
+    retentions: list[bool],
+    default_layout_desc: MemoryLayoutDesc,
+    object_group_layout_descs: list[MemoryLayoutDesc],
+) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
+    """Reserve write buffers, using each key's object-group layout.
+
+    Args:
+        l1_mgr: L1 manager to reserve from.
+        keys: Object keys to reserve.
+        retentions: Retention flags aligned with ``keys``.
+        default_layout_desc: Legacy fallback layout.
+        object_group_layout_descs: Optional per-object-group layouts.
+
+    Returns:
+        Reservation results keyed by object key, matching ``L1Manager.reserve_write``.
+
+    Raises:
+        ValueError: If ``keys`` and ``retentions`` lengths differ, or if a key's
+            object-group id has no corresponding registered layout.
+    """
+    if len(keys) != len(retentions):
+        raise ValueError("keys and retentions must have the same length")
+    if not object_group_layout_descs:
+        return l1_mgr.reserve_write(
+            keys=keys,
+            is_temporary=[not r for r in retentions],
+            layout_desc=default_layout_desc,
+            mode="new",
+        )
+
+    write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
+    group_to_items: dict[int, list[tuple[ObjectKey, bool]]] = defaultdict(list)
+    for key, retention in zip(keys, retentions, strict=True):
+        _layout_for_object_key(key, default_layout_desc, object_group_layout_descs)
+        group_to_items[key.object_group_id].append((key, retention))
+
+    for object_group_id, items in group_to_items.items():
+        group_keys = [key for key, _ in items]
+        group_retentions = [retention for _, retention in items]
+        write_results.update(
+            l1_mgr.reserve_write(
+                keys=group_keys,
+                is_temporary=[not r for r in group_retentions],
+                layout_desc=object_group_layout_descs[object_group_id],
+                mode="new",
+            )
+        )
+    return write_results
+
+
 def build_trim_mask(
     found: Bitmap,
     num_keys: int,
@@ -137,6 +206,8 @@ class InFlightPrefetchRequest:
     keys: list[ObjectKey]
     layout_desc: MemoryLayoutDesc
     phase: PrefetchPhase
+    object_group_layout_descs: list[MemoryLayoutDesc] = field(default_factory=list)
+    """Per-object-group layouts for L1 allocation during L2 load."""
     extra_count: int = 0
     """Extra read locks per key (on top of the default 1) to acquire when
     transitioning from write-locked to read-locked.  Must match the
@@ -245,6 +316,7 @@ class PrefetchController(StorageControllerInterface):
                 TrimPolicy,
                 AttnWindowDesc,
                 PrefetchMode,
+                list[MemoryLayoutDesc],
             ]
         ] = []
 
@@ -265,6 +337,7 @@ class PrefetchController(StorageControllerInterface):
                 TrimPolicy,
                 AttnWindowDesc,
                 PrefetchMode,
+                list[MemoryLayoutDesc],
             ]
         ] = []
         self._next_request_id: PrefetchRequestId = 0
@@ -350,6 +423,7 @@ class PrefetchController(StorageControllerInterface):
         policy: TrimPolicy = TrimPolicy.PREFIX,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        object_group_layout_descs: list[MemoryLayoutDesc] | None = None,
     ) -> PrefetchRequestId:
         """
         Submit a prefetch request for the given keys.
@@ -382,6 +456,8 @@ class PrefetchController(StorageControllerInterface):
                 forces every loaded key permanent and acquires no read lock;
                 ``LOOKUP`` defers retention to the configured
                 :class:`PrefetchPolicy` and read-locks loaded keys.
+            object_group_layout_descs: Optional per-object-group layouts for L1
+                write buffer allocation during L2 load.
 
         Returns:
             A request ID for tracking via query_prefetch_result.
@@ -390,7 +466,16 @@ class PrefetchController(StorageControllerInterface):
             request_id = self._next_request_id
             self._next_request_id += 1
             self._submission_queue.append(
-                (request_id, keys, layout_desc, extra_count, policy, attn_desc, mode)
+                (
+                    request_id,
+                    keys,
+                    layout_desc,
+                    extra_count,
+                    policy,
+                    attn_desc,
+                    mode,
+                    list(object_group_layout_descs or []),
+                )
             )
         self._submission_efd.notify()
         return request_id
@@ -774,12 +859,26 @@ class PrefetchController(StorageControllerInterface):
         while (
             self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
         ):
-            request_id, keys, layout_desc, extra_count, policy, attn_desc, mode = (
-                self._pending_queue.pop(0)
-            )
+            (
+                request_id,
+                keys,
+                layout_desc,
+                extra_count,
+                policy,
+                attn_desc,
+                mode,
+                object_group_layout_descs,
+            ) = self._pending_queue.pop(0)
             self._status_pending_count -= 1
             self._start_lookup_phase(
-                request_id, keys, layout_desc, extra_count, policy, attn_desc, mode
+                request_id,
+                keys,
+                layout_desc,
+                extra_count,
+                policy,
+                attn_desc,
+                mode,
+                object_group_layout_descs,
             )
 
     # =========================================================================
@@ -795,6 +894,7 @@ class PrefetchController(StorageControllerInterface):
         policy: TrimPolicy = TrimPolicy.PREFIX,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         mode: PrefetchMode = PrefetchMode.LOOKUP,
+        object_group_layout_descs: list[MemoryLayoutDesc] | None = None,
     ) -> None:
         """Submit lookup_and_lock to all live (non-draining) adapters for a
         new request."""
@@ -819,6 +919,7 @@ class PrefetchController(StorageControllerInterface):
             keys=keys,
             layout_desc=layout_desc,
             phase=PrefetchPhase.LOOKUP,
+            object_group_layout_descs=list(object_group_layout_descs or []),
             extra_count=extra_count,
             policy=policy,
             attn_desc=attn_desc,
@@ -899,11 +1000,12 @@ class PrefetchController(StorageControllerInterface):
             retentions = self._policy.select_l1_retentions(
                 keys_to_reserve,
             )
-        write_results = l1_mgr.reserve_write(
-            keys=keys_to_reserve,
-            is_temporary=[not r for r in retentions],
-            layout_desc=request.layout_desc,
-            mode="new",
+        write_results = reserve_write_by_object_group_layout(
+            l1_mgr,
+            keys_to_reserve,
+            retentions,
+            request.layout_desc,
+            request.object_group_layout_descs,
         )
 
         # Step 4: filter to successfully reserved keys
@@ -980,12 +1082,8 @@ class PrefetchController(StorageControllerInterface):
             )
             request.pending_load_tasks[adapter_idx] = task_id
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
-            # events.  Uniform layout per chunk -> size * count.
-            total_bytes = (
-                per_adapter_objs[0].get_size() * len(per_adapter_objs)
-                if per_adapter_objs
-                else 0
-            )
+            # events. Hybrid object groups can have different sizes.
+            total_bytes = sum(obj.get_size() for obj in per_adapter_objs)
             request.load_bytes_by_adapter[adapter_idx] = total_bytes
 
             self._event_bus.publish(

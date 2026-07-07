@@ -661,8 +661,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         kv_groups_manager = cache_context.kv_layer_groups_manager
         attn_desc = kv_groups_manager.get_attn_desc()
+        object_group_layout_descs = [
+            get_layout_desc(cache_context, self._ctx.chunk_size, object_group_id)
+            for object_group_id in range(attn_desc.num_object_groups)
+        ]
         self._ctx.layout_desc_registry.register(
-            model_name, world_size, layout_desc, attn_desc
+            model_name,
+            world_size,
+            layout_desc,
+            attn_desc,
+            object_group_layout_descs=object_group_layout_descs,
         )
 
         with self._lock:

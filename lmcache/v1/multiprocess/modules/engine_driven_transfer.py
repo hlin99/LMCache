@@ -366,15 +366,36 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                         f"Object group {object_group_id}: shape list length "
                         f"{len(shapes)} must match dtype list length {len(dtypes)}"
                     )
+                group_dtypes = []
+                for kernel_group_id, dtype_name in enumerate(dtypes):
+                    group_dtype = getattr(torch, dtype_name, None)
+                    if group_dtype is None or not isinstance(group_dtype, torch.dtype):
+                        raise ValueError(
+                            f"Object group {object_group_id}, kernel group "
+                            f"{kernel_group_id}: invalid dtype name {dtype_name!r}"
+                        )
+                    group_dtypes.append(group_dtype)
                 object_group_layout_descs.append(
                     MemoryLayoutDesc(
                         shapes=[torch.Size(group_shape) for group_shape in shapes],
-                        dtypes=[getattr(torch, dtype_name) for dtype_name in dtypes],
+                        dtypes=group_dtypes,
                     )
                 )
+        if payload.attn_window_num_chunks and object_group_layout_descs:
+            if len(payload.attn_window_num_chunks) != len(object_group_layout_descs):
+                raise ValueError(
+                    "attn_window_num_chunks length "
+                    f"{len(payload.attn_window_num_chunks)} must match "
+                    "object_group layout count "
+                    f"{len(object_group_layout_descs)}"
+                )
+        if object_group_layout_descs and not payload.attn_window_num_chunks:
+            attn_window_num_chunks = [-1] * len(object_group_layout_descs)
+        else:
+            attn_window_num_chunks = payload.attn_window_num_chunks
         attn_desc = (
-            AttnWindowDesc(payload.attn_window_num_chunks)
-            if payload.attn_window_num_chunks
+            AttnWindowDesc(attn_window_num_chunks)
+            if attn_window_num_chunks
             else None
         )
         metadata = EngineDrivenContextMetadata(
@@ -416,8 +437,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         self._ctx.layout_desc_registry.register(
             payload.model_name,
             payload.world_size,
-            metadata.layout_desc_for_object_group(0),
+            metadata.layout_desc,
             attn_desc if attn_desc is not None else AttnWindowDesc([-1]),
+            object_group_layout_descs=metadata.object_group_layout_descs,
         )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
