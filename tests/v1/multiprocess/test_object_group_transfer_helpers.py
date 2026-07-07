@@ -4,8 +4,9 @@
 These tests cover:
 
 * Pure geometry helpers (CPU-only, no GPU/native-extension required):
-  ``select_block_ids_for_window``, ``recalculate_blocks_to_skip``,
-  ``compute_num_objects_to_skip``, and ``batched_iteration_with_skip``.
+  ``has_sufficient_block_ids``, ``select_block_ids_for_window``,
+  ``recalculate_blocks_to_skip``, ``compute_num_objects_to_skip``, and
+  ``batched_iteration_with_skip``.
 * ``prepare_object_group_transfer`` — verified by mocking the native
   ``lmc_ops`` types so the test does not require a GPU.
 * ``execute_prepared_object_group_transfer`` — verified by mocking
@@ -32,6 +33,51 @@ def _make_attn_desc(num_chunks_in_sw: list[int]) -> Any:
     from lmcache.v1.distributed.api import AttnWindowDesc
 
     return AttnWindowDesc(num_chunks_in_sw=num_chunks_in_sw)
+
+
+# ---------------------------------------------------------------------------
+# has_sufficient_block_ids
+# ---------------------------------------------------------------------------
+
+
+class TestHasSufficientBlockIds:
+    """Tests for :func:`has_sufficient_block_ids`."""
+
+    def test_returns_true_when_all_groups_cover_all_chunks(self) -> None:
+        """Every group with at least num_chunks * bpc block IDs passes."""
+        from lmcache.v1.multiprocess.object_group_utils import (
+            has_sufficient_block_ids,
+        )
+
+        assert has_sufficient_block_ids(
+            block_ids=[[0, 1, 2, 3], [10, 11, 12, 13, 14, 15]],
+            blocks_per_chunk=[2, 3],
+            num_chunks=2,
+        )
+
+    def test_returns_false_when_any_group_is_short(self) -> None:
+        """A single underfilled group fails the validation."""
+        from lmcache.v1.multiprocess.object_group_utils import (
+            has_sufficient_block_ids,
+        )
+
+        assert not has_sufficient_block_ids(
+            block_ids=[[0, 1, 2, 3], [10, 11, 12, 13, 14]],
+            blocks_per_chunk=[2, 3],
+            num_chunks=2,
+        )
+
+    def test_extra_block_ids_are_allowed(self) -> None:
+        """Groups may contain more than the minimum required raw block IDs."""
+        from lmcache.v1.multiprocess.object_group_utils import (
+            has_sufficient_block_ids,
+        )
+
+        assert has_sufficient_block_ids(
+            block_ids=[[0, 1, 2, 3, 4]],
+            blocks_per_chunk=[2],
+            num_chunks=2,
+        )
 
 
 # ---------------------------------------------------------------------------

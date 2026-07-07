@@ -45,6 +45,7 @@ from lmcache.v1.multiprocess.object_group_utils import (
     batched_iteration_with_skip,
     compute_num_objects_to_skip,
     execute_prepared_object_group_transfer,
+    has_sufficient_block_ids,
     prepare_object_group_transfer,
     recalculate_blocks_to_skip,
     select_block_ids_for_window,
@@ -793,11 +794,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # garbage entry. A later request can store it once the block IDs are
             # complete. Checked on the raw block ids, before cutting drops the
             # per-chunk blocks that sliding-window groups do not need.
-            if any(
-                len(group_block_ids) < num_chunks * bpc
-                for group_block_ids, bpc in zip(
-                    gpu_block_ids, blocks_per_chunk, strict=True
-                )
+            if not has_sufficient_block_ids(
+                gpu_block_ids, blocks_per_chunk, num_chunks
             ):
                 logger.warning(
                     "STORE block ID underflow for request_id=%s: each group needs "
@@ -1015,11 +1013,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # kernel to write out-of-bounds GPU memory. Checked on the raw
             # block ids, before cutting drops the per-chunk blocks that
             # sliding-window groups do not need.
-            if any(
-                len(group_block_ids) < num_chunks * bpc
-                for group_block_ids, bpc in zip(
-                    gpu_block_ids, blocks_per_chunk, strict=True
-                )
+            if not has_sufficient_block_ids(
+                gpu_block_ids, blocks_per_chunk, num_chunks
             ):
                 logger.error(
                     "RETRIEVE block ID underflow for request_id=%s: each group "

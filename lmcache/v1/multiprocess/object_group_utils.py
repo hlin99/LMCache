@@ -4,9 +4,9 @@
 This module provides reusable logic shared between LMCache-driven and
 (in a later step) engine-driven transfer paths:
 
-* Pure geometry helpers: :func:`select_block_ids_for_window`,
-  :func:`recalculate_blocks_to_skip`, :func:`batched_iteration_with_skip`,
-  :func:`compute_num_objects_to_skip`.
+* Pure geometry helpers: :func:`has_sufficient_block_ids`,
+  :func:`select_block_ids_for_window`, :func:`recalculate_blocks_to_skip`,
+  :func:`batched_iteration_with_skip`, :func:`compute_num_objects_to_skip`.
 * Transfer-plan builder: :func:`prepare_object_group_transfer` assembles
   the ``KernelGroupSpec`` and ``BatchStep`` lists that
   ``lmc_ops.execute_object_group_transfer`` consumes.
@@ -80,6 +80,29 @@ class StagingBuilder(Protocol[TransferObjectT]):
 # ---------------------------------------------------------------------------
 # Pure geometry helpers
 # ---------------------------------------------------------------------------
+
+
+def has_sufficient_block_ids(
+    block_ids: Sequence[Sequence[int]],
+    blocks_per_chunk: Sequence[int],
+    num_chunks: int,
+) -> bool:
+    """Return whether every kernel group has enough raw block IDs for all chunks.
+
+    Args:
+        block_ids: Raw block-ID lists, indexed by kernel group.
+        blocks_per_chunk: Number of raw blocks needed per chunk for each
+            kernel group.
+        num_chunks: Number of chunks that each kernel group must cover.
+
+    Returns:
+        True when every kernel group has at least
+        ``num_chunks * blocks_per_chunk`` raw block IDs; otherwise False.
+    """
+    return not any(
+        len(group_block_ids) < num_chunks * bpc
+        for group_block_ids, bpc in zip(block_ids, blocks_per_chunk, strict=True)
+    )
 
 
 def select_block_ids_for_window(
