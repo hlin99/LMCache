@@ -683,18 +683,18 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         batch_size: int,
         skip_first_n_tokens: int,
         direction: Any,
-        staging_builder: Any,
+        staging_copy_builder: Any,
     ) -> tuple[list[str], list[str]]:
         concrete_objects = [obj for obj in objects if obj is not None]
         assert concrete_objects
-        staging_builder(
+        staging_copy_builder(
             concrete_objects, [torch.empty_like(concrete_objects[0])], False
         )
         captured["prepare"] = {
             "batch_size": batch_size,
             "skip_first_n_tokens": skip_first_n_tokens,
             "direction": direction,
-            "staging_builder": staging_builder,
+            "staging_copy_builder": staging_copy_builder,
             "num_objects": len(objects),
         }
         return ["spec"], ["step"]
@@ -738,7 +738,7 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
     assert result is True
     assert captured["prepare"]["direction"] == lmc_ops.TransferDirection.D2H
     assert (
-        captured["prepare"]["staging_builder"]
+        captured["prepare"]["staging_copy_builder"]
         is worker_transfer._build_pickle_tensor_staging_copies
     )
     assert captured["prepare"]["batch_size"] == 4
@@ -843,16 +843,18 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         batch_size: int,
         skip_first_n_tokens: int,
         direction: Any,
-        staging_builder: Any,
+        staging_copy_builder: Any,
     ) -> tuple[list[str], list[str]]:
         concrete_objects = [obj for obj in objects if obj is not None]
         assert concrete_objects
-        staging_builder(concrete_objects, [torch.empty_like(concrete_objects[0])], True)
+        staging_copy_builder(
+            concrete_objects, [torch.empty_like(concrete_objects[0])], True
+        )
         captured["prepare"] = {
             "batch_size": batch_size,
             "skip_first_n_tokens": skip_first_n_tokens,
             "direction": direction,
-            "staging_builder": staging_builder,
+            "staging_copy_builder": staging_copy_builder,
         }
         return ["spec"], ["step"]
 
@@ -902,7 +904,7 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
     assert result is True
     assert captured["prepare"]["direction"] == lmc_ops.TransferDirection.H2D
     assert (
-        captured["prepare"]["staging_builder"]
+        captured["prepare"]["staging_copy_builder"]
         is worker_transfer._build_shm_tensor_staging_copies
     )
     assert captured["prepare"]["batch_size"] == 4

@@ -52,6 +52,8 @@ import lmcache.c_ops as lmc_ops
 import lmcache.python_ops_fallback as _python_ops_fallback
 
 logger = init_logger(__name__)
+_ENGINE_OBJECT_GROUP_BLOCK_IDS_BUFFER_SIZE = 1 << 20
+_ENGINE_OBJECT_GROUP_MAX_BATCH_SIZE = 4
 
 # Environment variable that lets the user override the default routing
 # performed by :func:`create_transfer_context`. Accepted values match the
@@ -170,7 +172,11 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
             separate_object_groups=True,
         )
-        block_ids_buffer = torch.empty(1 << 20, dtype=torch.long, device=device)
+        block_ids_buffer = torch.empty(
+            _ENGINE_OBJECT_GROUP_BLOCK_IDS_BUFFER_SIZE,
+            dtype=torch.long,
+            device=device,
+        )
         super().__init__(
             kv_caches=kv_caches_norm,
             device=device,
@@ -188,7 +194,7 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
             self.group_kv_pointers_.append(
                 torch.tensor(ptrs, dtype=torch.long, device=device)
             )
-        self._max_batch_size = 4
+        self._max_batch_size = _ENGINE_OBJECT_GROUP_MAX_BATCH_SIZE
         self.tmp_chunk_group_offsets_: list[int] = [0]
         for group_idx, group in enumerate(
             self.kv_layer_groups_manager_.kv_layer_groups
@@ -233,7 +239,7 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
         """Return a typed temporary buffer for a batch/kernel group pair."""
         if batch_idx >= self.max_batch_size:
             raise ValueError(
-                "batch_idx %d >= max_batch_size %d" % (batch_idx, self.max_batch_size)
+                f"batch_idx {batch_idx} >= max_batch_size {self.max_batch_size}"
             )
         group = self.kv_layer_groups_manager_.kv_layer_groups[kernel_group_idx]
         shape = self.get_kv_buffer_shape(
@@ -256,7 +262,7 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
         """Return a flat temporary buffer for a batch/object group pair."""
         if batch_idx >= self.max_batch_size:
             raise ValueError(
-                "batch_idx %d >= max_batch_size %d" % (batch_idx, self.max_batch_size)
+                f"batch_idx {batch_idx} >= max_batch_size {self.max_batch_size}"
             )
         object_group = self.kv_layer_groups_manager_.object_groups[object_group_idx]
         kg_indices = object_group.kernel_group_indices
@@ -277,9 +283,9 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
         compress_ratio = group.tokens_per_block // group.slots_per_block
         if num_tokens % compress_ratio != 0:
             raise ValueError(
-                "num_tokens (%d) is not a multiple of compress_ratio (%d) "
-                "for kernel_group_idx %d"
-                % (num_tokens, compress_ratio, kernel_group_idx)
+                f"num_tokens ({num_tokens}) is not a multiple of "
+                f"compress_ratio ({compress_ratio}) for kernel_group_idx "
+                f"{kernel_group_idx}"
             )
         num_slots = num_tokens // compress_ratio
         shape_desc = group.shape_desc
@@ -435,7 +441,7 @@ def _execute_engine_object_group_transfer(
     objects: Sequence[torch.Tensor | None],
     skip_first_n_tokens: int,
     direction: "lmc_ops.TransferDirection",
-    staging_builder: Callable[
+    staging_copy_builder: Callable[
         [Sequence[torch.Tensor], Sequence[torch.Tensor], bool],
         list["lmc_ops.StagingCopy"],
     ],
@@ -467,7 +473,7 @@ def _execute_engine_object_group_transfer(
         batch_size,
         skip_first_n_tokens,
         direction,
-        staging_builder,
+        staging_copy_builder,
     )
     execute_prepared_object_group_transfer(
         direction,
@@ -841,7 +847,7 @@ class EngineDrivenTransferContext(TransferContext):
                     cpu_chunks,
                     skip_first_n_tokens=0,
                     direction=lmc_ops.TransferDirection.D2H,
-                    staging_builder=_build_pickle_tensor_staging_copies,
+                    staging_copy_builder=_build_pickle_tensor_staging_copies,
                     batch_size=(
                         self._object_group_transfer_state.cache_context.max_batch_size
                     ),
@@ -853,7 +859,7 @@ class EngineDrivenTransferContext(TransferContext):
                 ):
                     if chunk_idx >= num_chunks:
                         raise ValueError(
-                            f"chunk index {chunk_idx} exceeds num_chunks {num_chunks}"
+                            f"chunk_idx {chunk_idx} out of range [0, {num_chunks})"
                         )
                     objects[chunk_idx] = buffer
                 _execute_engine_object_group_transfer(
@@ -862,7 +868,7 @@ class EngineDrivenTransferContext(TransferContext):
                     objects,
                     skip_first_n_tokens=0,
                     direction=lmc_ops.TransferDirection.D2H,
-                    staging_builder=_build_shm_tensor_staging_copies,
+                    staging_copy_builder=_build_shm_tensor_staging_copies,
                     batch_size=1,
                 )
                 cpu_chunks = out_buffers
@@ -917,7 +923,7 @@ class EngineDrivenTransferContext(TransferContext):
                         self._object_group_transfer_state, block_ids
                     )
                 ):
-                    staging_builder = (
+                    staging_copy_builder = (
                         _build_shm_tensor_staging_copies
                         if _is_shm_engine_context(self._engine_driven_context)
                         else _build_pickle_tensor_staging_copies
@@ -928,7 +934,7 @@ class EngineDrivenTransferContext(TransferContext):
                         src_buffers,
                         skip_first_n_tokens=skip_first_n_tokens,
                         direction=lmc_ops.TransferDirection.H2D,
-                        staging_builder=staging_builder,
+                        staging_copy_builder=staging_copy_builder,
                         batch_size=(
                             self._object_group_transfer_state.cache_context
                             .max_batch_size
