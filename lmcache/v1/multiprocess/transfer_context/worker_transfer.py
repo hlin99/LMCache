@@ -4,6 +4,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
@@ -15,11 +16,25 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
+from lmcache.v1.gpu_connector.utils import (
+    LayoutHints,
+    get_group_data_ptrs,
+    is_mla,
+    normalize_and_discover_per_layer_formats,
+)
+from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import engine_group_layer_indices
 from lmcache.v1.multiprocess.mq import MessageQueueClient
+from lmcache.v1.multiprocess.object_group_utils import (
+    execute_prepared_object_group_transfer,
+    has_sufficient_block_ids,
+    prepare_object_group_transfer,
+    select_block_ids_for_cache_context,
+)
 from lmcache.v1.multiprocess.protocol import RequestType
 from lmcache.v1.multiprocess.protocols.engine import RegisterEngineDrivenContextResponse
 from lmcache.v1.multiprocess.transfer_context.base import (
@@ -30,8 +45,11 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from lmcache.v1.platform.base_cache_context import BaseCacheContext
 from lmcache.v1.platform import _registry as platform_registry
 from lmcache.v1.platform import get_device_info
+import lmcache.c_ops as lmc_ops
+import lmcache.python_ops_fallback as _python_ops_fallback
 
 logger = init_logger(__name__)
 
@@ -115,6 +133,349 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
             "engine-driven transfer does not support hybrid KV cache groups"
         )
     return block_ids[0]
+
+
+def _has_native_object_group_transfer() -> bool:
+    """Return whether the native object-group executor is available."""
+    return (
+        lmc_ops.execute_object_group_transfer
+        is not _python_ops_fallback.execute_object_group_transfer
+    )
+
+
+class _EngineObjectGroupCacheContext(BaseCacheContext):
+    """Raw-tensor cache context used by engine-driven object-group planning."""
+
+    device_type = "cuda"
+
+    def __init__(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        lmcache_tokens_per_chunk: int,
+        layout_hints: LayoutHints | None,
+        engine_group_infos: Sequence[EngineGroupInfo],
+    ) -> None:
+        tensors = list(kv_caches.values())
+        kv_caches_norm, engine_kv_formats = normalize_and_discover_per_layer_formats(
+            tensors,
+            engine_group_layer_indices(engine_group_infos),
+            EngineType.VLLM,
+            layout_hints,
+        )
+        device = kv_caches_norm[0].device
+        kv_layer_groups_manager = KVLayerGroupsManager(
+            kv_caches_norm,
+            engine_kv_formats=engine_kv_formats,
+            engine_group_infos=engine_group_infos,
+            lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+            separate_object_groups=True,
+        )
+        block_ids_buffer = torch.empty(1 << 20, dtype=torch.long, device=device)
+        super().__init__(
+            kv_caches=kv_caches_norm,
+            device=device,
+            num_layers=len(engine_kv_formats),
+            kv_layer_groups_manager=kv_layer_groups_manager,
+            block_ids_buffer=block_ids_buffer,
+            lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+        )
+
+        self.group_kv_pointers_: list[torch.Tensor] = []
+        for idx, group in enumerate(self.kv_layer_groups_manager_.kv_layer_groups):
+            ptrs = get_group_data_ptrs(
+                self.kv_caches_, self.get_engine_kv_format(idx), group.layer_indices
+            )
+            self.group_kv_pointers_.append(
+                torch.tensor(ptrs, dtype=torch.long, device=device)
+            )
+        self._max_batch_size = 4
+        self.tmp_chunk_group_offsets_: list[int] = [0]
+        for group_idx, group in enumerate(
+            self.kv_layer_groups_manager_.kv_layer_groups
+        ):
+            shape = self.get_kv_buffer_shape(lmcache_tokens_per_chunk, group_idx)
+            byte_size = shape.numel() * group.dtype.itemsize
+            self.tmp_chunk_group_offsets_.append(
+                self.tmp_chunk_group_offsets_[-1] + byte_size
+            )
+        self.tmp_chunk_bytes_ = self.tmp_chunk_group_offsets_[-1]
+        self.tmp_buffer_ = torch.empty(
+            self.tmp_chunk_bytes_ * self.max_batch_size,
+            dtype=torch.uint8,
+            device=device,
+        )
+
+    @property
+    def stream(self) -> object:
+        """Return the current device stream placeholder."""
+        return torch_dev.current_stream()
+
+    @property
+    def cupy_stream(self) -> object:
+        """Return the current device stream placeholder."""
+        return torch_dev.current_stream()
+
+    @property
+    def max_batch_size(self) -> int:
+        """Return the maximum number of object-group objects per batch."""
+        return self._max_batch_size
+
+    def close(self) -> None:
+        """Release resources held by this raw-tensor context."""
+
+    def get_kernel_group_kv_pointers(self, kernel_group_idx: int) -> torch.Tensor:
+        """Return the pointer tensor for a kernel group."""
+        return self.group_kv_pointers_[kernel_group_idx]
+
+    def get_temp_kernel_group_buffer(
+        self, batch_idx: int, kernel_group_idx: int
+    ) -> torch.Tensor:
+        """Return a typed temporary buffer for a batch/kernel group pair."""
+        if batch_idx >= self.max_batch_size:
+            raise ValueError(
+                "batch_idx %d >= max_batch_size %d" % (batch_idx, self.max_batch_size)
+            )
+        group = self.kv_layer_groups_manager_.kv_layer_groups[kernel_group_idx]
+        shape = self.get_kv_buffer_shape(
+            self.lmcache_tokens_per_chunk, kernel_group_idx
+        )
+        group_start = self.tmp_chunk_group_offsets_[kernel_group_idx]
+        group_end = self.tmp_chunk_group_offsets_[kernel_group_idx + 1]
+        chunk = self.tmp_chunk_bytes_
+        return (
+            self.tmp_buffer_[
+                batch_idx * chunk + group_start : batch_idx * chunk + group_end
+            ]
+            .view(group.dtype)
+            .view(shape)
+        )
+
+    def get_temp_object_group_buffer(
+        self, batch_idx: int, object_group_idx: int
+    ) -> torch.Tensor:
+        """Return a flat temporary buffer for a batch/object group pair."""
+        if batch_idx >= self.max_batch_size:
+            raise ValueError(
+                "batch_idx %d >= max_batch_size %d" % (batch_idx, self.max_batch_size)
+            )
+        object_group = self.kv_layer_groups_manager_.object_groups[object_group_idx]
+        kg_indices = object_group.kernel_group_indices
+        group_start = self.tmp_chunk_group_offsets_[kg_indices[0]]
+        group_end = self.tmp_chunk_group_offsets_[kg_indices[-1] + 1]
+        chunk = self.tmp_chunk_bytes_
+        return self.tmp_buffer_[
+            batch_idx * chunk + group_start : batch_idx * chunk + group_end
+        ]
+
+    def get_kernel_group_shape_dtype(
+        self,
+        num_tokens: int,
+        kernel_group_idx: int,
+    ) -> tuple[torch.Size, torch.dtype]:
+        """Return ``(shape, dtype)`` for a kernel group and token count."""
+        group = self.kv_layer_groups_manager_.kv_layer_groups[kernel_group_idx]
+        compress_ratio = group.tokens_per_block // group.slots_per_block
+        if num_tokens % compress_ratio != 0:
+            raise ValueError(
+                "num_tokens (%d) is not a multiple of compress_ratio (%d) "
+                "for kernel_group_idx %d"
+                % (num_tokens, compress_ratio, kernel_group_idx)
+            )
+        num_slots = num_tokens // compress_ratio
+        shape_desc = group.shape_desc
+        return (
+            torch.Size(
+                (
+                    shape_desc.kv_size,
+                    group.num_layers,
+                    num_slots,
+                    group.hidden_dim_size,
+                )
+            ),
+            group.dtype,
+        )
+
+    def cache_size_per_token(self) -> int:
+        """Return cache bytes per logical token across all groups."""
+        total = 0
+        for group_idx, group in enumerate(
+            self.kv_layer_groups_manager_.kv_layer_groups
+        ):
+            compress_ratio = group.tokens_per_block // group.slots_per_block
+            numels = self.get_kv_buffer_shape(compress_ratio, group_idx).numel()
+            total += numels * group.dtype.itemsize // compress_ratio
+        return total
+
+
+@dataclass
+class _EngineObjectGroupTransferState:
+    """Prepared raw-tensor state for engine-driven object-group transfers."""
+
+    cache_context: BaseCacheContext
+    object_group_id: int = 0
+    host_buffer_alignment: int = LazyMemoryAllocator.PIN_CHUNK_SIZE
+
+    def close(self) -> None:
+        """Release resources held by the cache context."""
+        self.cache_context.close()
+
+
+def _build_engine_object_group_transfer_state(
+    kv_caches: dict[str, torch.Tensor],
+    lmcache_tokens_per_chunk: int,
+    layout_hints: LayoutHints | None,
+    engine_group_infos: Sequence[EngineGroupInfo],
+) -> _EngineObjectGroupTransferState | None:
+    """Build object-group state when the native engine-driven path can use it."""
+    tensors = list(kv_caches.values())
+    if (
+        not tensors
+        or tensors[0].device.type != "cuda"
+        or not _has_native_object_group_transfer()
+    ):
+        return None
+    return _EngineObjectGroupTransferState(
+        cache_context=_EngineObjectGroupCacheContext(
+            kv_caches,
+            lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+            layout_hints=layout_hints,
+            engine_group_infos=engine_group_infos,
+        )
+    )
+
+
+def _build_tensor_staging_copies(
+    objects: Sequence[torch.Tensor],
+    staging_buffers: Sequence[torch.Tensor],
+    is_h2d: bool,
+) -> list["lmc_ops.StagingCopy"]:
+    """Build native staging descriptors for tensor-backed transport objects."""
+    copies: list["lmc_ops.StagingCopy"] = []
+    for tensor, staging_buffer in zip(objects, staging_buffers, strict=True):
+        if tensor.nbytes != staging_buffer.nbytes:
+            raise ValueError(
+                f"Size mismatch: tensor nbytes={tensor.nbytes}, "
+                f"staging_buffer nbytes={staging_buffer.nbytes}"
+            )
+        host_ptr = tensor.data_ptr()
+        device_ptr = staging_buffer.data_ptr()
+        host_offset = host_ptr % LazyMemoryAllocator.PIN_CHUNK_SIZE
+        if is_h2d:
+            copies.append(
+                lmc_ops.StagingCopy(device_ptr, host_ptr, tensor.nbytes, host_offset)
+            )
+        else:
+            copies.append(
+                lmc_ops.StagingCopy(host_ptr, device_ptr, tensor.nbytes, host_offset)
+            )
+    return copies
+
+
+def _build_pickle_tensor_staging_copies(
+    objects: Sequence[torch.Tensor],
+    staging_buffers: Sequence[torch.Tensor],
+    is_h2d: bool,
+) -> list["lmc_ops.StagingCopy"]:
+    """Build staging descriptors for pickle tensor payloads."""
+    return _build_tensor_staging_copies(objects, staging_buffers, is_h2d)
+
+
+def _build_shm_tensor_staging_copies(
+    objects: Sequence[torch.Tensor],
+    staging_buffers: Sequence[torch.Tensor],
+    is_h2d: bool,
+) -> list["lmc_ops.StagingCopy"]:
+    """Build staging descriptors for SHM tensor views."""
+    return _build_tensor_staging_copies(objects, staging_buffers, is_h2d)
+
+
+def _is_shm_engine_context(context: EngineDrivenContext) -> bool:
+    """Return whether an engine-driven context uses SHM transport."""
+    # Local
+    from .shm import EngineDrivenContextShm
+
+    return isinstance(context, EngineDrivenContextShm)
+
+
+def _allocate_pickle_transfer_tensors(
+    layout_desc: MemoryLayoutDesc,
+    count: int,
+) -> list[torch.Tensor]:
+    """Allocate pickle transport tensors matching the registered layout."""
+    if len(layout_desc.shapes) != 1 or len(layout_desc.dtypes) != 1:
+        raise ValueError(
+            "engine-driven pickle object-group transfer expects exactly one "
+            "shape/dtype entry"
+        )
+    return [
+        torch.empty(
+            layout_desc.shapes[0],
+            dtype=layout_desc.dtypes[0],
+            device=torch.device("cpu"),
+            pin_memory=torch_dev.is_available(),
+        )
+        for _ in range(count)
+    ]
+
+
+def _supports_single_engine_object_group(
+    state: _EngineObjectGroupTransferState,
+    block_ids: list[list[int]],
+) -> bool:
+    """Return whether the current engine-driven request maps to one object group."""
+    manager = state.cache_context.kv_layer_groups_manager
+    if len(manager.object_groups) != 1:
+        return False
+    return manager.num_kernel_groups == 1 and len(block_ids) == 1
+
+
+def _execute_engine_object_group_transfer(
+    state: _EngineObjectGroupTransferState,
+    block_ids: list[list[int]],
+    objects: Sequence[torch.Tensor | None],
+    skip_first_n_tokens: int,
+    direction: "lmc_ops.TransferDirection",
+    staging_builder: Callable[
+        [Sequence[torch.Tensor], Sequence[torch.Tensor], bool],
+        list["lmc_ops.StagingCopy"],
+    ],
+    batch_size: int,
+) -> None:
+    """Plan and execute an engine-driven object-group transfer."""
+    cache_context = state.cache_context
+    raw_blocks_per_chunk = [
+        cache_context.calculate_num_blocks(
+            cache_context.lmcache_tokens_per_chunk, kernel_group_id
+        )
+        for kernel_group_id in range(
+            cache_context.kv_layer_groups_manager.num_kernel_groups
+        )
+    ]
+    if not has_sufficient_block_ids(
+        block_ids,
+        raw_blocks_per_chunk,
+        len(objects),
+    ):
+        raise ValueError("block_ids do not cover all engine-driven transfer objects")
+    selected_block_ids = select_block_ids_for_cache_context(cache_context, block_ids)
+    block_ids_gpu = cache_context.stage_block_ids(selected_block_ids)
+    kernel_group_specs, batch_steps = prepare_object_group_transfer(
+        cache_context,
+        block_ids_gpu,
+        objects,
+        state.object_group_id,
+        batch_size,
+        skip_first_n_tokens,
+        direction,
+        staging_builder,
+    )
+    execute_prepared_object_group_transfer(
+        direction,
+        cache_context.device,
+        kernel_group_specs,
+        batch_steps,
+        host_buffer_alignment=state.host_buffer_alignment,
+    )
 
 
 class TransferContext(ABC):
@@ -331,6 +692,7 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        self._object_group_transfer_state: _EngineObjectGroupTransferState | None = None
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -377,6 +739,12 @@ class EngineDrivenTransferContext(TransferContext):
         ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
         self._layout_hints = layout_hints
         self._engine_kv_format = engine_kv_format
+        self._object_group_transfer_state = _build_engine_object_group_transfer_state(
+            kv_caches,
+            lmcache_tokens_per_chunk=blocks_in_chunk * block_size,
+            layout_hints=layout_hints,
+            engine_group_infos=engine_group_infos,
+        )
 
         use_mla_flag = is_mla(engine_kv_format)
         shape = (
@@ -455,6 +823,55 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
+        if (
+            self._object_group_transfer_state is not None
+            and _supports_single_engine_object_group(
+                self._object_group_transfer_state, block_ids
+            )
+        ):
+            flat_block_ids = _single_group_block_ids(block_ids)
+            num_chunks = len(flat_block_ids) // blocks_in_chunk
+            if out_buffers is None:
+                cpu_chunks = _allocate_pickle_transfer_tensors(
+                    self._engine_driven_context.layout_desc, num_chunks
+                )
+                _execute_engine_object_group_transfer(
+                    self._object_group_transfer_state,
+                    block_ids,
+                    cpu_chunks,
+                    skip_first_n_tokens=0,
+                    direction=lmc_ops.TransferDirection.D2H,
+                    staging_builder=_build_pickle_tensor_staging_copies,
+                    batch_size=(
+                        self._object_group_transfer_state.cache_context.max_batch_size
+                    ),
+                )
+            else:
+                objects: list[torch.Tensor | None] = [None] * num_chunks
+                for buffer, chunk_idx in zip(
+                    out_buffers, chunk_indices or [], strict=True
+                ):
+                    if chunk_idx >= num_chunks:
+                        raise ValueError(
+                            f"chunk index {chunk_idx} exceeds num_chunks {num_chunks}"
+                        )
+                    objects[chunk_idx] = buffer
+                _execute_engine_object_group_transfer(
+                    self._object_group_transfer_state,
+                    block_ids,
+                    objects,
+                    skip_first_n_tokens=0,
+                    direction=lmc_ops.TransferDirection.D2H,
+                    staging_builder=_build_shm_tensor_staging_copies,
+                    batch_size=1,
+                )
+                cpu_chunks = out_buffers
+            torch_dev.synchronize()
+            ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+
+            future = MessagingFuture()
+            future.set_result(ok)
+            return future
         cpu_chunks = gather_paged_kv_to_cpu(
             kv_caches,
             _single_group_block_ids(block_ids),
@@ -494,15 +911,39 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
-                )
+                if (
+                    self._object_group_transfer_state is not None
+                    and _supports_single_engine_object_group(
+                        self._object_group_transfer_state, block_ids
+                    )
+                ):
+                    staging_builder = (
+                        _build_shm_tensor_staging_copies
+                        if _is_shm_engine_context(self._engine_driven_context)
+                        else _build_pickle_tensor_staging_copies
+                    )
+                    _execute_engine_object_group_transfer(
+                        self._object_group_transfer_state,
+                        block_ids,
+                        src_buffers,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        direction=lmc_ops.TransferDirection.H2D,
+                        staging_builder=staging_builder,
+                        batch_size=(
+                            self._object_group_transfer_state.cache_context
+                            .max_batch_size
+                        ),
+                    )
+                else:
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        _single_group_block_ids(block_ids),
+                        src_buffers,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
@@ -516,6 +957,9 @@ class EngineDrivenTransferContext(TransferContext):
         return future
 
     def close(self) -> None:
+        if self._object_group_transfer_state is not None:
+            self._object_group_transfer_state.close()
+            self._object_group_transfer_state = None
         if self._engine_driven_context is not None:
             self._engine_driven_context.close()
             self._engine_driven_context = None

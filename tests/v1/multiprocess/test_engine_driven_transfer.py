@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from unittest.mock import MagicMock, patch
@@ -581,6 +581,334 @@ def test_musa_data_context_retrieve_uses_device_agnostic_scatter(
 
     assert result is True
     assert "prefer_musa_native" not in captured_kwargs
+
+
+def test_engine_driven_pickle_store_uses_object_group_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pickle store uses shared object-group planning when native state exists."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    class _FakeManager:
+        object_groups = [MagicMock(kernel_group_indices=[0])]
+        num_kernel_groups = 1
+
+        def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
+            return 8
+
+    class _FakeCacheContext:
+        lmcache_tokens_per_chunk = 8
+        kv_layer_groups_manager = _FakeManager()
+        device = torch.device("cuda")
+        max_batch_size = 4
+
+        def calculate_num_blocks(
+            self, num_tokens: int, _kernel_group_id: int
+        ) -> int:
+            return num_tokens // 4
+
+        def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
+            return [torch.tensor(block_ids[0], dtype=torch.long)]
+
+    class _FakeState:
+        cache_context = _FakeCacheContext()
+        object_group_id = 0
+        host_buffer_alignment = 4096
+
+        def close(self) -> None:
+            return None
+
+    class _FakeEngineDrivenContext:
+        layout_desc = MemoryLayoutDesc(
+            shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+        )
+
+        def prepare_store(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def commit_store(
+            self, _key: Any, _instance_id: int, chunks: list[torch.Tensor]
+        ) -> bool:
+            captured["committed_chunks"] = chunks
+            return True
+
+        def close(self) -> None:
+            return None
+
+    captured: dict[str, Any] = {}
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: _FakeEngineDrivenContext(),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "_build_engine_object_group_transfer_state",
+        lambda *_args, **_kwargs: _FakeState(),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "select_block_ids_for_cache_context",
+        lambda _cache_context, block_ids: block_ids,
+    )
+    monkeypatch.setattr(
+        worker_transfer.lmc_ops,
+        "StagingCopy",
+        lambda *args: args,
+    )
+
+    def _fake_prepare(
+        _cache_context: Any,
+        _block_ids_gpu: list[torch.Tensor],
+        objects: Sequence[torch.Tensor | None],
+        _object_group_id: int,
+        batch_size: int,
+        skip_first_n_tokens: int,
+        direction: Any,
+        staging_builder: Any,
+    ) -> tuple[list[str], list[str]]:
+        concrete_objects = [obj for obj in objects if obj is not None]
+        assert concrete_objects
+        staging_builder(
+            concrete_objects, [torch.empty_like(concrete_objects[0])], False
+        )
+        captured["prepare"] = {
+            "batch_size": batch_size,
+            "skip_first_n_tokens": skip_first_n_tokens,
+            "direction": direction,
+            "staging_builder": staging_builder,
+            "num_objects": len(objects),
+        }
+        return ["spec"], ["step"]
+
+    def _fake_execute(
+        direction: Any,
+        device: torch.device,
+        specs: list[str],
+        steps: list[str],
+        *,
+        host_buffer_alignment: int,
+    ) -> None:
+        captured["execute"] = (direction, device, specs, steps, host_buffer_alignment)
+
+    monkeypatch.setattr(worker_transfer, "prepare_object_group_transfer", _fake_prepare)
+    monkeypatch.setattr(
+        worker_transfer, "execute_prepared_object_group_transfer", _fake_execute
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "gather_paged_kv_to_cpu",
+        lambda *_args, **_kwargs: pytest.fail("fallback gather should not run"),
+    )
+
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+    )
+
+    result = ctx.submit_store(
+        "req", _default_key(), 1, _make_kv_caches(), [[0, 1]], MagicMock(), 2
+    ).result()
+
+    assert result is True
+    assert captured["prepare"]["direction"] == lmc_ops.TransferDirection.D2H
+    assert (
+        captured["prepare"]["staging_builder"]
+        is worker_transfer._build_pickle_tensor_staging_copies
+    )
+    assert captured["prepare"]["batch_size"] == 4
+    assert captured["prepare"]["skip_first_n_tokens"] == 0
+    assert captured["prepare"]["num_objects"] == 1
+    assert captured["execute"][4] == 4096
+    assert len(captured["committed_chunks"]) == 1
+
+
+def test_engine_driven_shm_retrieve_uses_object_group_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SHM retrieve uses shared object-group planning when native state exists."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    class _FakeManager:
+        object_groups = [MagicMock(kernel_group_indices=[0])]
+        num_kernel_groups = 1
+
+        def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
+            return 8
+
+    class _FakeCacheContext:
+        lmcache_tokens_per_chunk = 8
+        kv_layer_groups_manager = _FakeManager()
+        device = torch.device("cuda")
+        max_batch_size = 4
+
+        def calculate_num_blocks(
+            self, num_tokens: int, _kernel_group_id: int
+        ) -> int:
+            return num_tokens // 4
+
+        def stage_block_ids(self, block_ids: list[list[int]]) -> list[torch.Tensor]:
+            return [torch.tensor(block_ids[0], dtype=torch.long)]
+
+    class _FakeState:
+        cache_context = _FakeCacheContext()
+        object_group_id = 0
+        host_buffer_alignment = 8192
+
+        def close(self) -> None:
+            return None
+
+    class _FakeEngineDrivenContext:
+        def prepare_retrieve(self, *_args: Any, **_kwargs: Any) -> list[torch.Tensor]:
+            return [torch.empty(2, 2, 8, 16)]
+
+        def commit_retrieve(self, *_args: Any, **_kwargs: Any) -> bool:
+            captured["commit_retrieve"] = True
+            return True
+
+        def close(self) -> None:
+            return None
+
+    captured: dict[str, Any] = {}
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: _FakeEngineDrivenContext(),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "_build_engine_object_group_transfer_state",
+        lambda *_args, **_kwargs: _FakeState(),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "select_block_ids_for_cache_context",
+        lambda _cache_context, block_ids: block_ids,
+    )
+    monkeypatch.setattr(worker_transfer, "_is_shm_engine_context", lambda _ctx: True)
+    monkeypatch.setattr(
+        worker_transfer.lmc_ops,
+        "StagingCopy",
+        lambda *args: args,
+    )
+
+    def _fake_prepare(
+        _cache_context: Any,
+        _block_ids_gpu: list[torch.Tensor],
+        objects: Sequence[torch.Tensor | None],
+        _object_group_id: int,
+        batch_size: int,
+        skip_first_n_tokens: int,
+        direction: Any,
+        staging_builder: Any,
+    ) -> tuple[list[str], list[str]]:
+        concrete_objects = [obj for obj in objects if obj is not None]
+        assert concrete_objects
+        staging_builder(concrete_objects, [torch.empty_like(concrete_objects[0])], True)
+        captured["prepare"] = {
+            "batch_size": batch_size,
+            "skip_first_n_tokens": skip_first_n_tokens,
+            "direction": direction,
+            "staging_builder": staging_builder,
+        }
+        return ["spec"], ["step"]
+
+    def _fake_execute(
+        direction: Any,
+        device: torch.device,
+        specs: list[str],
+        steps: list[str],
+        *,
+        host_buffer_alignment: int,
+    ) -> None:
+        captured["execute"] = (direction, device, specs, steps, host_buffer_alignment)
+
+    monkeypatch.setattr(worker_transfer, "prepare_object_group_transfer", _fake_prepare)
+    monkeypatch.setattr(
+        worker_transfer, "execute_prepared_object_group_transfer", _fake_execute
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "scatter_cpu_to_paged_kv",
+        lambda *_args, **_kwargs: pytest.fail("fallback scatter should not run"),
+    )
+
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+    )
+
+    result = ctx.submit_retrieve(
+        "req",
+        _default_key(),
+        1,
+        _make_kv_caches(),
+        [[0, 1]],
+        MagicMock(),
+        2,
+        skip_first_n_tokens=4,
+    ).result()
+
+    assert result is True
+    assert captured["prepare"]["direction"] == lmc_ops.TransferDirection.H2D
+    assert (
+        captured["prepare"]["staging_builder"]
+        is worker_transfer._build_shm_tensor_staging_copies
+    )
+    assert captured["prepare"]["batch_size"] == 4
+    assert captured["prepare"]["skip_first_n_tokens"] == 4
+    assert captured["execute"][4] == 8192
+    assert captured["commit_retrieve"] is True
 
 
 def test_create_transfer_context_env_var_overrides_default(
