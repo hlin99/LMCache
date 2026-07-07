@@ -14,7 +14,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import AttnWindowDesc, MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.posix_shm import (
     shm_create_readwrite,
     shm_munmap,
@@ -37,11 +37,8 @@ from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 TestObjectKey = str | ObjectKey
 
 
-def _make_attn_window_desc(num_chunks_in_sw: list[int]) -> Any:
-    """Return a real attention-window descriptor for test cache contexts."""
-    # First Party
-    from lmcache.v1.distributed.api import AttnWindowDesc
-
+def _make_attn_window_desc(num_chunks_in_sw: list[int]) -> AttnWindowDesc:
+    """Return an attention-window descriptor for test cache contexts."""
     return AttnWindowDesc(num_chunks_in_sw)
 
 
@@ -653,7 +650,7 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
-        def get_attn_desc(self) -> Any:
+        def get_attn_desc(self) -> AttnWindowDesc:
             return _make_attn_window_desc([-1])
 
     class FakeCacheContext:
@@ -823,7 +820,7 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
-        def get_attn_desc(self) -> Any:
+        def get_attn_desc(self) -> AttnWindowDesc:
             return _make_attn_window_desc([-1])
 
     class FakeCacheContext:
@@ -993,7 +990,7 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         ]
         num_kernel_groups = 2
 
-        def get_attn_desc(self) -> Any:
+        def get_attn_desc(self) -> AttnWindowDesc:
             return _make_attn_window_desc([-1, 2])
 
     class FakeCacheContext:
@@ -1167,7 +1164,7 @@ def test_engine_driven_shm_retrieve_plans_all_object_groups(
         ]
         num_kernel_groups = 2
 
-        def get_attn_desc(self) -> Any:
+        def get_attn_desc(self) -> AttnWindowDesc:
             return _make_attn_window_desc([-1, 2])
 
     class FakeCacheContext:

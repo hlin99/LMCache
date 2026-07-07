@@ -1075,6 +1075,13 @@ class EngineDrivenTransferContext(TransferContext):
                 else []
             ),
         )
+        if self._object_group_transfer_state is not None:
+            kv_groups_manager = (
+                self._object_group_transfer_state.cache_context.kv_layer_groups_manager
+            )
+            attn_window_num_chunks = kv_groups_manager.get_attn_desc().num_chunks_in_sw
+        else:
+            attn_window_num_chunks = []
 
         future = send_request(
             mq_client,
@@ -1097,11 +1104,7 @@ class EngineDrivenTransferContext(TransferContext):
                         [str(dtype).split(".")[-1] for dtype in layout.dtypes]
                         for layout in metadata.object_group_layout_descs
                     ],
-                    attn_window_num_chunks=(
-                        self._object_group_transfer_state.cache_context.kv_layer_groups_manager.get_attn_desc().num_chunks_in_sw
-                        if self._object_group_transfer_state is not None
-                        else []
-                    ),
+                    attn_window_num_chunks=attn_window_num_chunks,
                 )
             ],
         )
