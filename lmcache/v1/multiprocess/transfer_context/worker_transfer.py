@@ -211,16 +211,25 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
                 torch.tensor(ptrs, dtype=torch.long, device=device)
             )
         self._max_batch_size = _ENGINE_OBJECT_GROUP_MAX_BATCH_SIZE
-        self._tmp_chunk_group_offsets: list[int] = [0]
-        for group_idx, group in enumerate(
-            self.kv_layer_groups_manager_.kv_layer_groups
-        ):
-            shape = self.get_kv_buffer_shape(lmcache_tokens_per_chunk, group_idx)
-            byte_size = shape.numel() * group.dtype.itemsize
-            self._tmp_chunk_group_offsets.append(
-                self._tmp_chunk_group_offsets[-1] + byte_size
-            )
-        self._tmp_chunk_bytes = self._tmp_chunk_group_offsets[-1]
+        num_kernel_groups = self.kv_layer_groups_manager_.num_kernel_groups
+        self._tmp_kernel_group_offsets: list[tuple[int, int]] = [
+            (0, 0) for _ in range(num_kernel_groups)
+        ]
+        self._tmp_object_group_offsets: list[tuple[int, int]] = []
+        offset = 0
+        for object_group in self.kv_layer_groups_manager_.object_groups:
+            object_group_start = offset
+            for group_idx in object_group.kernel_group_indices:
+                group = self.kv_layer_groups_manager_.kv_layer_groups[group_idx]
+                shape = self.get_kv_buffer_shape(lmcache_tokens_per_chunk, group_idx)
+                byte_size = shape.numel() * group.dtype.itemsize
+                self._tmp_kernel_group_offsets[group_idx] = (
+                    offset,
+                    offset + byte_size,
+                )
+                offset += byte_size
+            self._tmp_object_group_offsets.append((object_group_start, offset))
+        self._tmp_chunk_bytes = offset
         self._tmp_buffer = torch.empty(
             self._tmp_chunk_bytes * self.max_batch_size,
             dtype=torch.uint8,
@@ -261,8 +270,7 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
         shape = self.get_kv_buffer_shape(
             self.lmcache_tokens_per_chunk, kernel_group_idx
         )
-        group_start = self._tmp_chunk_group_offsets[kernel_group_idx]
-        group_end = self._tmp_chunk_group_offsets[kernel_group_idx + 1]
+        group_start, group_end = self._tmp_kernel_group_offsets[kernel_group_idx]
         chunk = self._tmp_chunk_bytes
         return (
             self._tmp_buffer[
@@ -280,10 +288,7 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
             raise ValueError(
                 f"batch_idx {batch_idx} >= max_batch_size {self.max_batch_size}"
             )
-        object_group = self.kv_layer_groups_manager_.object_groups[object_group_idx]
-        kg_indices = object_group.kernel_group_indices
-        group_start = self._tmp_chunk_group_offsets[kg_indices[0]]
-        group_end = self._tmp_chunk_group_offsets[kg_indices[-1] + 1]
+        group_start, group_end = self._tmp_object_group_offsets[object_group_idx]
         chunk = self._tmp_chunk_bytes
         return self._tmp_buffer[
             batch_idx * chunk + group_start : batch_idx * chunk + group_end
@@ -334,12 +339,29 @@ class _EngineObjectGroupTransferState:
     """Prepared raw-tensor state for engine-driven object-group transfers."""
 
     cache_context: BaseCacheContext
-    object_group_id: int = 0
+    object_group_layout_descs: list[MemoryLayoutDesc]
     host_buffer_alignment: int = LazyMemoryAllocator.PIN_CHUNK_SIZE
 
     def close(self) -> None:
         """Release resources held by the cache context."""
         self.cache_context.close()
+
+
+def _get_object_group_layout_descs(
+    cache_context: BaseCacheContext,
+) -> list[MemoryLayoutDesc]:
+    """Return per-object-group CPU transport layouts for a cache context."""
+    layouts: list[MemoryLayoutDesc] = []
+    for object_group in cache_context.kv_layer_groups_manager.object_groups:
+        shapes_and_dtypes = [
+            cache_context.get_kernel_group_shape_dtype(
+                cache_context.lmcache_tokens_per_chunk, kernel_group_id
+            )
+            for kernel_group_id in object_group.kernel_group_indices
+        ]
+        shapes, dtypes = zip(*shapes_and_dtypes, strict=True)
+        layouts.append(MemoryLayoutDesc(shapes=list(shapes), dtypes=list(dtypes)))
+    return layouts
 
 
 def _build_engine_object_group_transfer_state(
@@ -371,13 +393,15 @@ def _build_engine_object_group_transfer_state(
         or not _has_native_object_group_transfer()
     ):
         return None
+    cache_context = _EngineObjectGroupCacheContext(
+        kv_caches,
+        lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+        layout_hints=layout_hints,
+        engine_group_infos=engine_group_infos,
+    )
     return _EngineObjectGroupTransferState(
-        cache_context=_EngineObjectGroupCacheContext(
-            kv_caches,
-            lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
-            layout_hints=layout_hints,
-            engine_group_infos=engine_group_infos,
-        )
+        cache_context=cache_context,
+        object_group_layout_descs=_get_object_group_layout_descs(cache_context),
     )
 
 
@@ -508,18 +532,15 @@ def _allocate_pickle_transfer_tensors(
     Returns:
         CPU tensors suitable for pickle commit payloads.
 
-    Raises:
-        ValueError: If the layout does not describe exactly one tensor object.
     """
-    if len(layout_desc.shapes) != 1 or len(layout_desc.dtypes) != 1:
-        raise ValueError(
-            "engine-driven pickle object-group transfer expects exactly one "
-            "shape/dtype entry"
-        )
+    nbytes = sum(
+        shape.numel() * dtype.itemsize
+        for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True)
+    )
     return [
         torch.empty(
-            layout_desc.shapes[0],
-            dtype=layout_desc.dtypes[0],
+            (nbytes,),
+            dtype=torch.uint8,
             device=torch.device("cpu"),
             pin_memory=torch_dev.is_available(),
         )
@@ -527,37 +548,75 @@ def _allocate_pickle_transfer_tensors(
     ]
 
 
-def _supports_single_engine_object_group(
+def _get_num_chunks_from_block_ids(
     state: _EngineObjectGroupTransferState,
     block_ids: list[list[int]],
-) -> bool:
-    """Return whether the request maps to the current single-group contract.
+) -> int:
+    """Return the transfer chunk count implied by the first kernel group."""
+    if not block_ids:
+        return 0
+    blocks_per_chunk = state.cache_context.calculate_num_blocks(
+        state.cache_context.lmcache_tokens_per_chunk, 0
+    )
+    return len(block_ids[0]) // blocks_per_chunk
 
-    The optimized engine-driven path currently supports exactly one object
-    group containing exactly one kernel group, with ``block_ids`` supplied as a
-    single kernel-group list.  Other layouts remain on the fallback path instead
-    of risking a mismatched transport object layout.  Store fallback uses
-    :func:`gather_paged_kv_to_cpu`; retrieve fallback uses
-    :func:`scatter_cpu_to_paged_kv`.
 
-    Args:
-        state: Prepared object-group transfer state.
-        block_ids: Request block IDs indexed by kernel group.
+def _group_flat_transport_objects(
+    flat_objects: Sequence[torch.Tensor],
+    num_object_groups: int,
+    num_chunks: int,
+) -> list[list[torch.Tensor]]:
+    """Split object-group-major flat transport objects into per-group lists."""
+    expected = num_object_groups * num_chunks
+    if len(flat_objects) != expected:
+        raise ValueError(
+            f"Expected {expected} engine-driven transport objects, "
+            f"got {len(flat_objects)}"
+        )
+    return [
+        list(flat_objects[start : start + num_chunks])
+        for start in range(0, expected, num_chunks)
+    ]
 
-    Returns:
-        True when the current engine-driven transport can use the shared
-        object-group helper path for this request.
-    """
-    manager = state.cache_context.kv_layer_groups_manager
-    if len(manager.object_groups) != 1:
-        return False
-    return manager.num_kernel_groups == 1 and len(block_ids) == 1
+
+def _flatten_transport_objects(
+    objects_by_group: Sequence[Sequence[torch.Tensor | None]],
+) -> list[torch.Tensor]:
+    """Flatten object-group-major transport objects after dropping skipped slots."""
+    return [
+        obj
+        for objects in objects_by_group
+        for obj in objects
+        if obj is not None
+    ]
+
+
+def _build_sparse_transport_objects(
+    buffers: Sequence[torch.Tensor],
+    flat_chunk_indices: Sequence[int],
+    num_object_groups: int,
+    num_chunks: int,
+) -> list[list[torch.Tensor | None]]:
+    """Build sparse per-group object lists from SHM flat chunk indices."""
+    objects_by_group: list[list[torch.Tensor | None]] = [
+        [None] * num_chunks for _ in range(num_object_groups)
+    ]
+    for buffer, flat_idx in zip(buffers, flat_chunk_indices, strict=True):
+        if flat_idx < 0 or flat_idx >= num_object_groups * num_chunks:
+            raise ValueError(
+                f"chunk_idx {flat_idx} out of range "
+                f"[0, {num_object_groups * num_chunks})"
+            )
+        object_group_id = flat_idx // num_chunks
+        chunk_idx = flat_idx % num_chunks
+        objects_by_group[object_group_id][chunk_idx] = buffer
+    return objects_by_group
 
 
 def _execute_engine_object_group_transfer(
     state: _EngineObjectGroupTransferState,
     block_ids: list[list[int]],
-    objects: Sequence[torch.Tensor | None],
+    objects_by_group: Sequence[Sequence[torch.Tensor | None]],
     skip_first_n_tokens: int,
     direction: "lmc_ops.TransferDirection",
     staging_copy_builder: Callable[
@@ -576,8 +635,8 @@ def _execute_engine_object_group_transfer(
     Args:
         state: Prepared object-group transfer state.
         block_ids: Raw block IDs indexed by kernel group.
-        objects: Tensor transport objects, with ``None`` entries allowed for
-            skipped D2H store chunks.
+        objects_by_group: Tensor transport objects indexed by object group and
+            chunk, with ``None`` entries allowed for skipped D2H store chunks.
         skip_first_n_tokens: Retrieve prefix to preserve.
         direction: Native transfer direction.
         staging_copy_builder: Builder for native staging-copy descriptors.
@@ -587,6 +646,16 @@ def _execute_engine_object_group_transfer(
         ValueError: If ``block_ids`` do not cover every requested object.
     """
     cache_context = state.cache_context
+    if len(objects_by_group) != len(
+        cache_context.kv_layer_groups_manager.object_groups
+    ):
+        raise ValueError(
+            "objects_by_group length does not match engine-driven object groups"
+        )
+    num_chunks = len(objects_by_group[0]) if objects_by_group else 0
+    if any(len(objects) != num_chunks for objects in objects_by_group):
+        raise ValueError("all object groups must contain the same number of chunks")
+
     raw_blocks_per_chunk = [
         cache_context.calculate_num_blocks(
             cache_context.lmcache_tokens_per_chunk, kernel_group_id
@@ -598,28 +667,29 @@ def _execute_engine_object_group_transfer(
     if not has_sufficient_block_ids(
         block_ids,
         raw_blocks_per_chunk,
-        len(objects),
+        num_chunks,
     ):
         raise ValueError("block_ids do not cover all engine-driven transfer objects")
     selected_block_ids = select_block_ids_for_cache_context(cache_context, block_ids)
     block_ids_gpu = cache_context.stage_block_ids(selected_block_ids)
-    kernel_group_specs, batch_steps = prepare_object_group_transfer(
-        cache_context,
-        block_ids_gpu,
-        objects,
-        state.object_group_id,
-        batch_size,
-        skip_first_n_tokens,
-        direction,
-        staging_copy_builder,
-    )
-    execute_prepared_object_group_transfer(
-        direction,
-        cache_context.device,
-        kernel_group_specs,
-        batch_steps,
-        host_buffer_alignment=state.host_buffer_alignment,
-    )
+    for object_group_id, objects in enumerate(objects_by_group):
+        kernel_group_specs, batch_steps = prepare_object_group_transfer(
+            cache_context,
+            block_ids_gpu,
+            objects,
+            object_group_id,
+            batch_size,
+            skip_first_n_tokens,
+            direction,
+            staging_copy_builder,
+        )
+        execute_prepared_object_group_transfer(
+            direction,
+            cache_context.device,
+            kernel_group_specs,
+            batch_steps,
+            host_buffer_alignment=state.host_buffer_alignment,
+        )
 
 
 class TransferContext(ABC):
@@ -825,11 +895,13 @@ class LMCacheDrivenTransferContext(TransferContext):
 
 
 class EngineDrivenTransferContext(TransferContext):
-    """Engine-driven transfer context for non-CUDA workers.
+    """Engine-driven transfer context for worker-side copy mode.
 
     In this mode the engine (worker side) owns the data movement: the
     worker adapter gathers/packs KV into CPU buffers, commits via
     message-queue, and the server side persists/rehydrates from storage.
+    CUDA workers use the shared object-group transfer planner when native
+    support is available; other workers use the low-level gather/scatter path.
     """
 
     def __init__(self) -> None:
@@ -864,13 +936,7 @@ class EngineDrivenTransferContext(TransferContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
     ) -> None:
-        """Register KV caches with the non-GPU context server.
-
-        ``engine_group_infos`` is accepted to satisfy the base interface but
-        is currently a no-op: the non-GPU transfer path does not support
-        hybrid KV cache groups and rejects multi-group transfers at store /
-        retrieve time (see ``_single_group_block_ids``).
-        """
+        """Register KV caches with the engine-driven context server."""
         # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
         # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
         # on the CUDA path. The non-CUDA path is yet to be implemented.
@@ -900,6 +966,16 @@ class EngineDrivenTransferContext(TransferContext):
         )
         dtype = getattr(torch, dtype_str)
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        metadata = EngineDrivenContextMetadata(
+            layout_desc=layout_desc,
+            block_size=block_size,
+            use_mla=use_mla_flag,
+            object_group_layout_descs=(
+                self._object_group_transfer_state.object_group_layout_descs
+                if self._object_group_transfer_state is not None
+                else []
+            ),
+        )
 
         future = send_request(
             mq_client,
@@ -914,6 +990,21 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    object_group_shapes=[
+                        [list(shape) for shape in layout.shapes]
+                        for layout in metadata.object_group_layout_descs
+                    ],
+                    object_group_dtypes=[
+                        [str(dtype).split(".")[-1] for dtype in layout.dtypes]
+                        for layout in metadata.object_group_layout_descs
+                    ],
+                    attn_window_num_chunks=(
+                        self._object_group_transfer_state.cache_context
+                        .kv_layer_groups_manager.get_attn_desc()
+                        .num_chunks_in_sw
+                        if self._object_group_transfer_state is not None
+                        else []
+                    ),
                 )
             ],
         )
@@ -924,11 +1015,6 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name = response.shm_name
             pool_size = response.pool_size
 
-        metadata = EngineDrivenContextMetadata(
-            layout_desc=layout_desc,
-            block_size=block_size,
-            use_mla=use_mla_flag,
-        )
         self._engine_driven_context = create_engine_driven_context(
             metadata,
             mq_client,
@@ -967,43 +1053,38 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        if (
-            self._object_group_transfer_state is not None
-            and _supports_single_engine_object_group(
-                self._object_group_transfer_state, block_ids
+        if self._object_group_transfer_state is not None:
+            state = self._object_group_transfer_state
+            num_chunks = _get_num_chunks_from_block_ids(state, block_ids)
+            num_object_groups = len(
+                state.cache_context.kv_layer_groups_manager.object_groups
             )
-        ):
-            flat_block_ids = _single_group_block_ids(block_ids)
-            num_chunks = len(flat_block_ids) // blocks_in_chunk
             if out_buffers is None:
-                cpu_chunks = _allocate_pickle_transfer_tensors(
-                    self._engine_driven_context.layout_desc, num_chunks
-                )
+                objects_by_group = [
+                    _allocate_pickle_transfer_tensors(layout_desc, num_chunks)
+                    for layout_desc in state.object_group_layout_descs
+                ]
                 _execute_engine_object_group_transfer(
-                    self._object_group_transfer_state,
+                    state,
                     block_ids,
-                    cpu_chunks,
+                    objects_by_group,
                     skip_first_n_tokens=0,
                     direction=lmc_ops.TransferDirection.D2H,
                     staging_copy_builder=_build_pickle_tensor_staging_copies,
-                    batch_size=(
-                        self._object_group_transfer_state.cache_context.max_batch_size
-                    ),
+                    batch_size=state.cache_context.max_batch_size,
                 )
+                cpu_chunks = _flatten_transport_objects(objects_by_group)
             else:
-                objects: list[torch.Tensor | None] = [None] * num_chunks
-                for buffer, chunk_idx in zip(
-                    out_buffers, chunk_indices or [], strict=True
-                ):
-                    if chunk_idx >= num_chunks:
-                        raise ValueError(
-                            f"chunk_idx {chunk_idx} out of range [0, {num_chunks})"
-                        )
-                    objects[chunk_idx] = buffer
+                objects_by_group = _build_sparse_transport_objects(
+                    out_buffers,
+                    chunk_indices or [],
+                    num_object_groups,
+                    num_chunks,
+                )
                 _execute_engine_object_group_transfer(
-                    self._object_group_transfer_state,
+                    state,
                     block_ids,
-                    objects,
+                    objects_by_group,
                     skip_first_n_tokens=0,
                     direction=lmc_ops.TransferDirection.D2H,
                     staging_copy_builder=_build_shm_tensor_staging_copies,
@@ -1055,28 +1136,27 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                if (
-                    self._object_group_transfer_state is not None
-                    and _supports_single_engine_object_group(
-                        self._object_group_transfer_state, block_ids
+                if self._object_group_transfer_state is not None:
+                    state = self._object_group_transfer_state
+                    num_chunks = _get_num_chunks_from_block_ids(state, block_ids)
+                    objects_by_group = _group_flat_transport_objects(
+                        src_buffers,
+                        len(state.cache_context.kv_layer_groups_manager.object_groups),
+                        num_chunks,
                     )
-                ):
                     staging_copy_builder = (
                         _build_shm_tensor_staging_copies
                         if _is_shm_engine_context(self._engine_driven_context)
                         else _build_pickle_tensor_staging_copies
                     )
                     _execute_engine_object_group_transfer(
-                        self._object_group_transfer_state,
+                        state,
                         block_ids,
-                        src_buffers,
+                        objects_by_group,
                         skip_first_n_tokens=skip_first_n_tokens,
                         direction=lmc_ops.TransferDirection.H2D,
                         staging_copy_builder=staging_copy_builder,
-                        batch_size=(
-                            self._object_group_transfer_state.cache_context
-                            .max_batch_size
-                        ),
+                        batch_size=state.cache_context.max_batch_size,
                     )
                 else:
                     scatter_cpu_to_paged_kv(

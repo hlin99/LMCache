@@ -24,6 +24,7 @@ from lmcache.v1.multiprocess.transfer_context.shm import ShmSlotDescriptor
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.memory_management import MemoryObj
     from lmcache.v1.distributed.storage_manager import StorageManager
 
 logger = init_logger(__name__)
@@ -32,6 +33,63 @@ logger = init_logger(__name__)
 def _dtype_to_name(dtype: torch.dtype) -> str:
     """Return a stable torch dtype name without module prefix."""
     return str(dtype).split(".")[-1]
+
+
+def _flat_uint8_tensor(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
+    """Return a flat uint8 view over the first ``num_bytes`` of ``tensor``."""
+    return tensor.view(torch.uint8)[:num_bytes]
+
+
+def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
+    """Return a tensor view suitable for engine-driven CPU transport.
+
+    Multi-shape object groups cannot be represented by ``MemoryObj.tensor``
+    because that legacy property reshapes to the first shape only. For those
+    objects, return a flat uint8 view over the full logical object bytes.
+    """
+    shapes = memory_obj.get_shapes()
+    raw_tensor = memory_obj.raw_tensor
+    if raw_tensor is None:
+        return None
+    if len(shapes) == 1:
+        return memory_obj.tensor
+    return _flat_uint8_tensor(raw_tensor, memory_obj.get_size())
+
+
+def _copy_tensor_to_memory_obj(src: torch.Tensor, memory_obj: "MemoryObj") -> bool:
+    """Copy ``src`` bytes into ``memory_obj`` when sizes are compatible."""
+    dst = _memory_obj_tensor_view(memory_obj)
+    if dst is None or src.nbytes != memory_obj.get_size():
+        return False
+    _flat_uint8_tensor(dst, dst.nbytes).copy_(_flat_uint8_tensor(src, src.nbytes))
+    return True
+
+
+def _slot_descriptor_from_memory_obj(
+    memory_obj: "MemoryObj",
+) -> dict[str, Any] | None:
+    """Build an SHM slot descriptor for a reserved memory object."""
+    tensor = _memory_obj_tensor_view(memory_obj)
+    if tensor is None:
+        return None
+    return ShmSlotDescriptor(
+        offset=memory_obj.shm_offset,
+        length=memory_obj.shm_byte_length,
+        shape=list(tensor.shape),
+        dtype=_dtype_to_name(tensor.dtype),
+    ).to_dict()
+
+
+def _flatten_object_keys(
+    key: IPCCacheServerKey,
+    context: EngineDrivenContextMetadata,
+    resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
+) -> list[ObjectKey]:
+    """Resolve object keys in object-group-major order."""
+    obj_keys: list[ObjectKey] = []
+    for object_group_id in range(context.num_object_groups):
+        obj_keys.extend(resolve_obj_keys(key, object_group_id))
+    return obj_keys
 
 
 def create_transfer_strategy(
@@ -91,7 +149,7 @@ class TransferStrategy(abc.ABC):
         key: IPCCacheServerKey,
         instance_id: int,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> PrepareStoreResponse:
         """Prepare destination resources for a store request.
 
@@ -99,7 +157,8 @@ class TransferStrategy(abc.ABC):
             key: Cache key identifying the requested token range.
             instance_id: Worker instance identifier.
             context: Non-GPU transfer metadata for the instance.
-            resolve_obj_keys: Callable that resolves object keys from ``key``.
+            resolve_obj_keys: Callable that resolves object keys from ``key``
+                and an object-group index.
 
         Returns:
             Transport-specific store preparation response.
@@ -112,7 +171,7 @@ class TransferStrategy(abc.ABC):
         instance_id: int,
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> bool:
         """Finalize a store request.
 
@@ -121,7 +180,8 @@ class TransferStrategy(abc.ABC):
             instance_id: Worker instance identifier.
             cpu_data: Serialized payload from the worker.
             context: Non-GPU transfer metadata for the instance.
-            resolve_obj_keys: Callable that resolves object keys from ``key``.
+            resolve_obj_keys: Callable that resolves object keys from ``key``
+                and an object-group index.
 
         Returns:
             ``True`` when the strategy successfully commits the store request.
@@ -132,14 +192,17 @@ class TransferStrategy(abc.ABC):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
         """Prepare source resources for a retrieve request.
 
         Args:
             key: Cache key identifying the requested token range.
             instance_id: Worker instance identifier.
-            resolve_obj_keys: Callable that resolves object keys from ``key``.
+            context: Non-GPU transfer metadata for the instance.
+            resolve_obj_keys: Callable that resolves object keys from ``key``
+                and an object-group index.
 
         Returns:
             Transport-specific retrieve preparation response.
@@ -187,7 +250,7 @@ class PickleTransferStrategy(TransferStrategy):
         key: IPCCacheServerKey,
         instance_id: int,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> PrepareStoreResponse:
         """Return empty store context for pickle mode.
 
@@ -201,47 +264,53 @@ class PickleTransferStrategy(TransferStrategy):
         instance_id: int,
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> bool:
         """Deserialize and write pickled chunks into reserved objects.
 
         Returns:
             ``True`` when every reserved object is written successfully.
         """
-        obj_keys = resolve_obj_keys(key)
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-        reserved_dict = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
-        )
+        chunk_offset = 0
         written_keys: list[ObjectKey] = []
-        try:
-            for idx, obj_key in enumerate(obj_keys):
-                if obj_key not in reserved_dict:
-                    continue
-                if idx >= len(chunks):
-                    continue
-                memory_obj = reserved_dict[obj_key]
-                if memory_obj.tensor is None:
-                    continue
-                chunk_cpu = chunks[idx]
-                if chunk_cpu.shape != memory_obj.tensor.shape:
-                    continue
-                memory_obj.tensor.copy_(chunk_cpu)
-                written_keys.append(obj_key)
-        finally:
-            if written_keys:
-                self._storage_manager.finish_write(written_keys)
+        reserved_count = 0
+        for object_group_id in range(context.num_object_groups):
+            obj_keys = resolve_obj_keys(key, object_group_id)
+            layout_desc = context.layout_desc_for_object_group(object_group_id)
+            reserved_dict = self._storage_manager.reserve_write(
+                obj_keys, layout_desc, "new"
+            )
+            reserved_count += len(reserved_dict)
+            try:
+                for chunk_idx, obj_key in enumerate(obj_keys):
+                    if obj_key not in reserved_dict:
+                        continue
+                    flat_idx = chunk_offset + chunk_idx
+                    if flat_idx >= len(chunks):
+                        continue
+                    memory_obj = reserved_dict[obj_key]
+                    if _copy_tensor_to_memory_obj(chunks[flat_idx], memory_obj):
+                        written_keys.append(obj_key)
+            finally:
+                group_written = [
+                    obj_key for obj_key in written_keys if obj_key in obj_keys
+                ]
+                if group_written:
+                    self._storage_manager.finish_write(group_written)
+            chunk_offset += len(obj_keys)
 
-        return len(written_keys) == len(reserved_dict)
+        return len(written_keys) == reserved_count
 
     def prepare_retrieve(
         self,
         key: IPCCacheServerKey,
         instance_id: int,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return serialized pickle payload."""
-        obj_keys = resolve_obj_keys(key)
+        obj_keys = _flatten_object_keys(key, context, resolve_obj_keys)
         prefetched_keys: list[ObjectKey] = []
         try:
             read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
@@ -251,11 +320,12 @@ class PickleTransferStrategy(TransferStrategy):
                 prefetched_keys = obj_keys[: len(maybe_memory_objs)]
                 chunks = []
                 for memory_obj in maybe_memory_objs:
-                    if memory_obj.tensor is None:
+                    tensor = _memory_obj_tensor_view(memory_obj)
+                    if tensor is None:
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
                         )
-                    chunks.append(memory_obj.tensor.cpu().clone())
+                    chunks.append(tensor.cpu().clone())
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
@@ -314,42 +384,42 @@ class ShmTransferStrategy(TransferStrategy):
         key: IPCCacheServerKey,
         instance_id: int,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> PrepareStoreResponse:
         """Reserve SHM-backed objects and return slot descriptors.
 
         Returns:
             Context with ``slots`` and ``chunk_indices``.
         """
-        obj_keys = resolve_obj_keys(key)
-        reserved = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
-        )
         slots: list[dict[str, Any]] = []
         chunk_indices: list[int] = []
         reserved_keys: list[ObjectKey] = []
-        try:
-            for idx, obj_key in enumerate(obj_keys):
-                memory_obj = reserved.get(obj_key)
-                if memory_obj is None or memory_obj.tensor is None:
-                    continue
-                slots.append(
-                    ShmSlotDescriptor(
-                        offset=memory_obj.shm_offset,
-                        length=memory_obj.shm_byte_length,
-                        shape=list(memory_obj.tensor.shape),
-                        dtype=_dtype_to_name(memory_obj.tensor.dtype),
-                    ).to_dict()
-                )
-                chunk_indices.append(idx)
-                reserved_keys.append(obj_key)
-        finally:
-            reserved_keys_set = set(reserved_keys)
-            unused_keys = [
-                obj_key for obj_key in reserved if obj_key not in reserved_keys_set
-            ]
-            if unused_keys:
-                self._storage_manager.finish_write(unused_keys)
+        chunk_offset = 0
+        for object_group_id in range(context.num_object_groups):
+            obj_keys = resolve_obj_keys(key, object_group_id)
+            layout_desc = context.layout_desc_for_object_group(object_group_id)
+            reserved = self._storage_manager.reserve_write(
+                obj_keys, layout_desc, "new"
+            )
+            try:
+                for idx, obj_key in enumerate(obj_keys):
+                    memory_obj = reserved.get(obj_key)
+                    if memory_obj is None:
+                        continue
+                    slot = _slot_descriptor_from_memory_obj(memory_obj)
+                    if slot is None:
+                        continue
+                    slots.append(slot)
+                    chunk_indices.append(chunk_offset + idx)
+                    reserved_keys.append(obj_key)
+            finally:
+                reserved_keys_set = set(reserved_keys)
+                unused_keys = [
+                    obj_key for obj_key in reserved if obj_key not in reserved_keys_set
+                ]
+                if unused_keys:
+                    self._storage_manager.finish_write(unused_keys)
+            chunk_offset += len(obj_keys)
         if not reserved_keys:
             return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
         transfer_key = self._transfer_key_factory(key, instance_id)
@@ -365,7 +435,7 @@ class ShmTransferStrategy(TransferStrategy):
         instance_id: int,
         cpu_data: bytes,
         context: EngineDrivenContextMetadata,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> bool:
         """Finalize SHM store write locks or fallback to pickle commit.
 
@@ -393,10 +463,11 @@ class ShmTransferStrategy(TransferStrategy):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
-        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey, int], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
         """Read SHM objects and return slot descriptors for worker access."""
-        obj_keys = resolve_obj_keys(key)
+        obj_keys = _flatten_object_keys(key, context, resolve_obj_keys)
         shm_prefetched_keys, shm_memory_objs = self._storage_manager.unsafe_read(
             obj_keys
         )
@@ -410,17 +481,11 @@ class ShmTransferStrategy(TransferStrategy):
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         slots: list[dict[str, Any]] = []
         for memory_obj in shm_memory_objs:
-            if memory_obj.tensor is None:
+            slot = _slot_descriptor_from_memory_obj(memory_obj)
+            if slot is None:
                 self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
                 return PrepareRetrieveResponse(success=False, data=b"", context={})
-            slots.append(
-                ShmSlotDescriptor(
-                    offset=memory_obj.shm_offset,
-                    length=memory_obj.shm_byte_length,
-                    shape=list(memory_obj.tensor.shape),
-                    dtype=_dtype_to_name(memory_obj.tensor.dtype),
-                ).to_dict()
-            )
+            slots.append(slot)
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
             self._pending_reads[transfer_key] = shm_prefetched_keys

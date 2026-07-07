@@ -132,6 +132,13 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         hidden_dim_size: Flattened hidden dimension per token.
         dtype_str: Torch dtype name (e.g. ``"float16"``).
         use_mla: Whether the worker KV format is MLA.
+        object_group_shapes: Optional per-object-group tensor shapes. The
+            outer list is indexed by object group; the inner list is indexed by
+            kernel group within that object group.
+        object_group_dtypes: Optional per-object-group torch dtype names,
+            aligned with ``object_group_shapes``.
+        attn_window_num_chunks: Optional per-object-group attention-window
+            sizes in LMCache chunks. ``-1`` means full attention.
     """
 
     instance_id: int
@@ -142,6 +149,9 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    object_group_shapes: list[list[list[int]]] = msgspec.field(default_factory=list)
+    object_group_dtypes: list[list[str]] = msgspec.field(default_factory=list)
+    attn_window_num_chunks: list[int] = msgspec.field(default_factory=list)
 
 
 @dataclass

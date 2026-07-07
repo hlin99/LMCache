@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 import inspect
 
@@ -118,6 +118,35 @@ class EngineDrivenContextMetadata:
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
+    object_group_layout_descs: list[MemoryLayoutDesc] = field(default_factory=list)
+
+    @property
+    def num_object_groups(self) -> int:
+        """Return the number of object groups described by this metadata."""
+        return max(1, len(self.object_group_layout_descs))
+
+    def layout_desc_for_object_group(self, object_group_id: int) -> MemoryLayoutDesc:
+        """Return the memory layout descriptor for one object group.
+
+        Args:
+            object_group_id: Object group index to resolve.
+
+        Returns:
+            The per-object-group layout descriptor when available; otherwise
+            the backward-compatible single ``layout_desc``.
+
+        Raises:
+            IndexError: If ``object_group_id`` is outside the registered
+                object-group layout range.
+        """
+        if not self.object_group_layout_descs:
+            if object_group_id != 0:
+                raise IndexError(
+                    f"object_group_id {object_group_id} out of range for "
+                    "single-layout engine-driven metadata"
+                )
+            return self.layout_desc
+        return self.object_group_layout_descs[object_group_id]
 
 
 class EngineDrivenContext(ABC):
