@@ -1085,6 +1085,8 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         call["direction"] == lmc_ops.TransferDirection.D2H
         for call in captured["prepare_calls"]
     )
+    # FakeState declares two chunks for object group 0 with 16-byte layouts,
+    # followed by two chunks for object group 1 with 24-byte layouts.
     assert captured["committed_chunk_shapes"] == [(16,), (16,), (24,), (24,)]
 
 

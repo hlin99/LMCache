@@ -43,7 +43,8 @@ def _flat_uint8_tensor(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
         num_bytes: Number of bytes to expose from the start of ``tensor``.
 
     Returns:
-        A one-dimensional ``torch.uint8`` view of length ``num_bytes``.
+        A one-dimensional ``torch.uint8`` tensor of length ``num_bytes`` that
+        shares storage with ``tensor``; no data copy is performed.
 
     Raises:
         ValueError: If ``num_bytes`` is negative or exceeds ``tensor.nbytes``.
@@ -346,8 +347,9 @@ class PickleTransferStrategy(TransferStrategy):
                     if _copy_tensor_to_memory_obj(chunks[flat_idx], memory_obj):
                         written_keys.append(obj_key)
             finally:
+                obj_keys_set = set(obj_keys)
                 group_written = [
-                    obj_key for obj_key in written_keys if obj_key in obj_keys
+                    obj_key for obj_key in written_keys if obj_key in obj_keys_set
                 ]
                 if group_written:
                     self._storage_manager.finish_write(group_written)

@@ -211,6 +211,13 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
                 torch.tensor(ptrs, dtype=torch.long, device=device)
             )
         self._max_batch_size = _ENGINE_OBJECT_GROUP_MAX_BATCH_SIZE
+        # The native planner needs two views into the same temporary chunk
+        # buffer. Kernel-group offsets map each kernel group to its byte range
+        # inside the chunk buffer. Object-group offsets span the concatenated
+        # kernel-group ranges that belong to each object group. The running
+        # offset advances in object-group order so each object group's staging
+        # buffer is a compact byte range while kernel groups can still be
+        # addressed directly by index.
         num_kernel_groups = self.kv_layer_groups_manager_.num_kernel_groups
         self._tmp_kernel_group_offsets: list[tuple[int, int]] = [
             (0, 0) for _ in range(num_kernel_groups)
@@ -373,7 +380,7 @@ def _get_object_group_layout_descs(
     return layouts
 
 
-def _layout_desc_nbytes(layout_desc: MemoryLayoutDesc) -> int:
+def _layout_desc_num_bytes(layout_desc: MemoryLayoutDesc) -> int:
     """Return the total byte size described by a memory layout descriptor.
 
     Args:
@@ -557,7 +564,7 @@ def _allocate_pickle_transfer_tensors(
         CPU tensors suitable for pickle commit payloads.
 
     """
-    nbytes = _layout_desc_nbytes(layout_desc)
+    nbytes = _layout_desc_num_bytes(layout_desc)
     return [
         torch.empty(
             (nbytes,),
@@ -640,7 +647,9 @@ def _flatten_transport_objects(
             then chunk. ``None`` entries represent skipped SHM store chunks.
 
     Returns:
-        Non-``None`` tensors in object-group-major order.
+        Non-``None`` tensors in object-group-major order: all non-skipped
+        chunks for object group 0, then all non-skipped chunks for object group
+        1, and so on.
     """
     return [
         obj
