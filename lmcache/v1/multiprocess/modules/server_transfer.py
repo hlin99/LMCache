@@ -58,7 +58,17 @@ def _flat_uint8_tensor(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
 
 
 def _memory_obj_size(memory_obj: "MemoryObj", tensor: torch.Tensor) -> int:
-    """Return a memory object's logical byte size, falling back to tensor bytes."""
+    """Return a memory object's logical byte size, falling back to tensor bytes.
+
+    Args:
+        memory_obj: Memory object to query.
+        tensor: Fallback tensor used when ``memory_obj`` does not expose a
+            usable size.
+
+    Returns:
+        The memory object's byte size, or ``tensor.nbytes`` if ``get_size()``
+        is unavailable, unsupported, or returns a non-integer value.
+    """
     try:
         size = memory_obj.get_size()
     except (AttributeError, NotImplementedError):
@@ -67,7 +77,16 @@ def _memory_obj_size(memory_obj: "MemoryObj", tensor: torch.Tensor) -> int:
 
 
 def _safe_memory_obj_attr(memory_obj: "MemoryObj", attr_name: str) -> Any:
-    """Return a MemoryObj attribute, or None if the backend does not support it."""
+    """Return a MemoryObj attribute when the backend supports it.
+
+    Args:
+        memory_obj: Memory object to query.
+        attr_name: Name of the attribute or property to retrieve.
+
+    Returns:
+        The attribute value, or ``None`` if accessing it raises
+        ``AttributeError`` or ``NotImplementedError``.
+    """
     try:
         return getattr(memory_obj, attr_name)
     except (AttributeError, NotImplementedError):
@@ -75,7 +94,16 @@ def _safe_memory_obj_attr(memory_obj: "MemoryObj", attr_name: str) -> Any:
 
 
 def _safe_memory_obj_call(memory_obj: "MemoryObj", method_name: str) -> Any:
-    """Call a MemoryObj method, or return None if the backend does not support it."""
+    """Call a MemoryObj method when the backend supports it.
+
+    Args:
+        memory_obj: Memory object to query.
+        method_name: Name of the method to call without arguments.
+
+    Returns:
+        The method return value, or ``None`` if the method is missing, is not
+        callable, or raises ``AttributeError`` or ``NotImplementedError``.
+    """
     method = _safe_memory_obj_attr(memory_obj, method_name)
     if not callable(method):
         return None

@@ -75,7 +75,22 @@ def _layout_for_object_key(
     default_layout_desc: MemoryLayoutDesc,
     object_group_layout_descs: list[MemoryLayoutDesc],
 ) -> MemoryLayoutDesc:
-    """Return the L1 allocation layout for an object key."""
+    """Return the L1 allocation layout for an object key.
+
+    Args:
+        key: Object key containing the object-group id.
+        default_layout_desc: Fallback layout when no per-object-group layouts
+            are registered.
+        object_group_layout_descs: Per-object-group layouts.
+
+    Returns:
+        The layout descriptor for ``key.object_group_id`` or the fallback
+        layout when no per-object-group layouts are registered.
+
+    Raises:
+        ValueError: If per-object-group layouts are registered and
+            ``key.object_group_id`` is out of bounds.
+    """
     if object_group_layout_descs:
         if key.object_group_id >= len(object_group_layout_descs):
             raise ValueError(
@@ -84,6 +99,23 @@ def _layout_for_object_key(
             )
         return object_group_layout_descs[key.object_group_id]
     return default_layout_desc
+
+
+def _memory_obj_size_bytes(memory_obj: MemoryObj) -> int:
+    """Return a memory object's logical byte size.
+
+    Args:
+        memory_obj: Memory object reserved for an L2 load.
+
+    Returns:
+        The object byte size, or 0 if the MemoryObj implementation does not
+        expose a usable ``get_size()`` result.
+    """
+    try:
+        size = memory_obj.get_size()
+    except (AttributeError, NotImplementedError):
+        return 0
+    return size if isinstance(size, int) else 0
 
 
 def reserve_write_by_object_group_layout(
@@ -1086,7 +1118,7 @@ class PrefetchController(StorageControllerInterface):
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
             # events. Sum actual object sizes because hybrid layouts can mix
             # object groups with different per-object byte sizes.
-            total_bytes = sum(obj.get_size() for obj in per_adapter_objs)
+            total_bytes = sum(_memory_obj_size_bytes(obj) for obj in per_adapter_objs)
             request.load_bytes_by_adapter[adapter_idx] = total_bytes
 
             self._event_bus.publish(

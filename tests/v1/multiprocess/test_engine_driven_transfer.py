@@ -54,7 +54,8 @@ class ServerModuleFactory(Protocol):
     Args:
         storage_manager_config: Optional engine storage config override.
         chunk_size: Engine chunk size used to initialize the context.
-        object_keys: Object keys returned by ``ipc_key_to_object_keys``.
+        object_keys: Object keys returned by ``ipc_key_to_object_keys`` as
+            either a flat single-group list or a nested per-object-group list.
         mock_storage: Optional storage mock; defaults to a new ``MagicMock``.
         mock_session: Optional session mock; defaults to a new ``MagicMock``.
 
@@ -67,7 +68,7 @@ class ServerModuleFactory(Protocol):
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[Any] | None = None,
+        object_keys: list[Any] | list[list[Any]] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1637,7 +1638,7 @@ def server_module_factory(
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[Any] | None = None,
+        object_keys: list[Any] | list[list[Any]] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1648,7 +1649,8 @@ def server_module_factory(
         Args:
             storage_manager_config: Optional engine storage config override.
             chunk_size: Engine chunk size passed to context construction.
-            object_keys: Keys returned from ``ipc_key_to_object_keys`` patch.
+            object_keys: Keys returned from ``ipc_key_to_object_keys`` patch,
+                as either a flat single-group list or nested per-group lists.
             mock_storage: Optional storage mock instance to inject.
             mock_session: Optional session mock instance to inject.
 
@@ -1673,7 +1675,9 @@ def server_module_factory(
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus")
         )
         resolved_object_keys = object_keys or ["obj"]
-        if not resolved_object_keys or not isinstance(resolved_object_keys[0], list):
+        if not resolved_object_keys or (
+            resolved_object_keys and not isinstance(resolved_object_keys[0], list)
+        ):
             resolved_object_keys = [resolved_object_keys]
 
         def _resolve_object_keys(
@@ -2266,8 +2270,8 @@ def test_server_hybrid_pickle_store_and_retrieve_use_group_layouts(
     assert response.success is True
     recovered = pickle.loads(response.data)
     assert [tensor.numel() for tensor in recovered] == [16, 16, 24, 24]
-    for actual, expected in zip(recovered, chunks, strict=True):
-        assert torch.equal(actual, expected)
+    for recovered_tensor, expected_tensor in zip(recovered, chunks, strict=True):
+        assert torch.equal(recovered_tensor, expected_tensor)
 
 
 def test_server_hybrid_shm_prepare_store_and_retrieve_order(
