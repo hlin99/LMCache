@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 import inspect
 
@@ -118,6 +118,40 @@ class EngineDrivenContextMetadata:
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
+    object_group_layout_descs: list[MemoryLayoutDesc] = field(default_factory=list)
+
+    @property
+    def num_object_groups(self) -> int:
+        """Return the number of object groups described by this metadata."""
+        return max(1, len(self.object_group_layout_descs))
+
+    def layout_desc_for_object_group(self, object_group_id: int) -> MemoryLayoutDesc:
+        """Return the memory layout descriptor for one object group.
+
+        Args:
+            object_group_id: Object group index to resolve.
+
+        Returns:
+            The per-object-group layout descriptor when available; otherwise
+            the backward-compatible single ``layout_desc``.
+
+        Raises:
+            IndexError: If ``object_group_id`` is outside the registered
+                object-group layout range.
+        """
+        if not self.object_group_layout_descs:
+            if object_group_id != 0:
+                raise IndexError(
+                    f"object_group_id {object_group_id} out of range for "
+                    "single-layout engine-driven metadata"
+                )
+            return self.layout_desc
+        if object_group_id >= len(self.object_group_layout_descs):
+            raise IndexError(
+                f"object_group_id {object_group_id} out of range for "
+                f"{len(self.object_group_layout_descs)} engine-driven object groups"
+            )
+        return self.object_group_layout_descs[object_group_id]
 
 
 class EngineDrivenContext(ABC):
@@ -309,6 +343,10 @@ def gather_paged_kv_to_cpu(
     chunk_indices: list[int] | None = None,
 ) -> list[torch.Tensor]:
     """Gather paged KV blocks into CPU chunk tensors.
+
+    This is the low-level engine-driven store fallback used when the
+    higher-level object-group transfer plan cannot be used for the active
+    transport/device combination.
 
     Args:
         kv_caches: Per-layer KV tensor mapping.
@@ -549,6 +587,11 @@ def scatter_cpu_to_paged_kv(
 ) -> None:
     """Scatter CPU chunk tensors back into paged KV tensors.
 
+    This is the low-level engine-driven retrieve fallback.  It uses
+    :func:`~lmcache.v1.multiprocess.object_group_utils.has_sufficient_block_ids`
+    from ``object_group_utils`` to validate that ``block_ids`` covers all
+    requested chunks before any transfer work begins (fail-closed).
+
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
         block_ids: Flattened destination block IDs for all chunks.  Length
@@ -576,14 +619,17 @@ def scatter_cpu_to_paged_kv(
         make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
     )
+    from lmcache.v1.multiprocess.object_group_utils import has_sufficient_block_ids
     import lmcache.c_ops as lmc_ops
 
     if not chunks:
         return
-    # Require enough block IDs to cover every chunk. Extra trailing block IDs
-    # are ignored by the per-chunk slicing below, mirroring the gather-side
-    # ``out`` length check for consistency.
-    if len(block_ids) < len(chunks) * blocks_per_chunk:
+    # Fail-closed: require enough block IDs to cover every chunk before
+    # starting any copy work.  Extra trailing block IDs are ignored by the
+    # per-chunk slicing below, mirroring the gather-side ``out`` length check.
+    # Uses the shared has_sufficient_block_ids helper from object_group_utils
+    # (the same helper used by the LMCache-driven path for consistency).
+    if not has_sufficient_block_ids([block_ids], [blocks_per_chunk], len(chunks)):
         raise ValueError(
             f"block_ids length ({len(block_ids)}) must be at least "
             f"len(chunks) ({len(chunks)}) * blocks_per_chunk "

@@ -3,7 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Sequence, cast
 import threading
 import time
 
@@ -41,18 +41,19 @@ from lmcache.v1.multiprocess.engine_module import (
     ThreadPoolType,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.native_completion import (
+    DeviceHostFuncDispatcher,
+    submit_callback_to_stream,
+)
 from lmcache.v1.multiprocess.object_group_utils import (
+    StagingBuilder,
     batched_iteration_with_skip,
     compute_num_objects_to_skip,
     execute_prepared_object_group_transfer,
     has_sufficient_block_ids,
     prepare_object_group_transfer,
     recalculate_blocks_to_skip,
-    select_block_ids_for_window,
-)
-from lmcache.v1.multiprocess.native_completion import (
-    DeviceHostFuncDispatcher,
-    submit_callback_to_stream,
+    select_block_ids_for_cache_context,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.platform.base_cache_context import BaseCacheContext
@@ -138,31 +139,9 @@ def downsample_and_stage_block_ids(
           [13, 14, 17, 18], # swa attention group only needs the last 2 block per chunk
         ]
     """
-    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
-    for kernel_group_id in range(num_kernel_groups):
-        subchunk_sw_size_tokens = (
-            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
-                kernel_group_id
-            )
-        )
-        tokens_per_chunk = min(
-            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
-        )
-        keep_blocks_per_chunk = cache_context.calculate_num_blocks(
-            tokens_per_chunk, kernel_group_id
-        )
-        total_blocks_per_chunk = cache_context.calculate_num_blocks(
-            cache_context.lmcache_tokens_per_chunk, kernel_group_id
-        )
-
-        block_ids[kernel_group_id] = select_block_ids_for_window(
-            block_ids[kernel_group_id],
-            total_blocks_per_chunk,
-            keep_blocks_per_chunk,
-        )
-
-    # Stage the cut block ids into GPU tensors
-    block_ids_gpu = cache_context.stage_block_ids(block_ids)
+    block_ids_gpu = cache_context.stage_block_ids(
+        select_block_ids_for_cache_context(cache_context, block_ids)
+    )
     return block_ids_gpu
 
 
@@ -214,7 +193,7 @@ def _run_object_group_transfer_plan(
         batch_size,
         skip_first_n_tokens,
         direction,
-        build_staging_copies,
+        cast(StagingBuilder[MemoryObj], build_staging_copies),
     )
     execute_prepared_object_group_transfer(
         direction,
@@ -684,7 +663,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         kv_groups_manager = cache_context.kv_layer_groups_manager
         attn_desc = kv_groups_manager.get_attn_desc()
         self._ctx.layout_desc_registry.register(
-            model_name, world_size, layout_desc, attn_desc
+            model_name,
+            world_size,
+            layout_desc,
+            attn_desc,
         )
 
         with self._lock:

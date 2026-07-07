@@ -15,13 +15,12 @@ These tests cover:
 
 # Standard
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 # Third Party
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Helpers shared across tests
@@ -30,6 +29,7 @@ import torch
 
 def _make_attn_desc(num_chunks_in_sw: list[int]) -> Any:
     """Return a real AttnWindowDesc without importing anything GPU-bound."""
+    # First Party
     from lmcache.v1.distributed.api import AttnWindowDesc
 
     return AttnWindowDesc(num_chunks_in_sw=num_chunks_in_sw)
@@ -45,6 +45,7 @@ class TestHasSufficientBlockIds:
 
     def test_returns_true_when_all_groups_cover_all_chunks(self) -> None:
         """Every group with at least num_chunks * bpc block IDs passes."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             has_sufficient_block_ids,
         )
@@ -57,6 +58,7 @@ class TestHasSufficientBlockIds:
 
     def test_returns_false_when_any_group_is_short(self) -> None:
         """A single underfilled group fails the validation."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             has_sufficient_block_ids,
         )
@@ -69,6 +71,7 @@ class TestHasSufficientBlockIds:
 
     def test_extra_block_ids_are_allowed(self) -> None:
         """Groups may contain more than the minimum required raw block IDs."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             has_sufficient_block_ids,
         )
@@ -77,6 +80,19 @@ class TestHasSufficientBlockIds:
             block_ids=[[0, 1, 2, 3, 4]],
             blocks_per_chunk=[2],
             num_chunks=2,
+        )
+
+    def test_zero_chunks_with_empty_block_ids_returns_true(self) -> None:
+        """Zero num_chunks is trivially satisfied by any block-ID list."""
+        # First Party
+        from lmcache.v1.multiprocess.object_group_utils import (
+            has_sufficient_block_ids,
+        )
+
+        assert has_sufficient_block_ids(
+            block_ids=[[]],
+            blocks_per_chunk=[4],
+            num_chunks=0,
         )
 
 
@@ -90,6 +106,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_full_window_returns_all_blocks(self) -> None:
         """When keep == total, every block is returned unchanged."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -102,6 +119,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_trailing_two_per_chunk(self) -> None:
         """Keep last 2 of every 4-block chunk."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -114,6 +132,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_one_per_chunk(self) -> None:
         """Keep only the last block of each chunk."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -126,6 +145,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_single_chunk(self) -> None:
         """Single-chunk input with partial keep."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -138,6 +158,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_empty_input(self) -> None:
         """Empty input returns empty output."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -149,6 +170,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_invalid_total_blocks(self) -> None:
         """total_blocks_per_chunk < 1 raises ValueError."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -160,6 +182,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_exceeds_total_raises(self) -> None:
         """keep_blocks_per_chunk > total_blocks_per_chunk raises ValueError."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -171,6 +194,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_keep_zero_raises(self) -> None:
         """keep_blocks_per_chunk < 1 raises ValueError."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -182,6 +206,7 @@ class TestSelectBlockIdsForWindow:
 
     def test_len_not_multiple_raises(self) -> None:
         """len(block_ids) not a multiple of total_blocks_per_chunk raises ValueError."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
@@ -205,11 +230,50 @@ class TestSelectBlockIdsForWindow:
         self, total: int, keep: int, ids: list, expected: list
     ) -> None:
         """Parametrized spot-checks for various (total, keep) combinations."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             select_block_ids_for_window,
         )
 
         assert select_block_ids_for_window(ids, total, keep) == expected
+
+
+class TestSelectBlockIdsForCacheContext:
+    """Tests for :func:`select_block_ids_for_cache_context`."""
+
+    def test_selects_per_kernel_group_windows_without_mutating_input(self) -> None:
+        """Each kernel group uses its own subchunk window geometry."""
+        # First Party
+        from lmcache.v1.multiprocess.object_group_utils import (
+            select_block_ids_for_cache_context,
+        )
+
+        class FakeGroupsManager:
+            num_kernel_groups = 2
+
+            def get_subchunk_sw_size_tokens(self, kernel_group_id: int) -> int:
+                return [8, 4][kernel_group_id]
+
+        class FakeCacheContext:
+            lmcache_tokens_per_chunk = 8
+            kv_layer_groups_manager = FakeGroupsManager()
+
+            def calculate_num_blocks(
+                self, num_tokens: int, _kernel_group_id: int
+            ) -> int:
+                return num_tokens // 2
+
+        block_ids = [[0, 1, 2, 3, 4, 5, 6, 7], [10, 11, 12, 13, 20, 21, 22, 23]]
+
+        result = select_block_ids_for_cache_context(
+            cast(Any, FakeCacheContext()), block_ids
+        )
+
+        assert result == [[0, 1, 2, 3, 4, 5, 6, 7], [12, 13, 22, 23]]
+        assert block_ids == [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [10, 11, 12, 13, 20, 21, 22, 23],
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +286,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_equal_window_and_chunk_is_identity(self) -> None:
         """When blocks_per_window == blocks_per_chunk, return unchanged."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
@@ -231,6 +296,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_zero_skip_always_zero(self) -> None:
         """Zero blocks_to_skip always returns zero."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
@@ -239,6 +305,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_skip_less_than_chunk_tail(self) -> None:
         """Skip falls entirely within the discarded prefix of the first chunk."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
@@ -250,6 +317,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_skip_exactly_one_full_chunk(self) -> None:
         """Skip exactly one full-chunk's worth maps to one window."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
@@ -260,6 +328,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_skip_extends_into_window_region(self) -> None:
         """Skip that extends into the kept window region is mapped correctly."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
@@ -270,6 +339,7 @@ class TestRecalculateBlocksToSkip:
 
     def test_example_from_docstring(self) -> None:
         """Verify the example in the docstring."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
@@ -281,6 +351,7 @@ class TestRecalculateBlocksToSkip:
     @pytest.mark.parametrize("skip", [0, 1, 2, 3, 4, 5, 8, 12])
     def test_result_never_negative(self, skip: int) -> None:
         """Result is always >= 0."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             recalculate_blocks_to_skip,
         )
@@ -298,6 +369,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_d2h_always_zero(self) -> None:
         """D2H (store) never skips any objects."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
@@ -307,6 +379,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_full_attention_h2d_zero(self) -> None:
         """Full-attention groups never skip objects, even for H2D."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
@@ -316,6 +389,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_sliding_window_h2d_skips_prefix(self) -> None:
         """H2D with a sliding window skips objects before the window."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
@@ -326,6 +400,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_sliding_window_num_objects_less_than_sw_skip_zero(self) -> None:
         """When fewer objects than the window size, skip nothing."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
@@ -335,6 +410,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_sliding_window_num_objects_equals_sw_skip_zero(self) -> None:
         """Exactly sw_size objects → skip zero."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
@@ -344,6 +420,7 @@ class TestComputeNumObjectsToSkip:
 
     def test_multiple_object_groups_correct_group_selected(self) -> None:
         """The correct group's window size is used."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             compute_num_objects_to_skip,
         )
@@ -364,6 +441,7 @@ class TestBatchedIterationWithSkipViaHelpers:
 
     def test_skip_and_batch(self) -> None:
         """Import from helpers module returns correct results."""
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             batched_iteration_with_skip,
         )
@@ -386,10 +464,11 @@ class TestExecutePreparedObjectGroupTransfer:
 
     def test_noop_on_empty_batch_steps(self) -> None:
         """No call to lmc_ops when batch_steps is empty."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         direction = lmc_ops.TransferDirection.D2H
         with patch.object(lmc_ops, "execute_object_group_transfer") as mock_exec:
@@ -398,11 +477,12 @@ class TestExecutePreparedObjectGroupTransfer:
 
     def test_calls_execute_with_correct_args(self) -> None:
         """When batch_steps is non-empty, execute_object_group_transfer is called."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
         from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         direction = lmc_ops.TransferDirection.H2D
         fake_specs = [MagicMock(name="spec0")]
@@ -423,10 +503,11 @@ class TestExecutePreparedObjectGroupTransfer:
 
     def test_multiple_batch_steps_calls_execute_once(self) -> None:
         """Multiple batch steps still result in a single execute call."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         direction = lmc_ops.TransferDirection.D2H
         fake_specs = [MagicMock(), MagicMock()]
@@ -440,10 +521,11 @@ class TestExecutePreparedObjectGroupTransfer:
 
     def test_custom_host_buffer_alignment_is_forwarded(self) -> None:
         """Caller-provided host buffer alignment is forwarded to lmc_ops."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         direction = lmc_ops.TransferDirection.H2D
         fake_specs = [MagicMock(name="spec0")]
@@ -503,6 +585,7 @@ def _make_mock_cache_context(
     Returns:
         Configured MagicMock acting as BaseCacheContext.
     """
+    # First Party
     from lmcache.v1.distributed.api import AttnWindowDesc
 
     if object_group_kernel_indices is None:
@@ -589,6 +672,7 @@ def _patch_native_types_and_staging():
         (patched ``BatchStep``), ``"lv"`` (patched ``LaunchVar``), and
         ``"staging"`` (fake staging builder) mocks.
     """
+    # First Party
     import lmcache.c_ops as lmc_ops
 
     mock_staging = MagicMock(return_value=[MagicMock(name="staging_copy")])
@@ -613,10 +697,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_builds_one_kernel_group_spec(self) -> None:
         """prepare_object_group_transfer creates one KernelGroupSpec per group."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(num_kernel_groups=1, blocks_per_chunk=2)
         block_ids_gpu = [torch.tensor([0, 1, 2, 3], dtype=torch.int32)]
@@ -639,10 +724,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_builds_batch_steps(self) -> None:
         """One batch step is created when memory_objs fits in one batch."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(
             lmcache_tokens_per_chunk=4,
@@ -670,10 +756,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_batches_objects_by_batch_size(self) -> None:
         """Multiple batch steps are created when mem_objs exceed batch_size."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(
             lmcache_tokens_per_chunk=4,
@@ -700,10 +787,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_sliding_window_h2d_skips_leading_objects(self) -> None:
         """Sliding-window H2D skips objects outside the window."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         # sw = 2, 5 objects → skip 3
         ctx = _make_mock_cache_context(
@@ -733,10 +821,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_none_in_d2h_batch_is_skipped(self) -> None:
         """None entries in D2H batches are silently skipped."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(
             lmcache_tokens_per_chunk=4,
@@ -763,10 +852,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_none_in_h2d_batch_raises(self) -> None:
         """None entries in H2D batches raise ValueError."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(
             lmcache_tokens_per_chunk=4,
@@ -795,10 +885,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_skip_first_n_tokens_skips_all_batches(self) -> None:
         """skip_first_n_tokens >= total tokens produces no batch steps."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         chunk_size = 4
         ctx = _make_mock_cache_context(
@@ -828,10 +919,11 @@ class TestPrepareObjectGroupTransfer:
 
     def test_empty_batch_steps_when_all_none_d2h(self) -> None:
         """All-None D2H batch produces no batch steps."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(
             lmcache_tokens_per_chunk=4,
@@ -869,11 +961,12 @@ class TestPrepareAndExecutePipeline:
 
     def test_execute_called_when_batch_steps_non_empty(self) -> None:
         """When prepare returns non-empty batch_steps, execute forwards them."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(
             lmcache_tokens_per_chunk=4,
@@ -907,11 +1000,12 @@ class TestPrepareAndExecutePipeline:
 
     def test_execute_not_called_when_batch_steps_empty(self) -> None:
         """Empty batch_steps (all-None D2H) → execute is never invoked."""
-        import lmcache.c_ops as lmc_ops
+        # First Party
         from lmcache.v1.multiprocess.object_group_utils import (
             execute_prepared_object_group_transfer,
             prepare_object_group_transfer,
         )
+        import lmcache.c_ops as lmc_ops
 
         ctx = _make_mock_cache_context(
             lmcache_tokens_per_chunk=4,

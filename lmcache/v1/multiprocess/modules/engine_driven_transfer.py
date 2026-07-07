@@ -13,6 +13,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
 )
@@ -292,10 +293,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> tuple[int, IPCCacheServerKey]:
         return (instance_id, key)
 
-    def _resolve_single_group_obj_keys(self, key: IPCCacheServerKey) -> list[ObjectKey]:
-        """Resolve object keys for the single object group used by
-        non-GPU transfers."""
-        return self._ctx.resolve_obj_keys(key, [0])[0]
+    def _resolve_object_group_obj_keys(
+        self, key: IPCCacheServerKey, object_group_id: int
+    ) -> list[ObjectKey]:
+        """Resolve object keys for one engine-driven object group."""
+        return self._ctx.resolve_obj_keys(key, [object_group_id])[0]
 
     def register_kv_cache_engine_driven_context(
         self,
@@ -345,10 +347,62 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
         )
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        object_group_layout_descs = []
+        if payload.object_group_shapes or payload.object_group_dtypes:
+            if len(payload.object_group_shapes) != len(payload.object_group_dtypes):
+                raise ValueError(
+                    "object_group_shapes and object_group_dtypes must have the "
+                    "same length"
+                )
+            for object_group_id, (shapes, dtypes) in enumerate(
+                zip(
+                    payload.object_group_shapes,
+                    payload.object_group_dtypes,
+                    strict=True,
+                )
+            ):
+                if len(shapes) != len(dtypes):
+                    raise ValueError(
+                        f"Object group {object_group_id}: shape list length "
+                        f"{len(shapes)} must match dtype list length {len(dtypes)}"
+                    )
+                group_dtypes = []
+                for kernel_group_id, dtype_name in enumerate(dtypes):
+                    group_dtype = getattr(torch, dtype_name, None)
+                    if group_dtype is None or not isinstance(group_dtype, torch.dtype):
+                        raise ValueError(
+                            f"Object group {object_group_id}, kernel group "
+                            f"{kernel_group_id}: invalid dtype name {dtype_name!r}"
+                        )
+                    group_dtypes.append(group_dtype)
+                object_group_layout_descs.append(
+                    MemoryLayoutDesc(
+                        shapes=[torch.Size(group_shape) for group_shape in shapes],
+                        dtypes=group_dtypes,
+                    )
+                )
+        if payload.attn_window_num_chunks and object_group_layout_descs:
+            if len(payload.attn_window_num_chunks) != len(object_group_layout_descs):
+                raise ValueError(
+                    "attn_window_num_chunks length "
+                    f"{len(payload.attn_window_num_chunks)} must match "
+                    "object_group layout count "
+                    f"{len(object_group_layout_descs)}"
+                )
+        if object_group_layout_descs and not payload.attn_window_num_chunks:
+            resolved_attn_window_num_chunks = [-1] * len(object_group_layout_descs)
+        else:
+            resolved_attn_window_num_chunks = payload.attn_window_num_chunks
+        attn_desc = (
+            AttnWindowDesc(resolved_attn_window_num_chunks)
+            if resolved_attn_window_num_chunks
+            else None
+        )
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=payload.block_size,
             use_mla=payload.use_mla,
+            object_group_layout_descs=object_group_layout_descs,
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
@@ -381,7 +435,10 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         )
 
         self._ctx.layout_desc_registry.register(
-            payload.model_name, payload.world_size, layout_desc
+            payload.model_name,
+            payload.world_size,
+            metadata.layout_desc,
+            attn_desc if attn_desc is not None else AttnWindowDesc([-1]),
         )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
@@ -427,7 +484,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             key=key,
             instance_id=instance_id,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=self._resolve_object_group_obj_keys,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
@@ -462,11 +519,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id=instance_id,
             cpu_data=cpu_data,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=self._resolve_object_group_obj_keys,
         )
         if st is not None and result:
             num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
+                len(self._resolve_object_group_obj_keys(key, 0)) * self._ctx.chunk_size
             )
             logger.info(
                 "Stored %d tokens in %.3f seconds",
@@ -494,11 +551,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            context=entry.metadata,
+            resolve_obj_keys=self._resolve_object_group_obj_keys,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["retrieve_start_time"] = time.perf_counter()
@@ -525,7 +583,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         result = strategy.commit_retrieve(key=key, instance_id=instance_id)
         if st is not None:
             num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
+                len(self._resolve_object_group_obj_keys(key, 0)) * self._ctx.chunk_size
             )
             logger.info(
                 "Retrieved %d tokens in %.3f seconds",

@@ -5,8 +5,10 @@ This module provides reusable logic shared between LMCache-driven and
 (in a later step) engine-driven transfer paths:
 
 * Pure geometry helpers: :func:`has_sufficient_block_ids`,
-  :func:`select_block_ids_for_window`, :func:`recalculate_blocks_to_skip`,
-  :func:`batched_iteration_with_skip`, :func:`compute_num_objects_to_skip`.
+  :func:`select_block_ids_for_window`,
+  :func:`select_block_ids_for_cache_context`,
+  :func:`recalculate_blocks_to_skip`, :func:`batched_iteration_with_skip`,
+  :func:`compute_num_objects_to_skip`.
 * Transfer-plan builder: :func:`prepare_object_group_transfer` assembles
   the ``KernelGroupSpec`` and ``BatchStep`` lists that
   ``lmc_ops.execute_object_group_transfer`` consumes.
@@ -162,6 +164,64 @@ def select_block_ids_for_window(
     return result
 
 
+def select_block_ids_for_cache_context(
+    cache_context: BaseCacheContext,
+    block_ids: list[list[int]],
+) -> list[list[int]]:
+    """Select/downsample raw block IDs for a cache context's transfer windows.
+
+    Args:
+        cache_context: Cache context whose kernel-group window sizes determine
+            how many trailing blocks per LMCache chunk are transferred.
+        block_ids: Raw block IDs indexed by kernel group. The input is not
+            mutated.
+
+    Returns:
+        A new per-kernel-group block-ID list with each group downsampled to the
+        blocks required by its sliding-window/subchunk transfer geometry.
+
+    Raises:
+        ValueError: If a group's block IDs are not chunk-aligned according to
+            :func:`select_block_ids_for_window`.
+
+    Example:
+        With ``lmcache_tokens_per_chunk=8`` and two tokens per block, each chunk
+        spans four raw blocks.  If kernel group 0 keeps all four blocks per
+        chunk, while kernel group 1 keeps only the trailing two blocks per
+        chunk:
+
+        >>> select_block_ids_for_cache_context(ctx, [
+        ...     [0, 1, 2, 3, 4, 5, 6, 7],
+        ...     [10, 11, 12, 13, 20, 21, 22, 23],
+        ... ])
+        [[0, 1, 2, 3, 4, 5, 6, 7], [12, 13, 22, 23]]
+    """
+    selected_block_ids = [list(group_block_ids) for group_block_ids in block_ids]
+    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
+    for kernel_group_id in range(num_kernel_groups):
+        subchunk_sw_size_tokens = (
+            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
+                kernel_group_id
+            )
+        )
+        tokens_per_chunk = min(
+            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
+        )
+        keep_blocks_per_chunk = cache_context.calculate_num_blocks(
+            tokens_per_chunk, kernel_group_id
+        )
+        total_blocks_per_chunk = cache_context.calculate_num_blocks(
+            cache_context.lmcache_tokens_per_chunk, kernel_group_id
+        )
+
+        selected_block_ids[kernel_group_id] = select_block_ids_for_window(
+            selected_block_ids[kernel_group_id],
+            total_blocks_per_chunk,
+            keep_blocks_per_chunk,
+        )
+    return selected_block_ids
+
+
 def recalculate_blocks_to_skip(
     blocks_per_chunk: int,
     blocks_per_window: int,
@@ -309,8 +369,8 @@ def prepare_object_group_transfer(
     Args:
         cache_context: GPU cache context for the registered worker instance.
         block_ids_gpu: GPU block-ID tensors, indexed by LMCache KV group index.
-            Produced by
-            :func:`~lmcache.v1.multiprocess.modules.lmcache_driven_transfer.downsample_and_stage_block_ids`.
+            Produced by the caller after applying the context's
+            sliding-window/subchunk block-ID selection.
         objects: Path-owned transfer objects, one per chunk.  ``None`` entries
             are allowed only for D2H (the batch is skipped); H2D with a
             ``None`` entry raises :class:`ValueError`.
