@@ -512,7 +512,7 @@ def _make_mock_cache_context(
 
 
 def _make_mock_memory_obj(size: int = 4) -> MagicMock:
-    """Create a MemoryObj-like mock with fields used by staging builders.
+    """Create a MemoryObj-like mock with fields used by the staging builder.
 
     Args:
         size: Byte size returned by ``get_size()`` and ``meta.address``.

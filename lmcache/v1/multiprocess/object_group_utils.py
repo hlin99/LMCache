@@ -23,7 +23,7 @@ allocate, release, or interpret transfer storage.
 
 # Standard
 from itertools import islice
-from typing import TYPE_CHECKING, Generator, Protocol, Sequence, cast
+from typing import TYPE_CHECKING, Generator, Protocol, Sequence, TypeVar, cast
 
 # Third Party
 import torch
@@ -40,8 +40,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+TransferObjectT = TypeVar("TransferObjectT", contravariant=True)
 
-class StagingBuilder(Protocol):
+
+class StagingBuilder(Protocol[TransferObjectT]):
     """Callable that builds native staging descriptors for a transfer batch.
 
     Implementations are path-specific: they interpret caller-owned transfer
@@ -64,10 +66,10 @@ class StagingBuilder(Protocol):
 
     def __call__(
         self,
-        objects: Sequence[object],
+        objects: Sequence[TransferObjectT],
         staging_buffers: Sequence[torch.Tensor],
         is_h2d: bool,
-    ) -> list["lmc_ops.StagingCopy"]:
+    ) -> list[lmc_ops.StagingCopy]:
         ...
 
 
@@ -258,12 +260,12 @@ def compute_num_objects_to_skip(
 def prepare_object_group_transfer(
     cache_context: BaseCacheContext,
     block_ids_gpu: list[torch.Tensor],
-    objects: Sequence[object | None],
+    objects: Sequence[TransferObjectT | None],
     object_group_id: int,
     batch_size: int,
     skip_first_n_tokens: int,
     direction: "lmc_ops.TransferDirection",
-    staging_builder: StagingBuilder,
+    staging_builder: StagingBuilder[TransferObjectT],
 ) -> tuple[list["lmc_ops.KernelGroupSpec"], list["lmc_ops.BatchStep"]]:
     """Build the ``KernelGroupSpec`` and ``BatchStep`` plan for one object group.
 
@@ -392,7 +394,7 @@ def prepare_object_group_transfer(
         skip_tokens_in_chunk = effective_start - batch_start_token
 
         staging = staging_builder(
-            cast(Sequence[object], object_batch),
+            cast(Sequence[TransferObjectT], object_batch),
             object_group_buffers[:batch_len],
             is_h2d,
         )
