@@ -76,7 +76,7 @@ def _memory_obj_size(memory_obj: "MemoryObj", tensor: torch.Tensor) -> int:
     return size if isinstance(size, int) else tensor.nbytes
 
 
-def _safe_memory_obj_attr(memory_obj: "MemoryObj", attr_name: str) -> Any:
+def _safe_memory_obj_attr(memory_obj: "MemoryObj", attr_name: str) -> object | None:
     """Return a MemoryObj attribute when the backend supports it.
 
     Args:
@@ -93,7 +93,7 @@ def _safe_memory_obj_attr(memory_obj: "MemoryObj", attr_name: str) -> Any:
         return None
 
 
-def _safe_memory_obj_call(memory_obj: "MemoryObj", method_name: str) -> Any:
+def _safe_memory_obj_call(memory_obj: "MemoryObj", method_name: str) -> object | None:
     """Call a MemoryObj method when the backend supports it.
 
     Args:
@@ -128,7 +128,8 @@ def _memory_obj_tensor_view(memory_obj: "MemoryObj") -> torch.Tensor | None:
         legacy tensor view for single-shape objects or a flat uint8 view for
         multi-shape objects.
     """
-    shapes = _safe_memory_obj_call(memory_obj, "get_shapes") or []
+    shapes_obj = _safe_memory_obj_call(memory_obj, "get_shapes")
+    shapes = shapes_obj if isinstance(shapes_obj, list) else []
     raw_tensor = _safe_memory_obj_attr(memory_obj, "raw_tensor")
     if not isinstance(raw_tensor, torch.Tensor):
         tensor = _safe_memory_obj_attr(memory_obj, "tensor")

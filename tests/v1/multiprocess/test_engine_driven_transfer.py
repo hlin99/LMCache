@@ -14,7 +14,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.posix_shm import (
     shm_create_readwrite,
     shm_munmap,
@@ -33,6 +33,8 @@ from lmcache.v1.multiprocess.transfer_context.base import (
 )
 from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+
+TestObjectKey = str | ObjectKey
 
 if TYPE_CHECKING:
     # First Party
@@ -68,7 +70,7 @@ class ServerModuleFactory(Protocol):
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[Any] | list[list[Any]] | None = None,
+        object_keys: list[TestObjectKey] | list[list[TestObjectKey]] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1638,7 +1640,7 @@ def server_module_factory(
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[Any] | list[list[Any]] | None = None,
+        object_keys: list[TestObjectKey] | list[list[TestObjectKey]] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1675,14 +1677,12 @@ def server_module_factory(
             patch("lmcache.v1.multiprocess.engine_context.get_event_bus")
         )
         resolved_object_keys = object_keys or ["obj"]
-        if not resolved_object_keys or (
-            resolved_object_keys and not isinstance(resolved_object_keys[0], list)
-        ):
+        if not resolved_object_keys or not isinstance(resolved_object_keys[0], list):
             resolved_object_keys = [resolved_object_keys]
 
         def _resolve_object_keys(
             _key: Any, _chunk_hashes: list[bytes], object_group_ids: list[int]
-        ) -> list[list[Any]]:
+        ) -> list[list[TestObjectKey]]:
             return [
                 resolved_object_keys[object_group_id]
                 for object_group_id in object_group_ids
@@ -2084,11 +2084,8 @@ def test_server_prepare_store_includes_chunk_indices(
     assert response_context.get("chunk_indices") == [1]
 
 
-def _hybrid_object_keys() -> list[list[Any]]:
+def _hybrid_object_keys() -> list[list[TestObjectKey]]:
     """Return two object groups with two chunks each for server hybrid tests."""
-    # First Party
-    from lmcache.v1.distributed.api import ObjectKey
-
     return [
         [
             ObjectKey(chunk_hash=b"h0", model_name="m", kv_rank=0, object_group_id=0),
@@ -2193,11 +2190,11 @@ def test_l2_prefetch_reserves_each_object_group_with_matching_layout(
     class FakeL1Manager:
         def reserve_write(
             self,
-            keys: list[Any],
+            keys: list[TestObjectKey],
             is_temporary: list[bool],
             layout_desc: MemoryLayoutDesc,
             mode: str,
-        ) -> dict[Any, tuple[Any, _TensorMemoryObj]]:
+        ) -> dict[TestObjectKey, tuple[object, _TensorMemoryObj]]:
             captured.append(
                 ([key.object_group_id for key in keys], layout_desc.shapes[0].numel())
             )
@@ -2231,10 +2228,14 @@ def test_server_hybrid_pickle_store_and_retrieve_use_group_layouts(
 ) -> None:
     """Pickle store/retrieve handles object-group-major hybrid layouts."""
     object_keys = _hybrid_object_keys()
-    stored: dict[Any, _TensorMemoryObj] = {}
+    stored: dict[TestObjectKey, _TensorMemoryObj] = {}
     reserve_layout_sizes: list[int] = []
 
-    def _reserve_write(obj_keys: list[Any], layout: MemoryLayoutDesc, *_args: Any) -> Any:
+    def _reserve_write(
+        obj_keys: list[TestObjectKey],
+        layout: MemoryLayoutDesc,
+        *_args: object,
+    ) -> dict[TestObjectKey, _TensorMemoryObj]:
         reserve_layout_sizes.append(layout.shapes[0].numel())
         result = {}
         for obj_key in obj_keys:
@@ -2245,7 +2246,7 @@ def test_server_hybrid_pickle_store_and_retrieve_use_group_layouts(
         return result
 
     @contextmanager
-    def _read_prefetched_results(obj_keys: list[Any]) -> Any:
+    def _read_prefetched_results(obj_keys: list[TestObjectKey]) -> Iterator[list[_TensorMemoryObj]]:
         yield [stored[obj_key] for obj_key in obj_keys]
 
     mock_storage = MagicMock()
@@ -2281,7 +2282,8 @@ def test_server_hybrid_shm_prepare_store_and_retrieve_order(
     """SHM prepare paths expose object-group-major hybrid slot layouts."""
     object_keys = _hybrid_object_keys()
 
-    def _memory_obj_for_key(obj_key: Any) -> _TensorMemoryObj:
+    def _memory_obj_for_key(obj_key: TestObjectKey) -> _TensorMemoryObj:
+        assert isinstance(obj_key, ObjectKey)
         size = 16 if obj_key.object_group_id == 0 else 24
         return _TensorMemoryObj(torch.zeros(size, dtype=torch.uint8), offset=size)
 
