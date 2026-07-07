@@ -146,7 +146,17 @@ def _has_native_object_group_transfer() -> bool:
 
 
 class _EngineObjectGroupCacheContext(BaseCacheContext):
-    """Raw-tensor cache context used by engine-driven object-group planning."""
+    """Bridge raw engine tensors into shared object-group transfer planning.
+
+    The LMCache-driven path receives a platform cache context from registered
+    IPC wrappers.  Engine-driven workers already own the raw vLLM KV tensors, so
+    this adapter supplies the same object-group metadata, pointer tensors, block
+    ID staging, and temporary buffers directly from those tensors.  Temporary
+    buffers are Python-owned and require no explicit cleanup.
+
+    Instances are created during engine-driven registration only when the native
+    object-group executor is available for the active CUDA-backed context.
+    """
 
     device_type = "cuda"
 
@@ -343,6 +353,10 @@ def _build_engine_object_group_transfer_state(
     Returns:
         Prepared raw-tensor object-group transfer state when the native helper
         can run for this engine-driven context; otherwise ``None``.
+
+        ``None`` is returned for empty KV caches, non-CUDA KV tensors, or when
+        the native object-group executor is unavailable.  Those cases continue
+        through the existing low-level gather/scatter fallback.
     """
     tensors = list(kv_caches.values())
     if (
@@ -377,6 +391,9 @@ def _build_tensor_staging_copies(
 
     Returns:
         Native staging-copy descriptors consumed by ``BatchStep``.
+        ``host_offset`` is computed as the CPU tensor pointer offset within
+        ``PIN_CHUNK_SIZE`` because the native copy helper splits pageable host
+        buffers at alignment boundaries and needs the offset within that window.
 
     Raises:
         ValueError: If a transfer tensor and staging buffer differ in size.
@@ -501,6 +518,11 @@ def _supports_single_engine_object_group(
 ) -> bool:
     """Return whether the request maps to the current single-group contract.
 
+    The optimized engine-driven path currently supports exactly one object
+    group containing exactly one kernel group, with ``block_ids`` supplied as a
+    single kernel-group list.  Other layouts remain on the fallback path instead
+    of risking a mismatched transport object layout.
+
     Args:
         state: Prepared object-group transfer state.
         block_ids: Request block IDs indexed by kernel group.
@@ -528,6 +550,11 @@ def _execute_engine_object_group_transfer(
     batch_size: int,
 ) -> None:
     """Plan and execute an engine-driven object-group transfer.
+
+    ``staging_copy_builder`` produces native ``StagingCopy`` descriptors for a
+    batch of transport tensors.  It is parameterized so pickle tensors and SHM
+    views can keep transport-specific ownership/allocation behavior while still
+    sharing the common object-group planner and executor.
 
     Args:
         state: Prepared object-group transfer state.

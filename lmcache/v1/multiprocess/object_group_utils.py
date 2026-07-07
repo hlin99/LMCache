@@ -183,6 +183,16 @@ def select_block_ids_for_cache_context(
     Raises:
         ValueError: If a group's block IDs are not chunk-aligned according to
             :func:`select_block_ids_for_window`.
+
+    Example:
+        With two chunks, kernel group 0 keeping all four blocks per chunk, and
+        kernel group 1 keeping the trailing two blocks per chunk:
+
+        >>> select_block_ids_for_cache_context(ctx, [
+        ...     [0, 1, 2, 3, 4, 5, 6, 7],
+        ...     [10, 11, 12, 13, 20, 21, 22, 23],
+        ... ])
+        [[0, 1, 2, 3, 4, 5, 6, 7], [12, 13, 22, 23]]
     """
     selected_block_ids = [list(group_block_ids) for group_block_ids in block_ids]
     num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
