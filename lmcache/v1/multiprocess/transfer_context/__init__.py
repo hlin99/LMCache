@@ -7,7 +7,6 @@ sub-module.
 """
 
 # Local
-from .async_engine_driven import AsyncEngineDrivenTransferContext
 from .base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
@@ -27,7 +26,6 @@ from .worker_transfer import (
 )
 
 __all__ = [
-    "AsyncEngineDrivenTransferContext",
     "EngineDrivenTransferContext",
     "LMCacheDrivenTransferContext",
     "MPTransferMode",
