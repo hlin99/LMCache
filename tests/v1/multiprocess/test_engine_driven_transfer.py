@@ -36,6 +36,15 @@ from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 
 TestObjectKey = str | ObjectKey
 
+
+def _attn_desc(num_chunks_in_sw: list[int]) -> Any:
+    """Return a real attention-window descriptor for test cache contexts."""
+    # First Party
+    from lmcache.v1.distributed.api import AttnWindowDesc
+
+    return AttnWindowDesc(num_chunks_in_sw)
+
+
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.config import StorageManagerConfig
@@ -626,8 +635,8 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
-        def get_attn_desc(self) -> MagicMock:
-            return MagicMock(num_chunks_in_sw=[-1])
+        def get_attn_desc(self) -> Any:
+            return _attn_desc([-1])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
@@ -796,8 +805,8 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         def get_subchunk_sw_size_tokens(self, _kernel_group_id: int) -> int:
             return 8
 
-        def get_attn_desc(self) -> MagicMock:
-            return MagicMock(num_chunks_in_sw=[-1])
+        def get_attn_desc(self) -> Any:
+            return _attn_desc([-1])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
@@ -966,8 +975,8 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         ]
         num_kernel_groups = 2
 
-        def get_attn_desc(self) -> MagicMock:
-            return MagicMock(num_chunks_in_sw=[-1, 2])
+        def get_attn_desc(self) -> Any:
+            return _attn_desc([-1, 2])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
@@ -1140,8 +1149,8 @@ def test_engine_driven_shm_retrieve_plans_all_object_groups(
         ]
         num_kernel_groups = 2
 
-        def get_attn_desc(self) -> MagicMock:
-            return MagicMock(num_chunks_in_sw=[-1, 2])
+        def get_attn_desc(self) -> Any:
+            return _attn_desc([-1, 2])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
