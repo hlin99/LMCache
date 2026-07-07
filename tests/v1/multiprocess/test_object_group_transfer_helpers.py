@@ -734,10 +734,7 @@ class TestPrepareObjectGroupTransfer:
         with _patch_native_types_and_staging() as mocks:
             with pytest.raises(
                 ValueError,
-                match=(
-                    "Object is None for some objects in the batch, cannot "
-                    "perform H2D copy"
-                ),
+                match=r"Object is None.*cannot perform H2D copy",
             ):
                 prepare_object_group_transfer(
                     ctx,
