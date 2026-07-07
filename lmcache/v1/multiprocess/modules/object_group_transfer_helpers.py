@@ -151,14 +151,14 @@ def recalculate_blocks_to_skip(
 
 
 def batched_iteration_with_skip(
-    lst: Sequence,
+    sequence: Sequence,
     batch_size: int,
     skip_count: int,
 ) -> Generator[tuple[int, tuple], None, None]:
     """Iterate over a sequence in batches, skipping an initial prefix.
 
     Args:
-        lst: The sequence to iterate over.
+        sequence: The sequence to iterate over.
         batch_size: The size of each batch.
         skip_count: The number of items to skip at the start of the list.
 
@@ -182,7 +182,7 @@ def batched_iteration_with_skip(
     if skip_count < 0:
         raise ValueError("skip_count must be non-negative")
 
-    it = iter(lst)
+    it = iter(sequence)
     for _ in range(skip_count):
         next(it, None)
     batch_start_idx = skip_count

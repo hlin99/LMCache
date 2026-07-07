@@ -417,9 +417,14 @@ def _make_mock_cache_context(
         num_kernel_groups: Number of kernel groups in the object group.
         object_group_kernel_indices: Kernel group IDs for object group 0.
         subchunk_sw_size_tokens: Sub-chunk sliding-window size.
-        blocks_per_chunk: Value returned by calculate_num_blocks for chunk tokens.
-        blocks_per_window: Value returned by calculate_num_blocks for window tokens.
+        blocks_per_chunk: Value returned by ``calculate_num_blocks`` when called
+            with ``lmcache_tokens_per_chunk`` tokens.  Must be consistent with
+            the chunk geometry used in each test (i.e. the block IDs tensor
+            must contain exactly ``num_chunks * blocks_per_chunk`` entries).
+        blocks_per_window: Value returned by ``calculate_num_blocks`` for any
+            other token count (i.e. the sliding-window size in blocks).
         num_chunks_in_sw: Per-object-group SW chunk count for AttnWindowDesc.
+            Use ``[-1]`` (the default) to simulate full-attention (no skip).
 
     Returns:
         Configured MagicMock acting as BaseCacheContext.
@@ -449,7 +454,7 @@ def _make_mock_cache_context(
 
     # Block calculations: return blocks_per_chunk for chunk-size tokens,
     # blocks_per_window for anything else (window-size tokens).
-    def _calculate_num_blocks(tokens: int, kg_id: int) -> int:
+    def _calculate_num_blocks(tokens: int, kernel_group_id: int) -> int:
         if tokens == lmcache_tokens_per_chunk:
             return blocks_per_chunk
         return blocks_per_window
@@ -460,12 +465,12 @@ def _make_mock_cache_context(
     paged_ptrs = torch.zeros(1, dtype=torch.int64)
     ctx.get_kernel_group_kv_pointers.return_value = paged_ptrs
 
-    def _get_temp_kg_buffer(slot: int, kg_id: int) -> torch.Tensor:
+    def _get_temp_kg_buffer(slot: int, kernel_group_id: int) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.int64)
 
     ctx.get_temp_kernel_group_buffer.side_effect = _get_temp_kg_buffer
 
-    def _get_temp_og_buffer(slot: int, og_id: int) -> torch.Tensor:
+    def _get_temp_og_buffer(slot: int, object_group_id: int) -> torch.Tensor:
         # Object-group buffer used for staging; nbytes must match memory_obj.
         return torch.zeros(4, dtype=torch.uint8)
 
@@ -802,12 +807,11 @@ class TestPrepareAndExecutePipeline:
                 skip_first_n_tokens=0,
                 direction=direction,
             )
+            assert len(steps) > 0, (
+                "expected non-empty batch_steps for valid memory objects"
+            )
             execute_prepared_object_group_transfer(direction, ctx.device, specs, steps)
-
-            if steps:
-                mock_exec.assert_called_once()
-            else:
-                mock_exec.assert_not_called()
+            mock_exec.assert_called_once()
 
     def test_execute_not_called_when_batch_steps_empty(self) -> None:
         """Empty batch_steps (all-None D2H) → execute is never invoked."""
