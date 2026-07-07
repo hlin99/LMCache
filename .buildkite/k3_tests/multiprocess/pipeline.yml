@@ -129,28 +129,27 @@ steps:
       # lm_eval load. Both steps reuse the same run.sh lm_eval_preemption
       # command; env vars select the transfer mode. Checks: no crash, score
       # drift < 0.01, preemption actually occurred, score >= SCORE_MIN.
-      - label: ":compression: lm_eval_lmcache_driven_preemption"
-        command: .buildkite/k3_tests/multiprocess/run.sh lm_eval_preemption
+      - label: ":compression: lm_eval_preemption ({{matrix.mode}})"
+        command: |
+          case "{{matrix.mode}}" in
+            lmcache_driven) ;;
+            engine_driven)
+              export LMCACHE_MP_TRANSFER_MODE="engine_driven"
+              export L1_USE_LAZY="false"
+              ;;
+          esac
+          .buildkite/k3_tests/multiprocess/run.sh lm_eval_preemption
+        matrix:
+          setup:
+            mode:
+              - "lmcache_driven"
+              - "engine_driven"
         timeout_in_minutes: 30
         env:
           GPU_MEMORY_UTILIZATION: "0.4"
           NUM_CONCURRENT: "256"
           MAX_MODEL_LEN: "4096"
           MAX_WAIT_SECONDS: "600"
-        agents: { queue: "k8s" }
-        plugins: [{ kubernetes: { podSpec: *pod-1gpu } }]
-        artifact_paths: ["*.log"]
-
-      - label: ":compression: lm_eval_engine_driven_preemption"
-        command: .buildkite/k3_tests/multiprocess/run.sh lm_eval_preemption
-        timeout_in_minutes: 30
-        env:
-          GPU_MEMORY_UTILIZATION: "0.4"
-          NUM_CONCURRENT: "256"
-          MAX_MODEL_LEN: "4096"
-          MAX_WAIT_SECONDS: "600"
-          LMCACHE_MP_TRANSFER_MODE: "engine_driven"
-          L1_USE_LAZY: "false"
         agents: { queue: "k8s" }
         plugins: [{ kubernetes: { podSpec: *pod-1gpu-dshm } }]
         artifact_paths: ["*.log"]
