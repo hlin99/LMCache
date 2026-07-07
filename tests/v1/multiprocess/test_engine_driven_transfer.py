@@ -45,6 +45,13 @@ def _attn_desc(num_chunks_in_sw: list[int]) -> Any:
     return AttnWindowDesc(num_chunks_in_sw)
 
 
+def _distinct_empty_buffers_like(objects: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+    """Return one distinct empty tensor buffer per input object."""
+    buffers = [torch.empty_like(obj) for obj in objects]
+    assert len({id(buffer) for buffer in buffers}) == len(buffers)
+    return buffers
+
+
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.config import StorageManagerConfig
@@ -726,7 +733,7 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         assert concrete_objects
         staging_copy_builder(
             concrete_objects,
-            [torch.empty_like(obj) for obj in concrete_objects],
+            _distinct_empty_buffers_like(concrete_objects),
             False,
         )
         captured["prepare"] = {
@@ -891,7 +898,7 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         assert concrete_objects
         staging_copy_builder(
             concrete_objects,
-            [torch.empty_like(obj) for obj in concrete_objects],
+            _distinct_empty_buffers_like(concrete_objects),
             True,
         )
         captured["prepare"] = {
@@ -1063,7 +1070,7 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         concrete_objects = [obj for obj in objects if obj is not None]
         staging_copy_builder(
             concrete_objects,
-            [torch.empty_like(obj) for obj in concrete_objects],
+            _distinct_empty_buffers_like(concrete_objects),
             False,
         )
         captured["prepare_calls"].append(
@@ -1237,7 +1244,7 @@ def test_engine_driven_shm_retrieve_plans_all_object_groups(
         concrete_objects = [obj for obj in objects if obj is not None]
         staging_copy_builder(
             concrete_objects,
-            [torch.empty_like(obj) for obj in concrete_objects],
+            _distinct_empty_buffers_like(concrete_objects),
             True,
         )
         captured["prepare_calls"].append(
