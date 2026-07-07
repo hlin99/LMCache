@@ -188,7 +188,8 @@ class _EngineObjectGroupCacheContext(BaseCacheContext):
         ):
             raise ValueError(
                 "engine-driven object-group transfer requires normalized "
-                "per-layer tensor KV caches"
+                "per-layer tensor KV caches, got "
+                f"{type(kv_caches_norm).__name__}"
             )
         kv_caches_norm = cast(list[torch.Tensor], kv_caches_norm)
         device = get_device(kv_caches_norm)

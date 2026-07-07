@@ -37,7 +37,7 @@ from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 TestObjectKey = str | ObjectKey
 
 
-def _attn_desc(num_chunks_in_sw: list[int]) -> Any:
+def _make_attn_window_desc(num_chunks_in_sw: list[int]) -> Any:
     """Return a real attention-window descriptor for test cache contexts."""
     # First Party
     from lmcache.v1.distributed.api import AttnWindowDesc
@@ -45,18 +45,18 @@ def _attn_desc(num_chunks_in_sw: list[int]) -> Any:
     return AttnWindowDesc(num_chunks_in_sw)
 
 
-def _distinct_empty_buffers_like(objects: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+def _make_staging_buffers(objects: Sequence[torch.Tensor]) -> list[torch.Tensor]:
     """Return one distinct empty tensor buffer per input object."""
     buffers = [torch.empty_like(obj) for obj in objects]
     assert len({id(buffer) for buffer in buffers}) == len(buffers)
     return buffers
 
 
-def test_distinct_empty_buffers_like_returns_one_buffer_per_object() -> None:
+def test_make_staging_buffers_returns_one_buffer_per_object() -> None:
     """Verify test staging buffers are distinct and aligned with inputs."""
     objects = [torch.zeros(2), torch.ones(3)]
 
-    buffers = _distinct_empty_buffers_like(objects)
+    buffers = _make_staging_buffers(objects)
 
     assert len(buffers) == len(objects)
     assert [tuple(buffer.shape) for buffer in buffers] == [(2,), (3,)]
@@ -654,7 +654,7 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
             return 8
 
         def get_attn_desc(self) -> Any:
-            return _attn_desc([-1])
+            return _make_attn_window_desc([-1])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
@@ -744,7 +744,7 @@ def test_engine_driven_pickle_store_uses_object_group_helpers(
         assert concrete_objects
         staging_copy_builder(
             concrete_objects,
-            _distinct_empty_buffers_like(concrete_objects),
+            _make_staging_buffers(concrete_objects),
             False,
         )
         captured["prepare"] = {
@@ -824,7 +824,7 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
             return 8
 
         def get_attn_desc(self) -> Any:
-            return _attn_desc([-1])
+            return _make_attn_window_desc([-1])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
@@ -909,7 +909,7 @@ def test_engine_driven_shm_retrieve_uses_object_group_helpers(
         assert concrete_objects
         staging_copy_builder(
             concrete_objects,
-            _distinct_empty_buffers_like(concrete_objects),
+            _make_staging_buffers(concrete_objects),
             True,
         )
         captured["prepare"] = {
@@ -994,7 +994,7 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         num_kernel_groups = 2
 
         def get_attn_desc(self) -> Any:
-            return _attn_desc([-1, 2])
+            return _make_attn_window_desc([-1, 2])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
@@ -1081,7 +1081,7 @@ def test_engine_driven_pickle_store_plans_all_object_groups(
         concrete_objects = [obj for obj in objects if obj is not None]
         staging_copy_builder(
             concrete_objects,
-            _distinct_empty_buffers_like(concrete_objects),
+            _make_staging_buffers(concrete_objects),
             False,
         )
         captured["prepare_calls"].append(
@@ -1168,7 +1168,7 @@ def test_engine_driven_shm_retrieve_plans_all_object_groups(
         num_kernel_groups = 2
 
         def get_attn_desc(self) -> Any:
-            return _attn_desc([-1, 2])
+            return _make_attn_window_desc([-1, 2])
 
     class FakeCacheContext:
         lmcache_tokens_per_chunk = 8
@@ -1255,7 +1255,7 @@ def test_engine_driven_shm_retrieve_plans_all_object_groups(
         concrete_objects = [obj for obj in objects if obj is not None]
         staging_copy_builder(
             concrete_objects,
-            _distinct_empty_buffers_like(concrete_objects),
+            _make_staging_buffers(concrete_objects),
             True,
         )
         captured["prepare_calls"].append(
