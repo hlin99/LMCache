@@ -19,6 +19,7 @@ LIMIT="${LIMIT:-300}"
 BUILD_ID="${BUILD_ID:-local_$$}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/lmcache_ci_results_${BUILD_ID}}"
 LM_EVAL_VERIFY_MODE="${LM_EVAL_VERIFY_MODE:-samples}"
+# Preemption-mode verification settings.
 SCORE_TOLERANCE="${SCORE_TOLERANCE:-0.05}"
 SCORE_MIN="${SCORE_MIN:-0.80}"
 VLLM_LOG="${VLLM_LOG:-/tmp/build_${BUILD_ID}_vllm.log}"
@@ -111,6 +112,7 @@ count_preemptions() {
 }
 
 verify_preemption() {
+    # Args: first_dir, second_dir, preemptions_before, preemptions_after.
     python3 - "$1" "$2" "$SCORE_TOLERANCE" "$SCORE_MIN" "$3" "$4" <<'PYEOF'
 import glob, json, os, sys
 
@@ -118,14 +120,17 @@ first_dir, second_dir = sys.argv[1:3]
 tolerance, score_min = map(float, sys.argv[3:5])
 before, after = map(int, sys.argv[5:7])
 
+# Parse gsm8k exact_match from the newest lm_eval results_*.json file.
 def score(results_dir):
     files = glob.glob(os.path.join(results_dir, "**", "results_*.json"), recursive=True)
     if not files:
         raise SystemExit(f"No results_*.json under {results_dir}")
     with open(max(files, key=os.path.getmtime)) as f:
         metrics = json.load(f)["results"]["gsm8k"]
-    for key in ["exact_match,strict-match", *metrics]:
-        if key in metrics and key.startswith("exact_match,") and "stderr" not in key:
+    if "exact_match,strict-match" in metrics:
+        return float(metrics["exact_match,strict-match"])
+    for key in metrics:
+        if key.startswith("exact_match,") and "stderr" not in key:
             return float(metrics[key])
     raise SystemExit(f"No exact_match metric in {sorted(metrics)}")
 
@@ -171,7 +176,6 @@ echo "============================================"
 if [ "$LM_EVAL_VERIFY_MODE" = "preemption" ]; then
     if ! verify_preemption "$FIRST_RUN_DIR" "$SECOND_RUN_DIR" \
             "$preemptions_before" "$preemptions_after"; then
-        echo "Verification failed: preemption checks failed"
         exit 1
     fi
 elif ! verify_samples_match "$FIRST_RUN_DIR" "$SECOND_RUN_DIR"; then
