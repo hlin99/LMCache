@@ -18,8 +18,9 @@ NUM_CONCURRENT="${NUM_CONCURRENT:-50}"
 LIMIT="${LIMIT:-300}"
 BUILD_ID="${BUILD_ID:-local_$$}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/lmcache_ci_results_${BUILD_ID}}"
+# samples: compare sorted samples JSONL; preemption: check scores and preempts.
 LM_EVAL_VERIFY_MODE="${LM_EVAL_VERIFY_MODE:-samples}"
-# Preemption-mode verification settings.
+# Preemption-mode settings: score drift, score floor, and vLLM log path.
 SCORE_TOLERANCE="${SCORE_TOLERANCE:-0.05}"
 SCORE_MIN="${SCORE_MIN:-0.80}"
 VLLM_LOG="${VLLM_LOG:-/tmp/build_${BUILD_ID}_vllm.log}"
@@ -46,6 +47,8 @@ echo ""
 
 mkdir -p "$FIRST_RUN_DIR" "$SECOND_RUN_DIR"
 
+# Run one lm_eval gsm8k pass; args are run_name and output_dir.
+# Writes lm_eval results_*.json and samples_*.jsonl under output_dir.
 run_lm_eval() {
     local run_name="$1"
     local output_dir="$2"
@@ -112,7 +115,9 @@ count_preemptions() {
 }
 
 verify_preemption() {
+    # Validate score drift, score floor, and observed preemptions.
     # Args: first_dir, second_dir, preemptions_before, preemptions_after.
+    # Reads SCORE_TOLERANCE and SCORE_MIN; returns non-zero on failure.
     python3 - "$1" "$2" "$SCORE_TOLERANCE" "$SCORE_MIN" "$3" "$4" <<'PYEOF'
 import glob, json, os, sys
 
@@ -120,8 +125,16 @@ first_dir, second_dir = sys.argv[1:3]
 tolerance, score_min = map(float, sys.argv[3:5])
 before, after = map(int, sys.argv[5:7])
 
-# Parse gsm8k exact_match from the newest lm_eval results_*.json file.
 def score(results_dir):
+    """Return gsm8k exact_match from newest results_*.json.
+
+    Args:
+        results_dir: lm_eval output directory to search recursively.
+    Returns:
+        float exact_match score in [0, 1].
+    Raises:
+        SystemExit: if no results file or exact_match metric is found.
+    """
     files = glob.glob(os.path.join(results_dir, "**", "results_*.json"), recursive=True)
     if not files:
         raise SystemExit(f"No results_*.json under {results_dir}")
