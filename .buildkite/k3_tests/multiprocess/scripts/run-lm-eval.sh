@@ -44,6 +44,7 @@ echo ""
 
 mkdir -p "$FIRST_RUN_DIR" "$SECOND_RUN_DIR"
 
+# Run one gsm8k lm_eval pass, writing results/samples to output_dir.
 run_lm_eval() {
     local run_name="$1"
     local output_dir="$2"
@@ -112,6 +113,7 @@ count_preemptions() {
 }
 
 verify_preemption() {
+    # Check score drift/floor and that preemptions increased in VLLM_LOG.
     python3 - "$1" "$2" "$SCORE_TOLERANCE" "$SCORE_MIN" "$3" "$4" <<'PYEOF'
 import glob, json, os, sys
 
@@ -119,6 +121,7 @@ first_dir, second_dir, tolerance, score_min, before, after = sys.argv[1:7]
 tolerance, score_min = float(tolerance), float(score_min)
 before, after = int(before), int(after)
 def score(results_dir):
+    """Return gsm8k exact_match from newest results_*.json or exit if missing."""
     files = glob.glob(os.path.join(results_dir, "**", "results_*.json"), recursive=True)
     if not files:
         raise SystemExit(f"No results_*.json under {results_dir}")
