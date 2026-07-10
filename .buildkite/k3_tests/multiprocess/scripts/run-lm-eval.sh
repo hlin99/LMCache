@@ -107,7 +107,7 @@ verify_samples_match() {
 count_preemptions() {
     [ -f "$VLLM_LOG" ] || { echo 0; return; }
     local count
-    count=$(grep -o "<preempted>" "$VLLM_LOG" 2>/dev/null | wc -l || true)
+    count=$(grep -c "<preempted>" "$VLLM_LOG" 2>/dev/null || true)
     echo "${count:-0}"
 }
 
@@ -124,8 +124,10 @@ def score(results_dir):
         raise SystemExit(f"No results_*.json under {results_dir}")
     with open(max(files, key=os.path.getmtime)) as f:
         metrics = json.load(f)["results"]["gsm8k"]
-    for key in ["exact_match,strict-match", *metrics]:
-        if key in metrics and key.startswith("exact_match,") and "stderr" not in key:
+    if "exact_match,strict-match" in metrics:
+        return float(metrics["exact_match,strict-match"])
+    for key in metrics:
+        if key.startswith("exact_match,") and "stderr" not in key:
             return float(metrics[key])
     raise SystemExit(f"No exact_match metric in {sorted(metrics)}")
 first, second = score(first_dir), score(second_dir)
