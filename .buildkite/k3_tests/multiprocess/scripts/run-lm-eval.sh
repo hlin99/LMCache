@@ -113,13 +113,13 @@ count_preemptions() {
 }
 
 verify_preemption() {
-    # Check score drift/floor and that preemptions increased in VLLM_LOG.
-    python3 - "$1" "$2" "$SCORE_TOLERANCE" "$SCORE_MIN" "$3" "$4" <<'PYEOF'
+    # Check score drift/floor and that each lm_eval run observed preemptions.
+    python3 - "$1" "$2" "$SCORE_TOLERANCE" "$SCORE_MIN" "$3" "$4" "$5" <<'PYEOF'
 import glob, json, os, sys
 
-first_dir, second_dir, tolerance, score_min, before, after = sys.argv[1:7]
+first_dir, second_dir, tolerance, score_min, before, after_first, after_second = sys.argv[1:8]
 tolerance, score_min = float(tolerance), float(score_min)
-before, after = int(before), int(after)
+before, after_first, after_second = int(before), int(after_first), int(after_second)
 def score(results_dir):
     """Return gsm8k exact_match from newest results_*.json or exit if missing."""
     files = glob.glob(os.path.join(results_dir, "**", "results_*.json"), recursive=True)
@@ -137,17 +137,23 @@ first, second = score(first_dir), score(second_dir)
 drift = abs(first - second)
 print(f"First run gsm8k exact_match: {first:.4f}")
 print(f"Second run gsm8k exact_match: {second:.4f}")
-print(f"vLLM preemptions logged: before={before}, after={after}")
+print(f"vLLM preemptions logged: before={before}, after_first={after_first}, after_second={after_second}")
 failures = []
 if drift > tolerance:
     failures.append(f"score drift {drift:.4f} > tolerance {tolerance}")
 if first < score_min or second < score_min:
     failures.append(f"scores below minimum {score_min}: first={first:.4f}, second={second:.4f}")
-if after <= before:
-    failures.append(f"no preemptions observed during test (before={before}, after={after})")
+if after_first <= before:
+    failures.append(f"no preemptions observed during first_run (before={before}, after_first={after_first})")
+if after_second <= after_first:
+    failures.append(f"no preemptions observed during second_run (after_first={after_first}, after_second={after_second})")
 if failures:
     raise SystemExit("FAILED:\n  - " + "\n  - ".join(failures))
-print(f"Preemption verification passed; observed {after - before} preemptions")
+print(
+    "Preemption verification passed; "
+    f"first_run observed {after_first - before}, "
+    f"second_run observed {after_second - after_first} preemptions"
+)
 PYEOF
 }
 
@@ -157,13 +163,14 @@ echo "=== First lm_eval run (cache population) ==="
 echo "============================================"
 [ "$LM_EVAL_VERIFY_MODE" = "preemption" ] && preemptions_before=$(count_preemptions)
 run_lm_eval "first_run" "$FIRST_RUN_DIR"
+[ "$LM_EVAL_VERIFY_MODE" = "preemption" ] && preemptions_after_first=$(count_preemptions)
 
 # Second run -- should use cached results
 echo "============================================"
 echo "=== Second lm_eval run (cache hit) ==="
 echo "============================================"
 run_lm_eval "second_run" "$SECOND_RUN_DIR"
-[ "$LM_EVAL_VERIFY_MODE" = "preemption" ] && preemptions_after=$(count_preemptions)
+[ "$LM_EVAL_VERIFY_MODE" = "preemption" ] && preemptions_after_second=$(count_preemptions)
 
 # Verify consistency
 echo "============================================"
@@ -171,7 +178,7 @@ echo "=== Verifying output consistency ==="
 echo "============================================"
 if [ "$LM_EVAL_VERIFY_MODE" = "preemption" ]; then
     verify_preemption "$FIRST_RUN_DIR" "$SECOND_RUN_DIR" \
-        "$preemptions_before" "$preemptions_after"
+        "$preemptions_before" "$preemptions_after_first" "$preemptions_after_second"
 elif ! verify_samples_match "$FIRST_RUN_DIR" "$SECOND_RUN_DIR"; then
     echo "Verification failed: samples files do not match"
     exit 1
