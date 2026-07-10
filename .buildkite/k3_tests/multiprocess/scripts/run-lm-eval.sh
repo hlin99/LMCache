@@ -111,7 +111,9 @@ verify_samples_match() {
 
 count_preemptions() {
     [ -f "$VLLM_LOG" ] || { echo 0; return; }
-    grep -c "<preempted>" "$VLLM_LOG" 2>/dev/null || echo 0
+    local count
+    count=$(grep -c "<preempted>" "$VLLM_LOG" 2>/dev/null || true)
+    echo "${count:-0}"
 }
 
 verify_preemption() {
