@@ -246,8 +246,8 @@ def _split_shm_buffers_by_group(
         return [None] * len(plans), [None] * len(plans)
     if server_group_counts is None:
         raise ValueError(
-            "structured SHM prepare_store must return group_counts with one "
-            "entry per group, got None"
+            "structured SHM prepare_store response must include group_counts "
+            "with one entry per group, got None"
         )
     has_invalid_group_counts = (
         len(server_group_counts) != len(plans)

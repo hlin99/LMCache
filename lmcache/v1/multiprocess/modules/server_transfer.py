@@ -553,7 +553,10 @@ class ShmTransferStrategy(TransferStrategy):
 
         if not reserved_keys:
             if reserved:
-                raise ValueError("all SHM reservations lack writable tensors")
+                raise ValueError(
+                    "all reserved SHM slots lack writable tensors; "
+                    "the storage backend may be misconfigured or exhausted"
+                )
             ctx: dict[str, Any] = {"slots": [], "chunk_indices": []}
             if context.uses_structured_groups:
                 ctx["group_counts"] = [0] * num_groups

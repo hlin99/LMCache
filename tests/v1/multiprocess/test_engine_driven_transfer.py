@@ -1504,17 +1504,24 @@ def test_server_pickle_partial_reservation_fails_without_publishing(
 
 
 @pytest.mark.parametrize(
-    ("destination", "source"),
+    ("destination", "source", "expected_error"),
     [
-        pytest.param(None, torch.ones(2, 2, 8, 16), id="missing-destination"),
+        pytest.param(
+            None,
+            torch.ones(2, 2, 8, 16),
+            "has no tensor",
+            id="missing-destination",
+        ),
         pytest.param(
             torch.zeros(2, 2, 8, 16),
             torch.ones(2, 2, 4, 16),
+            "chunk layout mismatch",
             id="shape-mismatch",
         ),
         pytest.param(
             torch.zeros(2, 2, 8, 16),
             torch.ones(2, 2, 8, 16, dtype=torch.float16),
+            "chunk layout mismatch",
             id="dtype-mismatch",
         ),
     ],
@@ -1524,6 +1531,7 @@ def test_server_pickle_invalid_reservation_cleans_without_publishing(
     server_module_factory: ServerModuleFactory,
     destination: torch.Tensor | None,
     source: torch.Tensor,
+    expected_error: str,
 ) -> None:
     """Pickle validates every destination before writing or publishing."""
     # First Party
@@ -1542,7 +1550,7 @@ def test_server_pickle_invalid_reservation_cleans_without_publishing(
         _default_register_payload(instance_id=21)
     )
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=expected_error):
         module.commit_store(_default_key(), 21, pickle.dumps([source]))
 
     mock_storage.delete_l1_keys.assert_called_once_with([obj_key], force=True)
