@@ -65,13 +65,15 @@ class ContiguousTransferWrapper:
             instance_id: The cache server instance ID.
 
         Returns:
-            The contiguous KV tensor if found, None otherwise.
+            The contiguous KV tensor if found and the retrieve was committed
+            successfully, None otherwise.
 
         Raises:
             ValueError: If the context returns more than one transfer group;
                 this wrapper stores one contiguous tensor per key.
             Exception: Any error raised while concatenating the retrieved
-                chunks, after the retrieve has been aborted.
+                chunks or while committing the retrieve, after the retrieve
+                has been aborted.
         """
         slot_tensors = self._normalize_prepare_retrieve(
             self._context.prepare_retrieve(key, instance_id), key, instance_id
@@ -83,10 +85,13 @@ class ContiguousTransferWrapper:
             # Both Pickle and SHM returns list of [2, L, T, D] tensors
             # Concatenate along the token dimension.
             result = torch.cat(slot_tensors, dim=2)
+            committed = self._context.commit_retrieve(key, instance_id)
         except Exception:
             self._abort_retrieve(key, instance_id)
             raise
-        self._context.commit_retrieve(key, instance_id)
+        if not committed:
+            self._abort_retrieve(key, instance_id)
+            return None
         return result
 
     def _normalize_prepare_retrieve(

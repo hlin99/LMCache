@@ -24,8 +24,17 @@ RetrieveResult = list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | Non
 class _FakeContext:
     """Minimal engine-driven transport recording retrieve lifecycle calls."""
 
-    def __init__(self, retrieve_result: RetrieveResult) -> None:
+    def __init__(
+        self,
+        retrieve_result: RetrieveResult,
+        commit_result: bool = True,
+        commit_error: Exception | None = None,
+        abort_error: Exception | None = None,
+    ) -> None:
         self.retrieve_result = retrieve_result
+        self.commit_result = commit_result
+        self.commit_error = commit_error
+        self.abort_error = abort_error
         self.committed = 0
         self.aborted = 0
 
@@ -35,18 +44,29 @@ class _FakeContext:
         """Return the canned response for this fake transport."""
         return self.retrieve_result
 
-    def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> None:
-        """Record a successful retrieve completion."""
+    def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Record a retrieve completion and report the canned outcome."""
         self.committed += 1
+        if self.commit_error is not None:
+            raise self.commit_error
+        return self.commit_result
 
-    def abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> None:
+    def abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         """Record an unsuccessful retrieve completion."""
         self.aborted += 1
+        if self.abort_error is not None:
+            raise self.abort_error
+        return True
 
 
-def _wrapper(result: RetrieveResult) -> tuple[ContiguousTransferWrapper, _FakeContext]:
+def _wrapper(
+    result: RetrieveResult,
+    commit_result: bool = True,
+    commit_error: Exception | None = None,
+    abort_error: Exception | None = None,
+) -> tuple[ContiguousTransferWrapper, _FakeContext]:
     """Build a contiguous wrapper over a fake context returning ``result``."""
-    context = _FakeContext(result)
+    context = _FakeContext(result, commit_result, commit_error, abort_error)
     return ContiguousTransferWrapper(context, 4), context  # type: ignore[arg-type]
 
 
@@ -93,3 +113,37 @@ def test_retrieve_aborts_when_chunks_cannot_be_concatenated() -> None:
         wrapper.retrieve(KEY, 0)
 
     assert (context.committed, context.aborted) == (0, 1)
+
+
+def test_retrieve_returns_none_when_commit_fails() -> None:
+    """An unsuccessful commit aborts once and reports a miss."""
+    wrapper, context = _wrapper(([torch.zeros(2, 1, 4, 8)], [1]), commit_result=False)
+
+    assert wrapper.retrieve(KEY, 0) is None
+    assert (context.committed, context.aborted) == (1, 1)
+
+
+def test_retrieve_aborts_and_reraises_when_commit_raises() -> None:
+    """A commit error aborts the retrieve and surfaces the original error."""
+    wrapper, context = _wrapper(
+        ([torch.zeros(2, 1, 4, 8)], [1]), commit_error=RuntimeError("commit failed")
+    )
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        wrapper.retrieve(KEY, 0)
+
+    assert (context.committed, context.aborted) == (1, 1)
+
+
+def test_retrieve_keeps_commit_error_when_abort_also_raises() -> None:
+    """A failing abort must not replace the commit error seen by the caller."""
+    wrapper, context = _wrapper(
+        ([torch.zeros(2, 1, 4, 8)], [1]),
+        commit_error=RuntimeError("commit failed"),
+        abort_error=RuntimeError("abort failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        wrapper.retrieve(KEY, 0)
+
+    assert (context.committed, context.aborted) == (1, 1)
