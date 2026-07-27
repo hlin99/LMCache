@@ -370,7 +370,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     def _make_retrieve_resolve_fn(
         self, entry: EngineDrivenContextEntry
     ) -> Callable[[IPCCacheServerKey], list[ObjectKey]]:
-        """Return a resolver that applies each group's registered window.
+        """Return a resolver that applies Sliding Window retrieval trimming.
+
+        The server is the sole owner of object-tail trimming: it limits each
+        group to the trailing object count in its registered attention window,
+        and the worker aligns those objects with pre-trimmed block IDs.
 
         Args:
             entry: Registered context entry.

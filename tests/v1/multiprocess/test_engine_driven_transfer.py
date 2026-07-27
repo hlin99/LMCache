@@ -1505,6 +1505,7 @@ def test_server_abort_store_discards_partial_shm_reservation(
     key = _default_key()
     assert module.prepare_store(key, 5).context.get("slots")
 
+    # Duplicate aborts succeed while discarding the reservation only once.
     assert module.commit_store(key, 5, ABORT_STORE_PAYLOAD) is True
     assert module.commit_store(key, 5, ABORT_STORE_PAYLOAD) is True
 

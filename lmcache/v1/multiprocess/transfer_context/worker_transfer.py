@@ -340,15 +340,16 @@ class TransferContext(ABC):
             model_name: Model name used by cache keys.
             world_size: KV world size.
             blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
-            lmcache_tokens_per_chunk: Authoritative logical tokens per LMCache
-                chunk.
             mq_client: Message queue client used to communicate with server.
             mq_timeout: Timeout in seconds for synchronous request wait.
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Optional inference-engine-provided layout hints.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
             excluded_layer_indices: Registered cross-layer sharing aliases
-                intentionally omitted from transfer groups.
+                intentionally omitted from transfer groups. Supply every
+                registered tensor that aliases an owner tensor.
+            lmcache_tokens_per_chunk: Authoritative logical tokens per LMCache
+                chunk. Required when ``engine_group_infos`` is non-empty.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -679,7 +680,7 @@ class EngineDrivenTransferContext(TransferContext):
             world_size: Tensor-parallel world size.
             blocks_in_chunk: Engine blocks per LMCache chunk (reference group).
             lmcache_tokens_per_chunk: Authoritative logical tokens per LMCache
-                chunk.
+                chunk. Required for hybrid/HMA grouped registration.
             mq_client: Message-queue client used for requests.
             mq_timeout: Timeout for the registration response.
             send_request: Request sender used by this context.
@@ -687,8 +688,13 @@ class EngineDrivenTransferContext(TransferContext):
             engine_group_infos: Optional engine KV-group metadata for
                 hybrid/HMA models. Empty means single-group legacy mode.
             excluded_layer_indices: Registered cross-layer sharing aliases
-                intentionally omitted from transfer groups.
+                intentionally omitted from transfer groups. Supply every
+                registered tensor that aliases an owner tensor.
         """
+        if engine_group_infos and lmcache_tokens_per_chunk is None:
+            raise ValueError(
+                "lmcache_tokens_per_chunk is required for grouped registration"
+            )
         layout_source = (
             build_group_kv_subset(kv_caches, engine_group_infos[0].layer_indices)
             if engine_group_infos
@@ -714,10 +720,6 @@ class EngineDrivenTransferContext(TransferContext):
         group_layouts: list[GroupLayoutSpec] = []
 
         if engine_group_infos:
-            if lmcache_tokens_per_chunk is None:
-                raise ValueError(
-                    "lmcache_tokens_per_chunk is required for grouped registration"
-                )
             shapes: list[torch.Size] = []
             dtypes: list[torch.dtype] = []
             chunk_tokens = lmcache_tokens_per_chunk

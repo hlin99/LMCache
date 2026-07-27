@@ -6,7 +6,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     # First Party
@@ -17,6 +17,18 @@ from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
 logger = init_logger(__name__)
+
+
+class KVCacheGroupLike(Protocol):
+    """Minimal vLLM KV cache group contract used for alias detection."""
+
+    layer_names: Sequence[str]
+
+
+class KVCacheConfigLike(Protocol):
+    """Minimal vLLM KV cache configuration contract used for alias detection."""
+
+    kv_cache_groups: Sequence[KVCacheGroupLike]
 
 
 def _is_sliding_window_spec(spec: Any) -> bool:
@@ -88,8 +100,8 @@ def _merge_layer_sw_sizes(per_layer_sw_size: list[int], indices: list[int]) -> i
 
 
 def get_excluded_layer_indices_from_vllm(
-    kv_cache_config: Any,
-    kv_caches: Mapping[str, Any],
+    kv_cache_config: KVCacheConfigLike | None,
+    kv_caches: Mapping[str, object],
 ) -> frozenset[int]:
     """Return registered cross-layer KV-sharing aliases excluded by vLLM.
 
@@ -102,11 +114,7 @@ def get_excluded_layer_indices_from_vllm(
         Registered tensor indices absent from every vLLM KV cache group. These
         entries alias owner tensors and must not form transfer object groups.
     """
-    vllm_groups = (
-        getattr(kv_cache_config, "kv_cache_groups", ()) or ()
-        if kv_cache_config is not None
-        else ()
-    )
+    vllm_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else ()
     if not vllm_groups:
         return frozenset()
     owned_layer_names = {
