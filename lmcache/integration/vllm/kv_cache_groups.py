@@ -6,7 +6,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     # First Party
@@ -17,6 +17,18 @@ from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
 logger = init_logger(__name__)
+
+
+class KVCacheGroupLike(Protocol):
+    """Minimal vLLM KV cache group contract used for alias detection."""
+
+    layer_names: Sequence[str]
+
+
+class KVCacheConfigLike(Protocol):
+    """Minimal vLLM KV cache configuration contract used for alias detection."""
+
+    kv_cache_groups: Sequence[KVCacheGroupLike]
 
 
 def _is_sliding_window_spec(spec: Any) -> bool:
@@ -85,6 +97,34 @@ def _merge_layer_sw_sizes(per_layer_sw_size: list[int], indices: list[int]) -> i
             "KV cache spec, but got inconsistent metadata or registered tensors."
         )
     return sw_sizes.pop()
+
+
+def get_excluded_layer_indices_from_vllm(
+    kv_cache_config: KVCacheConfigLike | None,
+    kv_caches: Mapping[str, object],
+) -> frozenset[int]:
+    """Return registered cross-layer KV-sharing aliases excluded by vLLM.
+
+    Args:
+        kv_cache_config: vLLM ``KVCacheConfig`` containing KV cache groups.
+        kv_caches: Registered KV tensors keyed by layer name. Dict iteration
+            order is the registration order used to assign tensor indices.
+
+    Returns:
+        Registered tensor indices absent from every vLLM KV cache group. These
+        entries alias owner tensors and must not form transfer object groups.
+    """
+    vllm_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else ()
+    if not vllm_groups:
+        return frozenset()
+    owned_layer_names = {
+        layer_name for group in vllm_groups for layer_name in group.layer_names
+    }
+    return frozenset(
+        idx
+        for idx, layer_name in enumerate(kv_caches)
+        if layer_name not in owned_layer_names
+    )
 
 
 def create_engine_group_infos_from_vllm(

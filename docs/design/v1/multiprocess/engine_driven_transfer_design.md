@@ -16,6 +16,87 @@ instead of CUDA IPC handles, then commits the bytes to the server.
 Goal: keep the existing lmcache-driven (CUDA IPC) path unchanged while adding
 a second engine-driven path that works across non-CUDA backends.
 
+Engine-driven transfer is also selectable on CUDA. This is required for hybrid
+models whose worker must gather/scatter multiple heterogeneous KV groups while
+the server only owns contiguous storage objects.
+
+### 1.1 Group and indexing model
+
+Registration creates one immutable transfer-group record per LMCache copy
+identity. The record is the source of truth for:
+
+- **engine group**: the serving-engine block-ID address space;
+- **kernel group**: layers sharing one native copy format and physical geometry;
+- **object group**: the stored object sequence and `ObjectKey.object_group_id`;
+- **layer index**: the tensor's position in registration order.
+
+Several transfer/kernel groups may reference the same engine group. The worker
+adapter expands engine block IDs into transfer-group order before calling the
+transfer context, so `block_ids[g]` always belongs to transfer group `g`.
+
+Every request validates exact divisibility by each group's full
+blocks-per-chunk value and requires equal logical chunk coverage. Sliding Window
+groups then retain trailing blocks within each chunk; retrieve additionally
+retains only the trailing objects covered by the window.
+
+Both transfer paths share this model, its planning logic
+(`lmcache/v1/multiprocess/transfer_context/common_copy.py`, the *what*), and its
+launch planning and execution
+(`lmcache/v1/multiprocess/transfer_context/common_exec.py`, the *how*):
+
+```text
+        registered_groups_from_kv_layer_groups()   registered_groups_from_engine_infos()
+                        |                                          |
+                        +----------------> RegisteredGroup <-------+
+                                                 |
+                                       build_group_transfer_plans()
+                                 (exact block validation, per-chunk Sliding
+                                  Window block selection, object-tail
+                                  selection, logical -> physical skip)
+                                                 |
+                                          plan_copy_batches()
+                                 (object batching, per-launch block ranges,
+                                  APC skip placement, dropped batches)
+                                                 |
+                                        execute_copy_batches()
+                                 (staging/launch/flush order, per direction)
+                                                 |
+                        +------------------------+------------------------+
+                        |                                                 |
+                  CopyEndpoint                                      CopyEndpoint
+              LMCache-driven server                            Engine-driven worker
+        `_StreamObjectGroupEndpoint` (immediate)          `WorkerCopyEndpoint` over
+        `_NativeObjectGroupEndpoint` (one recorded        `multi_layer_block_kv_transfer`
+        `execute_object_group_transfer`), over IPC        on worker-local KV tensors
+        KV views + MemoryObj staging                      + SHM/pickle chunk buffers
+```
+
+The endpoint is the only path-specific part. It owns the transport concerns the
+common modules deliberately exclude -- which buffers back the objects, how they
+are staged to and from the device, which native primitive performs the copy, and
+when the caller synchronizes, commits, or aborts. Everything that decides
+*which* blocks, objects, and slots move, *how they are batched*, and *in which
+order staging and launches are issued* is computed once, so the two paths cannot
+drift. `tests/v1/multiprocess/test_cross_path_copy_equivalence.py` pins this
+down end to end: for the same hybrid request both paths must produce identical
+store bytes and identical retrieved KV tensors.
+
+Wire order is group-major (`group 0 chunk 0..N`, then group 1, and so on).
+Structured SHM and pickle responses carry exact per-group counts, including
+registrations with one explicit group; legacy single-group responses retain
+their original shape.
+Sparse SHM store responses carry group-local chunk indices; ownership is never
+inferred from flat list lengths.
+
+### 1.2 Supported device matrix
+
+| Device/path | Single group | Hybrid/HMA |
+|---|---:|---:|
+| CUDA LMCache-driven | Yes | Yes |
+| CUDA Engine-driven | Yes | Yes |
+| Non-CUDA Engine-driven | Yes | Yes when the backend exposes the required native group-aware copy format |
+| Non-CUDA legacy fallback without native group copy | Yes | Fails fast |
+
 ## 2. Design
 
 ### 2.1 Architecture Overview

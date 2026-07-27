@@ -27,6 +27,8 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
+ABORT_STORE_PAYLOAD = b"LMCACHE_ABORT_STORE_V1"
+
 
 @dataclass
 class PrepareStoreResponse:
@@ -74,6 +76,7 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "ABORT_RETRIEVE",
 ]
 
 # Type alias for cache keys
@@ -244,6 +247,11 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             handler_type=HandlerType.BLOCKING,
         ),
         "COMMIT_RETRIEVE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "ABORT_RETRIEVE": ProtocolDefinition(
             payload_classes=[KeyType, int],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,

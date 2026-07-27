@@ -141,6 +141,12 @@ class GroupLayoutSpec(msgspec.Struct, frozen=True):
             group (dense from 0, matching ``EngineGroupInfo.engine_group_id``).
         sw_size_tokens: Sliding-window size in tokens for this group.
             ``-1`` means full attention (no window).
+        object_group_id: Object-key namespace for this group.
+        layer_indices: Registered KV tensor indices assigned to this group.
+        shape: Exact contiguous object shape after compression/window trimming.
+            Empty preserves compatibility with older structured payloads.
+        engine_kv_format: Integer native copy-format identifier, or ``-1`` when
+            the sender cannot encode the format.
     """
 
     num_layers: int
@@ -151,6 +157,10 @@ class GroupLayoutSpec(msgspec.Struct, frozen=True):
     tokens_per_block: int = 0
     engine_group_id: int = 0
     sw_size_tokens: int = -1
+    object_group_id: int = 0
+    layer_indices: tuple[int, ...] = ()
+    shape: tuple[int, ...] = ()
+    engine_kv_format: int = -1
 
 
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
@@ -171,6 +181,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
             describes one LMCache object group in group-index order, and the
             flat fields are ignored by the server (but still sent for wire
             forward-compat with old servers).
+        excluded_layer_indices: Registered cross-layer KV-sharing aliases that
+            intentionally have no transfer object group.
     """
 
     instance_id: int
@@ -181,7 +193,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
-    group_layouts: list[GroupLayoutSpec] = []
+    group_layouts: list[GroupLayoutSpec] = msgspec.field(default_factory=list)
+    excluded_layer_indices: tuple[int, ...] = ()
 
 
 @dataclass

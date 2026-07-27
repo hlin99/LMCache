@@ -5,7 +5,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import AbstractSet, Any, Callable, Protocol
 import os
 
 # Third Party
@@ -18,6 +18,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     GroupLayoutSpec,
+    IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -30,16 +31,21 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
     compute_kv_layout,
     create_engine_driven_context,
+    gather_engine_groups,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
-)
-from lmcache.v1.multiprocess.transfer_context.group_copy import (
-    GroupCopyPlan,
-    flatten_chunks_group_major,
-    gather_engine_groups,
-    plan_group_copy,
     scatter_engine_groups,
+)
+from lmcache.v1.multiprocess.transfer_context.common_copy import (
+    DiscoveredGroupLayout,
+    GroupTransferPlan,
+    RegisteredGroup,
+    build_group_kv_subset,
+    build_group_transfer_plans,
+    flatten_chunks_group_major,
+    registered_groups_from_engine_infos,
     unflatten_chunks_group_major,
+    validate_registered_groups,
 )
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.event_ipc import (
@@ -187,8 +193,8 @@ SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], Messagin
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
     """Return the flat block-id list for the legacy single-group path.
 
-    This helper is retained for explicit single-group fallback. The multi-group
-    (hybrid/HMA) paths use ``plan_group_copy`` instead.
+    This helper is retained for explicit single-group fallback. Structured
+    (hybrid/HMA) registrations use the common planner instead.
 
     Args:
         block_ids: Per-LMCache-group block ID lists.
@@ -211,28 +217,29 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
 def _split_shm_buffers_by_group(
     out_buffers: list[torch.Tensor] | None,
     chunk_indices: list[int] | None,
-    plans: list["GroupCopyPlan"],
+    plans: list["GroupTransferPlan"],
     *,
     server_group_counts: list[int] | None = None,
 ) -> tuple[list[list[torch.Tensor] | None], list[list[int] | None]]:
     """Split flat SHM out_buffers and chunk_indices lists by group.
 
     The SHM server returns a single flat list of buffers / indices in
-    group-major order with lengths equal to ``plan.num_chunks`` for each plan.
+    group-major order with lengths equal to ``plan.transfer_objects`` for each
+    plan.
     This helper partitions them back into per-group lists for multi-group
     gather calls.
 
     When ``out_buffers`` is ``None`` (pickle mode) all entries are ``None``.
-    When ``server_group_counts`` is provided (from the ``group_counts`` field
-    in the SHM ``prepare_store`` response context), it is used for exact
-    per-group slot counts.  Otherwise a proportional heuristic is applied.
+    This helper is called only for structured group plans. Their SHM responses
+    must carry exact ``server_group_counts`` even for one group; ownership is
+    never inferred from flat list lengths.
 
     Args:
         out_buffers: Flat list of SHM-backed output tensors (group-major), or
             ``None`` for pickle mode.
         chunk_indices: Flat list of sparse chunk indices (group-major), or
             ``None`` when all chunks are needed.
-        plans: Per-group copy plans (provides ``num_chunks`` per group).
+        plans: Per-group transfer plans (one object count per group).
         server_group_counts: Per-group slot counts from the server response, or
             ``None`` / empty list when not available.
 
@@ -242,6 +249,23 @@ def _split_shm_buffers_by_group(
     """
     if out_buffers is None:
         return [None] * len(plans), [None] * len(plans)
+    if server_group_counts is None:
+        raise ValueError(
+            "structured SHM prepare_store response must include group_counts "
+            "with one entry per group, got None"
+        )
+    has_invalid_group_counts = (
+        len(server_group_counts) != len(plans)
+        or any(not isinstance(count, int) or count < 0 for count in server_group_counts)
+        or sum(server_group_counts) != len(out_buffers)
+    )
+    if has_invalid_group_counts:
+        raise ValueError(
+            "structured SHM prepare_store must return one exact slot count "
+            f"per group; counts={server_group_counts}, buffers={len(out_buffers)}"
+        )
+    if chunk_indices is not None and len(chunk_indices) != len(out_buffers):
+        raise ValueError("SHM chunk_indices and output buffers must have equal length")
 
     out_per_group: list[list[torch.Tensor] | None] = []
     ci_per_group: list[list[int] | None] = []
@@ -249,77 +273,28 @@ def _split_shm_buffers_by_group(
     ci_offset = 0
 
     for g_idx, plan in enumerate(plans):
-        # Prefer exact counts from the server (set for hybrid/HMA multi-group
-        # SHM responses).  Fall back to heuristic proportional estimate when
-        # the server does not supply per-group counts.
-        if (
-            server_group_counts
-            and len(server_group_counts) > g_idx
-            and chunk_indices is not None
-        ):
-            n = server_group_counts[g_idx]
-        elif chunk_indices is None:
-            n = plan.num_chunks
-        else:
-            # Proportional heuristic: approximate per-group slot count.
-            total_chunks = sum(p.num_chunks for p in plans)
-            if total_chunks > 0 and len(chunk_indices) > 0:
-                n = round(plan.num_chunks * len(chunk_indices) / total_chunks)
-            else:
-                n = 0
+        n = server_group_counts[g_idx]
 
         g_buffers = out_buffers[buf_offset : buf_offset + n]
         buf_offset += n
         if chunk_indices is not None:
             g_ci = chunk_indices[ci_offset : ci_offset + n]
             ci_offset += n
+            if any(idx < 0 or idx >= plan.transfer_objects for idx in g_ci):
+                raise ValueError(
+                    f"group {g_idx} contains out-of-range local chunk indices {g_ci}"
+                )
         else:
             g_ci = None
 
         out_per_group.append(g_buffers if g_buffers else None)
         ci_per_group.append(g_ci if g_ci else None)
 
+    if buf_offset != len(out_buffers) or (
+        chunk_indices is not None and ci_offset != len(chunk_indices)
+    ):
+        raise ValueError("SHM group counts do not consume all prepared buffers")
     return out_per_group, ci_per_group
-
-
-def _group_counts_from_buffers(
-    flat_chunks: list[torch.Tensor],
-    plans: list["GroupCopyPlan"],
-) -> list[int]:
-    """Infer per-group chunk counts from the flat retrieved chunk list.
-
-    The retrieve path receives a flat group-major list from the server.  The
-    per-group counts are not explicitly carried in the single-group legacy wire
-    format, so we reconstruct them from ``plan.num_chunks``.
-
-    When the flat list is shorter than expected (partial cache hit), we
-    distribute chunks proportionally and clamp at zero.
-
-    Args:
-        flat_chunks: Flat list of CPU tensors returned by prepare_retrieve.
-        plans: Per-group copy plans.
-
-    Returns:
-        Per-group chunk counts summing to ``len(flat_chunks)``.
-    """
-    expected = [p.num_chunks for p in plans]
-    total_expected = sum(expected)
-    total_actual = len(flat_chunks)
-    if total_actual == total_expected:
-        return expected
-    # Partial hit: distribute actual chunks proportionally, ensuring sum matches.
-    if total_expected == 0:
-        return [0] * len(plans)
-    counts: list[int] = []
-    remaining = total_actual
-    for i, exp in enumerate(expected):
-        if i == len(expected) - 1:
-            counts.append(remaining)
-        else:
-            c = min(exp, remaining)
-            counts.append(c)
-            remaining -= c
-    return counts
 
 
 def _get_kv_device(kv_caches: dict[str, torch.Tensor]) -> torch.device:
@@ -361,6 +336,8 @@ class TransferContext(ABC):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        excluded_layer_indices: AbstractSet[int] = frozenset(),
+        lmcache_tokens_per_chunk: int | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -375,6 +352,11 @@ class TransferContext(ABC):
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Optional inference-engine-provided layout hints.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            excluded_layer_indices: Registered cross-layer sharing aliases
+                intentionally omitted from transfer groups. Supply every
+                registered tensor that aliases an owner tensor.
+            lmcache_tokens_per_chunk: Authoritative logical tokens per LMCache
+                chunk. Required when ``engine_group_infos`` is non-empty.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -485,6 +467,8 @@ class LMCacheDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        excluded_layer_indices: AbstractSet[int] = frozenset(),
+        lmcache_tokens_per_chunk: int | None = None,
     ) -> None:
         """Register the worker KV cache with the LMCache server.
 
@@ -494,11 +478,15 @@ class LMCacheDrivenTransferContext(TransferContext):
             model_name: Model identifier used by the server.
             world_size: Tensor-parallel world size.
             _blocks_in_chunk: Engine blocks per LMCache chunk.
+            lmcache_tokens_per_chunk: Authoritative LMCache chunk size
+                accepted for interface consistency.
             mq_client: Message-queue client used for requests.
             mq_timeout: Timeout for the registration response.
             send_request: Request sender used by this context.
             layout_hints: Optional KV-layout metadata.
             engine_group_infos: Optional engine KV-group metadata.
+            excluded_layer_indices: Cross-layer aliases accepted for interface
+                consistency.
 
         Raises:
             RuntimeError: If event IPC is unsupported for the KV-cache device.
@@ -655,8 +643,7 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
-        self._engine_group_infos: list[EngineGroupInfo] = []
-        self._group_block_sizes: list[int] = []
+        self._registered_groups: list[RegisteredGroup] = []
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -683,6 +670,8 @@ class EngineDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        excluded_layer_indices: AbstractSet[int] = frozenset(),
+        lmcache_tokens_per_chunk: int | None = None,
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
@@ -697,21 +686,32 @@ class EngineDrivenTransferContext(TransferContext):
             model_name: Model identifier used by the server.
             world_size: Tensor-parallel world size.
             blocks_in_chunk: Engine blocks per LMCache chunk (reference group).
+            lmcache_tokens_per_chunk: Authoritative logical tokens per LMCache
+                chunk. Required for hybrid/HMA grouped registration.
             mq_client: Message-queue client used for requests.
             mq_timeout: Timeout for the registration response.
             send_request: Request sender used by this context.
             layout_hints: Optional KV-layout metadata.
             engine_group_infos: Optional engine KV-group metadata for
                 hybrid/HMA models. Empty means single-group legacy mode.
+            excluded_layer_indices: Registered cross-layer sharing aliases
+                intentionally omitted from transfer groups. Supply every
+                registered tensor that aliases an owner tensor.
         """
+        layout_source = (
+            build_group_kv_subset(kv_caches, engine_group_infos[0].layer_indices)
+            if engine_group_infos
+            else kv_caches
+        )
         (
             block_size,
-            num_layers,
+            _layout_num_layers,
             hidden_dim_size,
             dtype_str,
             engine_kv_format,
             kv_size,
-        ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
+        ) = compute_kv_layout(layout_source, layout_hints=layout_hints)
+        num_layers = len(kv_caches)
         self._layout_hints = layout_hints
         self._engine_kv_format = engine_kv_format
 
@@ -719,84 +719,72 @@ class EngineDrivenTransferContext(TransferContext):
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
         use_mla_flag = kv_size == 1
 
-        self._engine_group_infos = list(engine_group_infos)
+        registered_groups: list[RegisteredGroup] = []
         group_layouts: list[GroupLayoutSpec] = []
 
         if engine_group_infos:
-            # Build per-group layout specs and per-group MemoryLayoutDesc.
-            shapes: list[torch.Size] = []
-            dtypes: list[torch.dtype] = []
-            group_block_sizes: list[int] = []
-            group_use_mla_flags: list[bool] = []
-
+            if lmcache_tokens_per_chunk is None:
+                raise ValueError(
+                    "lmcache_tokens_per_chunk must be specified when "
+                    "engine_group_infos is non-empty; provide the authoritative "
+                    "LMCache chunk size in tokens from the engine configuration"
+                )
+            layouts: list[DiscoveredGroupLayout] = []
+            dtype_strs: list[str] = []
             for info in engine_group_infos:
-                # First Party
-                from lmcache.v1.multiprocess.transfer_context.group_copy import (
-                    build_group_kv_subset,
-                    compute_group_blocks_in_chunk,
-                )
-
-                group_kv = (
-                    build_group_kv_subset(kv_caches, info.layer_indices)
-                    if info.layer_indices
-                    else kv_caches
-                )
+                group_kv = build_group_kv_subset(kv_caches, info.layer_indices)
                 (
                     g_block_size,
                     g_num_layers,
                     g_hidden_dim_size,
                     g_dtype_str,
-                    _g_engine_kv_format,
+                    g_engine_kv_format,
                     g_kv_size,
                 ) = compute_kv_layout(group_kv, layout_hints=layout_hints)
-                g_use_mla = g_kv_size == 1
-                g_tokens_per_block = info.tokens_per_block or g_block_size
-                try:
-                    g_blocks_in_chunk = compute_group_blocks_in_chunk(
-                        blocks_in_chunk,
-                        block_size,
-                        g_block_size,
-                        info.tokens_per_block,
-                    )
-                except ValueError:
-                    g_blocks_in_chunk = blocks_in_chunk
-                g_shape = (
-                    torch.Size(
-                        [
-                            g_num_layers,
-                            g_blocks_in_chunk * g_block_size,
-                            g_hidden_dim_size,
-                        ]
-                    )
-                    if g_use_mla
-                    else torch.Size(
-                        [
-                            2,
-                            g_num_layers,
-                            g_blocks_in_chunk * g_block_size,
-                            g_hidden_dim_size,
-                        ]
-                    )
-                )
-                shapes.append(g_shape)
-                dtypes.append(getattr(torch, g_dtype_str))
-                group_block_sizes.append(g_block_size)
-                group_use_mla_flags.append(g_use_mla)
-                group_layouts.append(
-                    GroupLayoutSpec(
+                dtype_strs.append(g_dtype_str)
+                layouts.append(
+                    DiscoveredGroupLayout(
+                        slots_per_block=g_block_size,
                         num_layers=g_num_layers,
                         hidden_dim_size=g_hidden_dim_size,
-                        dtype_str=g_dtype_str,
-                        block_size=g_block_size,
-                        use_mla=g_use_mla,
-                        tokens_per_block=g_tokens_per_block,
-                        engine_group_id=info.engine_group_id,
-                        sw_size_tokens=info.sw_size_tokens,
+                        kv_size=g_kv_size,
+                        dtype=getattr(torch, g_dtype_str),
+                        engine_kv_format=g_engine_kv_format,
                     )
                 )
 
-            layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
-            self._group_block_sizes = group_block_sizes
+            registered_groups = registered_groups_from_engine_infos(
+                engine_group_infos, layouts, lmcache_tokens_per_chunk
+            )
+            group_layouts = [
+                GroupLayoutSpec(
+                    num_layers=layout.num_layers,
+                    hidden_dim_size=layout.hidden_dim_size,
+                    dtype_str=dtype_str,
+                    block_size=layout.slots_per_block,
+                    use_mla=layout.kv_size == 1,
+                    tokens_per_block=group.tokens_per_block,
+                    engine_group_id=group.engine_group_id,
+                    sw_size_tokens=group.sw_size_tokens,
+                    object_group_id=group.object_group_id,
+                    layer_indices=group.layer_indices,
+                    shape=tuple(group.shape),
+                    engine_kv_format=int(layout.engine_kv_format),
+                )
+                for group, layout, dtype_str in zip(
+                    registered_groups, layouts, dtype_strs, strict=True
+                )
+            ]
+
+            validate_registered_groups(
+                registered_groups,
+                len(kv_caches),
+                excluded_layer_indices=excluded_layer_indices,
+            )
+            layout_desc = MemoryLayoutDesc(
+                shapes=[group.shape for group in registered_groups],
+                dtypes=[group.dtype for group in registered_groups],
+            )
         else:
             # Single-group / legacy path.
             shape = (
@@ -808,7 +796,6 @@ class EngineDrivenTransferContext(TransferContext):
             )
             dtype = getattr(torch, dtype_str)
             layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
-            self._group_block_sizes = [block_size]
 
         future = send_request(
             mq_client,
@@ -824,6 +811,7 @@ class EngineDrivenTransferContext(TransferContext):
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
                     group_layouts=group_layouts,
+                    excluded_layer_indices=tuple(sorted(excluded_layer_indices)),
                 )
             ],
         )
@@ -834,17 +822,11 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name = response.shm_name
             pool_size = response.pool_size
 
-        group_use_mla_flags_for_meta: list[bool] = (
-            [spec.use_mla for spec in group_layouts]
-            if group_layouts
-            else [use_mla_flag]
-        )
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
-            group_block_sizes=list(self._group_block_sizes),
-            group_use_mla=group_use_mla_flags_for_meta,
+            uses_structured_groups=bool(engine_group_infos),
         )
         self._engine_driven_context = create_engine_driven_context(
             metadata,
@@ -853,6 +835,7 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name=shm_name,
             pool_size=pool_size,
         )
+        self._registered_groups = registered_groups
         num_groups = len(engine_group_infos) if engine_group_infos else 1
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
@@ -865,28 +848,28 @@ class EngineDrivenTransferContext(TransferContext):
 
     def _build_group_plans(
         self,
-        kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
-        blocks_in_chunk: int,
-    ) -> list[GroupCopyPlan]:
-        """Build per-group copy plans, or return empty list for single-group mode.
+        *,
+        for_retrieve: bool = False,
+        skip_first_n_tokens: int = 0,
+    ) -> list[GroupTransferPlan]:
+        """Build the common request plans, or an empty list for legacy mode.
 
         Args:
-            kv_caches: Worker KV-cache tensors keyed by layer name.
-            block_ids: Per-LMCache-group block ID lists.
-            blocks_in_chunk: Reference blocks per LMCache chunk (group 0).
+            block_ids: Per-transfer-group block ID lists.
+            for_retrieve: Apply Sliding Window object-tail selection.
+            skip_first_n_tokens: Logical tokens at the head of the range that
+                must not be overwritten (APC-shared blocks).
 
         Returns:
-            Non-empty list when hybrid mode is active; empty list otherwise.
+            Non-empty list for structured registrations; empty list when the
+            worker registered in legacy single-group mode.
         """
-        if not self._engine_group_infos or len(block_ids) == 1:
-            return []
-        return plan_group_copy(
-            kv_caches,
+        return build_group_transfer_plans(
+            self._registered_groups,
             block_ids,
-            blocks_in_chunk,
-            self._engine_group_infos,
-            self._group_block_sizes,
+            for_retrieve=for_retrieve,
+            skip_first_n_tokens=skip_first_n_tokens,
         )
 
     def submit_store(
@@ -928,7 +911,7 @@ class EngineDrivenTransferContext(TransferContext):
 
         torch_dev.synchronize()
 
-        plans = self._build_group_plans(kv_caches, block_ids, blocks_in_chunk)
+        plans = self._build_group_plans(block_ids)
 
         result = self._engine_driven_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices, server_group_counts = (
@@ -940,40 +923,45 @@ class EngineDrivenTransferContext(TransferContext):
             future.set_result(True)
             return future
 
-        if plans:
-            # Multi-group (hybrid/HMA) path: gather per group and flatten.
-            out_per_group, ci_per_group = _split_shm_buffers_by_group(
-                out_buffers,
-                chunk_indices,
-                plans,
-                server_group_counts=server_group_counts,
-            )
-            chunks_per_group = gather_engine_groups(
-                plans,
-                layout_hints=self._layout_hints,
-                engine_kv_format=self._engine_kv_format,
-                out_per_group=out_per_group,
-                chunk_indices_per_group=ci_per_group,
-            )
-            flat_chunks = flatten_chunks_group_major(chunks_per_group)
-            if out_buffers is not None:
-                torch_dev.synchronize()
-            ok = self._engine_driven_context.commit_store(key, instance_id, flat_chunks)
-        else:
-            # Single-group (legacy) path.
-            cpu_chunks = gather_paged_kv_to_cpu(
-                kv_caches,
-                _single_group_block_ids(block_ids),
-                blocks_in_chunk,
-                layout_hints=self._layout_hints,
-                engine_kv_format=self._engine_kv_format,
-                out=out_buffers,
-                chunk_indices=chunk_indices,
-            )
-            if out_buffers is not None:
+        prepared_shm_store = out_buffers is not None
+        try:
+            if plans:
+                # Multi-group (hybrid/HMA) path: gather per group and flatten.
+                out_per_group, ci_per_group = _split_shm_buffers_by_group(
+                    out_buffers,
+                    chunk_indices,
+                    plans,
+                    server_group_counts=server_group_counts,
+                )
+                chunks_per_group = gather_engine_groups(
+                    plans,
+                    kv_caches,
+                    layout_hints=self._layout_hints,
+                    out_per_group=out_per_group,
+                    chunk_indices_per_group=ci_per_group,
+                )
+                cpu_chunks = flatten_chunks_group_major(chunks_per_group)
+            else:
+                # Single-group (legacy) path.
+                cpu_chunks = gather_paged_kv_to_cpu(
+                    kv_caches,
+                    _single_group_block_ids(block_ids),
+                    blocks_in_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=self._engine_kv_format,
+                    out=out_buffers,
+                    chunk_indices=chunk_indices,
+                )
+            if prepared_shm_store:
                 torch_dev.synchronize()
             ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+        except Exception:
+            if prepared_shm_store:
+                self._best_effort_abort_store(key, instance_id, "store failure")
+            raise
 
+        if not ok and prepared_shm_store:
+            self._best_effort_abort_store(key, instance_id, "unsuccessful commit")
         future = MessagingFuture()
         future.set_result(ok)
         return future
@@ -1018,24 +1006,36 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
-        plans = self._build_group_plans(kv_caches, block_ids, blocks_in_chunk)
+        plans = self._build_group_plans(
+            block_ids,
+            for_retrieve=True,
+            skip_first_n_tokens=skip_first_n_tokens,
+        )
 
-        src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
+        retrieve_result = self._engine_driven_context.prepare_retrieve(key, instance_id)
+        group_counts: list[int] = []
+        src_buffers: list[torch.Tensor] | None
+        if isinstance(retrieve_result, tuple):
+            src_buffers, group_counts = retrieve_result
+        else:
+            src_buffers = retrieve_result
         ok = src_buffers is not None
-        if src_buffers is not None:
-            try:
+        try:
+            if src_buffers is not None:
                 if plans:
-                    # Multi-group: split the flat chunk list by group and scatter.
-                    group_counts = _group_counts_from_buffers(src_buffers, plans)
+                    if len(group_counts) != len(plans):
+                        raise ValueError(
+                            "multi-group retrieve response omitted exact "
+                            "group ownership"
+                        )
                     chunks_per_group = unflatten_chunks_group_major(
                         src_buffers, group_counts
                     )
                     scatter_engine_groups(
                         plans,
+                        kv_caches,
                         chunks_per_group,
                         layout_hints=self._layout_hints,
-                        engine_kv_format=self._engine_kv_format,
-                        skip_first_n_tokens=skip_first_n_tokens,
                     )
                 else:
                     # Single-group (legacy) path.
@@ -1048,11 +1048,12 @@ class EngineDrivenTransferContext(TransferContext):
                         layout_hints=self._layout_hints,
                         engine_kv_format=self._engine_kv_format,
                     )
-            except (RuntimeError, ValueError, TypeError, IndexError):
-                logger.exception("Failed to scatter retrieved CPU context chunks")
-                ok = False
-            torch_dev.synchronize()
-        self._engine_driven_context.commit_retrieve(key, instance_id)
+                torch_dev.synchronize()
+        except (RuntimeError, ValueError, TypeError, IndexError):
+            logger.exception("Failed to scatter retrieved CPU context chunks")
+            ok = False
+
+        ok = self._finalize_retrieve(key, instance_id, transferred=ok)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
@@ -1063,10 +1064,79 @@ class EngineDrivenTransferContext(TransferContext):
         if self._engine_driven_context is not None:
             self._engine_driven_context.close()
             self._engine_driven_context = None
+        self._registered_groups = []
+        self._layout_hints = None
+        self._engine_kv_format = None
 
     def flush_inflight_stores(self) -> None:
         """No-op: synchronous context has no deferred stores."""
         pass
+
+    def _best_effort_abort_store(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        failure_context: str,
+    ) -> None:
+        """Release a failed SHM reservation without raising abort errors.
+
+        Args:
+            key: Cache key for the prepared store.
+            instance_id: Worker process instance identifier.
+            failure_context: Short description included in abort-error logs.
+
+        This side-effect-only method returns no value. Abort errors are logged
+        and suppressed so the caller's gather or commit exception propagates
+        unmodified.
+        """
+        if self._engine_driven_context is None:
+            return
+        try:
+            self._engine_driven_context.abort_store(key, instance_id)
+        except Exception:
+            logger.exception(
+                "Failed to abort synchronous SHM store after %s",
+                failure_context,
+            )
+
+    def _finalize_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        *,
+        transferred: bool,
+    ) -> bool:
+        """Commit or abort a retrieve and return the final transfer result.
+
+        Args:
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+            transferred: Whether the scatter completed successfully.
+
+        Returns:
+            ``True`` only when the scatter succeeded *and* the server committed
+            the retrieve. A failed scatter aborts instead of committing, so the
+            server never records a successful retrieve for it. Commit and abort
+            errors are logged and reported as ``False`` rather than raised, so
+            cleanup never replaces the transfer result with an exception.
+        """
+        if self._engine_driven_context is None:
+            return False
+        try:
+            if transferred:
+                committed = self._engine_driven_context.commit_retrieve(
+                    key, instance_id
+                )
+                if not committed:
+                    logger.warning("Server rejected engine-driven retrieve commit")
+                return committed
+            self._engine_driven_context.abort_retrieve(key, instance_id)
+        except Exception:
+            logger.exception(
+                "Failed to %s engine-driven retrieve",
+                "commit" if transferred else "abort",
+            )
+        return False
 
 
 def create_transfer_context(
@@ -1104,16 +1174,21 @@ def create_transfer_context(
         )
     device_type = next(iter(device_types))
     resolved_mode = _resolve_mode(mode)
-    logger.info(
-        "Creating transfer context (device_type=%s, mode=%s)",
-        device_type,
-        resolved_mode.value,
-    )
     if resolved_mode is MPTransferMode.LMCACHE_DRIVEN:
-        return _build_lmcache_driven_context(device_type)
-    if resolved_mode is MPTransferMode.ENGINE_DRIVEN:
-        return _build_engine_driven_context()
-    # AUTO: dispatch by device type (CUDA -> handle path, else -> data path).
-    if device_type == "cuda":
-        return LMCacheDrivenTransferContext()
-    return _build_engine_driven_context()
+        selected_mode = MPTransferMode.LMCACHE_DRIVEN
+        context = _build_lmcache_driven_context(device_type)
+    elif resolved_mode is MPTransferMode.ENGINE_DRIVEN:
+        selected_mode = MPTransferMode.ENGINE_DRIVEN
+        context = _build_engine_driven_context()
+    elif device_type == "cuda":
+        selected_mode = MPTransferMode.LMCACHE_DRIVEN
+        context = LMCacheDrivenTransferContext()
+    else:
+        selected_mode = MPTransferMode.ENGINE_DRIVEN
+        context = _build_engine_driven_context()
+    logger.info(
+        "LMCache MP transfer context selected: mode=%s device=%s",
+        selected_mode.value,
+        device_type,
+    )
+    return context

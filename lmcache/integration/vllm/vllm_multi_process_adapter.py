@@ -3,7 +3,7 @@
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, NoReturn, Protocol
+from typing import AbstractSet, Any, Callable, NoReturn, Protocol
 import enum
 import os
 import threading
@@ -1117,6 +1117,7 @@ class LMCacheMPWorkerAdapter:
         # Registered kv caches from vLLM
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.engine_group_infos: list[EngineGroupInfo] = []
+        self.excluded_layer_indices: frozenset[int] = frozenset()
 
         # Transport context for transfer operations.
         self.transfer_ctx: TransferContext | None = None
@@ -1233,6 +1234,7 @@ class LMCacheMPWorkerAdapter:
         self,
         kv_caches: dict[str, torch.Tensor],
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        excluded_layer_indices: AbstractSet[int] = frozenset(),
     ) -> None:
         """
         Register the kv caches with LMCache server.
@@ -1241,6 +1243,8 @@ class LMCacheMPWorkerAdapter:
             kv_caches: A dict of kv caches to register. The keys are the
                 layer names and the values are the corresponding tensors.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            excluded_layer_indices: Registered cross-layer KV-sharing aliases
+                intentionally omitted from transfer groups.
 
         Raises:
             ConnectionError: if the server does not respond within
@@ -1262,6 +1266,7 @@ class LMCacheMPWorkerAdapter:
                 )
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
+        self.excluded_layer_indices = frozenset(excluded_layer_indices)
         self._send_register_kv_caches_request(kv_caches)
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
@@ -1302,6 +1307,8 @@ class LMCacheMPWorkerAdapter:
                 send_request=send_lmcache_request,
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
+                excluded_layer_indices=self.excluded_layer_indices,
+                lmcache_tokens_per_chunk=self.lmcache_tokens_per_chunk,
             )
         except TimeoutError:
             raise ConnectionError(

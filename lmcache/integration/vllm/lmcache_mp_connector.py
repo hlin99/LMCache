@@ -45,6 +45,7 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 )
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
+    get_excluded_layer_indices_from_vllm,
 )
 from lmcache.integration.vllm.utils import (
     apply_mm_hashes_to_token_ids,
@@ -781,8 +782,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             kv_caches,
             layout_hints=layout_hints,
         )
+        excluded_layer_indices = get_excluded_layer_indices_from_vllm(
+            kv_cache_config, kv_caches
+        )
         self.worker_adapter.register_kv_caches(
-            kv_caches, engine_group_infos=engine_group_infos
+            kv_caches,
+            engine_group_infos=engine_group_infos,
+            excluded_layer_indices=excluded_layer_indices,
         )
         return
 

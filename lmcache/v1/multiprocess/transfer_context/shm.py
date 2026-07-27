@@ -18,6 +18,7 @@ from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.protocols.engine import ABORT_STORE_PAYLOAD
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
@@ -178,13 +179,20 @@ class EngineDrivenContextShm(EngineDrivenContext):
         slots = context.get("slots")
         if not isinstance(slots, list):
             return None
+        chunk_indices = context.get("chunk_indices")
+        if not isinstance(chunk_indices, list):
+            return None
+        group_counts = context.get("group_counts", [])
+        if self.metadata.uses_structured_groups and (
+            not isinstance(group_counts, list)
+            or len(group_counts) != self.metadata.num_object_groups
+            or any(not isinstance(count, int) or count < 0 for count in group_counts)
+            or sum(group_counts) != len(slots)
+        ):
+            raise ValueError("invalid structured SHM store ownership")
         if not slots:
             # Server explicitly signals all chunks are already cached.
-            return [], [], []
-        chunk_indices: list[int] = context["chunk_indices"]
-        # group_counts is set by the server for hybrid/HMA multi-group mode.
-        # Empty list means single-group (no per-group split information).
-        group_counts: list[int] = context.get("group_counts", [])
+            return [], [], group_counts
         return self._build_slot_tensors(slots), chunk_indices, group_counts
 
     def commit_store(
@@ -200,9 +208,21 @@ class EngineDrivenContextShm(EngineDrivenContext):
         except TimeoutError:
             return False
 
+    def abort_store(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Tell the server to discard a prepared SHM reservation."""
+        future = self.mq_client.submit_request(
+            RequestType.COMMIT_STORE,
+            [key, instance_id, ABORT_STORE_PAYLOAD],
+            get_response_class(RequestType.COMMIT_STORE),
+        )
+        try:
+            return bool(future.result(timeout=self.mq_timeout))
+        except TimeoutError:
+            return False
+
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:
         future = self.mq_client.submit_request(
             RequestType.PREPARE_RETRIEVE,
             [key, instance_id],
@@ -215,13 +235,57 @@ class EngineDrivenContextShm(EngineDrivenContext):
         if not response.success:
             return None
         slots = response.context.get("slots", [])
-        return self._build_slot_tensors(slots) if slots else None
+        if not slots:
+            return None
+        try:
+            tensors = self._build_slot_tensors(slots)
+            group_counts = response.context.get("group_counts", [])
+            if self.metadata.uses_structured_groups:
+                if (
+                    not isinstance(group_counts, list)
+                    or len(group_counts) != self.metadata.num_object_groups
+                    or any(
+                        not isinstance(count, int) or count < 0
+                        for count in group_counts
+                    )
+                    or sum(group_counts) != len(tensors)
+                ):
+                    raise ValueError("invalid structured SHM retrieve ownership")
+                return tensors, group_counts
+            return tensors
+        except Exception:
+            self.abort_retrieve(key, instance_id)
+            raise
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        return self._finish_retrieve(RequestType.COMMIT_RETRIEVE, key, instance_id)
+
+    def abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        return self._finish_retrieve(RequestType.ABORT_RETRIEVE, key, instance_id)
+
+    def _finish_retrieve(
+        self,
+        request_type: RequestType,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> bool:
+        """Send a retrieve finalization request.
+
+        Args:
+            request_type: Commit or abort operation to send.
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            The server's cleanup result, or ``False`` on timeout.
+
+        Raises:
+            Exception: If request submission or response decoding fails.
+        """
         future = self.mq_client.submit_request(
-            RequestType.COMMIT_RETRIEVE,
+            request_type,
             [key, instance_id],
-            get_response_class(RequestType.COMMIT_RETRIEVE),
+            get_response_class(request_type),
         )
         try:
             return bool(future.result(timeout=self.mq_timeout))

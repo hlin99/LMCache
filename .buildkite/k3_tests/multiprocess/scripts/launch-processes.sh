@@ -141,6 +141,21 @@ sleep 10
 # Without this, both instances fight over the same internal port.
 unset VLLM_PORT
 
+MP_TRANSFER_MODE_JSON=""
+# Keep these values aligned with MPTransferMode in
+# lmcache/v1/multiprocess/transfer_context/worker_transfer.py.
+case "${LMCACHE_MP_TRANSFER_MODE:-}" in
+    "")
+        ;;
+    auto|engine_driven|lmcache_driven)
+        MP_TRANSFER_MODE_JSON=", \"lmcache.mp.mp_transfer_mode\": \"${LMCACHE_MP_TRANSFER_MODE}\""
+        ;;
+    *)
+        echo "Invalid LMCACHE_MP_TRANSFER_MODE: ${LMCACHE_MP_TRANSFER_MODE}" >&2
+        exit 1
+        ;;
+esac
+
 # ── 2. vLLM with LMCache ────────────────────────────────────
 echo "=== Launching vLLM with LMCache ==="
 echo "Model: $MODEL"
@@ -152,7 +167,7 @@ VLLM_SERVER_DEV_MODE=1 \
 VLLM_BATCH_INVARIANT=${BATCH_INVARIANT} \
 PYTHONHASHSEED=0 \
 vllm serve "$MODEL" \
-    --kv-transfer-config "{\"kv_connector\":\"LMCacheMPConnector\", \"kv_role\":\"kv_both\", \"kv_load_failure_policy\": \"recompute\", \"kv_connector_extra_config\": {\"lmcache.mp.port\": $LMCACHE_PORT, \"lmcache.mp.mq_timeout\": 10}}" \
+    --kv-transfer-config "{\"kv_connector\":\"LMCacheMPConnector\", \"kv_role\":\"kv_both\", \"kv_load_failure_policy\": \"recompute\", \"kv_connector_extra_config\": {\"lmcache.mp.port\": $LMCACHE_PORT, \"lmcache.mp.mq_timeout\": 10${MP_TRANSFER_MODE_JSON}}}" \
     $ATTENTION_BACKEND_ARG \
     --port "$vllm_port" \
     --no-async-scheduling \

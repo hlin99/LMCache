@@ -8,6 +8,7 @@ import pickle
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -15,6 +16,8 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
 )
+
+logger = init_logger(__name__)
 
 
 class EngineDrivenContextPickle(EngineDrivenContext):
@@ -71,9 +74,13 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         except TimeoutError:
             return False
 
+    def abort_store(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """No-op because pickle prepare_store owns no reserved objects."""
+        return True
+
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:
         """Send PREPARE_RETRIEVE and deserialize the response data.
 
         Returns:
@@ -90,21 +97,66 @@ class EngineDrivenContextPickle(EngineDrivenContext):
             return None
         if not response.success or not response.data:
             return None
-        chunks: list[torch.Tensor] = pickle.loads(response.data)
-        return chunks
+        try:
+            chunks: list[torch.Tensor] = pickle.loads(response.data)
+            group_counts = response.context.get("group_counts", [])
+            if self.metadata.uses_structured_groups:
+                if (
+                    not isinstance(group_counts, list)
+                    or len(group_counts) != self.metadata.num_object_groups
+                    or any(
+                        not isinstance(count, int) or count < 0
+                        for count in group_counts
+                    )
+                    or sum(group_counts) != len(chunks)
+                ):
+                    raise ValueError("invalid structured pickle retrieve ownership")
+                return chunks, group_counts
+            return chunks
+        except Exception:
+            try:
+                self.abort_retrieve(key, instance_id)
+            except Exception:
+                logger.exception(
+                    "Failed to abort pickle retrieve after invalid response"
+                )
+            raise
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         """Send COMMIT_RETRIEVE (no-op for pickle path)."""
+        return self._finish_retrieve(RequestType.COMMIT_RETRIEVE, key, instance_id)
+
+    def abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Finalize an unsuccessful retrieve without a completion marker."""
+        return self._finish_retrieve(RequestType.ABORT_RETRIEVE, key, instance_id)
+
+    def close(self) -> None:
+        """No-op: the pickle path holds no persistent resources."""
+
+    def _finish_retrieve(
+        self,
+        request_type: RequestType,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> bool:
+        """Send a retrieve finalization request.
+
+        Args:
+            request_type: Commit or abort operation to send.
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            Always ``True`` because Pickle holds no read lock; response timeouts
+            are intentionally ignored.
+        """
         future = self.mq_client.submit_request(
-            RequestType.COMMIT_RETRIEVE,
+            request_type,
             [key, instance_id],
-            get_response_class(RequestType.COMMIT_RETRIEVE),
+            get_response_class(request_type),
         )
         try:
             future.result(timeout=self.mq_timeout)
         except TimeoutError:
             pass
         return True
-
-    def close(self) -> None:
-        """No-op: the pickle path holds no persistent resources."""

@@ -53,8 +53,6 @@ class EngineDrivenContextEntry:
         metadata: Layout metadata describing the non-CUDA chunk format.
         model_name: The name of the model associated with this context.
         world_size: The world size associated with this context.
-        num_object_groups: Number of LMCache object groups (1 for single-group,
-            >1 for hybrid/HMA). Drives per-group object key resolution.
         last_seen: ``time.monotonic()`` of the most recent activity from this
             instance (register, PING, prepare/commit). Drives reaping.
         has_liveness_signal: True once the instance has sent at least one
@@ -64,7 +62,6 @@ class EngineDrivenContextEntry:
     metadata: EngineDrivenContextMetadata
     model_name: str
     world_size: int
-    num_object_groups: int = 1
     last_seen: float = 0.0
     has_liveness_signal: bool = False
 
@@ -140,6 +137,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 self.commit_retrieve,
                 ThreadPoolType.AFFINITY,
             ),
+            HandlerSpec(
+                RequestType.ABORT_RETRIEVE,
+                self.abort_retrieve,
+                ThreadPoolType.AFFINITY,
+            ),
         ]
 
     def report_status(self) -> dict:
@@ -161,7 +163,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "world_size": entry.world_size,
                 "block_size": entry.metadata.block_size,
                 "use_mla": entry.metadata.use_mla,
-                "num_object_groups": entry.num_object_groups,
+                "num_object_groups": entry.metadata.num_object_groups,
             }
 
         return {
@@ -285,7 +287,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         for obj_keys in write_obj_keys:
             if obj_keys:
-                self._ctx.storage_manager.finish_write(obj_keys)
+                self._ctx.storage_manager.delete_l1_keys(obj_keys, force=True)
         for obj_keys in read_obj_keys:
             if obj_keys:
                 self._ctx.storage_manager.finish_read_prefetched(obj_keys)
@@ -341,7 +343,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             Callable that maps an IPC key to a flat ``list[ObjectKey]``.
         """
-        num_groups = entry.num_object_groups
+        num_groups = entry.metadata.num_object_groups
         if num_groups <= 1:
             return self._resolve_single_group_obj_keys
 
@@ -354,21 +356,38 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         return _multi_group_flat
 
-    def _make_resolve_fn_per_group(
+    def _make_retrieve_resolve_fn(
         self, entry: EngineDrivenContextEntry
-    ) -> Callable[[IPCCacheServerKey], list[list[ObjectKey]]]:
-        """Return a per-group object-key resolver for SHM multi-group stores.
+    ) -> Callable[[IPCCacheServerKey], list[ObjectKey]]:
+        """Return a resolver that applies Sliding Window retrieval trimming.
+
+        The server is the sole owner of object-tail trimming: it limits each
+        group to the trailing object count in its registered attention window,
+        and the worker aligns those objects with pre-trimmed block IDs. A
+        negative window count means full attention and leaves all keys intact.
 
         Args:
             entry: Registered context entry.
 
         Returns:
-            Callable that maps an IPC key to ``list[list[ObjectKey]]``.
+            Callable resolving window-valid keys in group-major order.
         """
-        num_groups = entry.num_object_groups
-        if num_groups <= 1:
-            return lambda key: [self._resolve_single_group_obj_keys(key)]
-        return lambda key: self._resolve_multi_group_obj_keys(key, num_groups)
+        num_groups = entry.metadata.num_object_groups
+        attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
+            entry.model_name, entry.world_size
+        )
+
+        def _resolve(key: IPCCacheServerKey) -> list[ObjectKey]:
+            per_group = self._resolve_multi_group_obj_keys(key, num_groups)
+            resolved: list[ObjectKey] = []
+            for group_id, group_keys in enumerate(per_group):
+                num_window_chunks = attn_desc.num_chunks_in_sw[group_id]
+                if num_window_chunks >= 0:
+                    group_keys = group_keys[-num_window_chunks:]
+                resolved.extend(group_keys)
+            return resolved
+
+        return _resolve
 
     def register_kv_cache_engine_driven_context(
         self,
@@ -413,30 +432,91 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             shapes: list[torch.Size] = []
             dtypes: list[torch.dtype] = []
             sw_windows: list[int] = []
-            group_block_sizes: list[int] = []
-            group_use_mla: list[bool] = []
+            # Legacy structured payloads predate explicit group IDs, layer maps,
+            # exact shapes, and copy formats. Any such field selects strict
+            # validation while an all-default payload remains decodable.
+            is_structured_v2 = any(
+                spec.layer_indices or spec.shape or spec.engine_kv_format >= 0
+                for spec in payload.group_layouts
+            )
+            expected_object_ids = list(range(len(payload.group_layouts)))
+            if is_structured_v2:
+                object_ids = [spec.object_group_id for spec in payload.group_layouts]
+                if object_ids != expected_object_ids:
+                    raise ValueError(
+                        f"object group IDs must be {expected_object_ids}, "
+                        f"got {object_ids}"
+                    )
+            engine_ids = {spec.engine_group_id for spec in payload.group_layouts}
+            if min(engine_ids) < 0 or engine_ids != set(range(max(engine_ids) + 1)):
+                raise ValueError(
+                    "engine group IDs must be non-negative and dense from zero"
+                )
+            if is_structured_v2:
+                mapped_layers = [
+                    layer_idx
+                    for spec in payload.group_layouts
+                    for layer_idx in spec.layer_indices
+                ]
+                if len(mapped_layers) != len(set(mapped_layers)):
+                    raise ValueError("registered layer indices must not be duplicated")
+                actual_layers = set(mapped_layers)
+                excluded_layers = set(payload.excluded_layer_indices)
+                invalid_excluded = [
+                    idx
+                    for idx in excluded_layers
+                    if idx < 0 or idx >= payload.num_layers
+                ]
+                if invalid_excluded:
+                    raise ValueError(
+                        f"excluded layer indices {invalid_excluded} are outside "
+                        f"[0, {payload.num_layers})"
+                    )
+                excluded_owned = actual_layers & excluded_layers
+                if excluded_owned:
+                    raise ValueError(
+                        "excluded layer indices must not be assigned to transfer "
+                        f"groups; owned={sorted(excluded_owned)}"
+                    )
+                expected_layers = set(range(payload.num_layers)) - excluded_layers
+                if actual_layers != expected_layers:
+                    raise ValueError(
+                        "registered layer mapping must cover every non-excluded "
+                        "KV tensor exactly once"
+                    )
 
             for spec in payload.group_layouts:
+                if (
+                    spec.num_layers <= 0
+                    or spec.hidden_dim_size <= 0
+                    or spec.block_size <= 0
+                    or (is_structured_v2 and spec.tokens_per_block <= 0)
+                ):
+                    raise ValueError(
+                        f"invalid geometry for object group {spec.object_group_id}"
+                    )
                 g_dtype = getattr(torch, spec.dtype_str, None)
                 if g_dtype is None or not isinstance(g_dtype, torch.dtype):
                     raise ValueError(
                         f"Invalid dtype_str '{spec.dtype_str}' in group_layouts: "
                         "must be a valid torch dtype attribute name."
                     )
-                chunk_tokens = self._ctx.chunk_size
-                g_shape = (
-                    torch.Size([spec.num_layers, chunk_tokens, spec.hidden_dim_size])
-                    if spec.use_mla
-                    else torch.Size(
-                        [2, spec.num_layers, chunk_tokens, spec.hidden_dim_size]
+                if spec.shape:
+                    g_shape = torch.Size(spec.shape)
+                else:
+                    chunk_tokens = self._ctx.chunk_size
+                    g_shape = (
+                        torch.Size(
+                            [spec.num_layers, chunk_tokens, spec.hidden_dim_size]
+                        )
+                        if spec.use_mla
+                        else torch.Size(
+                            [2, spec.num_layers, chunk_tokens, spec.hidden_dim_size]
+                        )
                     )
-                )
                 shapes.append(g_shape)
                 dtypes.append(g_dtype)
                 sw_windows.append(spec.sw_size_tokens)
-                group_block_sizes.append(spec.block_size)
-                group_use_mla.append(spec.use_mla)
-
             layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
             # AttnWindowDesc: convert -1 (full attention) tokens to chunk count.
             # -1 means full attention; positive sw_size_tokens means SW.
@@ -456,14 +536,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     num_chunks_in_sw.append(-1)
             attn_desc = AttnWindowDesc(num_chunks_in_sw=num_chunks_in_sw)
 
-            num_object_groups = len(payload.group_layouts)
             # Metadata: use group-0 flat fields for legacy compat.
             metadata = EngineDrivenContextMetadata(
                 layout_desc=layout_desc,
                 block_size=payload.block_size,
                 use_mla=payload.use_mla,
-                group_block_sizes=group_block_sizes,
-                group_use_mla=group_use_mla,
+                uses_structured_groups=True,
             )
         else:
             # --- Single-group / legacy registration ---
@@ -490,7 +568,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
             layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
             attn_desc = None
-            num_object_groups = 1
             metadata = EngineDrivenContextMetadata(
                 layout_desc=layout_desc,
                 block_size=payload.block_size,
@@ -504,7 +581,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             metadata=metadata,
             model_name=payload.model_name,
             world_size=payload.world_size,
-            num_object_groups=num_object_groups,
             last_seen=now,
             has_liveness_signal=False,
         )
@@ -517,6 +593,14 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
         )
+        if attn_desc is not None:
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc, attn_desc
+            )
+        else:
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc
+            )
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
@@ -527,17 +611,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload.instance_id,
             payload.model_name,
             payload.world_size,
-            num_object_groups,
+            metadata.num_object_groups,
         )
-
-        if attn_desc is not None:
-            self._ctx.layout_desc_registry.register(
-                payload.model_name, payload.world_size, layout_desc, attn_desc
-            )
-        else:
-            self._ctx.layout_desc_registry.register(
-                payload.model_name, payload.world_size, layout_desc
-            )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
         )
@@ -667,7 +742,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 instance ID.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        resolve_fn = self._make_resolve_fn(entry)
+        resolve_fn = self._make_retrieve_resolve_fn(entry)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
@@ -692,17 +767,50 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             ``True`` on success.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
-        session = self._ctx.session_manager.get_or_create(key.request_id)
-        st = session.extras.pop("retrieve_start_time", None)
-        result = strategy.commit_retrieve(key=key, instance_id=instance_id)
-        if st is not None:
+        result, st = self._release_retrieve(key, instance_id)
+        if st is not None and result:
             num_tokens = (
                 len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
             )
-            logger.debug(
-                "Retrieved %d tokens in %.3f seconds",
+            logger.info(
+                "Engine-driven retrieve completed: tokens=%d elapsed_seconds=%.3f",
                 num_tokens,
                 time.perf_counter() - st,
             )
         return result
+
+    @_lmcache_nvtx_annotate
+    def abort_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> bool:
+        """Release an unsuccessful retrieve without logging completion."""
+        result, _ = self._release_retrieve(key, instance_id)
+        return result
+
+    def _release_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> tuple[bool, float | None]:
+        """Release resources shared by successful and aborted retrieves.
+
+        Args:
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            A pair containing the strategy cleanup result and the recorded
+            start time. The start time is ``None`` when preparation did not
+            record one; successful commit uses it for completion timing while
+            abort discards it.
+
+        Raises:
+            Exception: If strategy cleanup fails.
+        """
+        _, strategy = self._resolve_for_transfer(instance_id)
+        session = self._ctx.session_manager.get_or_create(key.request_id)
+        st = session.extras.pop("retrieve_start_time", None)
+        result = strategy.commit_retrieve(key=key, instance_id=instance_id)
+        return result, st
