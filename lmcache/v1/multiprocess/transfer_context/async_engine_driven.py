@@ -241,7 +241,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         commit_executor = self._commit_executor
 
         # Build group plans on the forward thread (O(1), dict-slicing only).
-        plans = self._build_group_plans(kv_caches, block_ids, blocks_in_chunk)
+        plans = self._build_group_plans(kv_caches, block_ids)
         is_multi_group = bool(plans)
 
         # For single-group we still flatten block_ids here so the background
@@ -270,8 +270,23 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 ok = False
                 used_shm_direct = False
                 prepared_shm_store = False
+                abort_attempted = False
                 staged_chunks_single: list[torch.Tensor] = []
                 staged_per_group: list[list[torch.Tensor]] = []
+
+                def _best_effort_abort() -> None:
+                    nonlocal abort_attempted
+                    if not prepared_shm_store or abort_attempted:
+                        return
+                    abort_attempted = True
+                    try:
+                        engine_driven_context.abort_store(key, instance_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to abort async SHM store for request_id=%s",
+                            _request_id,
+                        )
+
                 try:
                     # --- Phase 1: prepare_store ---
                     result = engine_driven_context.prepare_store(key, instance_id)
@@ -369,21 +384,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         )
 
                     if not ok:
-                        if prepared_shm_store:
-                            engine_driven_context.abort_store(key, instance_id)
+                        _best_effort_abort()
                         logger.error(
                             "Async engine-driven commit_store failed for request_id=%s",
                             _request_id,
                         )
                 except Exception:
-                    if prepared_shm_store:
-                        try:
-                            engine_driven_context.abort_store(key, instance_id)
-                        except Exception:
-                            logger.exception(
-                                "Failed to abort async SHM store for request_id=%s",
-                                _request_id,
-                            )
+                    _best_effort_abort()
                     logger.exception(
                         "Async engine-driven store failed for request_id=%s",
                         _request_id,

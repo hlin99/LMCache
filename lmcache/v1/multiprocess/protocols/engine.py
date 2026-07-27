@@ -76,6 +76,7 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "ABORT_RETRIEVE",
 ]
 
 # Type alias for cache keys
@@ -246,6 +247,11 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             handler_type=HandlerType.BLOCKING,
         ),
         "COMMIT_RETRIEVE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "ABORT_RETRIEVE": ProtocolDefinition(
             payload_classes=[KeyType, int],
             response_class=bool,
             handler_type=HandlerType.BLOCKING,

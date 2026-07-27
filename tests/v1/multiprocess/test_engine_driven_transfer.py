@@ -1430,10 +1430,16 @@ def test_server_registration_accepts_explicit_cross_layer_alias(
 
 
 def test_server_store_and_retrieve_cpu_chunks(
+    monkeypatch: pytest.MonkeyPatch,
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Validate mocked server-side CPU chunk store and retrieve behavior."""
+    """Validate CPU transfer and its stable retrieve completion marker."""
+    # First Party
+    from lmcache.v1.multiprocess.modules import engine_driven_transfer
+
+    log_info = MagicMock()
+    monkeypatch.setattr(engine_driven_transfer.logger, "info", log_info)
     mock_storage = MagicMock()
     target_tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj = MagicMock()
@@ -1458,6 +1464,7 @@ def test_server_store_and_retrieve_cpu_chunks(
     key = _default_key()
     store_ok = module.commit_store(key, 2, pickle.dumps([payload]))
     response = module.prepare_retrieve(key, 2)
+    assert module.commit_retrieve(key, 2) is True
     success = response.success
     cpu_data = response.data
 
@@ -1468,6 +1475,17 @@ def test_server_store_and_retrieve_cpu_chunks(
     recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     assert len(recovered_chunks) == 1
     assert torch.allclose(recovered_chunks[0], payload)
+    assert any(
+        call.args
+        and call.args[0]
+        == "Engine-driven retrieve completed: tokens=%d elapsed_seconds=%.3f"
+        for call in log_info.call_args_list
+    )
+
+    log_info.reset_mock()
+    assert module.prepare_retrieve(key, 2).success is True
+    assert module.abort_retrieve(key, 2) is True
+    assert not log_info.called
 
 
 def test_server_pickle_partial_reservation_fails_without_publishing(
@@ -2031,8 +2049,6 @@ def test_pickle_retrieve_distinguishes_structured_and_legacy_single_group() -> N
             layout_desc=layout_desc,
             block_size=1,
             use_mla=False,
-            group_block_sizes=[1],
-            group_use_mla=[False],
             uses_structured_groups=True,
         ),
         mq_client=mq_client,
@@ -2218,8 +2234,6 @@ def test_engine_driven_context_shm_structured_single_group_retrieve() -> None:
             ),
             block_size=1,
             use_mla=False,
-            group_block_sizes=[1],
-            group_use_mla=[False],
             uses_structured_groups=True,
         ),
         mq_client=mq_client,

@@ -858,8 +858,6 @@ class EngineDrivenTransferContext(TransferContext):
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
-            group_block_sizes=[group.slots_per_block for group in registered_groups],
-            group_use_mla=[spec.use_mla for spec in group_layouts],
             uses_structured_groups=bool(engine_group_infos),
         )
         self._engine_driven_context = create_engine_driven_context(
@@ -884,7 +882,6 @@ class EngineDrivenTransferContext(TransferContext):
         self,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
-        blocks_in_chunk: int,
         *,
         for_retrieve: bool = False,
     ) -> list[GroupCopyPlan]:
@@ -893,7 +890,6 @@ class EngineDrivenTransferContext(TransferContext):
         Args:
             kv_caches: Worker KV-cache tensors keyed by layer name.
             block_ids: Per-LMCache-group block ID lists.
-            blocks_in_chunk: Reference blocks per LMCache chunk (group 0).
 
         Returns:
             Non-empty list when hybrid mode is active; empty list otherwise.
@@ -946,7 +942,7 @@ class EngineDrivenTransferContext(TransferContext):
 
         torch_dev.synchronize()
 
-        plans = self._build_group_plans(kv_caches, block_ids, blocks_in_chunk)
+        plans = self._build_group_plans(kv_caches, block_ids)
 
         result = self._engine_driven_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices, server_group_counts = (
@@ -958,9 +954,10 @@ class EngineDrivenTransferContext(TransferContext):
             future.set_result(True)
             return future
 
-        if plans:
-            # Multi-group (hybrid/HMA) path: gather per group and flatten.
-            try:
+        prepared_shm_store = out_buffers is not None
+        try:
+            if plans:
+                # Multi-group (hybrid/HMA) path: gather per group and flatten.
                 out_per_group, ci_per_group = _split_shm_buffers_by_group(
                     out_buffers,
                     chunk_indices,
@@ -973,17 +970,9 @@ class EngineDrivenTransferContext(TransferContext):
                     out_per_group=out_per_group,
                     chunk_indices_per_group=ci_per_group,
                 )
-            except Exception:
-                if out_buffers is not None:
-                    self._engine_driven_context.abort_store(key, instance_id)
-                raise
-            flat_chunks = flatten_chunks_group_major(chunks_per_group)
-            if out_buffers is not None:
-                torch_dev.synchronize()
-            ok = self._engine_driven_context.commit_store(key, instance_id, flat_chunks)
-        else:
-            # Single-group (legacy) path.
-            try:
+                cpu_chunks = flatten_chunks_group_major(chunks_per_group)
+            else:
+                # Single-group (legacy) path.
                 cpu_chunks = gather_paged_kv_to_cpu(
                     kv_caches,
                     _single_group_block_ids(block_ids),
@@ -993,16 +982,16 @@ class EngineDrivenTransferContext(TransferContext):
                     out=out_buffers,
                     chunk_indices=chunk_indices,
                 )
-            except Exception:
-                if out_buffers is not None:
-                    self._engine_driven_context.abort_store(key, instance_id)
-                raise
-            if out_buffers is not None:
+            if prepared_shm_store:
                 torch_dev.synchronize()
             ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
+        except Exception:
+            if prepared_shm_store:
+                self._best_effort_abort_store(key, instance_id, "store failure")
+            raise
 
-        if not ok and out_buffers is not None:
-            self._engine_driven_context.abort_store(key, instance_id)
+        if not ok and prepared_shm_store:
+            self._best_effort_abort_store(key, instance_id, "unsuccessful commit")
         future = MessagingFuture()
         future.set_result(ok)
         return future
@@ -1048,7 +1037,7 @@ class EngineDrivenTransferContext(TransferContext):
             )
 
         plans = self._build_group_plans(
-            kv_caches, block_ids, blocks_in_chunk, for_retrieve=True
+            kv_caches, block_ids, for_retrieve=True
         )
 
         retrieve_result = self._engine_driven_context.prepare_retrieve(key, instance_id)
@@ -1092,7 +1081,10 @@ class EngineDrivenTransferContext(TransferContext):
             logger.exception("Failed to scatter retrieved CPU context chunks")
             ok = False
         finally:
-            self._engine_driven_context.commit_retrieve(key, instance_id)
+            if ok:
+                self._engine_driven_context.commit_retrieve(key, instance_id)
+            else:
+                self._engine_driven_context.abort_retrieve(key, instance_id)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
@@ -1110,6 +1102,23 @@ class EngineDrivenTransferContext(TransferContext):
     def flush_inflight_stores(self) -> None:
         """No-op: synchronous context has no deferred stores."""
         pass
+
+    def _best_effort_abort_store(
+        self,
+        key: Any,
+        instance_id: int,
+        failure_context: str,
+    ) -> None:
+        """Abort a prepared SHM store without masking its original failure."""
+        if self._engine_driven_context is None:
+            return
+        try:
+            self._engine_driven_context.abort_store(key, instance_id)
+        except Exception:
+            logger.exception(
+                "Failed to abort synchronous SHM store after %s",
+                failure_context,
+            )
 
 
 def create_transfer_context(

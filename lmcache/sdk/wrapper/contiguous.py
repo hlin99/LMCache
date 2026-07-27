@@ -8,8 +8,11 @@ from __future__ import annotations
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContext
+
+logger = init_logger(__name__)
 
 
 class ContiguousTransferWrapper:
@@ -66,10 +69,21 @@ class ContiguousTransferWrapper:
         """
         slot_tensors = self._context.prepare_retrieve(key, instance_id)
         if not slot_tensors:
+            self._abort_retrieve(key, instance_id)
             return None
         try:
             # Both Pickle and SHM returns list of [2, L, T, D] tensors
             # Concatenate along the token dimension.
-            return torch.cat(slot_tensors, dim=2)
-        finally:
-            self._context.commit_retrieve(key, instance_id)
+            result = torch.cat(slot_tensors, dim=2)
+        except Exception:
+            self._abort_retrieve(key, instance_id)
+            raise
+        self._context.commit_retrieve(key, instance_id)
+        return result
+
+    def _abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> None:
+        """Abort a retrieve without hiding the original retrieval outcome."""
+        try:
+            self._context.abort_retrieve(key, instance_id)
+        except Exception:
+            logger.exception("Failed to abort contiguous retrieve")

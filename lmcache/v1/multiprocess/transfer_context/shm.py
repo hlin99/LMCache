@@ -254,14 +254,26 @@ class EngineDrivenContextShm(EngineDrivenContext):
                 return tensors, group_counts
             return tensors
         except Exception:
-            self.commit_retrieve(key, instance_id)
+            self.abort_retrieve(key, instance_id)
             raise
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        return self._finish_retrieve(RequestType.COMMIT_RETRIEVE, key, instance_id)
+
+    def abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        return self._finish_retrieve(RequestType.ABORT_RETRIEVE, key, instance_id)
+
+    def _finish_retrieve(
+        self,
+        request_type: RequestType,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> bool:
+        """Send a retrieve finalization request."""
         future = self.mq_client.submit_request(
-            RequestType.COMMIT_RETRIEVE,
+            request_type,
             [key, instance_id],
-            get_response_class(RequestType.COMMIT_RETRIEVE),
+            get_response_class(request_type),
         )
         try:
             return bool(future.result(timeout=self.mq_timeout))

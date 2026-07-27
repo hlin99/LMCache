@@ -90,6 +90,9 @@ class RequestType(enum.Enum):
     P2P_QUERY_LOOKUP_RESULTS = enum.auto()
     P2P_UNLOCK_OBJECTS = enum.auto()
 
+    # Engine-driven cleanup operations (appended for wire compatibility)
+    ABORT_RETRIEVE = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

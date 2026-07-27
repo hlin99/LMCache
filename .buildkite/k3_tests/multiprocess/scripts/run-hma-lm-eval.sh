@@ -132,13 +132,18 @@ reset_vllm_prefix_cache() {
 # Arguments:
 #   none.
 # Outputs:
-#   The integer count of "Retrieved" log lines to stdout (0 if the log file does
-#   not exist yet).
+#   The integer count of completed retrieve log lines to stdout (0 if the log
+#   file does not exist yet).
 count_retrieves() {
     # NB: ``grep -c`` prints 0 *and* exits 1 on no match, so guard the file
     # existence and use ``|| true`` (not ``|| echo 0``) to avoid emitting "0\n0".
     [ -f "$LMCACHE_LOG" ] || { echo 0; return; }
-    grep -c "Retrieved" "$LMCACHE_LOG" 2>/dev/null || true
+    if [ "$EXPECTED_MP_TRANSFER_MODE" = "engine_driven" ]; then
+        grep -cF "Engine-driven retrieve completed:" "$LMCACHE_LOG" \
+            2>/dev/null || true
+    else
+        grep -c "Retrieved" "$LMCACHE_LOG" 2>/dev/null || true
+    fi
 }
 
 # Verify the worker-selected transfer mode using the stable factory marker.

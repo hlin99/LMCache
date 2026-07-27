@@ -10,8 +10,6 @@ Core utilities
 --------------
 - ``build_group_kv_subset``: extract the sub-dict of KV tensors belonging to
   a single LMCache object group (by layer index).
-- ``compute_group_blocks_in_chunk``: derive per-group ``blocks_in_chunk`` from
-  the reference chunk size.
 - ``plan_group_copy``: build a list of :class:`GroupCopyPlan` entries (one per
   object group) from the registered ``EngineGroupInfo`` list and the
   per-LMCache-group flat block-ID lists.
@@ -91,46 +89,6 @@ def build_group_kv_subset(
                 "for the registered kv_caches."
             )
     return {k: v for i, (k, v) in enumerate(all_items) if i in idx_set}
-
-
-def compute_group_blocks_in_chunk(
-    ref_blocks_in_chunk: int,
-    ref_block_size: int,
-    group_block_size: int,
-    group_tokens_per_block: int = 0,
-) -> int:
-    """Derive blocks-per-chunk for a group given a reference chunk size.
-
-    The reference chunk size in tokens is ``ref_blocks_in_chunk * ref_block_size``.
-    For the target group, blocks-per-chunk = chunk_tokens / effective_block_size,
-    where ``effective_block_size = group_tokens_per_block`` when non-zero, else
-    ``group_block_size``.
-
-    Args:
-        ref_blocks_in_chunk: Blocks per LMCache chunk for the reference group
-            (typically group 0, or the value passed to ``submit_store``).
-        ref_block_size: Physical block size of the reference group (tokens per
-            paged block as detected from the tensor shape).
-        group_block_size: Physical block size of the target group.
-        group_tokens_per_block: Logical tokens per block for the target group as
-            reported by ``EngineGroupInfo.tokens_per_block``.  ``0`` means
-            equal to ``group_block_size``.
-
-    Returns:
-        Number of paged blocks per LMCache chunk for the target group.
-
-    Raises:
-        ValueError: If the computed chunk-token count is not divisible by the
-            effective block size.
-    """
-    chunk_tokens = ref_blocks_in_chunk * ref_block_size
-    effective_block_size = group_tokens_per_block or group_block_size
-    if chunk_tokens % effective_block_size != 0:
-        raise ValueError(
-            f"chunk_tokens={chunk_tokens} is not divisible by effective "
-            f"block_size={effective_block_size} for this group"
-        )
-    return chunk_tokens // effective_block_size
 
 
 @dataclass(frozen=True)

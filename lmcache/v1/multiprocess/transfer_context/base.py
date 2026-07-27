@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 import inspect
 
@@ -111,10 +111,8 @@ class EngineDrivenContextMetadata:
 
     For single-group (non-hybrid) models the flat fields ``block_size`` and
     ``use_mla`` together with a single-entry ``layout_desc`` fully describe the
-    chunk format.  For hybrid/HMA models ``group_block_sizes`` and
-    ``group_use_mla`` carry per-object-group overrides (one entry per LMCache
-    object group in group-index order).  When these lists are empty the
-    single-group flat fields apply.
+    chunk format. For hybrid/HMA models, ``layout_desc`` contains one shape and
+    dtype per object group.
 
     Attributes:
         layout_desc: Memory layout descriptor used to interpret chunk payloads.
@@ -122,54 +120,22 @@ class EngineDrivenContextMetadata:
         block_size: Tokens per paged block for group-0 (or the sole group in
             single-group mode).
         use_mla: Whether the KV format is MLA for group-0 (or sole group).
-        group_block_sizes: Per-object-group physical block sizes in group-index
-            order.  Empty means single-group; use ``block_size`` for all groups.
-        group_use_mla: Per-object-group MLA flags in group-index order.  Empty
-            means single-group; use ``use_mla`` for all groups.
         uses_structured_groups: Whether registration supplied explicit group
             metadata. This distinguishes structured single-group registrations
             from the legacy single-group protocol.
         num_object_groups: Number of object groups.  ``1`` for single-group mode,
-            ``len(group_block_sizes)`` for hybrid mode.
+            ``len(layout_desc.shapes)`` for structured mode.
     """
 
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
-    group_block_sizes: list[int] = field(default_factory=list)
-    group_use_mla: list[bool] = field(default_factory=list)
     uses_structured_groups: bool = False
 
     @property
     def num_object_groups(self) -> int:
         """Number of object groups: 1 for single-group, >1 for hybrid/HMA."""
-        return max(len(self.group_block_sizes), 1)
-
-    def block_size_for_group(self, group_idx: int) -> int:
-        """Return the physical block size for the given object-group index.
-
-        Args:
-            group_idx: 0-based object-group index.
-
-        Returns:
-            Per-group block size when available, otherwise the flat ``block_size``.
-        """
-        if self.group_block_sizes and group_idx < len(self.group_block_sizes):
-            return self.group_block_sizes[group_idx]
-        return self.block_size
-
-    def use_mla_for_group(self, group_idx: int) -> bool:
-        """Return the MLA flag for the given object-group index.
-
-        Args:
-            group_idx: 0-based object-group index.
-
-        Returns:
-            Per-group MLA flag when available, otherwise the flat ``use_mla``.
-        """
-        if self.group_use_mla and group_idx < len(self.group_use_mla):
-            return self.group_use_mla[group_idx]
-        return self.use_mla
+        return len(self.layout_desc.shapes) if self.uses_structured_groups else 1
 
 
 class EngineDrivenContext(ABC):
@@ -248,6 +214,11 @@ class EngineDrivenContext(ABC):
     @abstractmethod
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         """Commit retrieve. Pickle: no-op. Shm: release read locks."""
+        ...
+
+    @abstractmethod
+    def abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Release retrieve resources without reporting successful completion."""
         ...
 
     @abstractmethod

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable
 from unittest.mock import MagicMock
@@ -32,6 +32,8 @@ class _FakeStoreContext:
     commit_impl: Callable[[list[torch.Tensor]], bool]
     prepare_result: tuple[list[torch.Tensor], list[int], list[int]] | None = None
     prepare_impl: Callable[[], None] | None = None
+    abort_impl: Callable[[], bool] | None = None
+    abort_calls: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
         self.layout_desc = SimpleNamespace(
@@ -49,6 +51,10 @@ class _FakeStoreContext:
         self, _key: object, _instance_id: int, chunks: list[torch.Tensor]
     ) -> bool:
         return bool(self.commit_impl(chunks))
+
+    def abort_store(self, _key: object, _instance_id: int) -> bool:
+        self.abort_calls += 1
+        return self.abort_impl() if self.abort_impl is not None else True
 
     def close(self) -> None:
         return None
@@ -121,12 +127,18 @@ def _new_context(
     gather_gate: threading.Event,
     commit_impl: Callable[[list[torch.Tensor]], bool],
     max_inflight: int = 8,
+    prepare_result: tuple[list[torch.Tensor], list[int], list[int]] | None = None,
+    abort_impl: Callable[[], bool] | None = None,
 ) -> AsyncEngineDrivenTransferContext:
     monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
     _install_fake_gather(monkeypatch)
     ctx = AsyncEngineDrivenTransferContext(commit_workers=max_inflight)
     ctx._engine_driven_context = (
-        _FakeStoreContext(commit_impl=commit_impl)  # type: ignore[assignment]
+        _FakeStoreContext(
+            commit_impl=commit_impl,
+            prepare_result=prepare_result,
+            abort_impl=abort_impl,
+        )  # type: ignore[assignment]
     )
     return ctx
 
@@ -214,6 +226,111 @@ def test_commit_failure_sets_false_and_logs(
     assert future.result(timeout=1) is False
     log_exception.assert_called_once()
     ctx.close()
+
+
+@pytest.mark.parametrize("commit_result", [False, RuntimeError("commit failed")])
+def test_async_shm_commit_failure_aborts_once(
+    monkeypatch: pytest.MonkeyPatch,
+    commit_result: bool | RuntimeError,
+) -> None:
+    gather_gate = threading.Event()
+    out = [torch.zeros(2, 1, 1, 1)]
+    abort = MagicMock(return_value=True)
+
+    def _commit(_chunks: list[torch.Tensor]) -> bool:
+        if isinstance(commit_result, RuntimeError):
+            raise commit_result
+        return commit_result
+
+    ctx = _new_context(
+        monkeypatch,
+        gather_gate=gather_gate,
+        commit_impl=_commit,
+        prepare_result=(out, [0], [1]),
+        abort_impl=abort,
+    )
+    future = ctx.submit_store(
+        "r1", object(), 1, {"k": torch.zeros(1)}, [[0]], _FakeEvent(gather_gate), 1
+    )
+    gather_gate.set()
+
+    assert future.result(timeout=1) is False
+    abort.assert_called_once_with()
+    ctx.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "use_shm",
+        "commit_result",
+        "abort_raises",
+        "expected_result",
+        "expected_abort_calls",
+    ),
+    [
+        pytest.param(True, True, False, True, 0, id="shm-success"),
+        pytest.param(True, False, False, False, 1, id="shm-false"),
+        pytest.param(True, "commit error", False, None, 1, id="shm-exception"),
+        pytest.param(True, "commit error", True, None, 1, id="shm-abort-exception"),
+        pytest.param(False, "commit error", False, None, 0, id="pickle-exception"),
+    ],
+)
+def test_sync_store_abort_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    use_shm: bool,
+    commit_result: bool | str,
+    abort_raises: bool,
+    expected_result: bool | None,
+    expected_abort_calls: int,
+) -> None:
+    monkeypatch.setattr(worker_transfer, "torch_dev", _FakeTorchDev(threading.Event()))
+    _install_fake_gather(monkeypatch)
+    log_exception = MagicMock()
+    monkeypatch.setattr(worker_transfer.logger, "exception", log_exception)
+    abort = MagicMock(
+        side_effect=RuntimeError("abort error") if abort_raises else None,
+        return_value=True,
+    )
+
+    def _commit(_chunks: list[torch.Tensor]) -> bool:
+        if isinstance(commit_result, str):
+            raise RuntimeError(commit_result)
+        return commit_result
+
+    store_context = _FakeStoreContext(
+        commit_impl=_commit,
+        prepare_result=(
+            ([torch.zeros(2, 1, 1, 1)], [0], [1]) if use_shm else None
+        ),
+        abort_impl=abort,
+    )
+    ctx = EngineDrivenTransferContext()
+    ctx._engine_driven_context = store_context  # type: ignore[assignment]
+
+    if isinstance(commit_result, str):
+        with pytest.raises(RuntimeError, match=commit_result):
+            ctx.submit_store(
+                "r1",
+                object(),
+                1,
+                {"k": torch.zeros(1)},
+                [[0]],
+                _FakeEvent(threading.Event()),
+                1,
+            )
+    else:
+        result = ctx.submit_store(
+            "r1",
+            object(),
+            1,
+            {"k": torch.zeros(1)},
+            [[0]],
+            _FakeEvent(threading.Event()),
+            1,
+        ).result()
+        assert result is expected_result
+    assert abort.call_count == expected_abort_calls
+    assert log_exception.call_count == int(abort_raises)
 
 
 def test_flush_inflight_stores_no_inflight_is_noop(

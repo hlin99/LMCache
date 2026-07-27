@@ -137,6 +137,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 self.commit_retrieve,
                 ThreadPoolType.AFFINITY,
             ),
+            HandlerSpec(
+                RequestType.ABORT_RETRIEVE,
+                self.abort_retrieve,
+                ThreadPoolType.AFFINITY,
+            ),
         ]
 
     def report_status(self) -> dict:
@@ -351,22 +356,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         return _multi_group_flat
 
-    def _make_resolve_fn_per_group(
-        self, entry: EngineDrivenContextEntry
-    ) -> Callable[[IPCCacheServerKey], list[list[ObjectKey]]]:
-        """Return a per-group object-key resolver for SHM multi-group stores.
-
-        Args:
-            entry: Registered context entry.
-
-        Returns:
-            Callable that maps an IPC key to ``list[list[ObjectKey]]``.
-        """
-        num_groups = entry.metadata.num_object_groups
-        if num_groups <= 1:
-            return lambda key: [self._resolve_single_group_obj_keys(key)]
-        return lambda key: self._resolve_multi_group_obj_keys(key, num_groups)
-
     def _make_retrieve_resolve_fn(
         self, entry: EngineDrivenContextEntry
     ) -> Callable[[IPCCacheServerKey], list[ObjectKey]]:
@@ -443,9 +432,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             shapes: list[torch.Size] = []
             dtypes: list[torch.dtype] = []
             sw_windows: list[int] = []
-            group_block_sizes: list[int] = []
-            group_use_mla: list[bool] = []
-
             # Legacy structured payloads predate explicit group IDs, layer maps,
             # exact shapes, and copy formats. Any such field selects strict
             # validation while an all-default payload remains decodable.
@@ -531,9 +517,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 shapes.append(g_shape)
                 dtypes.append(g_dtype)
                 sw_windows.append(spec.sw_size_tokens)
-                group_block_sizes.append(spec.block_size)
-                group_use_mla.append(spec.use_mla)
-
             layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
             # AttnWindowDesc: convert -1 (full attention) tokens to chunk count.
             # -1 means full attention; positive sw_size_tokens means SW.
@@ -558,8 +541,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 layout_desc=layout_desc,
                 block_size=payload.block_size,
                 use_mla=payload.use_mla,
-                group_block_sizes=group_block_sizes,
-                group_use_mla=group_use_mla,
                 uses_structured_groups=True,
             )
         else:
@@ -786,17 +767,36 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             ``True`` on success.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
-        session = self._ctx.session_manager.get_or_create(key.request_id)
-        st = session.extras.pop("retrieve_start_time", None)
-        result = strategy.commit_retrieve(key=key, instance_id=instance_id)
-        if st is not None:
+        result, st = self._release_retrieve(key, instance_id)
+        if st is not None and result:
             num_tokens = (
                 len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
             )
-            logger.debug(
-                "Retrieved %d tokens in %.3f seconds",
+            logger.info(
+                "Engine-driven retrieve completed: tokens=%d elapsed_seconds=%.3f",
                 num_tokens,
                 time.perf_counter() - st,
             )
         return result
+
+    @_lmcache_nvtx_annotate
+    def abort_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> bool:
+        """Release an unsuccessful retrieve without logging completion."""
+        result, _ = self._release_retrieve(key, instance_id)
+        return result
+
+    def _release_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> tuple[bool, float | None]:
+        """Release retrieve resources and return its result and start time."""
+        _, strategy = self._resolve_for_transfer(instance_id)
+        session = self._ctx.session_manager.get_or_create(key.request_id)
+        st = session.extras.pop("retrieve_start_time", None)
+        result = strategy.commit_retrieve(key=key, instance_id=instance_id)
+        return result, st
