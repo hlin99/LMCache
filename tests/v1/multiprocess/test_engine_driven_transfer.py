@@ -14,7 +14,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.posix_shm import (
     shm_create_readwrite,
     shm_munmap,
@@ -67,7 +67,7 @@ class ServerModuleFactory(Protocol):
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[Any] | None = None,
+        object_keys: list[str | ObjectKey] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1273,7 +1273,7 @@ def server_module_factory(
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[Any] | None = None,
+        object_keys: list[str | ObjectKey] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1610,7 +1610,7 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
         _default_register_payload(instance_id=5)
     )
     key = _default_key()
-    with pytest.raises(ValueError, match="did not provide writable slots"):
+    with pytest.raises(ValueError, match="lack writable tensors"):
         module.prepare_store(key, 5)
     reserved_keys = mock_storage.reserve_write.call_args[0][0]
     mock_storage.delete_l1_keys.assert_called_once_with(reserved_keys, force=True)

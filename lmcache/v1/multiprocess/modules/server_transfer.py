@@ -357,9 +357,10 @@ class PickleTransferStrategy(TransferStrategy):
                 obj_keys, context.layout_desc, "new"
             )
 
-        if len(reserved_dict) != len(obj_keys) or any(
-            obj_key not in reserved_dict for obj_key in obj_keys
-        ):
+        has_complete_reservation = len(reserved_dict) == len(obj_keys) and all(
+            obj_key in reserved_dict for obj_key in obj_keys
+        )
+        if not has_complete_reservation:
             if reserved_dict:
                 self._storage_manager.delete_l1_keys(list(reserved_dict), force=True)
             return False
@@ -552,7 +553,7 @@ class ShmTransferStrategy(TransferStrategy):
 
         if not reserved_keys:
             if reserved:
-                raise ValueError("SHM reservations did not provide writable slots")
+                raise ValueError("all SHM reservations lack writable tensors")
             ctx: dict[str, Any] = {"slots": [], "chunk_indices": []}
             if context.uses_structured_groups:
                 ctx["group_counts"] = [0] * num_groups
