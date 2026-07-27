@@ -381,12 +381,12 @@ def test_both_paths_register_and_plan_the_same_transfer() -> None:
     plan, otherwise the two paths would disagree on what is stored.
     """
     # First Party
-    import lmcache.c_ops as lmc_ops
     from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
     from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
     from lmcache.v1.multiprocess.transfer_context.common_copy import (
         registered_groups_from_kv_layer_groups,
     )
+    import lmcache.c_ops as lmc_ops
 
     kv_format = lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
     # [kv, num_blocks, block_size, num_heads, head_size] per layer.

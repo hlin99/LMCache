@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -67,7 +67,7 @@ class ServerModuleFactory(Protocol):
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[str | ObjectKey] | None = None,
+        object_keys: Sequence[str | ObjectKey] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1348,7 +1348,7 @@ def server_module_factory(
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[str | ObjectKey] | None = None,
+        object_keys: Sequence[str | ObjectKey] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1386,7 +1386,7 @@ def server_module_factory(
         stack.enter_context(
             patch(
                 "lmcache.v1.multiprocess.engine_context.ipc_key_to_object_keys",
-                return_value=[object_keys or ["obj"]],
+                return_value=[list(object_keys) if object_keys else ["obj"]],
             )
         )
 
@@ -2256,8 +2256,13 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         )
         assert context.commit_store(key, 1, store_views)
 
-        retrieve_views = context.prepare_retrieve(key=key, instance_id=1)
-        assert retrieve_views is not None
+        retrieve_result = context.prepare_retrieve(key=key, instance_id=1)
+        assert retrieve_result is not None
+        retrieve_views = (
+            retrieve_result[0]
+            if isinstance(retrieve_result, tuple)
+            else retrieve_result
+        )
         assert torch.equal(
             retrieve_views[0],
             torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
