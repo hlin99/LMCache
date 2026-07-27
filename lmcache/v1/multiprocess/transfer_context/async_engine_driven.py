@@ -14,13 +14,13 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
-from lmcache.v1.multiprocess.transfer_context.group_copy import (
+from lmcache.v1.multiprocess.transfer_context.common_copy import (
     flatten_chunks_group_major,
     gather_engine_groups,
 )
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
-    GroupCopyPlan,
+    GroupTransferPlan,
     IPCEvent,
     _single_group_block_ids,
     _split_shm_buffers_by_group,
@@ -53,7 +53,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     ------------------
     When the base context registered with ``engine_group_infos``, the async
     store path routes through the multi-group
-    :func:`~.group_copy.gather_engine_groups` helper, assembling a group-major
+    :func:`~.common_copy.gather_engine_groups` helper, assembling a group-major
     flat chunk list before commit.  The blocking retrieve path is inherited
     from :class:`EngineDrivenTransferContext` unchanged.
 
@@ -167,32 +167,25 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
     def _alloc_staging_for_plans(
         self,
-        plans: list[GroupCopyPlan],
-        num_chunks_per_group: list[int],
+        plans: list[GroupTransferPlan],
     ) -> list[list[torch.Tensor]]:
-        """Allocate pinned staging tensors for each group in a multi-group store.
+        """Allocate pinned staging tensors for each group in a grouped store.
+
+        Shape, dtype, and object count all come from the common plans, so the
+        staging pool never has to re-derive a group's geometry.
 
         Args:
-            plans: Per-group copy plans providing shape/dtype information.
-            num_chunks_per_group: Number of chunks to allocate for each group.
+            plans: Per-group plans from the common request planner.
 
         Returns:
             Per-group lists of pinned staging tensors.
         """
-        layout_desc = self._engine_driven_context.layout_desc  # type: ignore[union-attr]
-        staged_per_group: list[list[torch.Tensor]] = []
-        for g_idx, plan in enumerate(plans):
-            n = num_chunks_per_group[g_idx]
-            if g_idx < len(layout_desc.shapes) and g_idx < len(layout_desc.dtypes):
-                shape = layout_desc.shapes[g_idx]
-                dtype = layout_desc.dtypes[g_idx]
-            elif layout_desc.shapes and layout_desc.dtypes:
-                shape = layout_desc.shapes[0]
-                dtype = layout_desc.dtypes[0]
-            else:
-                raise RuntimeError("engine-driven layout_desc.shapes/dtypes is empty")
-            staged_per_group.append(self._alloc_pinned_staging(shape, dtype, n))
-        return staged_per_group
+        return [
+            self._alloc_pinned_staging(
+                plan.group.shape, plan.group.dtype, plan.transfer_objects
+            )
+            for plan in plans
+        ]
 
     def submit_store(
         self,
@@ -212,7 +205,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         future that resolves only after all three phases complete.
 
         For hybrid/HMA models with multiple engine groups the gather phase runs
-        once per group via :func:`~.group_copy.gather_engine_groups`, producing
+        once per group via :func:`~.common_copy.gather_engine_groups`, producing
         a group-major flat chunk list that is committed in a single call.
 
         Args:
@@ -241,7 +234,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         commit_executor = self._commit_executor
 
         # Build group plans on the forward thread (O(1), dict-slicing only).
-        plans = self._build_group_plans(kv_caches, block_ids)
+        plans = self._build_group_plans(block_ids)
         is_multi_group = bool(plans)
 
         # For single-group we still flatten block_ids here so the background
@@ -317,15 +310,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 gather_target_flat = out_buffers
                             else:
                                 # Allocate staging for each group.
-                                num_chunks_per_group = [p.num_chunks for p in plans]
-                                staged_per_group = self._alloc_staging_for_plans(
-                                    plans, num_chunks_per_group
-                                )
+                                staged_per_group = self._alloc_staging_for_plans(plans)
                                 out_per_group = staged_per_group  # type: ignore[assignment]
                                 ci_per_group = [None] * len(plans)
 
                             chunks_per_group = gather_engine_groups(
                                 plans,
+                                kv_caches,
                                 layout_hints=self._layout_hints,
                                 out_per_group=out_per_group,
                                 chunk_indices_per_group=ci_per_group,

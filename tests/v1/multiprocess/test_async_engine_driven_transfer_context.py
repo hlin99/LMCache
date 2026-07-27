@@ -299,9 +299,7 @@ def test_sync_store_abort_lifecycle(
 
     store_context = _FakeStoreContext(
         commit_impl=_commit,
-        prepare_result=(
-            ([torch.zeros(2, 1, 1, 1)], [0], [1]) if use_shm else None
-        ),
+        prepare_result=(([torch.zeros(2, 1, 1, 1)], [0], [1]) if use_shm else None),
         abort_impl=abort,
     )
     ctx = EngineDrivenTransferContext()

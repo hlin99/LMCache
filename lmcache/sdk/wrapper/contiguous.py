@@ -66,8 +66,16 @@ class ContiguousTransferWrapper:
 
         Returns:
             The contiguous KV tensor if found, None otherwise.
+
+        Raises:
+            ValueError: If the context returns more than one transfer group;
+                this wrapper stores one contiguous tensor per key.
+            Exception: Any error raised while concatenating the retrieved
+                chunks, after the retrieve has been aborted.
         """
-        slot_tensors = self._context.prepare_retrieve(key, instance_id)
+        slot_tensors = self._normalize_prepare_retrieve(
+            self._context.prepare_retrieve(key, instance_id), key, instance_id
+        )
         if not slot_tensors:
             self._abort_retrieve(key, instance_id)
             return None
@@ -80,6 +88,42 @@ class ContiguousTransferWrapper:
             raise
         self._context.commit_retrieve(key, instance_id)
         return result
+
+    def _normalize_prepare_retrieve(
+        self,
+        result: list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> list[torch.Tensor]:
+        """Reduce a legacy or structured prepare response to one chunk list.
+
+        Args:
+            result: The value returned by ``prepare_retrieve``: a legacy
+                single-group list, a structured ``(chunks, group_counts)``
+                pair, or ``None`` on a miss.
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            The retrieved chunks, or an empty list on a miss.
+
+        Raises:
+            ValueError: If the structured response owns more than one transfer
+                group. The retrieve is aborted first, because this wrapper
+                assembles exactly one contiguous tensor.
+        """
+        if result is None:
+            return []
+        if not isinstance(result, tuple):
+            return result
+        chunks, group_counts = result
+        if len(group_counts) > 1:
+            self._abort_retrieve(key, instance_id)
+            raise ValueError(
+                "ContiguousTransferWrapper supports a single transfer group, "
+                f"but the retrieve response owns {len(group_counts)} groups"
+            )
+        return chunks
 
     def _abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> None:
         """Release retrieve resources while preserving the caller's outcome.

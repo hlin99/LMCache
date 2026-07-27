@@ -34,13 +34,15 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
-from lmcache.v1.multiprocess.transfer_context.group_copy import (
-    GroupCopyPlan,
+from lmcache.v1.multiprocess.transfer_context.common_copy import (
+    DiscoveredGroupLayout,
+    GroupTransferPlan,
     RegisteredGroup,
     build_group_kv_subset,
+    build_group_transfer_plans,
     flatten_chunks_group_major,
     gather_engine_groups,
-    plan_group_copy,
+    registered_groups_from_engine_infos,
     scatter_engine_groups,
     unflatten_chunks_group_major,
     validate_registered_groups,
@@ -191,8 +193,8 @@ SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], Messagin
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
     """Return the flat block-id list for the legacy single-group path.
 
-    This helper is retained for explicit single-group fallback. The multi-group
-    (hybrid/HMA) paths use ``plan_group_copy`` instead.
+    This helper is retained for explicit single-group fallback. Structured
+    (hybrid/HMA) registrations use the common planner instead.
 
     Args:
         block_ids: Per-LMCache-group block ID lists.
@@ -215,14 +217,15 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
 def _split_shm_buffers_by_group(
     out_buffers: list[torch.Tensor] | None,
     chunk_indices: list[int] | None,
-    plans: list["GroupCopyPlan"],
+    plans: list["GroupTransferPlan"],
     *,
     server_group_counts: list[int] | None = None,
 ) -> tuple[list[list[torch.Tensor] | None], list[list[int] | None]]:
     """Split flat SHM out_buffers and chunk_indices lists by group.
 
     The SHM server returns a single flat list of buffers / indices in
-    group-major order with lengths equal to ``plan.num_chunks`` for each plan.
+    group-major order with lengths equal to ``plan.transfer_objects`` for each
+    plan.
     This helper partitions them back into per-group lists for multi-group
     gather calls.
 
@@ -236,7 +239,7 @@ def _split_shm_buffers_by_group(
             ``None`` for pickle mode.
         chunk_indices: Flat list of sparse chunk indices (group-major), or
             ``None`` when all chunks are needed.
-        plans: Per-group copy plans (provides ``num_chunks`` per group).
+        plans: Per-group transfer plans (one object count per group).
         server_group_counts: Per-group slot counts from the server response, or
             ``None`` / empty list when not available.
 
@@ -277,7 +280,7 @@ def _split_shm_buffers_by_group(
         if chunk_indices is not None:
             g_ci = chunk_indices[ci_offset : ci_offset + n]
             ci_offset += n
-            if any(idx < 0 or idx >= plan.num_chunks for idx in g_ci):
+            if any(idx < 0 or idx >= plan.transfer_objects for idx in g_ci):
                 raise ValueError(
                     f"group {g_idx} contains out-of-range local chunk indices {g_ci}"
                 )
@@ -726,11 +729,9 @@ class EngineDrivenTransferContext(TransferContext):
                     "engine_group_infos is non-empty; provide the authoritative "
                     "LMCache chunk size in tokens from the engine configuration"
                 )
-            shapes: list[torch.Size] = []
-            dtypes: list[torch.dtype] = []
-            chunk_tokens = lmcache_tokens_per_chunk
-
-            for object_group_id, info in enumerate(engine_group_infos):
+            layouts: list[DiscoveredGroupLayout] = []
+            dtype_strs: list[str] = []
+            for info in engine_group_infos:
                 group_kv = build_group_kv_subset(kv_caches, info.layer_indices)
                 (
                     g_block_size,
@@ -740,84 +741,50 @@ class EngineDrivenTransferContext(TransferContext):
                     g_engine_kv_format,
                     g_kv_size,
                 ) = compute_kv_layout(group_kv, layout_hints=layout_hints)
-                g_use_mla = g_kv_size == 1
-                g_tokens_per_block = info.tokens_per_block or g_block_size
-                if chunk_tokens % g_tokens_per_block:
-                    raise ValueError(
-                        f"LMCache chunk size {chunk_tokens} is not divisible by "
-                        f"tokens_per_block={g_tokens_per_block} for object group "
-                        f"{object_group_id}"
-                    )
-                g_blocks_in_chunk = chunk_tokens // g_tokens_per_block
-                copy_tokens = (
-                    chunk_tokens
-                    if info.sw_size_tokens < 0
-                    else min(chunk_tokens, info.sw_size_tokens)
-                )
-                copy_blocks = max(
-                    1,
-                    (copy_tokens + g_tokens_per_block - 1) // g_tokens_per_block,
-                )
-                physical_slots = copy_blocks * g_block_size
-                g_shape = (
-                    torch.Size(
-                        [
-                            g_num_layers,
-                            physical_slots,
-                            g_hidden_dim_size,
-                        ]
-                    )
-                    if g_use_mla
-                    else torch.Size(
-                        [
-                            2,
-                            g_num_layers,
-                            physical_slots,
-                            g_hidden_dim_size,
-                        ]
-                    )
-                )
-                g_dtype = getattr(torch, g_dtype_str)
-                shapes.append(g_shape)
-                dtypes.append(g_dtype)
-                registered_group = RegisteredGroup(
-                    object_group_id=object_group_id,
-                    engine_group_id=info.engine_group_id,
-                    layer_indices=tuple(info.layer_indices),
-                    tokens_per_block=g_tokens_per_block,
-                    slots_per_block=g_block_size,
-                    blocks_per_chunk=g_blocks_in_chunk,
-                    copy_blocks_per_chunk=copy_blocks,
-                    chunk_tokens=chunk_tokens,
-                    shape=g_shape,
-                    dtype=g_dtype,
-                    engine_kv_format=g_engine_kv_format,
-                    sw_size_tokens=info.sw_size_tokens,
-                )
-                registered_groups.append(registered_group)
-                group_layouts.append(
-                    GroupLayoutSpec(
+                dtype_strs.append(g_dtype_str)
+                layouts.append(
+                    DiscoveredGroupLayout(
+                        slots_per_block=g_block_size,
                         num_layers=g_num_layers,
                         hidden_dim_size=g_hidden_dim_size,
-                        dtype_str=g_dtype_str,
-                        block_size=g_block_size,
-                        use_mla=g_use_mla,
-                        tokens_per_block=g_tokens_per_block,
-                        engine_group_id=info.engine_group_id,
-                        sw_size_tokens=info.sw_size_tokens,
-                        object_group_id=object_group_id,
-                        layer_indices=tuple(info.layer_indices),
-                        shape=tuple(g_shape),
-                        engine_kv_format=int(g_engine_kv_format),
+                        kv_size=g_kv_size,
+                        dtype=getattr(torch, g_dtype_str),
+                        engine_kv_format=g_engine_kv_format,
                     )
                 )
+
+            registered_groups = registered_groups_from_engine_infos(
+                engine_group_infos, layouts, lmcache_tokens_per_chunk
+            )
+            group_layouts = [
+                GroupLayoutSpec(
+                    num_layers=layout.num_layers,
+                    hidden_dim_size=layout.hidden_dim_size,
+                    dtype_str=dtype_str,
+                    block_size=layout.slots_per_block,
+                    use_mla=layout.kv_size == 1,
+                    tokens_per_block=group.tokens_per_block,
+                    engine_group_id=group.engine_group_id,
+                    sw_size_tokens=group.sw_size_tokens,
+                    object_group_id=group.object_group_id,
+                    layer_indices=group.layer_indices,
+                    shape=tuple(group.shape),
+                    engine_kv_format=int(layout.engine_kv_format),
+                )
+                for group, layout, dtype_str in zip(
+                    registered_groups, layouts, dtype_strs, strict=True
+                )
+            ]
 
             validate_registered_groups(
                 registered_groups,
                 len(kv_caches),
                 excluded_layer_indices=excluded_layer_indices,
             )
-            layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
+            layout_desc = MemoryLayoutDesc(
+                shapes=[group.shape for group in registered_groups],
+                dtypes=[group.dtype for group in registered_groups],
+            )
         else:
             # Single-group / legacy path.
             shape = (
@@ -881,27 +848,28 @@ class EngineDrivenTransferContext(TransferContext):
 
     def _build_group_plans(
         self,
-        kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
         *,
         for_retrieve: bool = False,
-    ) -> list[GroupCopyPlan]:
-        """Build per-group copy plans, or return empty list for single-group mode.
+        skip_first_n_tokens: int = 0,
+    ) -> list[GroupTransferPlan]:
+        """Build the common request plans, or an empty list for legacy mode.
 
         Args:
-            kv_caches: Worker KV-cache tensors keyed by layer name.
-            block_ids: Per-LMCache-group block ID lists.
+            block_ids: Per-transfer-group block ID lists.
+            for_retrieve: Apply Sliding Window object-tail selection.
+            skip_first_n_tokens: Logical tokens at the head of the range that
+                must not be overwritten (APC-shared blocks).
 
         Returns:
-            Non-empty list when hybrid mode is active; empty list otherwise.
+            Non-empty list for structured registrations; empty list when the
+            worker registered in legacy single-group mode.
         """
-        if not self._registered_groups:
-            return []
-        return plan_group_copy(
-            kv_caches,
-            block_ids,
+        return build_group_transfer_plans(
             self._registered_groups,
+            block_ids,
             for_retrieve=for_retrieve,
+            skip_first_n_tokens=skip_first_n_tokens,
         )
 
     def submit_store(
@@ -943,7 +911,7 @@ class EngineDrivenTransferContext(TransferContext):
 
         torch_dev.synchronize()
 
-        plans = self._build_group_plans(kv_caches, block_ids)
+        plans = self._build_group_plans(block_ids)
 
         result = self._engine_driven_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices, server_group_counts = (
@@ -967,6 +935,7 @@ class EngineDrivenTransferContext(TransferContext):
                 )
                 chunks_per_group = gather_engine_groups(
                     plans,
+                    kv_caches,
                     layout_hints=self._layout_hints,
                     out_per_group=out_per_group,
                     chunk_indices_per_group=ci_per_group,
@@ -1038,7 +1007,9 @@ class EngineDrivenTransferContext(TransferContext):
             )
 
         plans = self._build_group_plans(
-            kv_caches, block_ids, for_retrieve=True
+            block_ids,
+            for_retrieve=True,
+            skip_first_n_tokens=skip_first_n_tokens,
         )
 
         retrieve_result = self._engine_driven_context.prepare_retrieve(key, instance_id)
@@ -1062,9 +1033,9 @@ class EngineDrivenTransferContext(TransferContext):
                     )
                     scatter_engine_groups(
                         plans,
+                        kv_caches,
                         chunks_per_group,
                         layout_hints=self._layout_hints,
-                        skip_first_n_tokens=skip_first_n_tokens,
                     )
                 else:
                     # Single-group (legacy) path.
@@ -1081,11 +1052,8 @@ class EngineDrivenTransferContext(TransferContext):
         except (RuntimeError, ValueError, TypeError, IndexError):
             logger.exception("Failed to scatter retrieved CPU context chunks")
             ok = False
-        finally:
-            if ok:
-                self._engine_driven_context.commit_retrieve(key, instance_id)
-            else:
-                self._engine_driven_context.abort_retrieve(key, instance_id)
+
+        ok = self._finalize_retrieve(key, instance_id, transferred=ok)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
@@ -1130,6 +1098,40 @@ class EngineDrivenTransferContext(TransferContext):
                 "Failed to abort synchronous SHM store after %s",
                 failure_context,
             )
+
+    def _finalize_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        *,
+        transferred: bool,
+    ) -> bool:
+        """Commit or abort a retrieve and return the final transfer result.
+
+        Args:
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+            transferred: Whether the scatter completed successfully.
+
+        Returns:
+            ``True`` only when the scatter succeeded *and* the server committed
+            the retrieve. A failed scatter aborts instead of committing, so the
+            server never records a successful retrieve for it. Commit and abort
+            errors are logged and reported as ``False`` rather than raised, so
+            cleanup never replaces the transfer result with an exception.
+        """
+        if self._engine_driven_context is None:
+            return False
+        try:
+            if transferred:
+                return self._engine_driven_context.commit_retrieve(key, instance_id)
+            self._engine_driven_context.abort_retrieve(key, instance_id)
+        except Exception:
+            logger.exception(
+                "Failed to %s engine-driven retrieve",
+                "commit" if transferred else "abort",
+            )
+        return False
 
 
 def create_transfer_context(

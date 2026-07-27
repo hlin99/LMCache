@@ -37,9 +37,34 @@ transfer context, so `block_ids[g]` always belongs to transfer group `g`.
 Every request validates exact divisibility by each group's full
 blocks-per-chunk value and requires equal logical chunk coverage. Sliding Window
 groups then retain trailing blocks within each chunk; retrieve additionally
-retains only the trailing objects covered by the window. The same validated
-planner supplies sync and async Engine-driven copies and the LMCache-driven
-block-validation path.
+retains only the trailing objects covered by the window.
+
+Both transfer paths share this model and planning logic, in
+`lmcache/v1/multiprocess/transfer_context/common_copy.py`:
+
+```text
+        registered_groups_from_kv_layer_groups()   registered_groups_from_engine_infos()
+                        |                                          |
+                        +----------------> RegisteredGroup <-------+
+                                                 |
+                                       build_group_transfer_plans()
+                                 (exact block validation, per-chunk Sliding
+                                  Window block selection, object-tail
+                                  selection, logical -> physical skip)
+                                                 |
+                        +------------------------+------------------------+
+                        |                                                 |
+              LMCache-driven server                            Engine-driven worker
+        native object-group transfer over IPC              gather/scatter over local
+              KV views + MemoryObj staging                  KV tensors + SHM/pickle
+```
+
+Each path keeps its own copy *execution*, because they drive different native
+primitives (`execute_object_group_transfer` with server-side kernel-group specs
+versus `multi_layer_block_kv_transfer` on worker-local tensors) over different
+memory (IPC-opened views versus registered engine tensors). Everything that
+decides *which* blocks, objects, and slots move is computed once, in the common
+module, so the two paths cannot drift.
 
 Wire order is group-major (`group 0 chunk 0..N`, then group 1, and so on).
 Structured SHM and pickle responses carry exact per-group counts, including

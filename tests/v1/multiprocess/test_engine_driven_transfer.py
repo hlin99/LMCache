@@ -612,7 +612,7 @@ def test_structured_single_group_retrieve_uses_grouped_scatter(
     ).result()
 
     assert result is True
-    assert scatter.call_args.args[1] == [[chunk]]
+    assert scatter.call_args.args[2] == [[chunk]]
 
 
 def test_structured_single_group_sparse_shm_store_uses_exact_indices(

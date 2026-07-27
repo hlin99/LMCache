@@ -47,8 +47,11 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
-from lmcache.v1.multiprocess.transfer_context.group_copy import (
-    validate_group_block_ids,
+from lmcache.v1.multiprocess.transfer_context.common_copy import (
+    RegisteredGroup,
+    build_group_transfer_plans,
+    registered_groups_from_kv_layer_groups,
+    sliding_window_first_object,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
@@ -134,6 +137,22 @@ def batched_iteration_with_skip(
         batch_start_idx += len(batch)
 
 
+def build_registered_groups(cache_context: BaseCacheContext) -> list[RegisteredGroup]:
+    """Adapt the server's KV layer groups to the common registered-group model.
+
+    Args:
+        cache_context: The cache context owning the KV layer groups manager and
+            the authoritative LMCache chunk size.
+
+    Returns:
+        One :class:`RegisteredGroup` per kernel group, in kernel-group order.
+    """
+    return registered_groups_from_kv_layer_groups(
+        cache_context.kv_layer_groups_manager,
+        cache_context.lmcache_tokens_per_chunk,
+    )
+
+
 def downsample_and_stage_block_ids(
     cache_context: BaseCacheContext,
     block_ids: list[list[int]],
@@ -142,16 +161,25 @@ def downsample_and_stage_block_ids(
     stage it into GPU tensors for later use.
 
     This mainly targets the case where a portion of the blocks are not
-    needed for every chunk, such as deepseek v4's swa cache.
+    needed for every chunk, such as deepseek v4's swa cache. The per-chunk
+    selection itself comes from the common planner
+    (:func:`~lmcache.v1.multiprocess.transfer_context.common_copy.build_group_transfer_plans`),
+    which the engine-driven worker path uses as well.
 
-    Note that the we do NOT do any object-level skipping here.
+    Note that we do NOT do any object-level skipping here.
 
     Args:
         cache_context: The cache context containing the KV cache information.
         block_ids: The original block id lists, indexed by LMCache KV group index.
+            Mutated in place to the selected block IDs.
 
     Returns:
-        The cut block id lists, indexed by LMCache KV group index.
+        The staged (device-side) cut block id lists, indexed by LMCache KV
+        group index.
+
+    Raises:
+        ValueError: If the block-ID lists do not exactly cover the same logical
+            chunk count for every kernel group.
 
     Note:
         This function has some coupled logic with transfer_kv_per_object_group below.
@@ -175,69 +203,15 @@ def downsample_and_stage_block_ids(
           [13, 14, 17, 18], # swa attention group only needs the last 2 block per chunk
         ]
     """
-    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
-    full_blocks_per_chunk = [
-        cache_context.calculate_num_blocks(
-            cache_context.lmcache_tokens_per_chunk, kernel_group_id
-        )
-        for kernel_group_id in range(num_kernel_groups)
-    ]
-    validate_group_block_ids(block_ids, full_blocks_per_chunk)
-    for kernel_group_id in range(num_kernel_groups):
-        subchunk_sw_size_tokens = (
-            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
-                kernel_group_id
-            )
-        )
-        tokens_per_chunk = min(
-            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
-        )
-        keep_blocks_per_chunk = cache_context.calculate_num_blocks(
-            tokens_per_chunk, kernel_group_id
-        )
-        total_blocks_per_chunk = full_blocks_per_chunk[kernel_group_id]
-
-        new_block_ids = []
-        old_block_ids = block_ids[kernel_group_id]
-        for i in range(0, len(old_block_ids), total_blocks_per_chunk):
-            chunk_block_ids = old_block_ids[i : i + total_blocks_per_chunk]
-            new_block_ids.extend(chunk_block_ids[-keep_blocks_per_chunk:])
-
-        block_ids[kernel_group_id] = new_block_ids
+    plans = build_group_transfer_plans(
+        build_registered_groups(cache_context), block_ids
+    )
+    for plan in plans:
+        block_ids[plan.group.kernel_group_id] = list(plan.selected_block_ids)
 
     # Stage the cut block ids into GPU tensors
     block_ids_gpu = cache_context.stage_block_ids(block_ids)
     return block_ids_gpu
-
-
-def _recalculate_blocks_to_skip(
-    blocks_per_chunk: int,
-    blocks_per_window: int,
-    blocks_to_skip: int,
-) -> int:
-    """Re-calculate the number of blocks to skip for a batch of chunks based
-    on the blocks per chunk and blocks per sliding window WHEN the window
-    size is smaller than the lmcache chunk size.
-
-    Args:
-        blocks_per_chunk: The total number of blocks in one chunk for the
-            current group.
-        blocks_per_window: The number of blocks in the sliding window
-            for the current group. Should be less than or equal to
-            blocks_per_chunk.
-        blocks_to_skip: The number of blocks to skip.
-
-    Returns:
-        The re-calculated number of blocks to skip for the current batch of
-        chunks.
-    """
-    if blocks_per_chunk == blocks_per_window:
-        return blocks_to_skip
-
-    full_windows_to_skip = blocks_to_skip // blocks_per_chunk
-    tail_blocks = blocks_to_skip % blocks_per_chunk
-    tail_blocks_to_skip = tail_blocks - (blocks_per_chunk - blocks_per_window)
-    return full_windows_to_skip * blocks_per_window + max(0, tail_blocks_to_skip)
 
 
 def _run_object_group_transfer_plan(
@@ -283,24 +257,12 @@ def _run_object_group_transfer_plan(
     max_batch_size = cache_context.max_batch_size
 
     # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
+    groups_by_kg = {
+        group.kernel_group_id: group for group in build_registered_groups(cache_context)
+    }
     kernel_group_specs: list["lmc_ops.KernelGroupSpec"] = []
     spec_index_by_kg: dict[int, int] = {}
-    blocks_per_chunk_by_kg: dict[int, int] = {}
-    blocks_per_window_by_kg: dict[int, int] = {}
     for kernel_group_id in kernel_group_ids:
-        blocks_per_chunk = cache_context.calculate_num_blocks(
-            lmcache_chunk_size, kernel_group_id
-        )
-        tokens_per_window = min(
-            lmcache_chunk_size,
-            kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
-        )
-        blocks_per_window = cache_context.calculate_num_blocks(
-            tokens_per_window, kernel_group_id
-        )
-        blocks_per_chunk_by_kg[kernel_group_id] = blocks_per_chunk
-        blocks_per_window_by_kg[kernel_group_id] = blocks_per_window
-
         paged_ptrs = cache_context.get_kernel_group_kv_pointers(kernel_group_id)
         block_ids_tensor = block_ids_gpu[kernel_group_id]
         temp_buffers = [
@@ -327,11 +289,12 @@ def _run_object_group_transfer_plan(
         for slot in range(max_batch_size)
     ]
 
-    attn_desc = kv_groups_manager.get_attn_desc()
-    num_objects_to_skip = 0
-    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
-        num_objects_to_skip = max(0, len(memory_objs) - sw_size_chunks)
+    num_objects_to_skip = (
+        sliding_window_first_object(groups_by_kg[kernel_group_ids[0]], len(memory_objs))
+        if is_h2d
+        else 0
+    )
+    if num_objects_to_skip:
         logger.debug(
             "Detected sliding window for object group %d: "
             "skipping the first %d objects in the batch",
@@ -372,20 +335,13 @@ def _run_object_group_transfer_plan(
 
         launches: list["lmc_ops.LaunchVar"] = []
         for kernel_group_id in kernel_group_ids:
-            blocks_per_chunk = blocks_per_chunk_by_kg[kernel_group_id]
-            blocks_per_window = blocks_per_window_by_kg[kernel_group_id]
+            group = groups_by_kg[kernel_group_id]
+            blocks_per_window = group.copy_blocks_per_chunk
 
             start_block_pos = start_object_idx * blocks_per_window
             end_block_pos = (start_object_idx + batch_len) * blocks_per_window
 
-            orig_skip_blocks = cache_context.calculate_num_blocks(
-                skip_tokens_in_chunk, kernel_group_id
-            )
-            recalculated_skip_blocks = _recalculate_blocks_to_skip(
-                blocks_per_chunk,
-                blocks_per_window,
-                orig_skip_blocks,
-            )
+            recalculated_skip_blocks = group.blocks_to_skip(skip_tokens_in_chunk)
 
             launches.append(
                 lmc_ops.LaunchVar(
@@ -466,11 +422,15 @@ def transfer_kv_per_object_group(
     kernel_group_ids = object_group.kernel_group_indices
     is_h2d = direction == lmc_ops.TransferDirection.H2D
 
-    attn_desc = kv_groups_manager.get_attn_desc()
-    num_objects_to_skip = 0
-    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
-        num_objects_to_skip = max(0, len(memory_objs) - sw_size_chunks)
+    groups_by_kg = {
+        group.kernel_group_id: group for group in build_registered_groups(cache_context)
+    }
+    num_objects_to_skip = (
+        sliding_window_first_object(groups_by_kg[kernel_group_ids[0]], len(memory_objs))
+        if is_h2d
+        else 0
+    )
+    if num_objects_to_skip:
         logger.debug(
             "Detected sliding window for object group %d: "
             "skipping the first %d objects in the batch",
@@ -513,16 +473,8 @@ def transfer_kv_per_object_group(
 
         # Do paged KV copy
         for kernel_group_id in kernel_group_ids:
-            blocks_per_chunk = cache_context.calculate_num_blocks(
-                lmcache_chunk_size, kernel_group_id
-            )
-            tokens_per_window = min(
-                lmcache_chunk_size,
-                kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
-            )
-            blocks_per_window = cache_context.calculate_num_blocks(
-                tokens_per_window, kernel_group_id
-            )
+            group = groups_by_kg[kernel_group_id]
+            blocks_per_window = group.copy_blocks_per_chunk
 
             # Get the block ids for this chunk
             start_block_pos = start_object_idx * blocks_per_window
@@ -533,14 +485,7 @@ def transfer_kv_per_object_group(
             ]
 
             # Re-calculate the skip blocks for this kernel group
-            orig_skip_blocks = cache_context.calculate_num_blocks(
-                skip_tokens_in_chunk, kernel_group_id
-            )
-            recalculated_skip_blocks = _recalculate_blocks_to_skip(
-                blocks_per_chunk,
-                blocks_per_window,
-                orig_skip_blocks,
-            )
+            recalculated_skip_blocks = group.blocks_to_skip(skip_tokens_in_chunk)
 
             # Launch kernel
             group_kv_pointers = cache_context.get_kernel_group_kv_pointers(
