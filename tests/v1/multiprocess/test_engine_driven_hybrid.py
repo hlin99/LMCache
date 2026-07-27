@@ -96,8 +96,8 @@ class TestFlattenUnflatten:
         flat = flatten_chunks_group_major([g0, g1])
         assert len(flat) == 5
         recovered = unflatten_chunks_group_major(flat, [2, 3])
-        assert [torch.equal(a, b) for a, b in zip(g0, recovered[0])]
-        assert [torch.equal(a, b) for a, b in zip(g1, recovered[1])]
+        assert all(torch.equal(a, b) for a, b in zip(g0, recovered[0]))
+        assert all(torch.equal(a, b) for a, b in zip(g1, recovered[1]))
 
     def test_unflatten_raises_on_count_mismatch(self) -> None:
         """unflatten raises ValueError when group_counts sum != len(flat)."""
