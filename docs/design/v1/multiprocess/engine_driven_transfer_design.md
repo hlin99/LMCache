@@ -42,7 +42,9 @@ planner supplies sync and async Engine-driven copies and the LMCache-driven
 block-validation path.
 
 Wire order is group-major (`group 0 chunk 0..N`, then group 1, and so on).
-Multi-group SHM and pickle retrieve responses carry exact per-group counts.
+Structured SHM and pickle responses carry exact per-group counts, including
+registrations with one explicit group; legacy single-group responses retain
+their original shape.
 Sparse SHM store responses carry group-local chunk indices; ownership is never
 inferred from flat list lengths.
 

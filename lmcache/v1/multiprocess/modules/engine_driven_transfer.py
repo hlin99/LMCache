@@ -560,6 +560,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 use_mla=payload.use_mla,
                 group_block_sizes=group_block_sizes,
                 group_use_mla=group_use_mla,
+                uses_structured_groups=True,
             )
         else:
             # --- Single-group / legacy registration ---

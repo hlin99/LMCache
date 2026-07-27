@@ -67,7 +67,7 @@ class ServerModuleFactory(Protocol):
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[str] | None = None,
+        object_keys: list[Any] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -233,6 +233,30 @@ def _default_register_payload(
         dtype_str="float32",
         use_mla=False,
     )
+
+
+def _structured_single_group_payload(
+    instance_id: int,
+) -> "RegisterEngineDrivenContextPayload":
+    """Build a structured registration payload containing one object group."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import GroupLayoutSpec
+
+    payload = _default_register_payload(instance_id)
+    payload.group_layouts = [
+        GroupLayoutSpec(
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            block_size=4,
+            use_mla=False,
+            tokens_per_block=4,
+            layer_indices=(0, 1),
+            shape=(2, 2, 8, 16),
+            engine_kv_format=0,
+        )
+    ]
+    return payload
 
 
 def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
@@ -531,6 +555,142 @@ def test_group_registration_uses_authoritative_lmcache_chunk_size(
 
     payload = send_request.call_args.args[2][0]
     assert [spec.shape[-2] for spec in payload.group_layouts] == [128, 256]
+
+
+def test_structured_single_group_retrieve_uses_grouped_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One explicit group retains ownership through worker scatter."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    chunk = torch.ones(2, 2, 8, 16)
+
+    class _FakeContext:
+        def prepare_retrieve(
+            self, _key: object, _instance_id: int
+        ) -> tuple[list[torch.Tensor], list[int]]:
+            return [chunk], [1]
+
+        def commit_retrieve(self, _key: object, _instance_id: int) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    fake_context = _FakeContext()
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: fake_context,
+    )
+    scatter = MagicMock()
+    monkeypatch.setattr(worker_transfer, "scatter_engine_groups", scatter)
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches()
+    ctx.register(
+        instance_id=26,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=[EngineGroupInfo(0, (0, 1), tokens_per_block=4)],
+        lmcache_tokens_per_chunk=8,
+    )
+
+    result = ctx.submit_retrieve(
+        "req", _default_key(), 26, kv_caches, [[0, 1]], MagicMock(), 2
+    ).result()
+
+    assert result is True
+    assert scatter.call_args.args[1] == [[chunk]]
+
+
+def test_structured_single_group_sparse_shm_store_uses_exact_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sparse slots for one explicit group are gathered by group-local index."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    out_buffers = [
+        torch.zeros(2, 2, 8, 16),
+        torch.zeros(2, 2, 8, 16),
+    ]
+
+    class _FakeContext:
+        def prepare_store(
+            self, _key: object, _instance_id: int
+        ) -> tuple[list[torch.Tensor], list[int], list[int]]:
+            return out_buffers, [1, 3], [2]
+
+        def commit_store(
+            self,
+            _key: object,
+            _instance_id: int,
+            chunks: list[torch.Tensor],
+        ) -> bool:
+            return len(chunks) == len(out_buffers) and all(
+                chunk is out for chunk, out in zip(chunks, out_buffers, strict=True)
+            )
+
+        def abort_store(self, _key: object, _instance_id: int) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    fake_context = _FakeContext()
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: fake_context,
+    )
+    gather = MagicMock(return_value=[out_buffers])
+    monkeypatch.setattr(worker_transfer, "gather_engine_groups", gather)
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches(num_blocks=8)
+    ctx.register(
+        instance_id=27,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=[EngineGroupInfo(0, (0, 1), tokens_per_block=4)],
+        lmcache_tokens_per_chunk=8,
+    )
+
+    result = ctx.submit_store(
+        "req",
+        _default_key(tokens=32),
+        27,
+        kv_caches,
+        [list(range(8))],
+        MagicMock(),
+        2,
+    ).result()
+
+    assert result is True
+    assert gather.call_args.kwargs["out_per_group"] == [out_buffers]
+    assert gather.call_args.kwargs["chunk_indices_per_group"] == [[1, 3]]
 
 
 def test_musa_data_context_store_uses_device_agnostic_gather(
@@ -1113,7 +1273,7 @@ def server_module_factory(
         *,
         storage_manager_config: "StorageManagerConfig | None" = None,
         chunk_size: int = 8,
-        object_keys: list[str] | None = None,
+        object_keys: list[Any] | None = None,
         mock_storage: MagicMock | None = None,
         mock_session: MagicMock | None = None,
     ) -> tuple[
@@ -1310,6 +1470,85 @@ def test_server_store_and_retrieve_cpu_chunks(
     assert torch.allclose(recovered_chunks[0], payload)
 
 
+def test_server_pickle_partial_reservation_fails_without_publishing(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Pickle store rejects and deletes a partial new-object reservation."""
+    mock_storage = MagicMock()
+    keys = ["obj0", "obj1", "obj2"]
+    memory_objs = {}
+    for key in (keys[0], keys[2]):
+        memory_obj = MagicMock()
+        memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+        memory_objs[key] = memory_obj
+    mock_storage.reserve_write.return_value = memory_objs
+    module, _, _, _ = server_module_factory(
+        object_keys=keys,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=20)
+    )
+
+    result = module.commit_store(
+        _default_key(tokens=24),
+        20,
+        pickle.dumps([torch.ones(2, 2, 8, 16) for _ in keys]),
+    )
+
+    assert result is False
+    mock_storage.delete_l1_keys.assert_called_once_with(list(memory_objs), force=True)
+    mock_storage.finish_write.assert_not_called()
+    assert all(torch.count_nonzero(obj.tensor) == 0 for obj in memory_objs.values())
+
+
+@pytest.mark.parametrize(
+    ("destination", "source"),
+    [
+        pytest.param(None, torch.ones(2, 2, 8, 16), id="missing-destination"),
+        pytest.param(
+            torch.zeros(2, 2, 8, 16),
+            torch.ones(2, 2, 4, 16),
+            id="shape-mismatch",
+        ),
+        pytest.param(
+            torch.zeros(2, 2, 8, 16),
+            torch.ones(2, 2, 8, 16, dtype=torch.float16),
+            id="dtype-mismatch",
+        ),
+    ],
+)
+def test_server_pickle_invalid_reservation_cleans_without_publishing(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+    destination: torch.Tensor | None,
+    source: torch.Tensor,
+) -> None:
+    """Pickle validates every destination before writing or publishing."""
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    obj_key = ObjectKey(b"obj", "m", 0)
+    mock_storage = MagicMock()
+    memory_obj = MagicMock()
+    memory_obj.tensor = destination
+    mock_storage.reserve_write.return_value = {obj_key: memory_obj}
+    module, _, _, _ = server_module_factory(
+        object_keys=[obj_key],
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=21)
+    )
+
+    with pytest.raises(ValueError):
+        module.commit_store(_default_key(), 21, pickle.dumps([source]))
+
+    mock_storage.delete_l1_keys.assert_called_once_with([obj_key], force=True)
+    mock_storage.finish_write.assert_not_called()
+
+
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
@@ -1351,9 +1590,6 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
     server_module_factory: ServerModuleFactory,
 ) -> None:
     """Ensure SHM prepare_store releases reserved keys that have no writable tensor."""
-    # First Party
-    from lmcache.v1.multiprocess.protocols.engine import PrepareStoreResponse
-
     mock_storage = MagicMock()
     memory_obj = MagicMock()
     memory_obj.tensor = None
@@ -1374,11 +1610,160 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
         _default_register_payload(instance_id=5)
     )
     key = _default_key()
-    prepare_response = module.prepare_store(key, 5)
-    assert isinstance(prepare_response, PrepareStoreResponse)
-    assert prepare_response.context == {"slots": [], "chunk_indices": []}
+    with pytest.raises(ValueError, match="did not provide writable slots"):
+        module.prepare_store(key, 5)
     reserved_keys = mock_storage.reserve_write.call_args[0][0]
-    mock_storage.finish_write.assert_called_once_with(reserved_keys)
+    mock_storage.delete_l1_keys.assert_called_once_with(reserved_keys, force=True)
+    mock_storage.finish_write.assert_not_called()
+
+
+def test_server_shm_descriptor_failure_deletes_all_reservations(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A descriptor failure after one slot deletes every new reservation."""
+    keys = ["obj0", "obj1"]
+    mock_storage = MagicMock()
+    reserved = {}
+    for key in keys:
+        memory_obj = MagicMock()
+        memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+        memory_obj.shm_offset = 0
+        memory_obj.shm_byte_length = 2048
+        reserved[key] = memory_obj
+    mock_storage.reserve_write.return_value = reserved
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=4096
+        ),
+        object_keys=keys,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=24)
+    )
+
+    with (
+        patch(
+            "lmcache.v1.multiprocess.modules.server_transfer.ShmSlotDescriptor",
+            side_effect=[MagicMock(to_dict=lambda: {}), RuntimeError("bad slot")],
+        ),
+        pytest.raises(RuntimeError, match="bad slot"),
+    ):
+        module.prepare_store(_default_key(tokens=16), 24)
+
+    mock_storage.delete_l1_keys.assert_called_once_with(keys, force=True)
+    mock_storage.finish_write.assert_not_called()
+    assert module.commit_store(_default_key(tokens=16), 24, b"") is False
+
+
+def test_server_shm_invalid_structured_group_deletes_all_reservations(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """An undeclared group ID cannot leave earlier SHM reservations pending."""
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    keys = [
+        ObjectKey(b"valid", "m", 0, object_group_id=0),
+        ObjectKey(b"invalid", "m", 0, object_group_id=1),
+    ]
+    mock_storage = MagicMock()
+    reserved = {}
+    for key in keys:
+        memory_obj = MagicMock()
+        memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+        memory_obj.shm_offset = 0
+        memory_obj.shm_byte_length = 2048
+        reserved[key] = memory_obj
+    mock_storage.reserve_write.return_value = reserved
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=4096
+        ),
+        object_keys=keys,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _structured_single_group_payload(instance_id=25)
+    )
+
+    with pytest.raises(ValueError, match="invalid object_group_id=1"):
+        module.prepare_store(_default_key(tokens=16), 25)
+
+    mock_storage.delete_l1_keys.assert_called_once_with(keys, force=True)
+    mock_storage.finish_write.assert_not_called()
+
+
+def test_server_structured_single_group_sparse_shm_ownership(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Structured single-group SHM reports exact sparse slot ownership."""
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    keys = [ObjectKey(bytes([idx]), "m", 0, object_group_id=0) for idx in range(4)]
+    mock_storage = MagicMock()
+    reserved = {}
+    for offset, key_idx in enumerate((1, 3)):
+        memory_obj = MagicMock()
+        memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+        memory_obj.shm_offset = offset * 2048
+        memory_obj.shm_byte_length = 2048
+        reserved[keys[key_idx]] = memory_obj
+    mock_storage.reserve_write.return_value = reserved
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=8192
+        ),
+        object_keys=keys,
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _structured_single_group_payload(instance_id=22)
+    )
+    key = _default_key(tokens=32)
+
+    response = module.prepare_store(key, 22)
+
+    assert len(response.context["slots"]) == 2
+    assert response.context["chunk_indices"] == [1, 3]
+    assert response.context["group_counts"] == [2]
+    assert module.commit_store(key, 22, b"") is True
+    mock_storage.finish_write.assert_called_once_with([keys[1], keys[3]])
+    mock_storage.delete_l1_keys.assert_not_called()
+
+
+def test_server_structured_single_group_all_cached_reports_zero_count(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Structured all-cached SHM response retains explicit group ownership."""
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    mock_storage = MagicMock()
+    mock_storage.reserve_write.return_value = {}
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=4096
+        ),
+        object_keys=[ObjectKey(b"cached", "m", 0)],
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _structured_single_group_payload(instance_id=23)
+    )
+
+    response = module.prepare_store(_default_key(), 23)
+
+    assert response.context == {
+        "slots": [],
+        "chunk_indices": [],
+        "group_counts": [0],
+    }
 
 
 def test_server_shm_transport_uses_engine_level_config(
@@ -1619,6 +2004,50 @@ class _CompletedFuture:
         return self._value
 
 
+def test_pickle_retrieve_distinguishes_structured_and_legacy_single_group() -> None:
+    """Only structured single-group Pickle results carry exact ownership."""
+    chunks = [torch.ones(2, 2)]
+    response = PrepareRetrieveResponse(
+        success=True,
+        data=pickle.dumps(chunks),
+        context={"group_counts": [1]},
+    )
+    mq_client = MagicMock()
+    mq_client.submit_request.return_value = _CompletedFuture(response)
+    layout_desc = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2])],
+        dtypes=[torch.float32],
+    )
+    structured = EngineDrivenContextPickle(
+        metadata=EngineDrivenContextMetadata(
+            layout_desc=layout_desc,
+            block_size=1,
+            use_mla=False,
+            group_block_sizes=[1],
+            group_use_mla=[False],
+            uses_structured_groups=True,
+        ),
+        mq_client=mq_client,
+        mq_timeout=1.0,
+    )
+    legacy = EngineDrivenContextPickle(
+        metadata=EngineDrivenContextMetadata(
+            layout_desc=layout_desc,
+            block_size=1,
+            use_mla=False,
+        ),
+        mq_client=mq_client,
+        mq_timeout=1.0,
+    )
+
+    structured_result = structured.prepare_retrieve(_default_key(), 1)
+    legacy_result = legacy.prepare_retrieve(_default_key(), 1)
+
+    assert isinstance(structured_result, tuple)
+    assert structured_result[1] == [1]
+    assert isinstance(legacy_result, list)
+
+
 def _create_shm_segment(shm_name: str, size: int) -> int:
     """Create a POSIX SHM segment via the project facade.
 
@@ -1735,6 +2164,72 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
             torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
         )
         assert context.commit_retrieve(key, 1)
+    finally:
+        context.close()
+        shm_munmap(addr, 4096)
+        shm_unlink(shm_name)
+
+
+def test_engine_driven_context_shm_structured_single_group_retrieve() -> None:
+    """Structured one-group SHM retrieve returns ownership and releases locks."""
+    shm_name = f"lmcache_test_structured_retrieve_{os.getpid()}"
+    addr = _create_shm_segment(shm_name, 4096)
+    slots = [
+        {
+            "offset": 0,
+            "length": 16,
+            "shape": [2, 2],
+            "dtype": "float32",
+        }
+    ]
+    mq_client = MagicMock()
+
+    def _submit_request(
+        req_type: RequestType,
+        _payload: list[Any],
+        _response_cls: type[Any],
+    ) -> _CompletedFuture:
+        if req_type == RequestType.PREPARE_RETRIEVE:
+            return _CompletedFuture(
+                PrepareRetrieveResponse(
+                    success=True,
+                    data=b"",
+                    context={"slots": slots, "group_counts": [1]},
+                )
+            )
+        if req_type == RequestType.COMMIT_RETRIEVE:
+            return _CompletedFuture(True)
+        raise AssertionError(f"Unexpected request type: {req_type}")
+
+    mq_client.submit_request.side_effect = _submit_request
+    context = EngineDrivenContextShm(
+        metadata=EngineDrivenContextMetadata(
+            layout_desc=MemoryLayoutDesc(
+                shapes=[torch.Size([2, 2])],
+                dtypes=[torch.float32],
+            ),
+            block_size=1,
+            use_mla=False,
+            group_block_sizes=[1],
+            group_use_mla=[False],
+            uses_structured_groups=True,
+        ),
+        mq_client=mq_client,
+        mq_timeout=1.0,
+        shm_name=shm_name,
+        pool_size=4096,
+    )
+    try:
+        key = _default_key()
+        result = context.prepare_retrieve(key, 1)
+        assert isinstance(result, tuple)
+        assert len(result[0]) == 1
+        assert result[1] == [1]
+        assert context.commit_retrieve(key, 1)
+        assert [call.args[0] for call in mq_client.submit_request.call_args_list] == [
+            RequestType.PREPARE_RETRIEVE,
+            RequestType.COMMIT_RETRIEVE,
+        ]
     finally:
         context.close()
         shm_munmap(addr, 4096)

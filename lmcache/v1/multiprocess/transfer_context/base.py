@@ -126,6 +126,9 @@ class EngineDrivenContextMetadata:
             order.  Empty means single-group; use ``block_size`` for all groups.
         group_use_mla: Per-object-group MLA flags in group-index order.  Empty
             means single-group; use ``use_mla`` for all groups.
+        uses_structured_groups: Whether registration supplied explicit group
+            metadata. This distinguishes structured single-group registrations
+            from the legacy single-group protocol.
         num_object_groups: Number of object groups.  ``1`` for single-group mode,
             ``len(group_block_sizes)`` for hybrid mode.
     """
@@ -135,6 +138,7 @@ class EngineDrivenContextMetadata:
     use_mla: bool
     group_block_sizes: list[int] = field(default_factory=list)
     group_use_mla: list[bool] = field(default_factory=list)
+    uses_structured_groups: bool = False
 
     @property
     def num_object_groups(self) -> int:
@@ -215,8 +219,8 @@ class EngineDrivenContext(ABC):
                   block_ids sequence (e.g. [0, 2] means only chunks 0 and 2
                   need writing; chunk 1 is already cached).
                 - group_counts[g] is the exact number of SHM slots for group g
-                  in hybrid/HMA mode. Empty is valid only for a legacy
-                  single-group response.
+                  for every structured registration, including one explicit
+                  group. Empty is valid only for a legacy single-group response.
                 Caller gathers only these chunks into the provided tensors,
                 then calls commit_store with empty payload.
         """

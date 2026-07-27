@@ -179,13 +179,20 @@ class EngineDrivenContextShm(EngineDrivenContext):
         slots = context.get("slots")
         if not isinstance(slots, list):
             return None
+        chunk_indices = context.get("chunk_indices")
+        if not isinstance(chunk_indices, list):
+            return None
+        group_counts = context.get("group_counts", [])
+        if self.metadata.uses_structured_groups and (
+            not isinstance(group_counts, list)
+            or len(group_counts) != self.metadata.num_object_groups
+            or any(not isinstance(count, int) or count < 0 for count in group_counts)
+            or sum(group_counts) != len(slots)
+        ):
+            raise ValueError("invalid structured SHM store ownership")
         if not slots:
             # Server explicitly signals all chunks are already cached.
-            return [], [], []
-        chunk_indices: list[int] = context["chunk_indices"]
-        # group_counts is set by the server for hybrid/HMA multi-group mode.
-        # Empty list means single-group (no per-group split information).
-        group_counts: list[int] = context.get("group_counts", [])
+            return [], [], group_counts
         return self._build_slot_tensors(slots), chunk_indices, group_counts
 
     def commit_store(
@@ -233,7 +240,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         try:
             tensors = self._build_slot_tensors(slots)
             group_counts = response.context.get("group_counts", [])
-            if self.metadata.num_object_groups > 1:
+            if self.metadata.uses_structured_groups:
                 if (
                     not isinstance(group_counts, list)
                     or len(group_counts) != self.metadata.num_object_groups
@@ -243,7 +250,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
                     )
                     or sum(group_counts) != len(tensors)
                 ):
-                    raise ValueError("invalid multi-group SHM retrieve ownership")
+                    raise ValueError("invalid structured SHM retrieve ownership")
                 return tensors, group_counts
             return tensors
         except Exception:

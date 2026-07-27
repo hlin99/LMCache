@@ -226,8 +226,8 @@ def _split_shm_buffers_by_group(
     gather calls.
 
     When ``out_buffers`` is ``None`` (pickle mode) all entries are ``None``.
-    Multi-group SHM responses must carry exact ``server_group_counts``; group
-    ownership is never inferred from flat list lengths.
+    Structured SHM responses must carry exact ``server_group_counts`` even for
+    one group; group ownership is never inferred from flat list lengths.
 
     Args:
         out_buffers: Flat list of SHM-backed output tensors (group-major), or
@@ -244,14 +244,16 @@ def _split_shm_buffers_by_group(
     """
     if out_buffers is None:
         return [None] * len(plans), [None] * len(plans)
-    has_invalid_multi_group_counts = len(plans) > 1 and (
-        server_group_counts is None
-        or len(server_group_counts) != len(plans)
+    if server_group_counts is None:
+        raise ValueError("structured SHM prepare_store omitted exact group slot counts")
+    has_invalid_group_counts = (
+        len(server_group_counts) != len(plans)
+        or any(not isinstance(count, int) or count < 0 for count in server_group_counts)
         or sum(server_group_counts) != len(out_buffers)
     )
-    if has_invalid_multi_group_counts:
+    if has_invalid_group_counts:
         raise ValueError(
-            "multi-group SHM prepare_store must return one exact slot count "
+            "structured SHM prepare_store must return one exact slot count "
             f"per group; counts={server_group_counts}, buffers={len(out_buffers)}"
         )
     if chunk_indices is not None and len(chunk_indices) != len(out_buffers):
@@ -263,10 +265,7 @@ def _split_shm_buffers_by_group(
     ci_offset = 0
 
     for g_idx, plan in enumerate(plans):
-        if server_group_counts:
-            n = server_group_counts[g_idx]
-        else:
-            n = plan.num_chunks
+        n = server_group_counts[g_idx]
 
         g_buffers = out_buffers[buf_offset : buf_offset + n]
         buf_offset += n
@@ -691,12 +690,6 @@ class EngineDrivenTransferContext(TransferContext):
                 intentionally omitted from transfer groups. Supply every
                 registered tensor that aliases an owner tensor.
         """
-        if engine_group_infos and lmcache_tokens_per_chunk is None:
-            raise ValueError(
-                "lmcache_tokens_per_chunk must be specified when "
-                "engine_group_infos is non-empty; provide the authoritative "
-                "LMCache chunk size in tokens from the engine configuration"
-            )
         layout_source = (
             build_group_kv_subset(kv_caches, engine_group_infos[0].layer_indices)
             if engine_group_infos
@@ -722,6 +715,12 @@ class EngineDrivenTransferContext(TransferContext):
         group_layouts: list[GroupLayoutSpec] = []
 
         if engine_group_infos:
+            if lmcache_tokens_per_chunk is None:
+                raise ValueError(
+                    "lmcache_tokens_per_chunk must be specified when "
+                    "engine_group_infos is non-empty; provide the authoritative "
+                    "LMCache chunk size in tokens from the engine configuration"
+                )
             shapes: list[torch.Size] = []
             dtypes: list[torch.dtype] = []
             chunk_tokens = lmcache_tokens_per_chunk
@@ -857,6 +856,7 @@ class EngineDrivenTransferContext(TransferContext):
             use_mla=use_mla_flag,
             group_block_sizes=[group.slots_per_block for group in registered_groups],
             group_use_mla=[spec.use_mla for spec in group_layouts],
+            uses_structured_groups=bool(engine_group_infos),
         )
         self._engine_driven_context = create_engine_driven_context(
             metadata,

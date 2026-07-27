@@ -96,7 +96,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
             return None
         chunks: list[torch.Tensor] = pickle.loads(response.data)
         group_counts = response.context.get("group_counts", [])
-        if self.metadata.num_object_groups > 1:
+        if self.metadata.uses_structured_groups:
             if (
                 not isinstance(group_counts, list)
                 or len(group_counts) != self.metadata.num_object_groups
@@ -105,7 +105,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
                 )
                 or sum(group_counts) != len(chunks)
             ):
-                raise ValueError("invalid multi-group pickle retrieve ownership")
+                raise ValueError("invalid structured pickle retrieve ownership")
             return chunks, group_counts
         return chunks
 

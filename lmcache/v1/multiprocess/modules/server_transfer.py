@@ -292,10 +292,10 @@ class PickleTransferStrategy(TransferStrategy):
 
     Multi-group (hybrid/HMA) support
     ---------------------------------
-    When ``context.num_object_groups > 1``, the pickled ``cpu_data`` payload
-    is expected to contain a flat group-major list of tensors.  The server
-    resolves per-group object keys, reserves write slots with per-group
-    layouts, and maps flat-list positions to keys via matching ``object_group_id``.
+    Structured registrations use a group-major pickled ``cpu_data`` payload,
+    including when exactly one group is declared. The server resolves per-group
+    object keys, reserves write slots with per-group layouts, and maps flat-list
+    positions to keys via matching ``object_group_id``.
     """
 
     def __init__(
@@ -338,7 +338,7 @@ class PickleTransferStrategy(TransferStrategy):
         etc.).
 
         Returns:
-            ``True`` when every reserved object is written successfully.
+            ``True`` only when every requested object is reserved and written.
         """
         obj_keys = resolve_obj_keys(key)
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
@@ -357,12 +357,17 @@ class PickleTransferStrategy(TransferStrategy):
                 obj_keys, context.layout_desc, "new"
             )
 
+        if len(reserved_dict) != len(obj_keys) or any(
+            obj_key not in reserved_dict for obj_key in obj_keys
+        ):
+            if reserved_dict:
+                self._storage_manager.delete_l1_keys(list(reserved_dict), force=True)
+            return False
+
         try:
             validated_writes: list[tuple[ObjectKey, torch.Tensor, torch.Tensor]] = []
             for idx, obj_key in enumerate(obj_keys):
-                memory_obj = reserved_dict.get(obj_key)
-                if memory_obj is None:
-                    continue
+                memory_obj = reserved_dict[obj_key]
                 if memory_obj.tensor is None:
                     raise ValueError(f"reserved object {obj_key} has no tensor")
                 chunk_cpu = chunks[idx]
@@ -390,7 +395,7 @@ class PickleTransferStrategy(TransferStrategy):
             if written_keys:
                 self._storage_manager.finish_write(written_keys)
 
-        return len(written_keys) == len(reserved_dict)
+        return len(written_keys) == len(obj_keys)
 
     def prepare_retrieve(
         self,
@@ -442,11 +447,10 @@ class ShmTransferStrategy(TransferStrategy):
 
     Multi-group (hybrid/HMA) support
     ---------------------------------
-    When ``context.num_object_groups > 1``, slots and chunk_indices in the
-    response context are in group-major order.  The additional ``group_counts``
-    field (``list[int]``, one entry per group) encodes how many slots each
-    group occupies so the worker can reconstruct the per-group split without
-    any side-channel.
+    Structured response slots and chunk indices are in group-major order. The
+    ``group_counts`` field (``list[int]``, one entry per group) is present even
+    for one explicit group, so the worker can reconstruct ownership without a
+    side channel.
     """
 
     def __init__(
@@ -486,14 +490,17 @@ class ShmTransferStrategy(TransferStrategy):
     ) -> PrepareStoreResponse:
         """Reserve SHM-backed objects and return slot descriptors.
 
-        For single-group models returns ``{"slots": [...], "chunk_indices":
-        [...]}``.  For hybrid/HMA models also includes ``"group_counts":
-        [n0, n1, ...]`` encoding the per-group slot counts in group-major
-        order.
+        Legacy single-group responses contain ``slots`` and ``chunk_indices``.
+        Structured responses also contain ``group_counts`` even when they
+        declare exactly one group.
 
         Returns:
             Context with ``slots``, ``chunk_indices``, and optionally
             ``group_counts``.
+
+        Note:
+            Reservations use ``mode="new"``. Therefore abort and error cleanup
+            may force-delete every returned key without deleting prior data.
         """
         obj_keys = resolve_obj_keys(key)
         num_groups = context.num_object_groups
@@ -514,7 +521,7 @@ class ShmTransferStrategy(TransferStrategy):
         group_local_indices: list[int] = [0] * num_groups
         try:
             for obj_key in obj_keys:
-                gid = obj_key.object_group_id if num_groups > 1 else 0
+                gid = obj_key.object_group_id if context.uses_structured_groups else 0
                 if gid < 0 or gid >= num_groups:
                     raise ValueError(f"ObjectKey has invalid object_group_id={gid}")
                 local_chunk_index = group_local_indices[gid]
@@ -533,15 +540,21 @@ class ShmTransferStrategy(TransferStrategy):
                 chunk_indices.append(local_chunk_index)
                 reserved_keys.append(obj_key)
                 group_slot_counts[gid] += 1
-        finally:
-            reserved_keys_set = set(reserved_keys)
-            unused_keys = [k for k in reserved if k not in reserved_keys_set]
-            if unused_keys:
-                self._storage_manager.finish_write(unused_keys)
+        except Exception:
+            if reserved:
+                self._storage_manager.delete_l1_keys(list(reserved), force=True)
+            raise
+
+        reserved_keys_set = set(reserved_keys)
+        unused_keys = [k for k in reserved if k not in reserved_keys_set]
+        if unused_keys:
+            self._storage_manager.delete_l1_keys(unused_keys, force=True)
 
         if not reserved_keys:
+            if reserved:
+                raise ValueError("SHM reservations did not provide writable slots")
             ctx: dict[str, Any] = {"slots": [], "chunk_indices": []}
-            if num_groups > 1:
+            if context.uses_structured_groups:
                 ctx["group_counts"] = [0] * num_groups
             return PrepareStoreResponse(context=ctx)
 
@@ -550,7 +563,7 @@ class ShmTransferStrategy(TransferStrategy):
             self._pending_writes[transfer_key] = reserved_keys
 
         ctx = {"slots": slots, "chunk_indices": chunk_indices}
-        if num_groups > 1:
+        if context.uses_structured_groups:
             ctx["group_counts"] = group_slot_counts
         return PrepareStoreResponse(context=ctx)
 
