@@ -275,6 +275,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 staged_per_group: list[list[torch.Tensor]] = []
 
                 def attempt_abort_once() -> None:
+                    """Attempt one best-effort abort for this prepared SHM store."""
                     nonlocal abort_attempted
                     if not prepared_shm_store or abort_attempted:
                         return
