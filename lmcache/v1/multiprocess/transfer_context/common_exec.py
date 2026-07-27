@@ -136,7 +136,14 @@ class CopyEndpoint(ABC):
         """
 
     def flush(self) -> None:  # noqa: B027
-        """Issue any deferred work. Default: nothing to do."""
+        """Issue any work the endpoint deferred. Default: nothing to do.
+
+        Called exactly once, after the last batch and also when there was no
+        batch at all. Endpoints that record instead of issuing -- such as the
+        server's single ``execute_object_group_transfer`` call -- override this
+        as their one submission point; endpoints that issue every batch
+        immediately keep the default.
+        """
 
 
 def plan_copy_batches(

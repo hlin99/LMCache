@@ -351,12 +351,16 @@ def test_store_batching_boundary_does_not_change_object_bytes() -> None:
     _assert_payload_equal(server_bytes, worker_bytes)
 
 
-@pytest.mark.parametrize("skip_first_n_tokens", [0, TOKENS_PER_CHUNK * 5 + 2])
+@pytest.mark.parametrize(
+    "skip_first_n_tokens",
+    [0, TOKENS_PER_CHUNK, TOKENS_PER_CHUNK * 4, TOKENS_PER_CHUNK * 5 + 2],
+)
 def test_retrieve_writes_identical_kv_on_both_paths(skip_first_n_tokens: int) -> None:
     """A retrieve writes the same KV whether the server or the worker copies.
 
-    The non-zero skip crosses a batch boundary (object five of a four-object
-    batch), which is exactly where a per-batch skip must not be re-applied.
+    The skips cover a partial first batch, a whole batch, and a guard that
+    lands mid-batch on object five of a four-object batch -- exactly where a
+    per-batch skip must be placed once and not re-applied.
 
     Args:
         skip_first_n_tokens: APC prefix guard in logical tokens.
