@@ -9,14 +9,16 @@ import torch
 
 # First Party
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.transfer_context.base import (
+    gather_engine_groups,
+    scatter_engine_groups,
+)
 from lmcache.v1.multiprocess.transfer_context.common_copy import (
     DiscoveredGroupLayout,
     RegisteredGroup,
     build_group_transfer_plans,
     flatten_chunks_group_major,
-    gather_engine_groups,
     registered_groups_from_engine_infos,
-    scatter_engine_groups,
     sliding_window_first_object,
     unflatten_chunks_group_major,
     validate_group_block_ids,
@@ -246,7 +248,7 @@ def test_worker_scatter_consumes_server_trimmed_sliding_window_chunks(
 ) -> None:
     """Worker aligns server-trimmed objects without slicing them a second time."""
     # First Party
-    from lmcache.v1.multiprocess.transfer_context import common_copy
+    from lmcache.v1.multiprocess.transfer_context import base
 
     groups = [
         _group(0, 0, (0,)),
@@ -269,7 +271,7 @@ def test_worker_scatter_consumes_server_trimmed_sliding_window_chunks(
     ) -> None:
         seen.append((block_ids, [int(chunk.item()) for chunk in chunks]))
 
-    monkeypatch.setattr(common_copy, "scatter_cpu_to_paged_kv", fake_scatter)
+    monkeypatch.setattr(base, "scatter_cpu_to_paged_kv", fake_scatter)
     scatter_engine_groups(
         plans,
         kv_caches,
@@ -307,7 +309,7 @@ def test_gather_uses_each_groups_copy_format(
 ) -> None:
     """Execution forwards each group's discovered native copy format."""
     # First Party
-    from lmcache.v1.multiprocess.transfer_context import common_copy
+    from lmcache.v1.multiprocess.transfer_context import base
 
     groups = [_group(0, 0, (0,), copy_format=11), _group(1, 1, (1,), copy_format=22)]
     kv_caches = {"a": torch.empty(1), "b": torch.empty(1)}
@@ -323,7 +325,7 @@ def test_gather_uses_each_groups_copy_format(
         seen_formats.append(cast(int, kwargs["engine_kv_format"]))
         return [torch.empty(1)]
 
-    monkeypatch.setattr(common_copy, "gather_paged_kv_to_cpu", fake_gather)
+    monkeypatch.setattr(base, "gather_paged_kv_to_cpu", fake_gather)
 
     gather_engine_groups(plans, kv_caches)
 

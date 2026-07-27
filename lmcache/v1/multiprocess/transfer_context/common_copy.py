@@ -5,14 +5,15 @@ Both multiprocess transfer paths plan their copies here:
 
 * the **LMCache-driven** server path builds its groups from the
   :class:`~lmcache.v1.kv_layer_groups.KVLayerGroupsManager` it already owns
-  (see :func:`registered_groups_from_kv_layer_groups`) and executes the copy on
-  the server with IPC-opened KV views and ``MemoryObj`` staging;
+  (see :func:`registered_groups_from_kv_layer_groups`) and copies on the server
+  with IPC-opened KV views and ``MemoryObj`` staging;
 * the **Engine-driven** worker path builds its groups from the registered
   engine KV-group metadata (see :func:`registered_groups_from_engine_infos`)
-  and executes the copy on the worker with local KV tensors and SHM/pickle
-  tensor staging.
+  and copies on the worker with local KV tensors and SHM/pickle tensor
+  staging (see :func:`~.base.gather_engine_groups`).
 
-This module owns everything that must not be implemented twice:
+This module owns the *what* of a transfer -- everything that must not be
+implemented twice:
 
 - the immutable :class:`RegisteredGroup` description of one transfer group;
 - exact block-ID validation (:func:`validate_group_block_ids`);
@@ -21,14 +22,14 @@ This module owns everything that must not be implemented twice:
 - logical-token to physical block/slot skip conversion
   (:meth:`RegisteredGroup.blocks_to_skip`).
 
-It deliberately owns *no* transport, storage, or lifecycle concern: it does not
-reserve or release storage, allocate SHM, open IPC handles, or submit MQ
-requests. Copy *execution* stays path-specific because the two paths drive
-different native entry points (``execute_object_group_transfer`` on the server
-against IPC-opened paged KV, ``multi_layer_block_kv_transfer`` on the worker
-against local KV tensors); :func:`gather_engine_groups` and
-:func:`scatter_engine_groups` are the Engine-driven executors built on the
-common plans.
+The *how* -- object batching, per-launch block ranges, skip placement, and the
+staging/launch order -- lives in :mod:`.common_exec`, which both paths also
+share. Only the endpoint (which buffers, which native entry point, when to
+synchronize or commit) is path-specific.
+
+This module deliberately owns *no* transport, storage, or lifecycle concern: it
+does not reserve or release storage, allocate SHM, open IPC handles, or submit
+MQ requests.
 
 Indexing conventions
 ---------------------
@@ -62,12 +63,6 @@ from typing import TYPE_CHECKING, AbstractSet, Any, NamedTuple
 
 # Third Party
 import torch
-
-# First Party
-from lmcache.v1.gpu_connector.utils import LayoutHints
-
-# Local
-from .base import gather_paged_kv_to_cpu, scatter_cpu_to_paged_kv
 
 if TYPE_CHECKING:
     # First Party
@@ -589,6 +584,8 @@ class GroupTransferPlan:
         first_object: Leading objects omitted by Sliding Window retrieve.
         transfer_objects: Objects actually transferred
             (``total_objects - first_object``).
+        logical_skip: Logical tokens at the head of the *transferred* range
+            that must not be overwritten (APC-shared prefix guard).
         physical_skip: Physical slots to leave untouched at the head of
             ``selected_block_ids`` (APC-shared prefix guard).
     """
@@ -598,6 +595,7 @@ class GroupTransferPlan:
     total_objects: int
     first_object: int
     transfer_objects: int
+    logical_skip: int
     physical_skip: int
 
 
@@ -660,119 +658,89 @@ def build_group_transfer_plans(
                 total_objects=total_objects,
                 first_object=first_object,
                 transfer_objects=total_objects - first_object,
+                logical_skip=logical_skip,
                 physical_skip=group.physical_skip(logical_skip),
             )
         )
     return plans
 
 
-# ---------------------------------------------------------------------------
-# Engine-driven execution over the common plans
-# ---------------------------------------------------------------------------
+def physical_transfer_plan(
+    *,
+    layer_indices: tuple[int, ...],
+    block_size: int,
+    blocks_per_object: int,
+    hidden_dim_size: int,
+    kv_size: int,
+    dtype: torch.dtype,
+    engine_kv_format: Any,
+    selected_block_ids: Sequence[int],
+    num_objects: int,
+    skip_slots: int = 0,
+) -> GroupTransferPlan:
+    """Describe an already-selected block sequence as a single-group plan.
 
-
-def gather_engine_groups(
-    plans: Sequence[GroupTransferPlan],
-    kv_caches: dict[str, torch.Tensor],
-    layout_hints: LayoutHints | None = None,
-    out_per_group: list[list[torch.Tensor] | None] | None = None,
-    chunk_indices_per_group: list[list[int] | None] | None = None,
-) -> list[list[torch.Tensor]]:
-    """Gather KV data from device to CPU across all transfer groups.
-
-    Calls :func:`~.base.gather_paged_kv_to_cpu` once per group with the group's
-    KV subset, planned block IDs, and copied blocks per object, then assembles
-    the per-group chunk lists into a group-major result.
+    The Engine-driven copy primitives take physical inputs: a block-ID list
+    that Sliding Window trimming and object-tail selection have already been
+    applied to, and a slot-granular skip. This restates those inputs in the
+    common model -- one logical token per physical slot, no further trimming --
+    so they can be planned and executed by :mod:`.common_exec` instead of a
+    second, path-local batching loop.
 
     Args:
-        plans: Per-group plans from :func:`build_group_transfer_plans`.
-        kv_caches: Worker KV-cache tensors keyed by layer name.
-        layout_hints: Optional layout metadata forwarded to each
-            ``gather_paged_kv_to_cpu`` call.
-        out_per_group: Pre-allocated output tensors, one list per group.
-            ``None`` at index ``g`` means allocate fresh tensors for group
-            ``g`` (pickle mode). Length must equal ``len(plans)`` when given.
-        chunk_indices_per_group: Sparse chunk index lists, one per group.
-            ``None`` at index ``g`` means all chunks are needed. Length must
-            equal ``len(plans)`` when given.
+        layer_indices: KV tensor indices copied by the group.
+        block_size: Physical slots stored in one block.
+        blocks_per_object: Blocks copied for one object.
+        hidden_dim_size: ``num_heads * head_size`` of one slot.
+        kv_size: Object planes; ``1`` for MLA and fused-K/V, else ``2``.
+        dtype: Object tensor dtype.
+        engine_kv_format: Native copy format of the group.
+        selected_block_ids: Blocks to copy, object-major.
+        num_objects: Objects covered by ``selected_block_ids``.
+        skip_slots: Leading physical slots to leave untouched.
 
     Returns:
-        A group-major list: ``result[g]`` is the list of CPU tensors for group
-        ``g``. Empty list when ``plans`` is empty.
-    """
-    if not plans:
-        return []
-
-    result: list[list[torch.Tensor]] = []
-    for g_idx, plan in enumerate(plans):
-        out_g = out_per_group[g_idx] if out_per_group is not None else None
-        ci_g = (
-            chunk_indices_per_group[g_idx]
-            if chunk_indices_per_group is not None
-            else None
-        )
-        chunks = gather_paged_kv_to_cpu(
-            build_group_kv_subset(kv_caches, plan.group.layer_indices),
-            list(plan.selected_block_ids),
-            plan.group.copy_blocks_per_chunk,
-            layout_hints=layout_hints,
-            engine_kv_format=plan.group.engine_kv_format,
-            out=out_g,
-            chunk_indices=ci_g,
-        )
-        result.append(chunks)
-
-    return result
-
-
-def scatter_engine_groups(
-    plans: Sequence[GroupTransferPlan],
-    kv_caches: dict[str, torch.Tensor],
-    chunks_per_group: Sequence[list[torch.Tensor]],
-    layout_hints: LayoutHints | None = None,
-) -> None:
-    """Scatter KV data from CPU back to device across all transfer groups.
-
-    Calls :func:`~.base.scatter_cpu_to_paged_kv` once per group with the
-    group's KV subset, planned block IDs, and chunks. The APC prefix guard
-    comes from ``GroupTransferPlan.physical_skip``, resolved once by the common
-    planner.
-
-    Args:
-        plans: Per-group plans from :func:`build_group_transfer_plans`.
-        kv_caches: Worker KV-cache tensors keyed by layer name.
-        chunks_per_group: CPU tensors indexed ``[group_idx][chunk_idx]``.
-        layout_hints: Optional layout metadata forwarded to each
-            ``scatter_cpu_to_paged_kv`` call.
+        A plan whose single group copies exactly ``selected_block_ids``.
 
     Raises:
-        ValueError: If the number of chunk lists, or the object count of any
-            group, does not match its plan.
+        ValueError: If the block count does not match ``num_objects``, or any
+            geometry argument is not positive.
     """
-    if not plans:
-        return
-    if len(chunks_per_group) != len(plans):
+    if block_size < 1 or blocks_per_object < 1:
+        raise ValueError("block_size and blocks_per_object must be positive")
+    if len(selected_block_ids) != num_objects * blocks_per_object:
         raise ValueError(
-            f"chunks_per_group has {len(chunks_per_group)} entries "
-            f"but plans has {len(plans)} entries"
+            f"selected_block_ids has {len(selected_block_ids)} entries but "
+            f"{num_objects} objects * {blocks_per_object} blocks are expected"
         )
-    for plan, chunks in zip(plans, chunks_per_group, strict=True):
-        if len(chunks) != plan.transfer_objects:
-            raise ValueError(
-                f"server returned {len(chunks)} chunks for KV-cache object group "
-                f"{plan.group.object_group_id}, expected {plan.transfer_objects} "
-                f"(total_objects={plan.total_objects}, "
-                f"first_object={plan.first_object})"
-            )
-        scatter_cpu_to_paged_kv(
-            build_group_kv_subset(kv_caches, plan.group.layer_indices),
-            list(plan.selected_block_ids),
-            chunks,
-            plan.group.copy_blocks_per_chunk,
-            skip_first_n_tokens=plan.physical_skip,
-            layout_hints=layout_hints,
-            engine_kv_format=plan.group.engine_kv_format,
-        )
+    group = RegisteredGroup(
+        kernel_group_id=0,
+        object_group_id=0,
+        engine_group_id=0,
+        layer_indices=layer_indices,
+        tokens_per_block=block_size,
+        slots_per_block=block_size,
+        blocks_per_chunk=blocks_per_object,
+        copy_blocks_per_chunk=blocks_per_object,
+        chunk_tokens=blocks_per_object * block_size,
+        shape=contiguous_object_shape(
+            len(layer_indices),
+            blocks_per_object * block_size,
+            hidden_dim_size,
+            kv_size,
+        ),
+        dtype=dtype,
+        engine_kv_format=engine_kv_format,
+    )
+    return GroupTransferPlan(
+        group=group,
+        selected_block_ids=tuple(selected_block_ids),
+        total_objects=num_objects,
+        first_object=0,
+        transfer_objects=num_objects,
+        logical_skip=skip_slots,
+        physical_skip=group.physical_skip(skip_slots),
+    )
 
 
 # ---------------------------------------------------------------------------

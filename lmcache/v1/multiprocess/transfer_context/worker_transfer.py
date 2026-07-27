@@ -31,8 +31,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
     compute_kv_layout,
     create_engine_driven_context,
+    gather_engine_groups,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
+    scatter_engine_groups,
 )
 from lmcache.v1.multiprocess.transfer_context.common_copy import (
     DiscoveredGroupLayout,
@@ -41,9 +43,7 @@ from lmcache.v1.multiprocess.transfer_context.common_copy import (
     build_group_kv_subset,
     build_group_transfer_plans,
     flatten_chunks_group_major,
-    gather_engine_groups,
     registered_groups_from_engine_infos,
-    scatter_engine_groups,
     unflatten_chunks_group_major,
     validate_registered_groups,
 )

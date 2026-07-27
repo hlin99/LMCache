@@ -17,6 +17,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 import inspect
@@ -33,6 +34,20 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
+
+# Local
+from .common_copy import (
+    GroupTransferPlan,
+    build_group_kv_subset,
+    physical_transfer_plan,
+)
+from .common_exec import (
+    CopyBatch,
+    CopyEndpoint,
+    GroupLaunch,
+    execute_copy_batches,
+    plan_copy_batches,
+)
 
 if TYPE_CHECKING:
     # First Party
@@ -100,6 +115,88 @@ logger.info(
 def _tensors_to_ptrs(tensors: list[torch.Tensor]) -> list[int]:
     """Convert a list of tensors to a list of their data_ptr() values."""
     return [t.data_ptr() for t in tensors]
+
+
+_MAX_OBJECTS_PER_LAUNCH: int = 4
+"""Objects one compiled ``multi_layer_block_kv_transfer`` launch may cover.
+
+The CUDA kernel indexes a fixed-size object pointer array, so the worker copies
+are batched at this granularity. The Python fallback has no such limit.
+"""
+
+
+class WorkerCopyEndpoint(CopyEndpoint):
+    """Engine-driven endpoint over worker-local KV tensors and CPU chunks.
+
+    The chunk tensors are the objects themselves, so there is no staging step:
+    every batch issues one ``multi_layer_block_kv_transfer`` per group over the
+    slices the common planner selected.
+
+    Args:
+        paged_arg: Paged KV argument accepted by the resolved native op --
+            normalized tensors, or a device tensor of layer pointers.
+        objects_arg: Chunk tensors, or their data pointers, object-major.
+        block_ids_arg: Selected block IDs, or a device tensor of them.
+        device: Device the paged KV lives on.
+        direction: ``H2D`` (scatter) or ``D2H`` (gather).
+        shape_desc: Page-buffer shape descriptor of the group.
+        slots_per_object: Physical slots one object stores.
+        engine_kv_format: Native copy format of the group.
+    """
+
+    def __init__(
+        self,
+        *,
+        paged_arg: object,
+        objects_arg: "list[torch.Tensor] | list[int]",
+        block_ids_arg: "torch.Tensor | list[int]",
+        device: torch.device,
+        direction: "lmc_ops.TransferDirection",
+        shape_desc: object,
+        slots_per_object: int,
+        engine_kv_format: "lmc_ops.EngineKVFormat",
+    ) -> None:
+        # First Party
+        import lmcache.c_ops as lmc_ops_module
+
+        self._ops = lmc_ops_module
+        self._paged_arg = paged_arg
+        self._objects_arg = objects_arg
+        self._block_ids_arg = block_ids_arg
+        self._device = device
+        self._direction = direction
+        self._shape_desc = shape_desc
+        self._slots_per_object = slots_per_object
+        self._engine_kv_format = engine_kv_format
+
+    def stage_objects_to_device(self, batch: CopyBatch) -> None:
+        """No-op: the chunk tensors are already the transfer objects."""
+
+    def stage_objects_from_device(self, batch: CopyBatch) -> None:
+        """No-op: the chunk tensors are already the transfer objects."""
+
+    def launch_group_copy(self, batch: CopyBatch, launch: GroupLaunch) -> None:
+        """Copy one planned batch of objects between chunks and paged KV.
+
+        Args:
+            batch: Batch being copied.
+            launch: Planned block range, object count, and block skip.
+        """
+        self._ops.multi_layer_block_kv_transfer(
+            self._paged_arg,
+            self._objects_arg[
+                batch.object_start : batch.object_start + launch.num_objects
+            ],
+            self._block_ids_arg[
+                launch.block_offset : launch.block_offset + launch.num_blocks
+            ],
+            self._device,
+            self._direction,
+            self._shape_desc,
+            self._slots_per_object,
+            self._engine_kv_format,
+            launch.skip_blocks,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -514,25 +611,14 @@ def gather_paged_kv_to_cpu(
         )
 
     if selected_block_ids:
+        num_objects = len(iter_indices)
         if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
-            # Python fallback: accepts tensor list directly for all params.
-            paged_arg = normalized
-            objs_arg = chunks
-            block_ids_arg = selected_block_ids
-
-            # call kernel in one shot
-            lmc_ops.multi_layer_block_kv_transfer(
-                paged_arg,
-                objs_arg,
-                block_ids_arg,
-                tensors[0].device,
-                lmc_ops.TransferDirection.D2H,
-                shape_desc,
-                chunk_tokens,
-                engine_kv_format,
-                0,
-            )
-
+            # Python fallback: accepts tensor lists directly and has no
+            # per-launch object limit.
+            paged_arg: object = normalized
+            objects_arg: "list[torch.Tensor] | list[int]" = chunks
+            block_ids_arg: "torch.Tensor | list[int]" = selected_block_ids
+            max_objects_per_batch = num_objects
         else:
             # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
             _ptrs_np = np.array(
@@ -543,39 +629,38 @@ def gather_paged_kv_to_cpu(
 
             # This safely points to either the pre-pinned chunks
             # OR the temporary staged_chunks
-            objs_arg = _tensors_to_ptrs(chunks)
+            objects_arg = _tensors_to_ptrs(chunks)
 
             block_ids_arg = torch.tensor(
                 selected_block_ids, dtype=torch.int64, device=tensors[0].device
             )
+            max_objects_per_batch = _MAX_OBJECTS_PER_LAUNCH
 
-            # Split transfer to respect CUDA kernel's object count limitation
-            MAX_OBJECTS = 4
-            req_blocks_per_obj = blocks_per_chunk
-            total_objects = len(objs_arg)
-
-            for i in range(0, total_objects, MAX_OBJECTS):
-                # Slice object pointers and corresponding block IDs
-                batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-                start_block = i * req_blocks_per_obj
-                end_block = min(
-                    (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-                )
-                batch_blocks = block_ids_arg[start_block:end_block]
-
-                # Execute batched transfer
-                lmc_ops.multi_layer_block_kv_transfer(
-                    paged_arg,
-                    batch_objs_ptrs,
-                    batch_blocks,
-                    tensors[0].device,
-                    lmc_ops.TransferDirection.D2H,
-                    shape_desc,
-                    chunk_tokens,
-                    engine_kv_format,
-                    0,
-                )
+        plan = physical_transfer_plan(
+            layer_indices=tuple(range(num_layers)),
+            block_size=block_size,
+            blocks_per_object=blocks_per_chunk,
+            hidden_dim_size=content_size,
+            kv_size=get_kv_size(normalized, engine_kv_format),
+            dtype=tensors[0].dtype,
+            engine_kv_format=engine_kv_format,
+            selected_block_ids=selected_block_ids,
+            num_objects=num_objects,
+        )
+        execute_copy_batches(
+            plan_copy_batches([plan], max_objects_per_batch=max_objects_per_batch),
+            WorkerCopyEndpoint(
+                paged_arg=paged_arg,
+                objects_arg=objects_arg,
+                block_ids_arg=block_ids_arg,
+                device=tensors[0].device,
+                direction=lmc_ops.TransferDirection.D2H,
+                shape_desc=shape_desc,
+                slots_per_object=chunk_tokens,
+                engine_kv_format=engine_kv_format,
+            ),
+            direction=lmc_ops.TransferDirection.D2H,
+        )
 
     # --- Final reconciliation ---
     # If we used a staging buffer to protect unpinned shared memory,
@@ -636,7 +721,10 @@ def scatter_cpu_to_paged_kv(
     # First Party
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
+        get_head_size,
+        get_kv_size,
         get_num_blocks,
+        get_num_heads,
         get_num_layers,
         make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
@@ -679,7 +767,6 @@ def scatter_cpu_to_paged_kv(
             block_size,
             skip_first_n_tokens // block_size,
         )
-    skip_prefix_n_blocks = skip_first_n_tokens // block_size
 
     shape_desc = make_page_buffer_shape_desc(
         normalized,
@@ -700,22 +787,12 @@ def scatter_cpu_to_paged_kv(
         return
 
     if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
-        # Python fallback: accepts tensor list directly for all params.
-        paged_arg = normalized
-        objs_arg = chunks
-        block_ids_arg = selected_block_ids
-
-        lmc_ops.multi_layer_block_kv_transfer(
-            paged_arg,
-            objs_arg,
-            block_ids_arg,
-            tensors[0].device,
-            lmc_ops.TransferDirection.H2D,
-            shape_desc,
-            chunk_tokens,
-            engine_kv_format,
-            skip_prefix_n_blocks,
-        )
+        # Python fallback: accepts tensor lists directly and has no
+        # per-launch object limit.
+        paged_arg: object = normalized
+        objects_arg: "list[torch.Tensor] | list[int]" = chunks
+        block_ids_arg: "torch.Tensor | list[int]" = selected_block_ids
+        max_objects_per_batch = len(chunks)
     else:
         # assuming this is c ops path which requires pin memory
         # TODO: may have a better approach here
@@ -739,41 +816,149 @@ def scatter_cpu_to_paged_kv(
             dtype=np.uint64,
         ).view(np.int64)
         paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
-        objs_arg = _tensors_to_ptrs(chunks)
+        objects_arg = _tensors_to_ptrs(chunks)
         block_ids_arg = torch.tensor(
             selected_block_ids, dtype=torch.int64, device=tensors[0].device
         )
+        max_objects_per_batch = _MAX_OBJECTS_PER_LAUNCH
 
-        # Batched transfer to satisfy cuda's limitation (max 4 objects)
-        MAX_OBJECTS = 4
-        req_blocks_per_obj = (
-            blocks_per_chunk  # Each chunk corresponds to one object's blocks
-        )
-        total_chunks = len(chunks)
-
-        for i in range(0, total_chunks, MAX_OBJECTS):
-            # Slice objects and block IDs for this batch
-            batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-            start_block = i * req_blocks_per_obj
-            end_block = min(
-                (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-            )
-            batch_blocks = block_ids_arg[start_block:end_block]
-
-            # Execute transfer for this batch
-            lmc_ops.multi_layer_block_kv_transfer(
-                paged_arg,
-                batch_objs_ptrs,
-                batch_blocks,
-                tensors[0].device,
-                lmc_ops.TransferDirection.H2D,
-                shape_desc,
-                chunk_tokens,
-                engine_kv_format,
-                skip_prefix_n_blocks if i == 0 else 0,
-            )
+    plan = physical_transfer_plan(
+        layer_indices=tuple(range(num_layers)),
+        block_size=block_size,
+        blocks_per_object=blocks_per_chunk,
+        hidden_dim_size=get_num_heads(normalized, engine_kv_format)
+        * get_head_size(normalized, engine_kv_format),
+        kv_size=get_kv_size(normalized, engine_kv_format),
+        dtype=tensors[0].dtype,
+        engine_kv_format=engine_kv_format,
+        selected_block_ids=selected_block_ids,
+        num_objects=len(chunks),
+        skip_slots=skip_first_n_tokens,
+    )
+    execute_copy_batches(
+        plan_copy_batches([plan], max_objects_per_batch=max_objects_per_batch),
+        WorkerCopyEndpoint(
+            paged_arg=paged_arg,
+            objects_arg=objects_arg,
+            block_ids_arg=block_ids_arg,
+            device=tensors[0].device,
+            direction=lmc_ops.TransferDirection.H2D,
+            shape_desc=shape_desc,
+            slots_per_object=chunk_tokens,
+            engine_kv_format=engine_kv_format,
+        ),
+        direction=lmc_ops.TransferDirection.H2D,
+    )
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
     # WARNING: The caller MUST explicitly call `torch_dev.synchronize()`
     # before consuming these chunks to ensure data validity.
+
+
+# ---------------------------------------------------------------------------
+# Engine-driven execution over the common plans
+# ---------------------------------------------------------------------------
+
+
+def gather_engine_groups(
+    plans: Sequence[GroupTransferPlan],
+    kv_caches: dict[str, torch.Tensor],
+    layout_hints: LayoutHints | None = None,
+    out_per_group: list[list[torch.Tensor] | None] | None = None,
+    chunk_indices_per_group: list[list[int] | None] | None = None,
+) -> list[list[torch.Tensor]]:
+    """Gather KV data from device to CPU across all transfer groups.
+
+    Calls :func:`gather_paged_kv_to_cpu` once per group with the group's
+    KV subset, planned block IDs, and copied blocks per object, then assembles
+    the per-group chunk lists into a group-major result.
+
+    Args:
+        plans: Per-group plans from :func:`build_group_transfer_plans`.
+        kv_caches: Worker KV-cache tensors keyed by layer name.
+        layout_hints: Optional layout metadata forwarded to each
+            ``gather_paged_kv_to_cpu`` call.
+        out_per_group: Pre-allocated output tensors, one list per group.
+            ``None`` at index ``g`` means allocate fresh tensors for group
+            ``g`` (pickle mode). Length must equal ``len(plans)`` when given.
+        chunk_indices_per_group: Sparse chunk index lists, one per group.
+            ``None`` at index ``g`` means all chunks are needed. Length must
+            equal ``len(plans)`` when given.
+
+    Returns:
+        A group-major list: ``result[g]`` is the list of CPU tensors for group
+        ``g``. Empty list when ``plans`` is empty.
+    """
+    if not plans:
+        return []
+
+    result: list[list[torch.Tensor]] = []
+    for g_idx, plan in enumerate(plans):
+        out_g = out_per_group[g_idx] if out_per_group is not None else None
+        ci_g = (
+            chunk_indices_per_group[g_idx]
+            if chunk_indices_per_group is not None
+            else None
+        )
+        chunks = gather_paged_kv_to_cpu(
+            build_group_kv_subset(kv_caches, plan.group.layer_indices),
+            list(plan.selected_block_ids),
+            plan.group.copy_blocks_per_chunk,
+            layout_hints=layout_hints,
+            engine_kv_format=plan.group.engine_kv_format,
+            out=out_g,
+            chunk_indices=ci_g,
+        )
+        result.append(chunks)
+
+    return result
+
+
+def scatter_engine_groups(
+    plans: Sequence[GroupTransferPlan],
+    kv_caches: dict[str, torch.Tensor],
+    chunks_per_group: Sequence[list[torch.Tensor]],
+    layout_hints: LayoutHints | None = None,
+) -> None:
+    """Scatter KV data from CPU back to device across all transfer groups.
+
+    Calls :func:`scatter_cpu_to_paged_kv` once per group with the
+    group's KV subset, planned block IDs, and chunks. The APC prefix guard
+    comes from ``GroupTransferPlan.physical_skip``, resolved once by the common
+    planner.
+
+    Args:
+        plans: Per-group plans from :func:`build_group_transfer_plans`.
+        kv_caches: Worker KV-cache tensors keyed by layer name.
+        chunks_per_group: CPU tensors indexed ``[group_idx][chunk_idx]``.
+        layout_hints: Optional layout metadata forwarded to each
+            ``scatter_cpu_to_paged_kv`` call.
+
+    Raises:
+        ValueError: If the number of chunk lists, or the object count of any
+            group, does not match its plan.
+    """
+    if not plans:
+        return
+    if len(chunks_per_group) != len(plans):
+        raise ValueError(
+            f"chunks_per_group has {len(chunks_per_group)} entries "
+            f"but plans has {len(plans)} entries"
+        )
+    for plan, chunks in zip(plans, chunks_per_group, strict=True):
+        if len(chunks) != plan.transfer_objects:
+            raise ValueError(
+                f"server returned {len(chunks)} chunks for KV-cache object group "
+                f"{plan.group.object_group_id}, expected {plan.transfer_objects} "
+                f"(total_objects={plan.total_objects}, "
+                f"first_object={plan.first_object})"
+            )
+        scatter_cpu_to_paged_kv(
+            build_group_kv_subset(kv_caches, plan.group.layer_indices),
+            list(plan.selected_block_ids),
+            chunks,
+            plan.group.copy_blocks_per_chunk,
+            skip_first_n_tokens=plan.physical_skip,
+            layout_hints=layout_hints,
+            engine_kv_format=plan.group.engine_kv_format,
+        )

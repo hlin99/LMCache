@@ -13,10 +13,12 @@ import torch
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.transfer_context.base import (
+    gather_engine_groups,
+    gather_paged_kv_to_cpu,
+)
 from lmcache.v1.multiprocess.transfer_context.common_copy import (
     flatten_chunks_group_major,
-    gather_engine_groups,
 )
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
@@ -53,7 +55,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     ------------------
     When the base context registered with ``engine_group_infos``, the async
     store path routes through the multi-group
-    :func:`~.common_copy.gather_engine_groups` helper, assembling a group-major
+    :func:`~.base.gather_engine_groups` helper, assembling a group-major
     flat chunk list before commit.  The blocking retrieve path is inherited
     from :class:`EngineDrivenTransferContext` unchanged.
 
@@ -205,7 +207,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         future that resolves only after all three phases complete.
 
         For hybrid/HMA models with multiple engine groups the gather phase runs
-        once per group via :func:`~.common_copy.gather_engine_groups`, producing
+        once per group via :func:`~.base.gather_engine_groups`, producing
         a group-major flat chunk list that is committed in a single call.
 
         Args:
