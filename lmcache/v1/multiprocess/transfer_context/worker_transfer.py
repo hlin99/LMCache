@@ -18,6 +18,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     GroupLayoutSpec,
+    IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -1105,7 +1106,7 @@ class EngineDrivenTransferContext(TransferContext):
 
     def _best_effort_abort_store(
         self,
-        key: Any,
+        key: IPCCacheServerKey,
         instance_id: int,
         failure_context: str,
     ) -> None:

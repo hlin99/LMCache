@@ -33,7 +33,7 @@ class _FakeStoreContext:
     prepare_result: tuple[list[torch.Tensor], list[int], list[int]] | None = None
     prepare_impl: Callable[[], None] | None = None
     abort_impl: Callable[[], bool] | None = None
-    abort_store_calls: int = field(init=False, default=0)
+    abort_store_call_count: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
         self.layout_desc = SimpleNamespace(
@@ -53,7 +53,7 @@ class _FakeStoreContext:
         return bool(self.commit_impl(chunks))
 
     def abort_store(self, _key: object, _instance_id: int) -> bool:
-        self.abort_store_calls += 1
+        self.abort_store_call_count += 1
         return self.abort_impl() if self.abort_impl is not None else True
 
     def close(self) -> None:

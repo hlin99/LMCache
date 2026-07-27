@@ -274,7 +274,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 staged_chunks_single: list[torch.Tensor] = []
                 staged_per_group: list[list[torch.Tensor]] = []
 
-                def _best_effort_abort() -> None:
+                def attempt_abort_once() -> None:
                     nonlocal abort_attempted
                     if not prepared_shm_store or abort_attempted:
                         return
@@ -384,13 +384,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         )
 
                     if not ok:
-                        _best_effort_abort()
+                        attempt_abort_once()
                         logger.error(
                             "Async engine-driven commit_store failed for request_id=%s",
                             _request_id,
                         )
                 except Exception:
-                    _best_effort_abort()
+                    attempt_abort_once()
                     logger.exception(
                         "Async engine-driven store failed for request_id=%s",
                         _request_id,
