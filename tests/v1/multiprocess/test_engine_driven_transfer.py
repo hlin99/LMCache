@@ -615,6 +615,81 @@ def test_structured_single_group_retrieve_uses_grouped_scatter(
     assert scatter.call_args.args[2] == [[chunk]]
 
 
+@pytest.mark.parametrize(
+    "scatter_fails, commit_result, expect_commit",
+    [(True, True, False), (False, False, True)],
+)
+def test_failed_retrieve_never_reports_success(
+    monkeypatch: pytest.MonkeyPatch,
+    scatter_fails: bool,
+    commit_result: bool,
+    expect_commit: bool,
+) -> None:
+    """A retrieve is successful only when scatter and commit both succeed."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    calls: list[str] = []
+
+    class _FakeContext:
+        def prepare_retrieve(
+            self, _key: object, _instance_id: int
+        ) -> tuple[list[torch.Tensor], list[int]]:
+            return [torch.ones(2, 2, 8, 16)], [1]
+
+        def commit_retrieve(self, _key: object, _instance_id: int) -> bool:
+            calls.append("commit")
+            return commit_result
+
+        def abort_retrieve(self, _key: object, _instance_id: int) -> bool:
+            calls.append("abort")
+            return True
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: _FakeContext(),
+    )
+
+    def failing_scatter(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("scatter failed")
+
+    if scatter_fails:
+        monkeypatch.setattr(worker_transfer, "scatter_engine_groups", failing_scatter)
+    else:
+        monkeypatch.setattr(worker_transfer, "scatter_engine_groups", MagicMock())
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches()
+    ctx.register(
+        instance_id=31,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=[EngineGroupInfo(0, (0, 1), tokens_per_block=4)],
+        lmcache_tokens_per_chunk=8,
+    )
+
+    result = ctx.submit_retrieve(
+        "req", _default_key(), 31, kv_caches, [[0, 1]], MagicMock(), 2
+    ).result()
+
+    assert result is False
+    assert calls == (["commit"] if expect_commit else ["abort"])
+
+
 def test_structured_single_group_sparse_shm_store_uses_exact_indices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
