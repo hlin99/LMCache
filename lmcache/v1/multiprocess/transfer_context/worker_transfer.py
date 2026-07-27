@@ -212,6 +212,8 @@ def _split_shm_buffers_by_group(
     out_buffers: list[torch.Tensor] | None,
     chunk_indices: list[int] | None,
     plans: list["GroupCopyPlan"],
+    *,
+    server_group_counts: list[int] | None = None,
 ) -> tuple[list[list[torch.Tensor] | None], list[list[int] | None]]:
     """Split flat SHM out_buffers and chunk_indices lists by group.
 
@@ -221,6 +223,9 @@ def _split_shm_buffers_by_group(
     gather calls.
 
     When ``out_buffers`` is ``None`` (pickle mode) all entries are ``None``.
+    When ``server_group_counts`` is provided (from the ``group_counts`` field
+    in the SHM ``prepare_store`` response context), it is used for exact
+    per-group slot counts.  Otherwise a proportional heuristic is applied.
 
     Args:
         out_buffers: Flat list of SHM-backed output tensors (group-major), or
@@ -228,6 +233,8 @@ def _split_shm_buffers_by_group(
         chunk_indices: Flat list of sparse chunk indices (group-major), or
             ``None`` when all chunks are needed.
         plans: Per-group copy plans (provides ``num_chunks`` per group).
+        server_group_counts: Per-group slot counts from the server response, or
+            ``None`` / empty list when not available.
 
     Returns:
         ``(out_per_group, ci_per_group)`` where each list has one entry per
@@ -241,19 +248,20 @@ def _split_shm_buffers_by_group(
     buf_offset = 0
     ci_offset = 0
 
-    for plan in plans:
-        n = plan.num_chunks if chunk_indices is None else 0
-        # When chunk_indices is present, count how many indices fall in this
-        # group's portion of the flat sequence.
-        if chunk_indices is not None:
-            # The SHM server populates slots in group-major order matching
-            # prepare_store. We do not have per-group slot counts here, so we
-            # infer the group's slot count by scanning chunk_indices.
-            # Each group's slots appear consecutively; their count equals the
-            # number of non-cached chunks for that group (len of its entries).
-            # Since we only know plan.num_chunks (total) and not the filtered
-            # count, we use a safe heuristic: count SHM slots per group as
-            # proportional to plan.num_chunks / total_chunks.
+    for g_idx, plan in enumerate(plans):
+        # Prefer exact counts from the server (set for hybrid/HMA multi-group
+        # SHM responses).  Fall back to heuristic proportional estimate when
+        # the server does not supply per-group counts.
+        if (
+            server_group_counts
+            and len(server_group_counts) > g_idx
+            and chunk_indices is not None
+        ):
+            n = server_group_counts[g_idx]
+        elif chunk_indices is None:
+            n = plan.num_chunks
+        else:
+            # Proportional heuristic: approximate per-group slot count.
             total_chunks = sum(p.num_chunks for p in plans)
             if total_chunks > 0 and len(chunk_indices) > 0:
                 n = round(plan.num_chunks * len(chunk_indices) / total_chunks)
@@ -913,7 +921,9 @@ class EngineDrivenTransferContext(TransferContext):
         plans = self._build_group_plans(kv_caches, block_ids, blocks_in_chunk)
 
         result = self._engine_driven_context.prepare_store(key, instance_id)
-        out_buffers, chunk_indices = result if result is not None else (None, None)
+        out_buffers, chunk_indices, server_group_counts = (
+            result if result is not None else (None, None, [])
+        )
         # All chunks already in cache — nothing to gather or commit.
         if chunk_indices is not None and len(chunk_indices) == 0:
             future: MessagingFuture[bool] = MessagingFuture()
@@ -923,7 +933,8 @@ class EngineDrivenTransferContext(TransferContext):
         if plans:
             # Multi-group (hybrid/HMA) path: gather per group and flatten.
             out_per_group, ci_per_group = _split_shm_buffers_by_group(
-                out_buffers, chunk_indices, plans
+                out_buffers, chunk_indices, plans,
+                server_group_counts=server_group_counts,
             )
             chunks_per_group = gather_engine_groups(
                 plans,

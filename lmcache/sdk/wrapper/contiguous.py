@@ -47,7 +47,7 @@ class ContiguousTransferWrapper:
             ]
         else:
             # SHM: fill missing chunks' slots in place.
-            slot_tensors, chunk_indices = result
+            slot_tensors, chunk_indices, _group_counts = result
             for slot, chunk_idx in zip(slot_tensors, chunk_indices, strict=True):
                 start = chunk_idx * self._chunk_size
                 slot.copy_(kv[:, :, start : start + self._chunk_size, :])

@@ -30,7 +30,7 @@ class _FakeStoreContext:
     """Minimal engine-driven context for async store tests."""
 
     commit_impl: Callable[[list[torch.Tensor]], bool]
-    prepare_result: tuple[list[torch.Tensor], list[int]] | None = None
+    prepare_result: tuple[list[torch.Tensor], list[int], list[int]] | None = None
     prepare_impl: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
@@ -40,7 +40,7 @@ class _FakeStoreContext:
 
     def prepare_store(
         self, _key: object, _instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
         if self.prepare_impl is not None:
             self.prepare_impl()
         return self.prepare_result

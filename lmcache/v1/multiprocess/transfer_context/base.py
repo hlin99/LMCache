@@ -199,20 +199,25 @@ class EngineDrivenContext(ABC):
     @abstractmethod
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
         """Prepare SHM buffers for a store operation.
 
         Returns:
             None: pickle mode — no pre-allocated buffers. Caller gathers all
                 chunks to CPU itself and sends the serialized data via
                 commit_store.
-            ([], []): SHM mode but all chunks already cached. Caller should
+            ([], [], []): SHM mode but all chunks already cached. Caller should
                 skip gather and commit entirely.
-            (tensors, chunk_indices): SHM mode with new chunks to write.
+            (tensors, chunk_indices, group_counts): SHM mode with new chunks to
+                write.
                 - tensors[i] is a writable SHM-backed buffer for one chunk.
                 - chunk_indices[i] is the position of that chunk in the full
                   block_ids sequence (e.g. [0, 2] means only chunks 0 and 2
                   need writing; chunk 1 is already cached).
+                - group_counts[g] is the number of SHM slots for group g in
+                  hybrid/HMA mode.  Empty list means single-group (no per-group
+                  split information available; callers should fall back to the
+                  proportional heuristic).
                 Caller gathers only these chunks into the provided tensors,
                 then calls commit_store with empty payload.
         """

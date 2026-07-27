@@ -39,7 +39,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
 
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
         """Send PREPARE_STORE RPC. For pickle, returns no pre-allocated buffers."""
         future = self.mq_client.submit_request(
             RequestType.PREPARE_STORE,
