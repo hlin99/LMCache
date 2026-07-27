@@ -805,6 +805,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             start time. The start time is ``None`` when preparation did not
             record one; successful commit uses it for completion timing while
             abort discards it.
+
+        Raises:
+            Exception: If strategy cleanup fails.
         """
         _, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)

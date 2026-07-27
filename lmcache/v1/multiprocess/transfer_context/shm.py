@@ -269,7 +269,19 @@ class EngineDrivenContextShm(EngineDrivenContext):
         key: IPCCacheServerKey,
         instance_id: int,
     ) -> bool:
-        """Send a retrieve finalization request."""
+        """Send a retrieve finalization request.
+
+        Args:
+            request_type: Commit or abort operation to send.
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            The server's cleanup result, or ``False`` on timeout.
+
+        Raises:
+            Exception: If request submission or response decoding fails.
+        """
         future = self.mq_client.submit_request(
             request_type,
             [key, instance_id],

@@ -139,7 +139,17 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         key: IPCCacheServerKey,
         instance_id: int,
     ) -> bool:
-        """Send a retrieve finalization request."""
+        """Send a retrieve finalization request.
+
+        Args:
+            request_type: Commit or abort operation to send.
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            Always ``True`` because Pickle holds no read lock; response timeouts
+            are intentionally ignored.
+        """
         future = self.mq_client.submit_request(
             request_type,
             [key, instance_id],

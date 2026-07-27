@@ -84,6 +84,10 @@ class ContiguousTransferWrapper:
     def _abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> None:
         """Release retrieve resources while preserving the caller's outcome.
 
+        Args:
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
         Unlike ``commit_retrieve``, this marks the retrieve unsuccessful.
         Transport errors are logged and suppressed so they do not replace the
         miss result or exception already being returned by ``retrieve``.

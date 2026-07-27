@@ -1116,8 +1116,9 @@ class EngineDrivenTransferContext(TransferContext):
             instance_id: Worker process instance identifier.
             failure_context: Short description included in abort-error logs.
 
-        Abort errors are logged and suppressed so gather or commit failures
-        remain the exception observed by the caller.
+        This side-effect-only method returns no value. Abort errors are logged
+        and suppressed so the caller's gather or commit exception propagates
+        unmodified.
         """
         if self._engine_driven_context is None:
             return
