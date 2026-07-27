@@ -39,8 +39,10 @@ blocks-per-chunk value and requires equal logical chunk coverage. Sliding Window
 groups then retain trailing blocks within each chunk; retrieve additionally
 retains only the trailing objects covered by the window.
 
-Both transfer paths share this model and planning logic, in
-`lmcache/v1/multiprocess/transfer_context/common_copy.py`:
+Both transfer paths share this model, its planning logic
+(`lmcache/v1/multiprocess/transfer_context/common_copy.py`, the *what*), and its
+launch planning and execution
+(`lmcache/v1/multiprocess/transfer_context/common_exec.py`, the *how*):
 
 ```text
         registered_groups_from_kv_layer_groups()   registered_groups_from_engine_infos()
@@ -52,19 +54,32 @@ Both transfer paths share this model and planning logic, in
                                   Window block selection, object-tail
                                   selection, logical -> physical skip)
                                                  |
+                                          plan_copy_batches()
+                                 (object batching, per-launch block ranges,
+                                  APC skip placement, dropped batches)
+                                                 |
+                                        execute_copy_batches()
+                                 (staging/launch/flush order, per direction)
+                                                 |
                         +------------------------+------------------------+
                         |                                                 |
+                  CopyEndpoint                                      CopyEndpoint
               LMCache-driven server                            Engine-driven worker
-        native object-group transfer over IPC              gather/scatter over local
-              KV views + MemoryObj staging                  KV tensors + SHM/pickle
+        `_StreamObjectGroupEndpoint` (immediate)          `WorkerCopyEndpoint` over
+        `_NativeObjectGroupEndpoint` (one recorded        `multi_layer_block_kv_transfer`
+        `execute_object_group_transfer`), over IPC        on worker-local KV tensors
+        KV views + MemoryObj staging                      + SHM/pickle chunk buffers
 ```
 
-Each path keeps its own copy *execution*, because they drive different native
-primitives (`execute_object_group_transfer` with server-side kernel-group specs
-versus `multi_layer_block_kv_transfer` on worker-local tensors) over different
-memory (IPC-opened views versus registered engine tensors). Everything that
-decides *which* blocks, objects, and slots move is computed once, in the common
-module, so the two paths cannot drift.
+The endpoint is the only path-specific part. It owns the transport concerns the
+common modules deliberately exclude -- which buffers back the objects, how they
+are staged to and from the device, which native primitive performs the copy, and
+when the caller synchronizes, commits, or aborts. Everything that decides
+*which* blocks, objects, and slots move, *how they are batched*, and *in which
+order staging and launches are issued* is computed once, so the two paths cannot
+drift. `tests/v1/multiprocess/test_cross_path_copy_equivalence.py` pins this
+down end to end: for the same hybrid request both paths must produce identical
+store bytes and identical retrieved KV tensors.
 
 Wire order is group-major (`group 0 chunk 0..N`, then group 1, and so on).
 Structured SHM and pickle responses carry exact per-group counts, including
