@@ -794,7 +794,18 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         key: IPCCacheServerKey,
         instance_id: int,
     ) -> tuple[bool, float | None]:
-        """Release retrieve resources and return its result and start time."""
+        """Release resources shared by successful and aborted retrieves.
+
+        Args:
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            A pair containing the strategy cleanup result and the recorded
+            start time. The start time is ``None`` when preparation did not
+            record one; successful commit uses it for completion timing while
+            abort discards it.
+        """
         _, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("retrieve_start_time", None)

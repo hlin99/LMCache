@@ -1109,7 +1109,16 @@ class EngineDrivenTransferContext(TransferContext):
         instance_id: int,
         failure_context: str,
     ) -> None:
-        """Abort a prepared SHM store without masking its original failure."""
+        """Release a failed SHM reservation without raising abort errors.
+
+        Args:
+            key: Cache key for the prepared store.
+            instance_id: Worker process instance identifier.
+            failure_context: Short description included in abort-error logs.
+
+        Abort errors are logged and suppressed so gather or commit failures
+        remain the exception observed by the caller.
+        """
         if self._engine_driven_context is None:
             return
         try:

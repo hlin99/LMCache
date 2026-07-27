@@ -117,7 +117,9 @@ class EngineDrivenContextPickle(EngineDrivenContext):
             try:
                 self.abort_retrieve(key, instance_id)
             except Exception:
-                logger.exception("Failed to abort invalid pickle retrieve response")
+                logger.exception(
+                    "Failed to abort pickle retrieve after invalid response"
+                )
             raise
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:

@@ -218,7 +218,19 @@ class EngineDrivenContext(ABC):
 
     @abstractmethod
     def abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
-        """Release retrieve resources without reporting successful completion."""
+        """Release resources after a miss or failed retrieve.
+
+        Args:
+            key: Cache key for the retrieve range.
+            instance_id: Worker process instance identifier.
+
+        Returns:
+            ``True`` when server-side cleanup succeeds, otherwise ``False``.
+
+        Raises:
+            Exception: If the transport cannot submit or decode the cleanup
+                request.
+        """
         ...
 
     @abstractmethod

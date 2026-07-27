@@ -82,7 +82,12 @@ class ContiguousTransferWrapper:
         return result
 
     def _abort_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> None:
-        """Abort a retrieve without hiding the original retrieval outcome."""
+        """Release retrieve resources while preserving the caller's outcome.
+
+        Unlike ``commit_retrieve``, this marks the retrieve unsuccessful.
+        Transport errors are logged and suppressed so they do not replace the
+        miss result or exception already being returned by ``retrieve``.
+        """
         try:
             self._context.abort_retrieve(key, instance_id)
         except Exception:
