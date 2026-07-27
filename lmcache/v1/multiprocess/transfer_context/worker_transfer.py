@@ -226,8 +226,9 @@ def _split_shm_buffers_by_group(
     gather calls.
 
     When ``out_buffers`` is ``None`` (pickle mode) all entries are ``None``.
-    Structured SHM responses must carry exact ``server_group_counts`` even for
-    one group; group ownership is never inferred from flat list lengths.
+    This helper is called only for structured group plans. Their SHM responses
+    must carry exact ``server_group_counts`` even for one group; ownership is
+    never inferred from flat list lengths.
 
     Args:
         out_buffers: Flat list of SHM-backed output tensors (group-major), or

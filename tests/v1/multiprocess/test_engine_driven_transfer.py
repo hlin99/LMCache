@@ -238,7 +238,7 @@ def _default_register_payload(
 def _structured_single_group_payload(
     instance_id: int,
 ) -> "RegisterEngineDrivenContextPayload":
-    """Build a structured registration payload containing one object group."""
+    """Build a one-group payload whose explicit group_layouts select structured mode."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import GroupLayoutSpec
 
@@ -1618,7 +1618,7 @@ def test_server_prepare_store_releases_unused_reserved_write_locks(
         _default_register_payload(instance_id=5)
     )
     key = _default_key()
-    with pytest.raises(ValueError, match="lack writable tensors"):
+    with pytest.raises(ValueError, match="none have writable tensors"):
         module.prepare_store(key, 5)
     reserved_keys = mock_storage.reserve_write.call_args[0][0]
     mock_storage.delete_l1_keys.assert_called_once_with(reserved_keys, force=True)

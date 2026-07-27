@@ -357,6 +357,8 @@ class PickleTransferStrategy(TransferStrategy):
                 obj_keys, context.layout_desc, "new"
             )
 
+        # Equal lengths alone do not prove exact coverage if a backend returns
+        # an unexpected key, so validate membership as well.
         has_complete_reservation = len(reserved_dict) == len(obj_keys) and all(
             obj_key in reserved_dict for obj_key in obj_keys
         )
@@ -554,7 +556,7 @@ class ShmTransferStrategy(TransferStrategy):
         if not reserved_keys:
             if reserved:
                 raise ValueError(
-                    "all reserved SHM slots lack writable tensors; "
+                    "storage reserved SHM slots but none have writable tensors; "
                     "the storage backend may be misconfigured or exhausted"
                 )
             ctx: dict[str, Any] = {"slots": [], "chunk_indices": []}
