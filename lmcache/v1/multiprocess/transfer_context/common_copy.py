@@ -205,7 +205,9 @@ class RegisteredGroup:
 
         Returns:
             Number of physical slots to skip: :meth:`blocks_to_skip` scaled by
-            ``slots_per_block``.
+            ``slots_per_block``. A skip that does not land on a block boundary
+            rounds down, so protected tokens are never partially overwritten
+            while the copy stays block-granular.
 
         Raises:
             ValueError: If ``logical_skip`` is negative.

@@ -1124,7 +1124,12 @@ class EngineDrivenTransferContext(TransferContext):
             return False
         try:
             if transferred:
-                return self._engine_driven_context.commit_retrieve(key, instance_id)
+                committed = self._engine_driven_context.commit_retrieve(
+                    key, instance_id
+                )
+                if not committed:
+                    logger.warning("Server rejected engine-driven retrieve commit")
+                return committed
             self._engine_driven_context.abort_retrieve(key, instance_id)
         except Exception:
             logger.exception(
