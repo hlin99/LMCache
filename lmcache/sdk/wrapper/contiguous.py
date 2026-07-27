@@ -90,6 +90,9 @@ class ContiguousTransferWrapper:
             self._abort_retrieve(key, instance_id)
             raise
         if not committed:
+            logger.warning(
+                "Contiguous retrieve commit failed for key %s; aborting retrieve", key
+            )
             self._abort_retrieve(key, instance_id)
             return None
         return result
