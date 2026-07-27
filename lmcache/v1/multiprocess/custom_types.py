@@ -120,6 +120,39 @@ class IPCCacheServerKey:
 KVCache = list[DeviceIPCWrapper]
 
 
+class GroupLayoutSpec(msgspec.Struct, frozen=True):
+    """Per-LMCache-object-group layout specification for hybrid/HMA registration.
+
+    One entry per LMCache group (``EngineGroupInfo``) in a hybrid model.
+    When ``RegisterEngineDrivenContextPayload.group_layouts`` is non-empty the
+    server uses these per-group specs instead of the flat fields; this allows
+    Full-Attention + Sliding-Window hybrid models to register groups with
+    different block sizes, hidden dimensions, and dtypes.
+
+    Attributes:
+        num_layers: Number of KV tensor layers assigned to this object group.
+        hidden_dim_size: Flattened hidden dimension per token for this group.
+        dtype_str: Torch dtype name (e.g. ``"bfloat16"``).
+        block_size: Physical tokens per paged block for this group.
+        use_mla: Whether this group uses the MLA (single-plane) KV format.
+        tokens_per_block: Logical tokens per paged chunk. ``0`` means equal to
+            ``block_size`` (no compression/sub-block addressing).
+        engine_group_id: Which engine group supplies block IDs for this object
+            group (dense from 0, matching ``EngineGroupInfo.engine_group_id``).
+        sw_size_tokens: Sliding-window size in tokens for this group.
+            ``-1`` means full attention (no window).
+    """
+
+    num_layers: int
+    hidden_dim_size: int
+    dtype_str: str
+    block_size: int
+    use_mla: bool
+    tokens_per_block: int = 0
+    engine_group_id: int = 0
+    sw_size_tokens: int = -1
+
+
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
     """Payload for the REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT protocol message.
 
@@ -127,11 +160,17 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         instance_id: Worker instance identifier (typically PID).
         model_name: Model name associated with this worker.
         world_size: Worker world size used in cache keys.
-        block_size: Tokens per paged block.
-        num_layers: Number of model layers.
-        hidden_dim_size: Flattened hidden dimension per token.
-        dtype_str: Torch dtype name (e.g. ``"float16"``).
-        use_mla: Whether the worker KV format is MLA.
+        block_size: Tokens per paged block (group-0 / legacy single-group value).
+        num_layers: Number of model layers (group-0 / legacy value).
+        hidden_dim_size: Flattened hidden dimension per token (group-0 / legacy).
+        dtype_str: Torch dtype name (e.g. ``"float16"``; group-0 / legacy).
+        use_mla: Whether the worker KV format is MLA (group-0 / legacy).
+        group_layouts: Per-LMCache-object-group layout specs for hybrid/HMA
+            models. Empty list means single-group legacy mode; the flat fields
+            above are the authoritative source. When non-empty, each entry
+            describes one LMCache object group in group-index order, and the
+            flat fields are ignored by the server (but still sent for wire
+            forward-compat with old servers).
     """
 
     instance_id: int
@@ -142,6 +181,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    group_layouts: list[GroupLayoutSpec] = []
 
 
 @dataclass

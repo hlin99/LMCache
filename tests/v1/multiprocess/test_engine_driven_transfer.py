@@ -1561,7 +1561,7 @@ def test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq() -> None:
         key = _default_key()
         store_result = context.prepare_store(key=key, instance_id=1)
         assert store_result is not None
-        store_views, _ = store_result
+        store_views, _, _ = store_result
         store_views[0].copy_(
             torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
         )
