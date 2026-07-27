@@ -154,11 +154,11 @@ def test_non_gpu_reap_pops_strategy_as_pair() -> None:
     module = _bare_non_gpu_module()
     old = time.monotonic() - 1000.0
     module._engine_driven_contexts[1] = non_gpu_mod.EngineDrivenContextEntry(
-        MagicMock(), "m", 1, old, True
+        MagicMock(), "m", 1, 1, old, True
     )
     module._strategies[1] = MagicMock()
     module._engine_driven_contexts[2] = non_gpu_mod.EngineDrivenContextEntry(
-        MagicMock(), "m", 1, old, False
+        MagicMock(), "m", 1, 1, old, False
     )
     module._strategies[2] = MagicMock()
 
@@ -174,7 +174,7 @@ def test_non_gpu_resolve_for_transfer_refreshes_and_raises() -> None:
     last_seen; an unknown id raises ValueError."""
     module = _bare_non_gpu_module()
     module._engine_driven_contexts[1] = non_gpu_mod.EngineDrivenContextEntry(
-        MagicMock(), "m", 1, 0.0, False
+        MagicMock(), "m", 1, 1, 0.0, False
     )
     strategy = MagicMock()
     module._strategies[1] = strategy
