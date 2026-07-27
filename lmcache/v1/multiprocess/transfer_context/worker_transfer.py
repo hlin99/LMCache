@@ -695,7 +695,7 @@ class EngineDrivenTransferContext(TransferContext):
             raise ValueError(
                 "lmcache_tokens_per_chunk must be specified when "
                 "engine_group_infos is non-empty; provide the authoritative "
-                "LMCache chunk size in tokens"
+                "LMCache chunk size in tokens from the engine configuration"
             )
         layout_source = (
             build_group_kv_subset(kv_caches, engine_group_infos[0].layer_indices)

@@ -95,7 +95,7 @@ def test_registered_groups_validate_ids_layers_and_geometry() -> None:
         validate_registered_groups([_group(0, 0, (2,))], 2)
 
 
-def test_registered_groups_allow_explicit_cross_layer_aliases() -> None:
+def test_validate_registered_groups_with_explicit_cross_layer_aliases() -> None:
     """Only explicitly excluded cross-layer aliases may lack an owner group."""
     groups = [_group(0, 0, (0,)), _group(1, 1, (1,))]
 
