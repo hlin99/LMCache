@@ -13,7 +13,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
@@ -32,6 +32,86 @@ logger = init_logger(__name__)
 def _dtype_to_name(dtype: torch.dtype) -> str:
     """Return a stable torch dtype name without module prefix."""
     return str(dtype).split(".")[-1]
+
+
+def _per_group_layout_desc(
+    layout_desc: MemoryLayoutDesc, group_idx: int
+) -> MemoryLayoutDesc:
+    """Return a single-shape MemoryLayoutDesc for the given object group.
+
+    Args:
+        layout_desc: Full multi-group layout descriptor.
+        group_idx: 0-based object-group index.
+
+    Returns:
+        A ``MemoryLayoutDesc`` with exactly one shape and dtype, selecting
+        the entry at ``group_idx``.  If ``group_idx`` is out of range, falls
+        back to the first entry.
+    """
+    idx = group_idx if group_idx < len(layout_desc.shapes) else 0
+    return MemoryLayoutDesc(
+        shapes=[layout_desc.shapes[idx]],
+        dtypes=[layout_desc.dtypes[idx]],
+    )
+
+
+def _split_obj_keys_by_group(
+    obj_keys: list[ObjectKey],
+    num_groups: int,
+) -> dict[int, list[tuple[int, ObjectKey]]]:
+    """Split a flat (possibly group-major) list of ObjectKeys by object_group_id.
+
+    Args:
+        obj_keys: Flat list of ObjectKeys, typically in group-major order.
+        num_groups: Expected number of object groups.
+
+    Returns:
+        Mapping from ``object_group_id`` to ``[(original_index, ObjectKey), ...]``.
+    """
+    result: dict[int, list[tuple[int, ObjectKey]]] = {
+        g: [] for g in range(num_groups)
+    }
+    for idx, key in enumerate(obj_keys):
+        gid = key.object_group_id
+        if gid not in result:
+            result[gid] = []
+        result[gid].append((idx, key))
+    return result
+
+
+def _reserve_multi_group(
+    storage_manager: "StorageManager",
+    obj_keys: list[ObjectKey],
+    layout_desc: MemoryLayoutDesc,
+    num_groups: int,
+    mode: str = "new",
+) -> dict[ObjectKey, Any]:
+    """Reserve write slots for a multi-group flat obj_key list.
+
+    Splits keys by ``object_group_id``, reserves each group separately with
+    its per-group single-shape layout, then merges the results.
+
+    Args:
+        storage_manager: Storage manager for reservation.
+        obj_keys: Flat list of ObjectKeys in any order.
+        layout_desc: Multi-group layout descriptor (one shape per group).
+        num_groups: Number of expected object groups.
+        mode: Reservation mode (``"new"``, ``"update"``, or ``"all"``).
+
+    Returns:
+        Merged dict mapping each reserved ObjectKey to its MemoryObj.
+    """
+    by_group = _split_obj_keys_by_group(obj_keys, num_groups)
+    merged: dict[ObjectKey, Any] = {}
+    for g in range(num_groups):
+        group_pairs = by_group.get(g, [])
+        if not group_pairs:
+            continue
+        group_keys = [k for _, k in group_pairs]
+        g_layout = _per_group_layout_desc(layout_desc, g)
+        reserved = storage_manager.reserve_write(group_keys, g_layout, mode)
+        merged.update(reserved)
+    return merged
 
 
 def create_transfer_strategy(
@@ -63,7 +143,7 @@ def create_transfer_strategy(
         positive pool size, otherwise ``PickleTransferStrategy``.
     """
     if shm_name and pool_size > 0:
-        logger.info("Using shm non-GPU transfer strategy")
+        logger.debug("Using shm non-GPU transfer strategy")
         return ShmTransferStrategy(
             storage_manager=storage_manager,
             pending_writes=pending_writes,
@@ -73,7 +153,7 @@ def create_transfer_strategy(
             fallback_strategy=PickleTransferStrategy(storage_manager),
         )
 
-    logger.info("Using pickle non-GPU transfer strategy")
+    logger.debug("Using pickle non-GPU transfer strategy")
     return PickleTransferStrategy(storage_manager)
 
 
@@ -169,6 +249,13 @@ class PickleTransferStrategy(TransferStrategy):
     fallback by the SHM strategy when the worker sends an inline serialized payload.
     ``prepare_store`` returns an empty context, while ``commit_store`` deserializes
     the pickle payload and writes the resulting tensors into reserved objects.
+
+    Multi-group (hybrid/HMA) support
+    ---------------------------------
+    When ``context.num_object_groups > 1``, the pickled ``cpu_data`` payload
+    is expected to contain a flat group-major list of tensors.  The server
+    resolves per-group object keys, reserves write slots with per-group
+    layouts, and maps flat-list positions to keys via matching ``object_group_id``.
     """
 
     def __init__(
@@ -205,14 +292,27 @@ class PickleTransferStrategy(TransferStrategy):
     ) -> bool:
         """Deserialize and write pickled chunks into reserved objects.
 
+        For single-group models the pickled payload is ``list[Tensor]``
+        (one tensor per chunk). For hybrid/HMA models the payload is a flat
+        group-major ``list[Tensor]`` (group-0 chunks first, then group-1,
+        etc.).
+
         Returns:
             ``True`` when every reserved object is written successfully.
         """
         obj_keys = resolve_obj_keys(key)
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
-        reserved_dict = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
-        )
+        num_groups = context.num_object_groups
+
+        if num_groups > 1:
+            reserved_dict = _reserve_multi_group(
+                self._storage_manager, obj_keys, context.layout_desc, num_groups
+            )
+        else:
+            reserved_dict = self._storage_manager.reserve_write(
+                obj_keys, context.layout_desc, "new"
+            )
+
         written_keys: list[ObjectKey] = []
         try:
             for idx, obj_key in enumerate(obj_keys):
@@ -279,6 +379,14 @@ class ShmTransferStrategy(TransferStrategy):
     ``prepare_retrieve`` so workers can access storage buffers directly. It tracks
     pending SHM reservations until the matching commit step releases them, and it
     falls back to pickle-based commit handling when ``cpu_data`` is non-empty.
+
+    Multi-group (hybrid/HMA) support
+    ---------------------------------
+    When ``context.num_object_groups > 1``, slots and chunk_indices in the
+    response context are in group-major order.  The additional ``group_counts``
+    field (``list[int]``, one entry per group) encodes how many slots each
+    group occupies so the worker can reconstruct the per-group split without
+    any side-channel.
     """
 
     def __init__(
@@ -318,16 +426,31 @@ class ShmTransferStrategy(TransferStrategy):
     ) -> PrepareStoreResponse:
         """Reserve SHM-backed objects and return slot descriptors.
 
+        For single-group models returns ``{"slots": [...], "chunk_indices":
+        [...]}``.  For hybrid/HMA models also includes ``"group_counts":
+        [n0, n1, ...]`` encoding the per-group slot counts in group-major
+        order.
+
         Returns:
-            Context with ``slots`` and ``chunk_indices``.
+            Context with ``slots``, ``chunk_indices``, and optionally
+            ``group_counts``.
         """
         obj_keys = resolve_obj_keys(key)
-        reserved = self._storage_manager.reserve_write(
-            obj_keys, context.layout_desc, "new"
-        )
+        num_groups = context.num_object_groups
+
+        if num_groups > 1:
+            reserved = _reserve_multi_group(
+                self._storage_manager, obj_keys, context.layout_desc, num_groups
+            )
+        else:
+            reserved = self._storage_manager.reserve_write(
+                obj_keys, context.layout_desc, "new"
+            )
+
         slots: list[dict[str, Any]] = []
         chunk_indices: list[int] = []
         reserved_keys: list[ObjectKey] = []
+        group_slot_counts: list[int] = [0] * num_groups
         try:
             for idx, obj_key in enumerate(obj_keys):
                 memory_obj = reserved.get(obj_key)
@@ -343,21 +466,29 @@ class ShmTransferStrategy(TransferStrategy):
                 )
                 chunk_indices.append(idx)
                 reserved_keys.append(obj_key)
+                gid = obj_key.object_group_id if num_groups > 1 else 0
+                if gid < len(group_slot_counts):
+                    group_slot_counts[gid] += 1
         finally:
             reserved_keys_set = set(reserved_keys)
-            unused_keys = [
-                obj_key for obj_key in reserved if obj_key not in reserved_keys_set
-            ]
+            unused_keys = [k for k in reserved if k not in reserved_keys_set]
             if unused_keys:
                 self._storage_manager.finish_write(unused_keys)
+
         if not reserved_keys:
-            return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
+            ctx: dict[str, Any] = {"slots": [], "chunk_indices": []}
+            if num_groups > 1:
+                ctx["group_counts"] = [0] * num_groups
+            return PrepareStoreResponse(context=ctx)
+
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
             self._pending_writes[transfer_key] = reserved_keys
-        return PrepareStoreResponse(
-            context={"slots": slots, "chunk_indices": chunk_indices}
-        )
+
+        ctx = {"slots": slots, "chunk_indices": chunk_indices}
+        if num_groups > 1:
+            ctx["group_counts"] = group_slot_counts
+        return PrepareStoreResponse(context=ctx)
 
     def commit_store(
         self,
@@ -438,3 +569,4 @@ class ShmTransferStrategy(TransferStrategy):
         if prefetched_keys:
             self._storage_manager.finish_read_prefetched(prefetched_keys)
         return True
+

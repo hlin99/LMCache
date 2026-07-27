@@ -2,7 +2,8 @@
 """Engine-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 import threading
 import time
 
@@ -13,6 +14,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
 )
@@ -51,6 +53,8 @@ class EngineDrivenContextEntry:
         metadata: Layout metadata describing the non-CUDA chunk format.
         model_name: The name of the model associated with this context.
         world_size: The world size associated with this context.
+        num_object_groups: Number of LMCache object groups (1 for single-group,
+            >1 for hybrid/HMA). Drives per-group object key resolution.
         last_seen: ``time.monotonic()`` of the most recent activity from this
             instance (register, PING, prepare/commit). Drives reaping.
         has_liveness_signal: True once the instance has sent at least one
@@ -60,6 +64,7 @@ class EngineDrivenContextEntry:
     metadata: EngineDrivenContextMetadata
     model_name: str
     world_size: int
+    num_object_groups: int = 1
     last_seen: float = 0.0
     has_liveness_signal: bool = False
 
@@ -156,6 +161,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "world_size": entry.world_size,
                 "block_size": entry.metadata.block_size,
                 "use_mla": entry.metadata.use_mla,
+                "num_object_groups": entry.num_object_groups,
             }
 
         return {
@@ -290,12 +296,79 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     def _make_transfer_key(
         key: IPCCacheServerKey, instance_id: int
     ) -> tuple[int, IPCCacheServerKey]:
+        """Build the pending-SHM-map key from an IPC key and instance ID."""
         return (instance_id, key)
 
     def _resolve_single_group_obj_keys(self, key: IPCCacheServerKey) -> list[ObjectKey]:
-        """Resolve object keys for the single object group used by
-        non-GPU transfers."""
+        """Resolve object keys for the single object group (legacy path).
+
+        Args:
+            key: IPC cache key identifying the token range.
+
+        Returns:
+            Flat list of ``ObjectKey`` instances for group 0.
+        """
         return self._ctx.resolve_obj_keys(key, [0])[0]
+
+    def _resolve_multi_group_obj_keys(
+        self, key: IPCCacheServerKey, num_object_groups: int
+    ) -> list[list[ObjectKey]]:
+        """Resolve per-group object keys for hybrid/HMA transfers.
+
+        Args:
+            key: IPC cache key identifying the token range.
+            num_object_groups: Number of LMCache object groups.
+
+        Returns:
+            List-of-lists: ``result[g]`` is the ``ObjectKey`` list for group
+            ``g``.
+        """
+        return self._ctx.resolve_obj_keys(key, list(range(num_object_groups)))
+
+    def _make_resolve_fn(
+        self, entry: EngineDrivenContextEntry
+    ) -> Callable[[IPCCacheServerKey], list[ObjectKey]]:
+        """Return the appropriate object-key resolver for this entry.
+
+        For single-group entries returns the legacy resolver; for hybrid
+        entries returns a multi-group resolver whose outer-list is flattened
+        to a single list in group-major order (matching the group-major wire
+        format).
+
+        Args:
+            entry: Registered context entry.
+
+        Returns:
+            Callable that maps an IPC key to a flat ``list[ObjectKey]``.
+        """
+        num_groups = entry.num_object_groups
+        if num_groups <= 1:
+            return self._resolve_single_group_obj_keys
+
+        def _multi_group_flat(key: IPCCacheServerKey) -> list[ObjectKey]:
+            nested = self._resolve_multi_group_obj_keys(key, num_groups)
+            flat: list[ObjectKey] = []
+            for group_keys in nested:
+                flat.extend(group_keys)
+            return flat
+
+        return _multi_group_flat
+
+    def _make_resolve_fn_per_group(
+        self, entry: EngineDrivenContextEntry
+    ) -> Callable[[IPCCacheServerKey], list[list[ObjectKey]]]:
+        """Return a per-group object-key resolver for SHM multi-group stores.
+
+        Args:
+            entry: Registered context entry.
+
+        Returns:
+            Callable that maps an IPC key to ``list[list[ObjectKey]]``.
+        """
+        num_groups = entry.num_object_groups
+        if num_groups <= 1:
+            return lambda key: [self._resolve_single_group_obj_keys(key)]
+        return lambda key: self._resolve_multi_group_obj_keys(key, num_groups)
 
     def register_kv_cache_engine_driven_context(
         self,
@@ -303,13 +376,21 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> RegisterEngineDrivenContextResponse:
         """Register non-CUDA KV layout metadata for non-GPU context mode.
 
+        Supports both single-group (legacy) and hybrid/HMA multi-group models.
+        When ``payload.group_layouts`` is non-empty, per-group
+        ``MemoryLayoutDesc`` and ``AttnWindowDesc`` are built and registered;
+        the flat scalar fields (``block_size``, ``num_layers``, etc.) are used
+        as the group-0 fallback for backward-compatible old clients.
+
         Args:
-            payload: Struct containing all registration fields
-                (instance_id, model_name, world_size, block_size,
-                num_layers, hidden_dim_size, dtype_str, use_mla).
+            payload: Struct containing all registration fields.
+
+        Returns:
+            ``RegisterEngineDrivenContextResponse`` with SHM pool info.
 
         Raises:
-            ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
+            ValueError: If any dtype string in the payload is not a valid torch
+                dtype name.
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
@@ -319,7 +400,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             existing = self._engine_driven_contexts.get(payload.instance_id)
             if existing is not None:
                 existing.last_seen = now
-                logger.info(
+                logger.debug(
                     "Instance %d already registered (non-GPU); refreshing liveness",
                     payload.instance_id,
                 )
@@ -327,29 +408,91 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     shm_name=shm_name, pool_size=pool_size
                 )
 
-        dtype = getattr(torch, payload.dtype_str, None)
-        if dtype is None or not isinstance(dtype, torch.dtype):
-            raise ValueError(
-                f"Invalid dtype_str '{payload.dtype_str}': must be a valid torch dtype "
-                "attribute name (e.g. 'float16' for torch.float16, "
-                "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
+        if payload.group_layouts:
+            # --- Hybrid/HMA multi-group registration ---
+            shapes: list[torch.Size] = []
+            dtypes: list[torch.dtype] = []
+            sw_windows: list[int] = []
+            group_block_sizes: list[int] = []
+            group_use_mla: list[bool] = []
+
+            for spec in payload.group_layouts:
+                g_dtype = getattr(torch, spec.dtype_str, None)
+                if g_dtype is None or not isinstance(g_dtype, torch.dtype):
+                    raise ValueError(
+                        f"Invalid dtype_str '{spec.dtype_str}' in group_layouts: "
+                        "must be a valid torch dtype attribute name."
+                    )
+                chunk_tokens = self._ctx.chunk_size
+                g_shape = (
+                    torch.Size([spec.num_layers, chunk_tokens, spec.hidden_dim_size])
+                    if spec.use_mla
+                    else torch.Size(
+                        [2, spec.num_layers, chunk_tokens, spec.hidden_dim_size]
+                    )
+                )
+                shapes.append(g_shape)
+                dtypes.append(g_dtype)
+                sw_windows.append(spec.sw_size_tokens)
+                group_block_sizes.append(spec.block_size)
+                group_use_mla.append(spec.use_mla)
+
+            layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
+            # AttnWindowDesc: convert -1 (full attention) tokens to chunk count.
+            # -1 means full attention; positive sw_size_tokens means SW.
+            num_chunks_in_sw: list[int] = []
+            for sw_tokens in sw_windows:
+                if sw_tokens < 0:
+                    num_chunks_in_sw.append(-1)
+                elif self._ctx.chunk_size > 0:
+                    num_chunks_in_sw.append(
+                        max(1, (sw_tokens + self._ctx.chunk_size - 1) // self._ctx.chunk_size)
+                    )
+                else:
+                    num_chunks_in_sw.append(-1)
+            attn_desc = AttnWindowDesc(num_chunks_in_sw=num_chunks_in_sw)
+
+            num_object_groups = len(payload.group_layouts)
+            # Metadata: use group-0 flat fields for legacy compat.
+            metadata = EngineDrivenContextMetadata(
+                layout_desc=layout_desc,
+                block_size=payload.block_size,
+                use_mla=payload.use_mla,
+                group_block_sizes=group_block_sizes,
+                group_use_mla=group_use_mla,
+            )
+        else:
+            # --- Single-group / legacy registration ---
+            dtype = getattr(torch, payload.dtype_str, None)
+            if dtype is None or not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"Invalid dtype_str '{payload.dtype_str}': must be a valid torch "
+                    "dtype attribute name (e.g. 'float16' for torch.float16, "
+                    "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
+                )
+            shape = (
+                torch.Size(
+                    [payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
+                )
+                if payload.use_mla
+                else torch.Size(
+                    [
+                        2,
+                        payload.num_layers,
+                        self._ctx.chunk_size,
+                        payload.hidden_dim_size,
+                    ]
+                )
+            )
+            layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+            attn_desc = None
+            num_object_groups = 1
+            metadata = EngineDrivenContextMetadata(
+                layout_desc=layout_desc,
+                block_size=payload.block_size,
+                use_mla=payload.use_mla,
             )
 
-        shape = (
-            torch.Size(
-                [payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
-            )
-            if payload.use_mla
-            else torch.Size(
-                [2, payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
-            )
-        )
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
-        metadata = EngineDrivenContextMetadata(
-            layout_desc=layout_desc,
-            block_size=payload.block_size,
-            use_mla=payload.use_mla,
-        )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
         # other. REGISTER is SYNC-serialized, so it is the sole inserter.
@@ -357,6 +500,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             metadata=metadata,
             model_name=payload.model_name,
             world_size=payload.world_size,
+            num_object_groups=num_object_groups,
             last_seen=now,
             has_liveness_signal=False,
         )
@@ -374,15 +518,22 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             self._strategies[payload.instance_id] = strategy
 
         logger.info(
-            "Registered non-GPU context for instance %d (model=%s, world_size=%d)",
+            "Registered non-GPU context for instance %d (model=%s, world_size=%d, "
+            "num_groups=%d)",
             payload.instance_id,
             payload.model_name,
             payload.world_size,
+            num_object_groups,
         )
 
-        self._ctx.layout_desc_registry.register(
-            payload.model_name, payload.world_size, layout_desc
-        )
+        if attn_desc is not None:
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc, attn_desc
+            )
+        else:
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc
+            )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
         )
@@ -415,19 +566,26 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> PrepareStoreResponse:
         """Prepare a store operation.
 
+        For single-group instances returns the legacy response. For hybrid/HMA
+        instances, resolves per-group object keys and builds group-major slot
+        lists in the response context so the worker can gather each group into
+        the correct SHM slot.
+
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
 
         Returns:
-            PrepareStoreResponse with empty slots for pickle mode.
+            PrepareStoreResponse with empty slots for pickle mode, or per-group
+            SHM slot descriptors for SHM mode.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
+        resolve_fn = self._make_resolve_fn(entry)
         response = strategy.prepare_store(
             key=key,
             instance_id=instance_id,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=resolve_fn,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
@@ -442,10 +600,15 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> bool:
         """Commit serialized CPU chunks to storage.
 
+        For single-group instances uses the legacy flat chunk list. For
+        hybrid/HMA instances expects a group-major flat list of tensors
+        (committed via the multi-group resolver).
+
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
-            cpu_data: Pickled list of CPU tensors produced by the worker.
+            cpu_data: Pickled list of CPU tensors produced by the worker
+                (group-major for multi-group models, flat for single-group).
 
         Returns:
             ``True`` when all reserved objects are written, otherwise ``False``.
@@ -455,6 +618,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 instance ID.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
+        resolve_fn = self._make_resolve_fn(entry)
         session = self._ctx.session_manager.get_or_create(key.request_id)
         st = session.extras.pop("store_start_time", None)
         result = strategy.commit_store(
@@ -462,13 +626,13 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id=instance_id,
             cpu_data=cpu_data,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=resolve_fn,
         )
         if st is not None and result:
             num_tokens = (
                 len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
             )
-            logger.info(
+            logger.debug(
                 "Stored %d tokens in %.3f seconds",
                 num_tokens,
                 time.perf_counter() - st,
@@ -483,6 +647,10 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> PrepareRetrieveResponse:
         """Retrieve prefetched chunks and return serialized CPU tensors.
 
+        For single-group instances returns the legacy response. For hybrid/HMA
+        instances, resolves per-group object keys and returns group-major slot
+        descriptors / serialized chunk data.
+
         Args:
             key: Cache key for the token range to retrieve.
             instance_id: Worker instance identifier.
@@ -494,11 +662,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
+        resolve_fn = self._make_resolve_fn(entry)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=resolve_fn,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["retrieve_start_time"] = time.perf_counter()
@@ -513,11 +682,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         """Finalize a retrieve operation.
 
         Args:
-            key: Cache key (unused for pickle).
-            instance_id: Worker instance identifier (unused for pickle).
+            key: Cache key for the token range.
+            instance_id: Worker instance identifier.
 
         Returns:
-            Always ``True``.
+            ``True`` on success.
         """
         _, strategy = self._resolve_for_transfer(instance_id)
         session = self._ctx.session_manager.get_or_create(key.request_id)
@@ -527,9 +696,10 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             num_tokens = (
                 len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
             )
-            logger.info(
+            logger.debug(
                 "Retrieved %d tokens in %.3f seconds",
                 num_tokens,
                 time.perf_counter() - st,
             )
         return result
+

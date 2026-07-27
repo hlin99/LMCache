@@ -159,7 +159,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
 
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
         future = self.mq_client.submit_request(
             RequestType.PREPARE_STORE,
             [key, instance_id],
@@ -180,9 +180,12 @@ class EngineDrivenContextShm(EngineDrivenContext):
             return None
         if not slots:
             # Server explicitly signals all chunks are already cached.
-            return [], []
+            return [], [], []
         chunk_indices: list[int] = context["chunk_indices"]
-        return self._build_slot_tensors(slots), chunk_indices
+        # group_counts is set by the server for hybrid/HMA multi-group mode.
+        # Empty list means single-group (no per-group split information).
+        group_counts: list[int] = context.get("group_counts", [])
+        return self._build_slot_tensors(slots), chunk_indices, group_counts
 
     def commit_store(
         self, key: IPCCacheServerKey, instance_id: int, _chunks: list[torch.Tensor]
