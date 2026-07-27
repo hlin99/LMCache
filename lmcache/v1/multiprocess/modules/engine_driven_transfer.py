@@ -282,7 +282,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         for obj_keys in write_obj_keys:
             if obj_keys:
-                self._ctx.storage_manager.finish_write(obj_keys)
+                self._ctx.storage_manager.delete_l1_keys(obj_keys, force=True)
         for obj_keys in read_obj_keys:
             if obj_keys:
                 self._ctx.storage_manager.finish_read_prefetched(obj_keys)
@@ -437,9 +437,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     for layer_idx in spec.layer_indices
                 ]
                 if len(mapped_layers) != len(set(mapped_layers)):
-                    raise ValueError(
-                        "registered layer indices must not be duplicated"
-                    )
+                    raise ValueError("registered layer indices must not be duplicated")
                 if set(mapped_layers) != set(range(payload.num_layers)):
                     raise ValueError(
                         "registered layer mapping must cover every KV tensor "
@@ -558,6 +556,14 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
         )
+        if attn_desc is not None:
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc, attn_desc
+            )
+        else:
+            self._ctx.layout_desc_registry.register(
+                payload.model_name, payload.world_size, layout_desc
+            )
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
@@ -570,15 +576,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload.world_size,
             metadata.num_object_groups,
         )
-
-        if attn_desc is not None:
-            self._ctx.layout_desc_registry.register(
-                payload.model_name, payload.world_size, layout_desc, attn_desc
-            )
-        else:
-            self._ctx.layout_desc_registry.register(
-                payload.model_name, payload.world_size, layout_desc
-            )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
         )

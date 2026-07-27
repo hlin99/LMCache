@@ -4,7 +4,7 @@
 # Standard
 from _thread import LockType
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 import abc
 import pickle
 
@@ -16,6 +16,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.protocols.engine import (
+    ABORT_STORE_PAYLOAD,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
 )
@@ -85,6 +86,30 @@ def _split_obj_keys_by_group(
     return result
 
 
+def _object_group_counts(obj_keys: list[ObjectKey]) -> list[int]:
+    """Return exact group-major ownership counts when keys expose group IDs.
+
+    Test doubles and released single-group integrations may provide opaque keys;
+    those preserve the legacy empty-context response.
+
+    Args:
+        obj_keys: Resolved storage keys in wire order.
+
+    Returns:
+        Counts indexed by object-group ID, or an empty list for opaque keys.
+    """
+    group_ids = [getattr(key, "object_group_id", None) for key in obj_keys]
+    if not group_ids or any(group_id is None for group_id in group_ids):
+        return []
+    integer_ids = [cast(int, group_id) for group_id in group_ids]
+    if min(integer_ids) < 0:
+        raise ValueError("object group IDs must not be negative")
+    return [
+        sum(group_id == expected for group_id in integer_ids)
+        for expected in range(max(integer_ids) + 1)
+    ]
+
+
 def _reserve_multi_group(
     storage_manager: "StorageManager",
     obj_keys: list[ObjectKey],
@@ -113,14 +138,19 @@ def _reserve_multi_group(
             "multi-group layout must contain exactly one shape and dtype per group"
         )
     merged: dict[ObjectKey, Any] = {}
-    for g in range(num_groups):
-        group_pairs = by_group.get(g, [])
-        if not group_pairs:
-            continue
-        group_keys = [k for _, k in group_pairs]
-        g_layout = _per_group_layout_desc(layout_desc, g)
-        reserved = storage_manager.reserve_write(group_keys, g_layout, mode)
-        merged.update(reserved)
+    try:
+        for g in range(num_groups):
+            group_pairs = by_group.get(g, [])
+            if not group_pairs:
+                continue
+            group_keys = [k for _, k in group_pairs]
+            g_layout = _per_group_layout_desc(layout_desc, g)
+            reserved = storage_manager.reserve_write(group_keys, g_layout, mode)
+            merged.update(reserved)
+    except Exception:
+        if merged:
+            storage_manager.delete_l1_keys(list(merged), force=True)
+        raise
     return merged
 
 
@@ -327,32 +357,36 @@ class PickleTransferStrategy(TransferStrategy):
                 obj_keys, context.layout_desc, "new"
             )
 
-        expected_writes: list[tuple[ObjectKey, torch.Tensor, torch.Tensor]] = []
-        for idx, obj_key in enumerate(obj_keys):
-            memory_obj = reserved_dict.get(obj_key)
-            if memory_obj is None:
-                continue
-            if memory_obj.tensor is None:
-                raise ValueError(f"reserved object {obj_key} has no tensor")
-            chunk_cpu = chunks[idx]
-            if (
-                chunk_cpu.shape != memory_obj.tensor.shape
-                or chunk_cpu.dtype != memory_obj.tensor.dtype
-            ):
-                raise ValueError(
-                    f"chunk layout mismatch for object group "
-                    f"{obj_key.object_group_id}: got {chunk_cpu.shape}/"
-                    f"{chunk_cpu.dtype}, expected {memory_obj.tensor.shape}/"
-                    f"{memory_obj.tensor.dtype}"
-                )
-            expected_writes.append((obj_key, memory_obj.tensor, chunk_cpu))
-
-        written_keys: list[ObjectKey] = []
         try:
+            expected_writes: list[tuple[ObjectKey, torch.Tensor, torch.Tensor]] = []
+            for idx, obj_key in enumerate(obj_keys):
+                memory_obj = reserved_dict.get(obj_key)
+                if memory_obj is None:
+                    continue
+                if memory_obj.tensor is None:
+                    raise ValueError(f"reserved object {obj_key} has no tensor")
+                chunk_cpu = chunks[idx]
+                if (
+                    chunk_cpu.shape != memory_obj.tensor.shape
+                    or chunk_cpu.dtype != memory_obj.tensor.dtype
+                ):
+                    raise ValueError(
+                        f"chunk layout mismatch for object group "
+                        f"{obj_key.object_group_id}: got {chunk_cpu.shape}/"
+                        f"{chunk_cpu.dtype}, expected {memory_obj.tensor.shape}/"
+                        f"{memory_obj.tensor.dtype}"
+                    )
+                expected_writes.append((obj_key, memory_obj.tensor, chunk_cpu))
+
+            written_keys: list[ObjectKey] = []
             for obj_key, destination, chunk_cpu in expected_writes:
                 destination.copy_(chunk_cpu)
                 written_keys.append(obj_key)
-        finally:
+        except Exception:
+            if reserved_dict:
+                self._storage_manager.delete_l1_keys(list(reserved_dict), force=True)
+            raise
+        else:
             if written_keys:
                 self._storage_manager.finish_write(written_keys)
 
@@ -383,17 +417,7 @@ class PickleTransferStrategy(TransferStrategy):
                 return PrepareRetrieveResponse(
                     success=True,
                     data=pickle.dumps(chunks),
-                    context={
-                        "group_counts": [
-                            sum(key.object_group_id == group_id for key in obj_keys)
-                            for group_id in range(
-                                max(
-                                    (key.object_group_id for key in obj_keys), default=0
-                                )
-                                + 1
-                            )
-                        ]
-                    },
+                    context={"group_counts": _object_group_counts(obj_keys)},
                 )
         finally:
             if prefetched_keys:
@@ -543,6 +567,13 @@ class ShmTransferStrategy(TransferStrategy):
         Returns:
             ``True`` when pending SHM reservation is committed successfully.
         """
+        if cpu_data == ABORT_STORE_PAYLOAD:
+            transfer_key = self._transfer_key_factory(key, instance_id)
+            with self._pending_lock:
+                aborted_keys = self._pending_writes.pop(transfer_key, [])
+            if aborted_keys:
+                self._storage_manager.delete_l1_keys(aborted_keys, force=True)
+            return True
         if cpu_data != b"":
             return self._fallback_strategy.commit_store(
                 key=key,
@@ -595,16 +626,13 @@ class ShmTransferStrategy(TransferStrategy):
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
             self._pending_reads[transfer_key] = shm_prefetched_keys
-        group_counts = [
-            sum(key.object_group_id == group_id for key in shm_prefetched_keys)
-            for group_id in range(
-                max((key.object_group_id for key in shm_prefetched_keys), default=0) + 1
-            )
-        ]
         return PrepareRetrieveResponse(
             success=True,
             data=b"",
-            context={"slots": slots, "group_counts": group_counts},
+            context={
+                "slots": slots,
+                "group_counts": _object_group_counts(shm_prefetched_keys),
+            },
         )
 
     def commit_retrieve(

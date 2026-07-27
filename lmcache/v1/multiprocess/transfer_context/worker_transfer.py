@@ -691,7 +691,7 @@ class EngineDrivenTransferContext(TransferContext):
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
         use_mla_flag = kv_size == 1
 
-        self._registered_groups = []
+        registered_groups: list[RegisteredGroup] = []
         group_layouts: list[GroupLayoutSpec] = []
 
         if engine_group_infos:
@@ -765,7 +765,7 @@ class EngineDrivenTransferContext(TransferContext):
                     engine_kv_format=g_engine_kv_format,
                     sw_size_tokens=info.sw_size_tokens,
                 )
-                self._registered_groups.append(registered_group)
+                registered_groups.append(registered_group)
                 group_layouts.append(
                     GroupLayoutSpec(
                         num_layers=g_num_layers,
@@ -783,7 +783,7 @@ class EngineDrivenTransferContext(TransferContext):
                     )
                 )
 
-            validate_registered_groups(self._registered_groups, len(kv_caches))
+            validate_registered_groups(registered_groups, len(kv_caches))
             layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
         else:
             # Single-group / legacy path.
@@ -825,9 +825,7 @@ class EngineDrivenTransferContext(TransferContext):
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
-            group_block_sizes=[
-                group.slots_per_block for group in self._registered_groups
-            ],
+            group_block_sizes=[group.slots_per_block for group in registered_groups],
             group_use_mla=[spec.use_mla for spec in group_layouts],
         )
         self._engine_driven_context = create_engine_driven_context(
@@ -837,6 +835,7 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name=shm_name,
             pool_size=pool_size,
         )
+        self._registered_groups = registered_groups
         num_groups = len(engine_group_infos) if engine_group_infos else 1
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
@@ -927,34 +926,44 @@ class EngineDrivenTransferContext(TransferContext):
 
         if plans:
             # Multi-group (hybrid/HMA) path: gather per group and flatten.
-            out_per_group, ci_per_group = _split_shm_buffers_by_group(
-                out_buffers,
-                chunk_indices,
-                plans,
-                server_group_counts=server_group_counts,
-            )
-            chunks_per_group = gather_engine_groups(
-                plans,
-                layout_hints=self._layout_hints,
-                engine_kv_format=self._engine_kv_format,
-                out_per_group=out_per_group,
-                chunk_indices_per_group=ci_per_group,
-            )
+            try:
+                out_per_group, ci_per_group = _split_shm_buffers_by_group(
+                    out_buffers,
+                    chunk_indices,
+                    plans,
+                    server_group_counts=server_group_counts,
+                )
+                chunks_per_group = gather_engine_groups(
+                    plans,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=self._engine_kv_format,
+                    out_per_group=out_per_group,
+                    chunk_indices_per_group=ci_per_group,
+                )
+            except Exception:
+                if out_buffers is not None:
+                    self._engine_driven_context.abort_store(key, instance_id)
+                raise
             flat_chunks = flatten_chunks_group_major(chunks_per_group)
             if out_buffers is not None:
                 torch_dev.synchronize()
             ok = self._engine_driven_context.commit_store(key, instance_id, flat_chunks)
         else:
             # Single-group (legacy) path.
-            cpu_chunks = gather_paged_kv_to_cpu(
-                kv_caches,
-                _single_group_block_ids(block_ids),
-                blocks_in_chunk,
-                layout_hints=self._layout_hints,
-                engine_kv_format=self._engine_kv_format,
-                out=out_buffers,
-                chunk_indices=chunk_indices,
-            )
+            try:
+                cpu_chunks = gather_paged_kv_to_cpu(
+                    kv_caches,
+                    _single_group_block_ids(block_ids),
+                    blocks_in_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=self._engine_kv_format,
+                    out=out_buffers,
+                    chunk_indices=chunk_indices,
+                )
+            except Exception:
+                if out_buffers is not None:
+                    self._engine_driven_context.abort_store(key, instance_id)
+                raise
             if out_buffers is not None:
                 torch_dev.synchronize()
             ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
@@ -1009,13 +1018,14 @@ class EngineDrivenTransferContext(TransferContext):
 
         retrieve_result = self._engine_driven_context.prepare_retrieve(key, instance_id)
         group_counts: list[int] = []
+        src_buffers: list[torch.Tensor] | None
         if isinstance(retrieve_result, tuple):
             src_buffers, group_counts = retrieve_result
         else:
             src_buffers = retrieve_result
         ok = src_buffers is not None
-        if src_buffers is not None:
-            try:
+        try:
+            if src_buffers is not None:
                 if plans:
                     if len(group_counts) != len(plans):
                         raise ValueError(
@@ -1043,11 +1053,12 @@ class EngineDrivenTransferContext(TransferContext):
                         layout_hints=self._layout_hints,
                         engine_kv_format=self._engine_kv_format,
                     )
-            except (RuntimeError, ValueError, TypeError, IndexError):
-                logger.exception("Failed to scatter retrieved CPU context chunks")
-                ok = False
-            torch_dev.synchronize()
-        self._engine_driven_context.commit_retrieve(key, instance_id)
+                torch_dev.synchronize()
+        except (RuntimeError, ValueError, TypeError, IndexError):
+            logger.exception("Failed to scatter retrieved CPU context chunks")
+            ok = False
+        finally:
+            self._engine_driven_context.commit_retrieve(key, instance_id)
 
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
@@ -1058,6 +1069,9 @@ class EngineDrivenTransferContext(TransferContext):
         if self._engine_driven_context is not None:
             self._engine_driven_context.close()
             self._engine_driven_context = None
+        self._registered_groups = []
+        self._layout_hints = None
+        self._engine_kv_format = None
 
     def flush_inflight_stores(self) -> None:
         """No-op: synchronous context has no deferred stores."""

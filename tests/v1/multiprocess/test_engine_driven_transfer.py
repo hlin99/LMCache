@@ -1349,8 +1349,44 @@ def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
 
     module.unregister_kv_cache(4)
 
-    mock_storage.finish_write.assert_called_once()
+    mock_storage.delete_l1_keys.assert_called_once()
+    assert mock_storage.delete_l1_keys.call_args.kwargs == {"force": True}
     mock_storage.finish_read_prefetched.assert_called_once()
+
+
+def test_server_abort_store_discards_partial_shm_reservation(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A failed worker gather discards rather than commits prepared SHM slots."""
+    # First Party
+    from lmcache.v1.multiprocess.protocols.engine import ABORT_STORE_PAYLOAD
+
+    mock_storage = MagicMock()
+    mock_memory_obj = MagicMock()
+    mock_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    mock_memory_obj.shm_offset = 0
+    mock_memory_obj.shm_byte_length = 2048
+    mock_storage.reserve_write.side_effect = lambda obj_keys, *_args, **_kwargs: {
+        obj_key: mock_memory_obj for obj_key in obj_keys
+    }
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool", pool_size=4096
+        ),
+        mock_storage=mock_storage,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=5)
+    )
+    key = _default_key()
+    assert module.prepare_store(key, 5).context.get("slots")
+
+    assert module.commit_store(key, 5, ABORT_STORE_PAYLOAD) is True
+
+    mock_storage.delete_l1_keys.assert_called_once()
+    assert mock_storage.delete_l1_keys.call_args.kwargs == {"force": True}
+    mock_storage.finish_write.assert_not_called()
 
 
 def test_gather_paged_kv_with_chunk_indices_subset() -> None:

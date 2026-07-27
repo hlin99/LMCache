@@ -230,6 +230,11 @@ class EngineDrivenContext(ABC):
         ...
 
     @abstractmethod
+    def abort_store(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Release a prepared store without publishing its contents."""
+        ...
+
+    @abstractmethod
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
     ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:

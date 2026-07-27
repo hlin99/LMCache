@@ -27,6 +27,8 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
+ABORT_STORE_PAYLOAD = b"LMCACHE_ABORT_STORE_V1"
+
 
 @dataclass
 class PrepareStoreResponse:

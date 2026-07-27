@@ -71,6 +71,10 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         except TimeoutError:
             return False
 
+    def abort_store(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """No-op because pickle prepare_store owns no reserved objects."""
+        return True
+
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
     ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:

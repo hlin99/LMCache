@@ -18,6 +18,7 @@ from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.protocols.engine import ABORT_STORE_PAYLOAD
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
@@ -200,6 +201,18 @@ class EngineDrivenContextShm(EngineDrivenContext):
         except TimeoutError:
             return False
 
+    def abort_store(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Tell the server to discard a prepared SHM reservation."""
+        future = self.mq_client.submit_request(
+            RequestType.COMMIT_STORE,
+            [key, instance_id, ABORT_STORE_PAYLOAD],
+            get_response_class(RequestType.COMMIT_STORE),
+        )
+        try:
+            return bool(future.result(timeout=self.mq_timeout))
+        except TimeoutError:
+            return False
+
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
     ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:
@@ -217,20 +230,25 @@ class EngineDrivenContextShm(EngineDrivenContext):
         slots = response.context.get("slots", [])
         if not slots:
             return None
-        tensors = self._build_slot_tensors(slots)
-        group_counts = response.context.get("group_counts", [])
-        if self.metadata.num_object_groups > 1:
-            if (
-                not isinstance(group_counts, list)
-                or len(group_counts) != self.metadata.num_object_groups
-                or any(
-                    not isinstance(count, int) or count < 0 for count in group_counts
-                )
-                or sum(group_counts) != len(tensors)
-            ):
-                raise ValueError("invalid multi-group SHM retrieve ownership")
-            return tensors, group_counts
-        return tensors
+        try:
+            tensors = self._build_slot_tensors(slots)
+            group_counts = response.context.get("group_counts", [])
+            if self.metadata.num_object_groups > 1:
+                if (
+                    not isinstance(group_counts, list)
+                    or len(group_counts) != self.metadata.num_object_groups
+                    or any(
+                        not isinstance(count, int) or count < 0
+                        for count in group_counts
+                    )
+                    or sum(group_counts) != len(tensors)
+                ):
+                    raise ValueError("invalid multi-group SHM retrieve ownership")
+                return tensors, group_counts
+            return tensors
+        except Exception:
+            self.commit_retrieve(key, instance_id)
+            raise
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         future = self.mq_client.submit_request(

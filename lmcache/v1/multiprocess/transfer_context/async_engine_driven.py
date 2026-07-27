@@ -269,6 +269,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 gather_done: Any | None = None
                 ok = False
                 used_shm_direct = False
+                prepared_shm_store = False
                 staged_chunks_single: list[torch.Tensor] = []
                 staged_per_group: list[list[torch.Tensor]] = []
                 try:
@@ -277,6 +278,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     out_buffers, chunk_indices, server_group_counts = (
                         result if result is not None else (None, None, [])
                     )
+                    prepared_shm_store = out_buffers is not None
 
                     if chunk_indices is not None and len(chunk_indices) == 0:
                         ok = True
@@ -373,6 +375,14 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             _request_id,
                         )
                 except Exception:
+                    if prepared_shm_store:
+                        try:
+                            engine_driven_context.abort_store(key, instance_id)
+                        except Exception:
+                            logger.exception(
+                                "Failed to abort async SHM store for request_id=%s",
+                                _request_id,
+                            )
                     logger.exception(
                         "Async engine-driven store failed for request_id=%s",
                         _request_id,

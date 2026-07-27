@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+from typing import cast
+
 # Third Party
 import pytest
 import torch
@@ -8,6 +11,7 @@ import torch
 from lmcache.v1.multiprocess.transfer_context.group_copy import (
     RegisteredGroup,
     flatten_chunks_group_major,
+    gather_engine_groups,
     plan_group_copy,
     unflatten_chunks_group_major,
     validate_group_block_ids,
@@ -68,9 +72,7 @@ def test_registered_groups_validate_ids_layers_and_geometry() -> None:
     with pytest.raises(ValueError, match="dense"):
         validate_registered_groups([_group(0, 1, (0,))], 1)
     with pytest.raises(ValueError, match="duplicated"):
-        validate_registered_groups(
-            [_group(0, 0, (0,)), _group(1, 0, (0,))], 1
-        )
+        validate_registered_groups([_group(0, 0, (0,)), _group(1, 0, (0,))], 1)
     with pytest.raises(ValueError, match="missing"):
         validate_registered_groups([_group(0, 0, (0,))], 2)
     with pytest.raises(ValueError, match="outside"):
@@ -131,9 +133,7 @@ def test_plan_selects_sliding_window_tail_blocks_and_objects() -> None:
     ]
 
     store_plans = plan_group_copy(kv_caches, block_ids, groups)
-    retrieve_plans = plan_group_copy(
-        kv_caches, block_ids, groups, for_retrieve=True
-    )
+    retrieve_plans = plan_group_copy(kv_caches, block_ids, groups, for_retrieve=True)
 
     assert store_plans[1].flat_block_ids == [11, 13, 15, 17]
     assert retrieve_plans[1].first_object == 3
@@ -167,6 +167,37 @@ def test_group_major_wire_helpers_are_deterministic_and_strict() -> None:
         unflatten_chunks_group_major(flat, [4, -1])
     with pytest.raises(ValueError, match="sum"):
         unflatten_chunks_group_major(flat, [1, 1])
+
+
+def test_gather_uses_each_groups_copy_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution forwards each group's discovered native copy format."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import group_copy
+
+    groups = [
+        _group(0, 0, (0,), copy_format=11),
+        _group(1, 1, (1,), copy_format=22),
+    ]
+    kv_caches = {"a": torch.empty(1), "b": torch.empty(1)}
+    plans = plan_group_copy(kv_caches, [[0, 1], [2, 3]], groups)
+    seen_formats: list[int] = []
+
+    def fake_gather(
+        _kv_caches: dict[str, torch.Tensor],
+        _block_ids: list[int],
+        _blocks_per_chunk: int,
+        **kwargs: object,
+    ) -> list[torch.Tensor]:
+        seen_formats.append(cast(int, kwargs["engine_kv_format"]))
+        return [torch.empty(1)]
+
+    monkeypatch.setattr(group_copy, "gather_paged_kv_to_cpu", fake_gather)
+
+    gather_engine_groups(plans)
+
+    assert seen_formats == [11, 22]
 
 
 def test_empty_transfer_is_valid_for_every_group() -> None:
