@@ -46,7 +46,7 @@ so the worker can reconstruct the grouping on the retrieve side.
 
 # Standard
 from dataclasses import dataclass
-from typing import Any
+from typing import AbstractSet, Any
 
 # Third Party
 import torch
@@ -211,13 +211,17 @@ class RegisteredGroup:
 
 
 def validate_registered_groups(
-    groups: list[RegisteredGroup], num_registered_layers: int
+    groups: list[RegisteredGroup],
+    num_registered_layers: int,
+    excluded_layer_indices: AbstractSet[int] = frozenset(),
 ) -> None:
     """Validate group IDs, geometry, and the registered layer partition.
 
     Args:
         groups: Transfer groups in deterministic object-group order.
         num_registered_layers: Number of tensors in registered KV order.
+        excluded_layer_indices: Registered cross-layer sharing aliases that
+            intentionally have no transfer group.
 
     Raises:
         ValueError: If IDs are invalid, geometry is non-positive, or layers are
@@ -266,8 +270,23 @@ def validate_registered_groups(
         )
     if len(mapped_layers) != len(set(mapped_layers)):
         raise ValueError("registered layer indices must not be duplicated")
-    expected_layers = set(range(num_registered_layers))
     actual_layers = set(mapped_layers)
+    excluded_layers = set(excluded_layer_indices)
+    invalid_excluded = [
+        idx for idx in excluded_layers if idx < 0 or idx >= num_registered_layers
+    ]
+    if invalid_excluded:
+        raise ValueError(
+            f"excluded layer indices {invalid_excluded} are outside "
+            f"[0, {num_registered_layers})"
+        )
+    excluded_owned = actual_layers & excluded_layers
+    if excluded_owned:
+        raise ValueError(
+            "excluded layer indices must not be assigned to transfer groups; "
+            f"owned={sorted(excluded_owned)}"
+        )
+    expected_layers = set(range(num_registered_layers)) - excluded_layers
     if actual_layers != expected_layers:
         raise ValueError(
             "registered layer mapping must cover every KV tensor exactly once; "
@@ -432,7 +451,6 @@ def plan_group_copy(
 def gather_engine_groups(
     plans: list[GroupCopyPlan],
     layout_hints: LayoutHints | None = None,
-    engine_kv_format: Any = None,
     out_per_group: list[list[torch.Tensor] | None] | None = None,
     chunk_indices_per_group: list[list[int] | None] | None = None,
 ) -> list[list[torch.Tensor]]:
@@ -446,8 +464,6 @@ def gather_engine_groups(
         plans: Per-group copy plans produced by :func:`plan_group_copy`.
         layout_hints: Optional layout metadata forwarded to each
             ``gather_paged_kv_to_cpu`` call.
-        engine_kv_format: Optional engine KV format descriptor forwarded to
-            each ``gather_paged_kv_to_cpu`` call.
         out_per_group: Pre-allocated output tensors, one list per group.
             ``None`` at index ``g`` means allocate fresh tensors for group
             ``g`` (pickle mode). Length must equal ``len(plans)`` when given.
@@ -488,7 +504,6 @@ def scatter_engine_groups(
     plans: list[GroupCopyPlan],
     chunks_per_group: list[list[torch.Tensor]],
     layout_hints: LayoutHints | None = None,
-    engine_kv_format: Any = None,
     skip_first_n_tokens: int = 0,
 ) -> None:
     """Scatter KV data from CPU back to device across all object groups.
@@ -501,8 +516,6 @@ def scatter_engine_groups(
         chunks_per_group: CPU tensors indexed ``[group_idx][chunk_idx]``.
         layout_hints: Optional layout metadata forwarded to each
             ``scatter_cpu_to_paged_kv`` call.
-        engine_kv_format: Optional engine KV format descriptor forwarded to
-            each ``scatter_cpu_to_paged_kv`` call.
         skip_first_n_tokens: Tokens at the head of the block range to leave
             untouched (forwarded to every group's scatter call).
 
@@ -517,7 +530,12 @@ def scatter_engine_groups(
             f"but plans has {len(plans)} entries"
         )
     for plan, chunks in zip(plans, chunks_per_group, strict=True):
-        selected_chunks = chunks[plan.first_object :]
+        expected_chunks = plan.num_chunks - plan.first_object
+        if len(chunks) != expected_chunks:
+            raise ValueError(
+                f"object group {plan.lmcache_group_idx} returned {len(chunks)} "
+                f"chunks, expected {expected_chunks}"
+            )
         logical_skip = max(
             0,
             skip_first_n_tokens - plan.first_object * plan.group.chunk_tokens,
@@ -525,7 +543,7 @@ def scatter_engine_groups(
         scatter_cpu_to_paged_kv(
             plan.kv_subset,
             plan.flat_block_ids,
-            selected_chunks,
+            chunks,
             plan.blocks_in_chunk,
             skip_first_n_tokens=plan.group.physical_skip(logical_skip),
             layout_hints=layout_hints,

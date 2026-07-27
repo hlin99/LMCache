@@ -367,6 +367,34 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             return lambda key: [self._resolve_single_group_obj_keys(key)]
         return lambda key: self._resolve_multi_group_obj_keys(key, num_groups)
 
+    def _make_retrieve_resolve_fn(
+        self, entry: EngineDrivenContextEntry
+    ) -> Callable[[IPCCacheServerKey], list[ObjectKey]]:
+        """Return a resolver that applies each group's registered window.
+
+        Args:
+            entry: Registered context entry.
+
+        Returns:
+            Callable resolving window-valid keys in group-major order.
+        """
+        num_groups = entry.metadata.num_object_groups
+        attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
+            entry.model_name, entry.world_size
+        )
+
+        def _resolve(key: IPCCacheServerKey) -> list[ObjectKey]:
+            per_group = self._resolve_multi_group_obj_keys(key, num_groups)
+            resolved: list[ObjectKey] = []
+            for group_id, group_keys in enumerate(per_group):
+                num_window_chunks = attn_desc.num_chunks_in_sw[group_id]
+                if num_window_chunks >= 0:
+                    group_keys = group_keys[-num_window_chunks:]
+                resolved.extend(group_keys)
+            return resolved
+
+        return _resolve
+
     def register_kv_cache_engine_driven_context(
         self,
         payload: RegisterEngineDrivenContextPayload,
@@ -441,10 +469,29 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 ]
                 if len(mapped_layers) != len(set(mapped_layers)):
                     raise ValueError("registered layer indices must not be duplicated")
-                if set(mapped_layers) != set(range(payload.num_layers)):
+                actual_layers = set(mapped_layers)
+                excluded_layers = set(payload.excluded_layer_indices)
+                invalid_excluded = [
+                    idx
+                    for idx in excluded_layers
+                    if idx < 0 or idx >= payload.num_layers
+                ]
+                if invalid_excluded:
                     raise ValueError(
-                        "registered layer mapping must cover every KV tensor "
-                        "exactly once"
+                        f"excluded layer indices {invalid_excluded} are outside "
+                        f"[0, {payload.num_layers})"
+                    )
+                excluded_owned = actual_layers & excluded_layers
+                if excluded_owned:
+                    raise ValueError(
+                        "excluded layer indices must not be assigned to transfer "
+                        f"groups; owned={sorted(excluded_owned)}"
+                    )
+                expected_layers = set(range(payload.num_layers)) - excluded_layers
+                if actual_layers != expected_layers:
+                    raise ValueError(
+                        "registered layer mapping must cover every non-excluded "
+                        "KV tensor exactly once"
                     )
 
             for spec in payload.group_layouts:
@@ -708,7 +755,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 instance ID.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        resolve_fn = self._make_resolve_fn(entry)
+        resolve_fn = self._make_retrieve_resolve_fn(entry)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,

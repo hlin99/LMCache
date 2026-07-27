@@ -87,6 +87,38 @@ def _merge_layer_sw_sizes(per_layer_sw_size: list[int], indices: list[int]) -> i
     return sw_sizes.pop()
 
 
+def get_excluded_layer_indices_from_vllm(
+    kv_cache_config: Any,
+    kv_caches: Mapping[str, Any],
+) -> frozenset[int]:
+    """Return registered cross-layer KV-sharing aliases excluded by vLLM.
+
+    Args:
+        kv_cache_config: vLLM ``KVCacheConfig`` containing KV cache groups.
+        kv_caches: Registered KV tensors keyed by layer name, in registration
+            order.
+
+    Returns:
+        Registered tensor indices absent from every vLLM KV cache group. These
+        entries alias owner tensors and must not form transfer object groups.
+    """
+    vllm_groups = (
+        getattr(kv_cache_config, "kv_cache_groups", ()) or ()
+        if kv_cache_config is not None
+        else ()
+    )
+    if not vllm_groups:
+        return frozenset()
+    owned_layer_names = {
+        layer_name for group in vllm_groups for layer_name in group.layer_names
+    }
+    return frozenset(
+        idx
+        for idx, layer_name in enumerate(kv_caches)
+        if layer_name not in owned_layer_names
+    )
+
+
 def create_engine_group_infos_from_vllm(
     kv_cache_config: Any,
     kv_caches: Mapping[str, Any],

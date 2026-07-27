@@ -9,6 +9,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
+    get_excluded_layer_indices_from_vllm,
 )
 from lmcache.v1.multiprocess.group_view import (
     expand_engine_block_ids,
@@ -106,6 +107,18 @@ def test_conversion_preserves_engine_group_layers():
     assert num_engine_groups(spec) == 2
     assert get_engine_group_indices(spec, 4) == [0, 1, 0, 1]
     assert [group.tokens_per_block for group in spec] == [16, 16]
+
+
+def test_conversion_reports_cross_layer_aliases_explicitly():
+    """Registered aliases absent from vLLM groups are explicitly excluded."""
+    config = MockKVCacheConfig(
+        kv_cache_groups=[
+            MockKVCacheGroup(["layer.0", "layer.1"], MockKVCacheSpec(block_size=16))
+        ]
+    )
+    caches = _same_shape_caches(["layer.0", "layer.1", "layer.shared"])
+
+    assert get_excluded_layer_indices_from_vllm(config, caches) == frozenset({2})
 
 
 def test_conversion_splits_by_lmcache_layer_identity():

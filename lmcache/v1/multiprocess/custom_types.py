@@ -181,6 +181,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
             describes one LMCache object group in group-index order, and the
             flat fields are ignored by the server (but still sent for wire
             forward-compat with old servers).
+        excluded_layer_indices: Registered cross-layer KV-sharing aliases that
+            intentionally have no transfer object group.
     """
 
     instance_id: int
@@ -192,6 +194,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     dtype_str: str
     use_mla: bool
     group_layouts: list[GroupLayoutSpec] = msgspec.field(default_factory=list)
+    excluded_layer_indices: tuple[int, ...] = ()
 
 
 @dataclass

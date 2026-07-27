@@ -311,7 +311,6 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             chunks_per_group = gather_engine_groups(
                                 plans,
                                 layout_hints=self._layout_hints,
-                                engine_kv_format=self._engine_kv_format,
                                 out_per_group=out_per_group,
                                 chunk_indices_per_group=ci_per_group,
                             )
@@ -370,6 +369,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         )
 
                     if not ok:
+                        if prepared_shm_store:
+                            engine_driven_context.abort_store(key, instance_id)
                         logger.error(
                             "Async engine-driven commit_store failed for request_id=%s",
                             _request_id,

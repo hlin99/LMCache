@@ -13,6 +13,7 @@ from lmcache.v1.multiprocess.transfer_context.group_copy import (
     flatten_chunks_group_major,
     gather_engine_groups,
     plan_group_copy,
+    scatter_engine_groups,
     unflatten_chunks_group_major,
     validate_group_block_ids,
     validate_registered_groups,
@@ -94,6 +95,20 @@ def test_registered_groups_validate_ids_layers_and_geometry() -> None:
         validate_registered_groups([_group(0, 0, (2,))], 2)
 
 
+def test_registered_groups_allow_explicit_cross_layer_aliases() -> None:
+    """Only explicitly excluded cross-layer aliases may lack an owner group."""
+    groups = [_group(0, 0, (0,)), _group(1, 1, (1,))]
+
+    validate_registered_groups(groups, 3, excluded_layer_indices={2})
+
+    with pytest.raises(ValueError, match="missing"):
+        validate_registered_groups(groups, 3)
+    with pytest.raises(ValueError, match="excluded layer indices.*outside"):
+        validate_registered_groups(groups, 3, excluded_layer_indices={3})
+    with pytest.raises(ValueError, match="must not be assigned"):
+        validate_registered_groups(groups, 3, excluded_layer_indices={1})
+
+
 def test_plan_preserves_shared_engine_group_and_group_geometry() -> None:
     """Kernel groups may share an engine group while retaining copy identity."""
     groups = [
@@ -154,6 +169,52 @@ def test_plan_selects_sliding_window_tail_blocks_and_objects() -> None:
     assert retrieve_plans[1].first_object == 3
     assert retrieve_plans[1].flat_block_ids == [17]
     assert retrieve_plans[0].first_object == 0
+
+
+def test_scatter_consumes_server_trimmed_sliding_window_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker aligns server-trimmed objects without slicing them a second time."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import group_copy
+
+    groups = [
+        _group(0, 0, (0,)),
+        _group(1, 1, (1,), copy_blocks_per_chunk=1, sw_size_tokens=8),
+    ]
+    plans = plan_group_copy(
+        {
+            "full": torch.empty(2, 8, 4, 1),
+            "window": torch.empty(2, 8, 4, 1),
+        },
+        [list(range(8)), list(range(10, 18))],
+        groups,
+        for_retrieve=True,
+    )
+    seen: list[tuple[list[int], list[int]]] = []
+
+    def fake_scatter(
+        _kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+        chunks: list[torch.Tensor],
+        _blocks_per_chunk: int,
+        **_kwargs: object,
+    ) -> None:
+        seen.append((block_ids, [int(chunk.item()) for chunk in chunks]))
+
+    monkeypatch.setattr(group_copy, "scatter_cpu_to_paged_kv", fake_scatter)
+    scatter_engine_groups(
+        plans,
+        [
+            [torch.tensor(i) for i in range(4)],
+            [torch.tensor(3)],
+        ],
+    )
+
+    assert seen == [
+        (list(range(8)), [0, 1, 2, 3]),
+        ([17], [3]),
+    ]
 
 
 def test_compressed_group_converts_logical_skip_to_physical_slots() -> None:

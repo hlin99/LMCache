@@ -5,7 +5,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import AbstractSet, Any, Callable, Protocol
 import os
 
 # Third Party
@@ -329,6 +329,8 @@ class TransferContext(ABC):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        excluded_layer_indices: AbstractSet[int] = frozenset(),
+        lmcache_tokens_per_chunk: int | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -338,11 +340,15 @@ class TransferContext(ABC):
             model_name: Model name used by cache keys.
             world_size: KV world size.
             blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
+            lmcache_tokens_per_chunk: Authoritative logical tokens per LMCache
+                chunk.
             mq_client: Message queue client used to communicate with server.
             mq_timeout: Timeout in seconds for synchronous request wait.
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Optional inference-engine-provided layout hints.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            excluded_layer_indices: Registered cross-layer sharing aliases
+                intentionally omitted from transfer groups.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -453,6 +459,8 @@ class LMCacheDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        excluded_layer_indices: AbstractSet[int] = frozenset(),
+        lmcache_tokens_per_chunk: int | None = None,
     ) -> None:
         """Register the worker KV cache with the LMCache server.
 
@@ -462,11 +470,15 @@ class LMCacheDrivenTransferContext(TransferContext):
             model_name: Model identifier used by the server.
             world_size: Tensor-parallel world size.
             _blocks_in_chunk: Engine blocks per LMCache chunk.
+            lmcache_tokens_per_chunk: Authoritative LMCache chunk size
+                accepted for interface consistency.
             mq_client: Message-queue client used for requests.
             mq_timeout: Timeout for the registration response.
             send_request: Request sender used by this context.
             layout_hints: Optional KV-layout metadata.
             engine_group_infos: Optional engine KV-group metadata.
+            excluded_layer_indices: Cross-layer aliases accepted for interface
+                consistency.
 
         Raises:
             RuntimeError: If event IPC is unsupported for the KV-cache device.
@@ -650,6 +662,8 @@ class EngineDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        excluded_layer_indices: AbstractSet[int] = frozenset(),
+        lmcache_tokens_per_chunk: int | None = None,
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
@@ -664,12 +678,16 @@ class EngineDrivenTransferContext(TransferContext):
             model_name: Model identifier used by the server.
             world_size: Tensor-parallel world size.
             blocks_in_chunk: Engine blocks per LMCache chunk (reference group).
+            lmcache_tokens_per_chunk: Authoritative logical tokens per LMCache
+                chunk.
             mq_client: Message-queue client used for requests.
             mq_timeout: Timeout for the registration response.
             send_request: Request sender used by this context.
             layout_hints: Optional KV-layout metadata.
             engine_group_infos: Optional engine KV-group metadata for
                 hybrid/HMA models. Empty means single-group legacy mode.
+            excluded_layer_indices: Registered cross-layer sharing aliases
+                intentionally omitted from transfer groups.
         """
         layout_source = (
             build_group_kv_subset(kv_caches, engine_group_infos[0].layer_indices)
@@ -696,11 +714,13 @@ class EngineDrivenTransferContext(TransferContext):
         group_layouts: list[GroupLayoutSpec] = []
 
         if engine_group_infos:
+            if lmcache_tokens_per_chunk is None:
+                raise ValueError(
+                    "lmcache_tokens_per_chunk is required for grouped registration"
+                )
             shapes: list[torch.Size] = []
             dtypes: list[torch.dtype] = []
-            first_info = engine_group_infos[0]
-            reference_tokens_per_block = first_info.tokens_per_block or block_size
-            chunk_tokens = blocks_in_chunk * reference_tokens_per_block
+            chunk_tokens = lmcache_tokens_per_chunk
 
             for object_group_id, info in enumerate(engine_group_infos):
                 group_kv = build_group_kv_subset(kv_caches, info.layer_indices)
@@ -784,7 +804,11 @@ class EngineDrivenTransferContext(TransferContext):
                     )
                 )
 
-            validate_registered_groups(registered_groups, len(kv_caches))
+            validate_registered_groups(
+                registered_groups,
+                len(kv_caches),
+                excluded_layer_indices=excluded_layer_indices,
+            )
             layout_desc = MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
         else:
             # Single-group / legacy path.
@@ -812,6 +836,7 @@ class EngineDrivenTransferContext(TransferContext):
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
                     group_layouts=group_layouts,
+                    excluded_layer_indices=tuple(sorted(excluded_layer_indices)),
                 )
             ],
         )
@@ -937,7 +962,6 @@ class EngineDrivenTransferContext(TransferContext):
                 chunks_per_group = gather_engine_groups(
                     plans,
                     layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
                     out_per_group=out_per_group,
                     chunk_indices_per_group=ci_per_group,
                 )
@@ -969,6 +993,8 @@ class EngineDrivenTransferContext(TransferContext):
                 torch_dev.synchronize()
             ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
 
+        if not ok and out_buffers is not None:
+            self._engine_driven_context.abort_store(key, instance_id)
         future = MessagingFuture()
         future.set_result(ok)
         return future
@@ -1040,7 +1066,6 @@ class EngineDrivenTransferContext(TransferContext):
                         plans,
                         chunks_per_group,
                         layout_hints=self._layout_hints,
-                        engine_kv_format=self._engine_kv_format,
                         skip_first_n_tokens=skip_first_n_tokens,
                     )
                 else:

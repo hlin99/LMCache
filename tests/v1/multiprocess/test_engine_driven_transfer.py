@@ -479,6 +479,60 @@ def test_musa_data_context_keeps_layout_validation_device_agnostic(
     )
 
 
+def test_group_registration_uses_authoritative_lmcache_chunk_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-group geometry derives from LMCache tokens, not the first group."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (
+            16,
+            1,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            2,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *_args, **_kwargs: MagicMock(),
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    send_request = MagicMock(return_value=future)
+    ctx = EngineDrivenTransferContext()
+
+    ctx.register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(num_layers=2, block_size=16),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=16,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=[
+            EngineGroupInfo(0, (0,), tokens_per_block=32),
+            EngineGroupInfo(1, (1,), tokens_per_block=16),
+        ],
+        lmcache_tokens_per_chunk=256,
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert [spec.shape[-2] for spec in payload.group_layouts] == [128, 256]
+
+
 def test_musa_data_context_store_uses_device_agnostic_gather(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -645,6 +699,42 @@ def test_create_transfer_context_env_var_overrides_default(
     monkeypatch.setenv(ENV_MP_TRANSFER_MODE, "lmcache_driven")
     context = create_transfer_context({"layer_0": torch.randn(2, 2)})
     assert isinstance(context, LMCacheDrivenTransferContext)
+
+
+@pytest.mark.parametrize(
+    ("device_type", "mode", "expected_mode"),
+    [
+        ("cuda", "engine_driven", "engine_driven"),
+        ("cuda", "auto", "lmcache_driven"),
+        ("cpu", "auto", "engine_driven"),
+    ],
+)
+def test_create_transfer_context_logs_stable_mode_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    mode: str,
+    expected_mode: str,
+) -> None:
+    """Transfer routing emits the stable worker marker consumed by CI."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+
+    fake_context = MagicMock()
+    monkeypatch.setattr(
+        worker_transfer, "_build_engine_driven_context", lambda: fake_context
+    )
+    logger = MagicMock()
+    monkeypatch.setattr(worker_transfer, "logger", logger)
+    tensor = MagicMock()
+    tensor.device.type = device_type
+
+    worker_transfer.create_transfer_context({"layer_0": tensor}, mode=mode)
+
+    logger.info.assert_called_once_with(
+        "LMCache MP transfer context selected: mode=%s device=%s",
+        expected_mode,
+        device_type,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1146,6 +1236,39 @@ def test_server_register_and_find_non_cuda_context_layout(
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
+def test_server_registration_accepts_explicit_cross_layer_alias(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Server applies the worker's explicit excluded-layer ownership contract."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import GroupLayoutSpec
+
+    payload = _default_register_payload(instance_id=6)
+    payload.num_layers = 3
+    payload.group_layouts = [
+        GroupLayoutSpec(
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            block_size=4,
+            use_mla=False,
+            tokens_per_block=4,
+            layer_indices=(0, 1),
+            shape=(2, 2, 8, 16),
+            engine_kv_format=0,
+        )
+    ]
+    payload.excluded_layer_indices = (2,)
+    module, _, _, ctx = server_module_factory(chunk_size=8)
+
+    module.register_kv_cache_engine_driven_context(payload)
+
+    layout = ctx.layout_desc_registry.find("m", 1)
+    assert layout is not None
+    assert layout.shapes == [torch.Size([2, 2, 8, 16])]
+
+
 def test_server_store_and_retrieve_cpu_chunks(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
@@ -1382,6 +1505,7 @@ def test_server_abort_store_discards_partial_shm_reservation(
     key = _default_key()
     assert module.prepare_store(key, 5).context.get("slots")
 
+    assert module.commit_store(key, 5, ABORT_STORE_PAYLOAD) is True
     assert module.commit_store(key, 5, ABORT_STORE_PAYLOAD) is True
 
     mock_storage.delete_l1_keys.assert_called_once()

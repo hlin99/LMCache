@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Force the shared HMA correctness flow through CUDA Engine-driven transfer.
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LMCACHE_MP_TRANSFER_MODE=engine_driven
