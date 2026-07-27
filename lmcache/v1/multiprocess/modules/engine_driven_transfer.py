@@ -53,8 +53,6 @@ class EngineDrivenContextEntry:
         metadata: Layout metadata describing the non-CUDA chunk format.
         model_name: The name of the model associated with this context.
         world_size: The world size associated with this context.
-        num_object_groups: Number of LMCache object groups (1 for single-group,
-            >1 for hybrid/HMA). Drives per-group object key resolution.
         last_seen: ``time.monotonic()`` of the most recent activity from this
             instance (register, PING, prepare/commit). Drives reaping.
         has_liveness_signal: True once the instance has sent at least one
@@ -64,7 +62,6 @@ class EngineDrivenContextEntry:
     metadata: EngineDrivenContextMetadata
     model_name: str
     world_size: int
-    num_object_groups: int = 1
     last_seen: float = 0.0
     has_liveness_signal: bool = False
 
@@ -161,7 +158,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "world_size": entry.world_size,
                 "block_size": entry.metadata.block_size,
                 "use_mla": entry.metadata.use_mla,
-                "num_object_groups": entry.num_object_groups,
+                "num_object_groups": entry.metadata.num_object_groups,
             }
 
         return {
@@ -341,7 +338,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             Callable that maps an IPC key to a flat ``list[ObjectKey]``.
         """
-        num_groups = entry.num_object_groups
+        num_groups = entry.metadata.num_object_groups
         if num_groups <= 1:
             return self._resolve_single_group_obj_keys
 
@@ -365,7 +362,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             Callable that maps an IPC key to ``list[list[ObjectKey]]``.
         """
-        num_groups = entry.num_object_groups
+        num_groups = entry.metadata.num_object_groups
         if num_groups <= 1:
             return lambda key: [self._resolve_single_group_obj_keys(key)]
         return lambda key: self._resolve_multi_group_obj_keys(key, num_groups)
@@ -416,21 +413,68 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             group_block_sizes: list[int] = []
             group_use_mla: list[bool] = []
 
+            is_structured_v2 = any(
+                spec.layer_indices or spec.shape or spec.engine_kv_format >= 0
+                for spec in payload.group_layouts
+            )
+            expected_object_ids = list(range(len(payload.group_layouts)))
+            if is_structured_v2:
+                object_ids = [spec.object_group_id for spec in payload.group_layouts]
+                if object_ids != expected_object_ids:
+                    raise ValueError(
+                        f"object group IDs must be {expected_object_ids}, "
+                        f"got {object_ids}"
+                    )
+            engine_ids = {spec.engine_group_id for spec in payload.group_layouts}
+            if min(engine_ids) < 0 or engine_ids != set(range(max(engine_ids) + 1)):
+                raise ValueError(
+                    "engine group IDs must be non-negative and dense from zero"
+                )
+            if is_structured_v2:
+                mapped_layers = [
+                    layer_idx
+                    for spec in payload.group_layouts
+                    for layer_idx in spec.layer_indices
+                ]
+                if len(mapped_layers) != len(set(mapped_layers)):
+                    raise ValueError(
+                        "registered layer indices must not be duplicated"
+                    )
+                if set(mapped_layers) != set(range(payload.num_layers)):
+                    raise ValueError(
+                        "registered layer mapping must cover every KV tensor "
+                        "exactly once"
+                    )
+
             for spec in payload.group_layouts:
+                if (
+                    spec.num_layers <= 0
+                    or spec.hidden_dim_size <= 0
+                    or spec.block_size <= 0
+                    or (is_structured_v2 and spec.tokens_per_block <= 0)
+                ):
+                    raise ValueError(
+                        f"invalid geometry for object group {spec.object_group_id}"
+                    )
                 g_dtype = getattr(torch, spec.dtype_str, None)
                 if g_dtype is None or not isinstance(g_dtype, torch.dtype):
                     raise ValueError(
                         f"Invalid dtype_str '{spec.dtype_str}' in group_layouts: "
                         "must be a valid torch dtype attribute name."
                     )
-                chunk_tokens = self._ctx.chunk_size
-                g_shape = (
-                    torch.Size([spec.num_layers, chunk_tokens, spec.hidden_dim_size])
-                    if spec.use_mla
-                    else torch.Size(
-                        [2, spec.num_layers, chunk_tokens, spec.hidden_dim_size]
+                if spec.shape:
+                    g_shape = torch.Size(spec.shape)
+                else:
+                    chunk_tokens = self._ctx.chunk_size
+                    g_shape = (
+                        torch.Size(
+                            [spec.num_layers, chunk_tokens, spec.hidden_dim_size]
+                        )
+                        if spec.use_mla
+                        else torch.Size(
+                            [2, spec.num_layers, chunk_tokens, spec.hidden_dim_size]
+                        )
                     )
-                )
                 shapes.append(g_shape)
                 dtypes.append(g_dtype)
                 sw_windows.append(spec.sw_size_tokens)
@@ -456,7 +500,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     num_chunks_in_sw.append(-1)
             attn_desc = AttnWindowDesc(num_chunks_in_sw=num_chunks_in_sw)
 
-            num_object_groups = len(payload.group_layouts)
             # Metadata: use group-0 flat fields for legacy compat.
             metadata = EngineDrivenContextMetadata(
                 layout_desc=layout_desc,
@@ -490,7 +533,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             )
             layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
             attn_desc = None
-            num_object_groups = 1
             metadata = EngineDrivenContextMetadata(
                 layout_desc=layout_desc,
                 block_size=payload.block_size,
@@ -504,7 +546,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             metadata=metadata,
             model_name=payload.model_name,
             world_size=payload.world_size,
-            num_object_groups=num_object_groups,
             last_seen=now,
             has_liveness_signal=False,
         )
@@ -527,7 +568,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload.instance_id,
             payload.model_name,
             payload.world_size,
-            num_object_groups,
+            metadata.num_object_groups,
         )
 
         if attn_desc is not None:

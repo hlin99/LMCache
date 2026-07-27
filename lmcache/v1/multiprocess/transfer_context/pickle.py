@@ -73,7 +73,7 @@ class EngineDrivenContextPickle(EngineDrivenContext):
 
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:
         """Send PREPARE_RETRIEVE and deserialize the response data.
 
         Returns:
@@ -91,6 +91,18 @@ class EngineDrivenContextPickle(EngineDrivenContext):
         if not response.success or not response.data:
             return None
         chunks: list[torch.Tensor] = pickle.loads(response.data)
+        group_counts = response.context.get("group_counts", [])
+        if self.metadata.num_object_groups > 1:
+            if (
+                not isinstance(group_counts, list)
+                or len(group_counts) != self.metadata.num_object_groups
+                or any(
+                    not isinstance(count, int) or count < 0 for count in group_counts
+                )
+                or sum(group_counts) != len(chunks)
+            ):
+                raise ValueError("invalid multi-group pickle retrieve ownership")
+            return chunks, group_counts
         return chunks
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:

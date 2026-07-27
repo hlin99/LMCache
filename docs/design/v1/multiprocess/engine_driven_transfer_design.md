@@ -16,6 +16,45 @@ instead of CUDA IPC handles, then commits the bytes to the server.
 Goal: keep the existing lmcache-driven (CUDA IPC) path unchanged while adding
 a second engine-driven path that works across non-CUDA backends.
 
+Engine-driven transfer is also selectable on CUDA. This is required for hybrid
+models whose worker must gather/scatter multiple heterogeneous KV groups while
+the server only owns contiguous storage objects.
+
+### 1.1 Group and indexing model
+
+Registration creates one immutable transfer-group record per LMCache copy
+identity. The record is the source of truth for:
+
+- **engine group**: the serving-engine block-ID address space;
+- **kernel group**: layers sharing one native copy format and physical geometry;
+- **object group**: the stored object sequence and `ObjectKey.object_group_id`;
+- **layer index**: the tensor's position in registration order.
+
+Several transfer/kernel groups may reference the same engine group. The worker
+adapter expands engine block IDs into transfer-group order before calling the
+transfer context, so `block_ids[g]` always belongs to transfer group `g`.
+
+Every request validates exact divisibility by each group's full
+blocks-per-chunk value and requires equal logical chunk coverage. Sliding Window
+groups then retain trailing blocks within each chunk; retrieve additionally
+retains only the trailing objects covered by the window. The same validated
+planner supplies sync and async Engine-driven copies and the LMCache-driven
+block-validation path.
+
+Wire order is group-major (`group 0 chunk 0..N`, then group 1, and so on).
+Multi-group SHM and pickle retrieve responses carry exact per-group counts.
+Sparse SHM store responses carry group-local chunk indices; ownership is never
+inferred from flat list lengths.
+
+### 1.2 Supported device matrix
+
+| Device/path | Single group | Hybrid/HMA |
+|---|---:|---:|
+| CUDA LMCache-driven | Yes | Yes |
+| CUDA Engine-driven | Yes | Yes |
+| Non-CUDA Engine-driven | Yes | Yes when the backend exposes the required native group-aware copy format |
+| Non-CUDA legacy fallback without native group copy | Yes | Fails fast |
+
 ## 2. Design
 
 ### 2.1 Architecture Overview

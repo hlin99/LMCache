@@ -45,6 +45,8 @@ BUILD_ID="${BUILD_ID:-local_$$}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/lmcache_ci_results_${BUILD_ID}}"
 # LMCache MP server log, scanned to confirm the retrieve run hit LMCache.
 LMCACHE_LOG="${LMCACHE_LOG:-/tmp/build_${BUILD_ID}_lmcache.log}"
+VLLM_LOG="${VLLM_LOG:-/tmp/build_${BUILD_ID}_vllm.log}"
+EXPECTED_MP_TRANSFER_MODE="${EXPECTED_MP_TRANSFER_MODE:-}"
 
 HMA_DIR="$RESULTS_DIR/hma_lm_eval"
 VLLM_RUN_DIR="$HMA_DIR/vllm_run"
@@ -139,7 +141,26 @@ count_retrieves() {
     grep -c "Retrieved" "$LMCACHE_LOG" 2>/dev/null || true
 }
 
+# Verify the worker-selected transfer mode using the stable factory marker.
+assert_expected_transfer_mode() {
+    [ -n "$EXPECTED_MP_TRANSFER_MODE" ] || return 0
+    local marker="LMCache MP transfer context selected: mode=${EXPECTED_MP_TRANSFER_MODE} device=cuda"
+    local elapsed=0
+    while [ "$elapsed" -lt 30 ]; do
+        if [ -f "$VLLM_LOG" ] && grep -Fq "$marker" "$VLLM_LOG"; then
+            echo "Confirmed worker transfer mode: ${EXPECTED_MP_TRANSFER_MODE}"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    echo "ERROR: worker log did not contain stable transfer marker: $marker"
+    tail -20 "$VLLM_LOG" 2>/dev/null || true
+    return 1
+}
+
 # ── 1. vLLM run: compute from scratch, populating LMCache ───
+assert_expected_transfer_mode
 run_lm_eval "$VLLM_PORT" "$VLLM_RUN_DIR" "vLLM run"
 
 # Let async stores drain to the LMCache server before invalidating the APC.

@@ -202,7 +202,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
 
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:
         future = self.mq_client.submit_request(
             RequestType.PREPARE_RETRIEVE,
             [key, instance_id],
@@ -215,7 +215,22 @@ class EngineDrivenContextShm(EngineDrivenContext):
         if not response.success:
             return None
         slots = response.context.get("slots", [])
-        return self._build_slot_tensors(slots) if slots else None
+        if not slots:
+            return None
+        tensors = self._build_slot_tensors(slots)
+        group_counts = response.context.get("group_counts", [])
+        if self.metadata.num_object_groups > 1:
+            if (
+                not isinstance(group_counts, list)
+                or len(group_counts) != self.metadata.num_object_groups
+                or any(
+                    not isinstance(count, int) or count < 0 for count in group_counts
+                )
+                or sum(group_counts) != len(tensors)
+            ):
+                raise ValueError("invalid multi-group SHM retrieve ownership")
+            return tensors, group_counts
+        return tensors
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         future = self.mq_client.submit_request(

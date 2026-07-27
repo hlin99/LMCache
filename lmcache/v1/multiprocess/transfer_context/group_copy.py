@@ -46,24 +46,16 @@ so the worker can reconstruct the grouping on the retrieve side.
 
 # Standard
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 # Third Party
 import torch
 
 # First Party
-from lmcache.logging import init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
 
 # Local
 from .base import gather_paged_kv_to_cpu, scatter_cpu_to_paged_kv
-
-if TYPE_CHECKING:
-    # First Party
-    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-
-logger = init_logger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -141,6 +133,180 @@ def compute_group_blocks_in_chunk(
     return chunk_tokens // effective_block_size
 
 
+@dataclass(frozen=True)
+class RegisteredGroup:
+    """Authoritative registration metadata for one transfer/object group.
+
+    Attributes:
+        object_group_id: Storage object-key namespace, dense from zero.
+        engine_group_id: Serving-engine block-ID address space.
+        layer_indices: Registered KV tensor indices copied by this group.
+        tokens_per_block: Logical tokens represented by one engine block.
+        slots_per_block: Physical KV slots stored in one engine block.
+        blocks_per_chunk: Engine blocks covering one LMCache logical chunk.
+        copy_blocks_per_chunk: Trailing blocks copied for each object after
+            Sliding Window subchunk trimming.
+        chunk_tokens: Logical tokens represented by one LMCache object.
+        shape: Contiguous tensor shape for one stored object.
+        dtype: Contiguous tensor dtype.
+        engine_kv_format: Native copy format discovered for this group.
+        sw_size_tokens: Sliding Window size, or ``-1`` for full attention.
+    """
+
+    object_group_id: int
+    engine_group_id: int
+    layer_indices: tuple[int, ...]
+    tokens_per_block: int
+    slots_per_block: int
+    blocks_per_chunk: int
+    copy_blocks_per_chunk: int
+    chunk_tokens: int
+    shape: torch.Size
+    dtype: torch.dtype
+    engine_kv_format: Any
+    sw_size_tokens: int = -1
+
+    @property
+    def objects_in_window(self) -> int | None:
+        """Return retained object count for retrieve, or ``None`` for full attention."""
+        if self.sw_size_tokens < 0:
+            return None
+        return max(
+            1, (self.sw_size_tokens + self.chunk_tokens - 1) // self.chunk_tokens
+        )
+
+    def physical_skip(self, logical_skip: int) -> int:
+        """Convert a logical token skip to this group's physical slot geometry.
+
+        Args:
+            logical_skip: Logical tokens to preserve at the start of the
+                selected object range.
+
+        Returns:
+            Number of physical slots to skip.
+
+        Raises:
+            ValueError: If the logical position cannot be represented exactly
+                in the group's compressed physical geometry.
+        """
+        if logical_skip < 0:
+            raise ValueError("logical_skip must be non-negative")
+        numerator = logical_skip * self.slots_per_block
+        if numerator % self.tokens_per_block:
+            raise ValueError(
+                f"logical skip {logical_skip} is not representable for object "
+                f"group {self.object_group_id}: tokens_per_block="
+                f"{self.tokens_per_block}, slots_per_block={self.slots_per_block}"
+            )
+        return numerator // self.tokens_per_block
+
+
+def validate_registered_groups(
+    groups: list[RegisteredGroup], num_registered_layers: int
+) -> None:
+    """Validate group IDs, geometry, and the registered layer partition.
+
+    Args:
+        groups: Transfer groups in deterministic object-group order.
+        num_registered_layers: Number of tensors in registered KV order.
+
+    Raises:
+        ValueError: If IDs are invalid, geometry is non-positive, or layers are
+            duplicated, omitted, or out of range.
+    """
+    if not groups:
+        raise ValueError("at least one registered transfer group is required")
+    expected_object_ids = list(range(len(groups)))
+    object_ids = [group.object_group_id for group in groups]
+    if object_ids != expected_object_ids:
+        raise ValueError(
+            f"object group IDs must be {expected_object_ids}, got {object_ids}"
+        )
+    engine_ids = {group.engine_group_id for group in groups}
+    if min(engine_ids) < 0 or engine_ids != set(range(max(engine_ids) + 1)):
+        raise ValueError(
+            "engine group IDs must be non-negative and dense from zero, got "
+            f"{sorted(engine_ids)}"
+        )
+
+    mapped_layers: list[int] = []
+    for group in groups:
+        if (
+            group.tokens_per_block <= 0
+            or group.slots_per_block <= 0
+            or group.blocks_per_chunk <= 0
+            or group.copy_blocks_per_chunk <= 0
+            or group.copy_blocks_per_chunk > group.blocks_per_chunk
+            or group.chunk_tokens <= 0
+        ):
+            raise ValueError(
+                f"invalid block geometry for object group {group.object_group_id}"
+            )
+        if not group.layer_indices:
+            raise ValueError(
+                f"object group {group.object_group_id} has no registered layers"
+            )
+        mapped_layers.extend(group.layer_indices)
+
+    invalid_layers = [
+        idx for idx in mapped_layers if idx < 0 or idx >= num_registered_layers
+    ]
+    if invalid_layers:
+        raise ValueError(
+            f"layer indices {invalid_layers} are outside [0, {num_registered_layers})"
+        )
+    if len(mapped_layers) != len(set(mapped_layers)):
+        raise ValueError("registered layer indices must not be duplicated")
+    expected_layers = set(range(num_registered_layers))
+    actual_layers = set(mapped_layers)
+    if actual_layers != expected_layers:
+        raise ValueError(
+            "registered layer mapping must cover every KV tensor exactly once; "
+            f"missing={sorted(expected_layers - actual_layers)}"
+        )
+
+
+def validate_group_block_ids(
+    block_ids: list[list[int]], blocks_per_chunk: list[int]
+) -> int:
+    """Validate transfer-boundary block IDs and return the logical chunk count.
+
+    Args:
+        block_ids: Block IDs indexed by transfer-plan group.
+        blocks_per_chunk: Full (pre-window-trim) blocks per logical chunk for
+            each transfer-plan group.
+
+    Returns:
+        Common logical chunk count covered by every group.
+
+    Raises:
+        ValueError: If group counts differ, geometry is non-positive, a list has
+            a remainder, or groups cover different logical chunk counts.
+    """
+    if len(block_ids) != len(blocks_per_chunk):
+        raise ValueError(
+            f"expected {len(blocks_per_chunk)} block-ID lists, got {len(block_ids)}"
+        )
+    chunk_counts: list[int] = []
+    for group_id, (ids, group_blocks) in enumerate(
+        zip(block_ids, blocks_per_chunk, strict=True)
+    ):
+        if group_blocks <= 0:
+            raise ValueError(f"blocks_per_chunk for group {group_id} must be positive")
+        remainder = len(ids) % group_blocks
+        if remainder:
+            raise ValueError(
+                f"block_ids[{group_id}] has {len(ids)} entries, not an exact "
+                f"multiple of blocks_per_chunk={group_blocks}"
+            )
+        chunk_counts.append(len(ids) // group_blocks)
+    if chunk_counts and len(set(chunk_counts)) != 1:
+        raise ValueError(
+            f"block-ID groups cover different logical chunk counts: {chunk_counts}"
+        )
+    return chunk_counts[0] if chunk_counts else 0
+
+
 # ---------------------------------------------------------------------------
 # GroupCopyPlan
 # ---------------------------------------------------------------------------
@@ -163,21 +329,39 @@ class GroupCopyPlan:
         num_chunks: Total number of LMCache chunks to transfer.
     """
 
-    lmcache_group_idx: int
-    engine_group_id: int
+    group: RegisteredGroup
     flat_block_ids: list[int]
-    blocks_in_chunk: int
-    layer_indices: tuple[int, ...] | list[int]
     kv_subset: dict[str, torch.Tensor]
     num_chunks: int
+    first_object: int = 0
+
+    @property
+    def lmcache_group_idx(self) -> int:
+        """Return the protocol-visible transfer group index."""
+        return self.group.object_group_id
+
+    @property
+    def engine_group_id(self) -> int:
+        """Return the serving-engine block address-space ID."""
+        return self.group.engine_group_id
+
+    @property
+    def blocks_in_chunk(self) -> int:
+        """Return copied (post-window-trim) blocks per object."""
+        return self.group.copy_blocks_per_chunk
+
+    @property
+    def layer_indices(self) -> tuple[int, ...]:
+        """Return registered tensor indices copied by this group."""
+        return self.group.layer_indices
 
 
 def plan_group_copy(
     kv_caches: dict[str, torch.Tensor],
     block_ids_per_lmcache_group: list[list[int]],
-    blocks_in_chunk: int,
-    engine_group_infos: "list[EngineGroupInfo]",
-    group_block_sizes: list[int],
+    groups: list[RegisteredGroup],
+    *,
+    for_retrieve: bool = False,
 ) -> list[GroupCopyPlan]:
     """Build per-group copy plans from registration metadata and block IDs.
 
@@ -191,73 +375,40 @@ def plan_group_copy(
         block_ids_per_lmcache_group: Block-ID lists indexed by LMCache group
             index; ``block_ids_per_lmcache_group[g]`` is the flat block-ID list
             for LMCache group ``g``.
-        blocks_in_chunk: Reference blocks-per-chunk (for engine group 0, or
-            whichever group corresponds to the flat ``blocks_in_chunk`` argument
-            passed to ``submit_store``).
-        engine_group_infos: Registered ``EngineGroupInfo`` entries, one per
-            LMCache group in group-index order.
-        group_block_sizes: Per-LMCache-group physical block sizes.  Index ``g``
-            is the block size for LMCache group ``g``.
+        groups: Authoritative registered transfer groups.
+        for_retrieve: Apply Sliding Window object-tail selection when true.
 
     Returns:
         One :class:`GroupCopyPlan` per LMCache group, in group-index order.
         Empty if ``engine_group_infos`` is empty.
     """
-    if not engine_group_infos:
+    if not groups:
         return []
-
-    ref_block_size = group_block_sizes[0] if group_block_sizes else 0
-    # Fall back to inferring from kv_caches when no per-group sizes recorded.
-    if not ref_block_size and kv_caches:
-        # Shape conventions: (2, NB, BS, ...) or (NB, BS, ...) or similar.
-        # Physical block_size is typically dim 1 (NB) or 2 (BS). We use the
-        # same heuristic as compute_kv_layout which is called during register().
-        # However, we need only the *chunk* token count here and can derive it
-        # from blocks_in_chunk * detected_block_size when available.
-        # If we have no block size info at all we cannot compute per-group
-        # blocks_in_chunk for non-group-0 groups — emit a warning and use the
-        # caller-supplied blocks_in_chunk for all groups.
-        logger.warning(
-            "No per-group block sizes available; using blocks_in_chunk=%d for "
-            "all groups. Per-group tokens-per-block override will be skipped.",
-            blocks_in_chunk,
-        )
+    num_chunks = validate_group_block_ids(
+        block_ids_per_lmcache_group,
+        [group.blocks_per_chunk for group in groups],
+    )
 
     plans: list[GroupCopyPlan] = []
-    for lmcache_group_idx, info in enumerate(engine_group_infos):
-        flat_ids = block_ids_per_lmcache_group[lmcache_group_idx]
+    for group, input_ids in zip(groups, block_ids_per_lmcache_group, strict=True):
+        selected_ids: list[int] = []
+        for offset in range(0, len(input_ids), group.blocks_per_chunk):
+            chunk_ids = input_ids[offset : offset + group.blocks_per_chunk]
+            selected_ids.extend(chunk_ids[-group.copy_blocks_per_chunk :])
 
-        # Per-group blocks_in_chunk.
-        if group_block_sizes and lmcache_group_idx < len(group_block_sizes):
-            g_block_size = group_block_sizes[lmcache_group_idx]
-            if ref_block_size and g_block_size != ref_block_size:
-                g_blocks_in_chunk = compute_group_blocks_in_chunk(
-                    blocks_in_chunk,
-                    ref_block_size,
-                    g_block_size,
-                    info.tokens_per_block,
-                )
-            else:
-                g_blocks_in_chunk = blocks_in_chunk
-        else:
-            g_blocks_in_chunk = blocks_in_chunk
-
-        num_chunks = len(flat_ids) // g_blocks_in_chunk if g_blocks_in_chunk else 0
-        kv_subset = (
-            build_group_kv_subset(kv_caches, info.layer_indices)
-            if info.layer_indices
-            else kv_caches
-        )
+        first_object = 0
+        if for_retrieve and group.objects_in_window is not None:
+            first_object = max(0, num_chunks - group.objects_in_window)
+            selected_ids = selected_ids[first_object * group.copy_blocks_per_chunk :]
+        kv_subset = build_group_kv_subset(kv_caches, group.layer_indices)
 
         plans.append(
             GroupCopyPlan(
-                lmcache_group_idx=lmcache_group_idx,
-                engine_group_id=info.engine_group_id,
-                flat_block_ids=flat_ids,
-                blocks_in_chunk=g_blocks_in_chunk,
-                layer_indices=info.layer_indices,
+                group=group,
+                flat_block_ids=selected_ids,
                 kv_subset=kv_subset,
                 num_chunks=num_chunks,
+                first_object=first_object,
             )
         )
 
@@ -315,7 +466,7 @@ def gather_engine_groups(
             plan.flat_block_ids,
             plan.blocks_in_chunk,
             layout_hints=layout_hints,
-            engine_kv_format=engine_kv_format,
+            engine_kv_format=plan.group.engine_kv_format,
             out=out_g,
             chunk_indices=ci_g,
         )
@@ -356,15 +507,20 @@ def scatter_engine_groups(
             f"chunks_per_group has {len(chunks_per_group)} entries "
             f"but plans has {len(plans)} entries"
         )
-    for plan, chunks in zip(plans, chunks_per_group, strict=False):
+    for plan, chunks in zip(plans, chunks_per_group, strict=True):
+        selected_chunks = chunks[plan.first_object :]
+        logical_skip = max(
+            0,
+            skip_first_n_tokens - plan.first_object * plan.group.chunk_tokens,
+        )
         scatter_cpu_to_paged_kv(
             plan.kv_subset,
             plan.flat_block_ids,
-            chunks,
+            selected_chunks,
             plan.blocks_in_chunk,
-            skip_first_n_tokens=skip_first_n_tokens,
+            skip_first_n_tokens=plan.group.physical_skip(logical_skip),
             layout_hints=layout_hints,
-            engine_kv_format=engine_kv_format,
+            engine_kv_format=plan.group.engine_kv_format,
         )
 
 
@@ -410,6 +566,8 @@ def unflatten_chunks_group_major(
     Raises:
         ValueError: If ``sum(group_counts) != len(flat_chunks)``.
     """
+    if any(count < 0 for count in group_counts):
+        raise ValueError("group_counts must not contain negative values")
     if sum(group_counts) != len(flat_chunks):
         raise ValueError(
             f"group_counts sum {sum(group_counts)} != len(flat_chunks) "

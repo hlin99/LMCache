@@ -44,14 +44,20 @@ def _per_group_layout_desc(
         group_idx: 0-based object-group index.
 
     Returns:
-        A ``MemoryLayoutDesc`` with exactly one shape and dtype, selecting
-        the entry at ``group_idx``.  If ``group_idx`` is out of range, falls
-        back to the first entry.
+        A ``MemoryLayoutDesc`` with exactly one shape and dtype.
+
+    Raises:
+        ValueError: If ``group_idx`` is not declared by the layout.
     """
-    idx = group_idx if group_idx < len(layout_desc.shapes) else 0
+    if (
+        group_idx < 0
+        or group_idx >= len(layout_desc.shapes)
+        or group_idx >= len(layout_desc.dtypes)
+    ):
+        raise ValueError(f"invalid object group ID {group_idx} for layout")
     return MemoryLayoutDesc(
-        shapes=[layout_desc.shapes[idx]],
-        dtypes=[layout_desc.dtypes[idx]],
+        shapes=[layout_desc.shapes[group_idx]],
+        dtypes=[layout_desc.dtypes[group_idx]],
     )
 
 
@@ -72,7 +78,9 @@ def _split_obj_keys_by_group(
     for idx, key in enumerate(obj_keys):
         gid = key.object_group_id
         if gid not in result:
-            result[gid] = []
+            raise ValueError(
+                f"ObjectKey declares object_group_id={gid}, expected [0, {num_groups})"
+            )
         result[gid].append((idx, key))
     return result
 
@@ -100,6 +108,10 @@ def _reserve_multi_group(
         Merged dict mapping each reserved ObjectKey to its MemoryObj.
     """
     by_group = _split_obj_keys_by_group(obj_keys, num_groups)
+    if len(layout_desc.shapes) != num_groups or len(layout_desc.dtypes) != num_groups:
+        raise ValueError(
+            "multi-group layout must contain exactly one shape and dtype per group"
+        )
     merged: dict[ObjectKey, Any] = {}
     for g in range(num_groups):
         group_pairs = by_group.get(g, [])
@@ -301,6 +313,10 @@ class PickleTransferStrategy(TransferStrategy):
         obj_keys = resolve_obj_keys(key)
         chunks: list[torch.Tensor] = pickle.loads(cpu_data)
         num_groups = context.num_object_groups
+        if len(chunks) != len(obj_keys):
+            raise ValueError(
+                f"pickle payload has {len(chunks)} chunks for {len(obj_keys)} keys"
+            )
 
         if num_groups > 1:
             reserved_dict = _reserve_multi_group(
@@ -311,20 +327,30 @@ class PickleTransferStrategy(TransferStrategy):
                 obj_keys, context.layout_desc, "new"
             )
 
+        expected_writes: list[tuple[ObjectKey, torch.Tensor, torch.Tensor]] = []
+        for idx, obj_key in enumerate(obj_keys):
+            memory_obj = reserved_dict.get(obj_key)
+            if memory_obj is None:
+                continue
+            if memory_obj.tensor is None:
+                raise ValueError(f"reserved object {obj_key} has no tensor")
+            chunk_cpu = chunks[idx]
+            if (
+                chunk_cpu.shape != memory_obj.tensor.shape
+                or chunk_cpu.dtype != memory_obj.tensor.dtype
+            ):
+                raise ValueError(
+                    f"chunk layout mismatch for object group "
+                    f"{obj_key.object_group_id}: got {chunk_cpu.shape}/"
+                    f"{chunk_cpu.dtype}, expected {memory_obj.tensor.shape}/"
+                    f"{memory_obj.tensor.dtype}"
+                )
+            expected_writes.append((obj_key, memory_obj.tensor, chunk_cpu))
+
         written_keys: list[ObjectKey] = []
         try:
-            for idx, obj_key in enumerate(obj_keys):
-                if obj_key not in reserved_dict:
-                    continue
-                if idx >= len(chunks):
-                    continue
-                memory_obj = reserved_dict[obj_key]
-                if memory_obj.tensor is None:
-                    continue
-                chunk_cpu = chunks[idx]
-                if chunk_cpu.shape != memory_obj.tensor.shape:
-                    continue
-                memory_obj.tensor.copy_(chunk_cpu)
+            for obj_key, destination, chunk_cpu in expected_writes:
+                destination.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
             if written_keys:
@@ -355,7 +381,19 @@ class PickleTransferStrategy(TransferStrategy):
                         )
                     chunks.append(memory_obj.tensor.cpu().clone())
                 return PrepareRetrieveResponse(
-                    success=True, data=pickle.dumps(chunks), context={}
+                    success=True,
+                    data=pickle.dumps(chunks),
+                    context={
+                        "group_counts": [
+                            sum(key.object_group_id == group_id for key in obj_keys)
+                            for group_id in range(
+                                max(
+                                    (key.object_group_id for key in obj_keys), default=0
+                                )
+                                + 1
+                            )
+                        ]
+                    },
                 )
         finally:
             if prefetched_keys:
@@ -449,8 +487,14 @@ class ShmTransferStrategy(TransferStrategy):
         chunk_indices: list[int] = []
         reserved_keys: list[ObjectKey] = []
         group_slot_counts: list[int] = [0] * num_groups
+        group_local_indices: list[int] = [0] * num_groups
         try:
-            for idx, obj_key in enumerate(obj_keys):
+            for obj_key in obj_keys:
+                gid = obj_key.object_group_id if num_groups > 1 else 0
+                if gid < 0 or gid >= num_groups:
+                    raise ValueError(f"ObjectKey has invalid object_group_id={gid}")
+                local_chunk_index = group_local_indices[gid]
+                group_local_indices[gid] += 1
                 memory_obj = reserved.get(obj_key)
                 if memory_obj is None or memory_obj.tensor is None:
                     continue
@@ -462,11 +506,9 @@ class ShmTransferStrategy(TransferStrategy):
                         dtype=_dtype_to_name(memory_obj.tensor.dtype),
                     ).to_dict()
                 )
-                chunk_indices.append(idx)
+                chunk_indices.append(local_chunk_index)
                 reserved_keys.append(obj_key)
-                gid = obj_key.object_group_id if num_groups > 1 else 0
-                if gid < len(group_slot_counts):
-                    group_slot_counts[gid] += 1
+                group_slot_counts[gid] += 1
         finally:
             reserved_keys_set = set(reserved_keys)
             unused_keys = [k for k in reserved if k not in reserved_keys_set]
@@ -553,7 +595,17 @@ class ShmTransferStrategy(TransferStrategy):
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
             self._pending_reads[transfer_key] = shm_prefetched_keys
-        return PrepareRetrieveResponse(success=True, data=b"", context={"slots": slots})
+        group_counts = [
+            sum(key.object_group_id == group_id for key in shm_prefetched_keys)
+            for group_id in range(
+                max((key.object_group_id for key in shm_prefetched_keys), default=0) + 1
+            )
+        ]
+        return PrepareRetrieveResponse(
+            success=True,
+            data=b"",
+            context={"slots": slots, "group_counts": group_counts},
+        )
 
     def commit_retrieve(
         self,

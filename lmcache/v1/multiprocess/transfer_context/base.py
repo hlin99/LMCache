@@ -214,10 +214,9 @@ class EngineDrivenContext(ABC):
                 - chunk_indices[i] is the position of that chunk in the full
                   block_ids sequence (e.g. [0, 2] means only chunks 0 and 2
                   need writing; chunk 1 is already cached).
-                - group_counts[g] is the number of SHM slots for group g in
-                  hybrid/HMA mode.  Empty list means single-group (no per-group
-                  split information available; callers should fall back to the
-                  proportional heuristic).
+                - group_counts[g] is the exact number of SHM slots for group g
+                  in hybrid/HMA mode. Empty is valid only for a legacy
+                  single-group response.
                 Caller gathers only these chunks into the provided tensors,
                 then calls commit_store with empty payload.
         """
@@ -233,8 +232,8 @@ class EngineDrivenContext(ABC):
     @abstractmethod
     def prepare_retrieve(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> list[torch.Tensor] | None:
-        """Prepare retrieve. Returns chunks or shm views, or None on miss."""
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[int]] | None:
+        """Prepare retrieve with exact group counts for structured responses."""
         ...
 
     @abstractmethod

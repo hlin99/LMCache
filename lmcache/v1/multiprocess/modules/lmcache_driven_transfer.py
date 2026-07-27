@@ -47,6 +47,9 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.v1.multiprocess.transfer_context.group_copy import (
+    validate_group_block_ids,
+)
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -173,6 +176,13 @@ def downsample_and_stage_block_ids(
         ]
     """
     num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
+    full_blocks_per_chunk = [
+        cache_context.calculate_num_blocks(
+            cache_context.lmcache_tokens_per_chunk, kernel_group_id
+        )
+        for kernel_group_id in range(num_kernel_groups)
+    ]
+    validate_group_block_ids(block_ids, full_blocks_per_chunk)
     for kernel_group_id in range(num_kernel_groups):
         subchunk_sw_size_tokens = (
             cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
@@ -185,18 +195,10 @@ def downsample_and_stage_block_ids(
         keep_blocks_per_chunk = cache_context.calculate_num_blocks(
             tokens_per_chunk, kernel_group_id
         )
-        total_blocks_per_chunk = cache_context.calculate_num_blocks(
-            cache_context.lmcache_tokens_per_chunk, kernel_group_id
-        )
+        total_blocks_per_chunk = full_blocks_per_chunk[kernel_group_id]
 
         new_block_ids = []
         old_block_ids = block_ids[kernel_group_id]
-        assert len(old_block_ids) % total_blocks_per_chunk == 0, (
-            f"len(block_ids[{kernel_group_id}]) should be a multiple "
-            f"of total_blocks_per_chunk ({total_blocks_per_chunk}), but got "
-            f"{len(old_block_ids)}"
-        )
-
         for i in range(0, len(old_block_ids), total_blocks_per_chunk):
             chunk_block_ids = old_block_ids[i : i + total_blocks_per_chunk]
             new_block_ids.extend(chunk_block_ids[-keep_blocks_per_chunk:])
