@@ -142,7 +142,8 @@ sleep 10
 unset VLLM_PORT
 
 MP_TRANSFER_MODE_JSON=""
-# Keep these values aligned with MPTransferMode in worker_transfer.py.
+# Keep these values aligned with MPTransferMode in
+# lmcache/v1/multiprocess/transfer_context/worker_transfer.py.
 case "${LMCACHE_MP_TRANSFER_MODE:-}" in
     "")
         ;;

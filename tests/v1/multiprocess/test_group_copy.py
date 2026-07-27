@@ -171,7 +171,7 @@ def test_plan_selects_sliding_window_tail_blocks_and_objects() -> None:
     assert retrieve_plans[0].first_object == 0
 
 
-def test_scatter_consumes_server_trimmed_sliding_window_chunks(
+def test_worker_scatter_consumes_server_trimmed_sliding_window_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Worker aligns server-trimmed objects without slicing them a second time."""

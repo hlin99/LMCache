@@ -374,7 +374,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         The server is the sole owner of object-tail trimming: it limits each
         group to the trailing object count in its registered attention window,
-        and the worker aligns those objects with pre-trimmed block IDs.
+        and the worker aligns those objects with pre-trimmed block IDs. A
+        negative window count means full attention and leaves all keys intact.
 
         Args:
             entry: Registered context entry.

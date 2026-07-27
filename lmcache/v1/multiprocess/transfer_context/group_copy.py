@@ -534,7 +534,8 @@ def scatter_engine_groups(
         if len(chunks) != expected_chunks:
             raise ValueError(
                 f"server returned {len(chunks)} chunks for object group "
-                f"{plan.lmcache_group_idx}, expected {expected_chunks}"
+                f"{plan.lmcache_group_idx}, expected {expected_chunks} "
+                f"(num_chunks={plan.num_chunks}, first_object={plan.first_object})"
             )
         logical_skip = max(
             0,

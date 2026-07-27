@@ -107,8 +107,8 @@ def get_excluded_layer_indices_from_vllm(
 
     Args:
         kv_cache_config: vLLM ``KVCacheConfig`` containing KV cache groups.
-        kv_caches: Registered KV tensors keyed by layer name, in registration
-            order.
+        kv_caches: Registered KV tensors keyed by layer name. Dict iteration
+            order is the registration order used to assign tensor indices.
 
     Returns:
         Registered tensor indices absent from every vLLM KV cache group. These

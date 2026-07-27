@@ -693,7 +693,9 @@ class EngineDrivenTransferContext(TransferContext):
         """
         if engine_group_infos and lmcache_tokens_per_chunk is None:
             raise ValueError(
-                "lmcache_tokens_per_chunk is required for grouped registration"
+                "lmcache_tokens_per_chunk must be specified when "
+                "engine_group_infos is non-empty; provide the authoritative "
+                "LMCache chunk size in tokens"
             )
         layout_source = (
             build_group_kv_subset(kv_caches, engine_group_infos[0].layer_indices)
