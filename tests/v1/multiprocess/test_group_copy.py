@@ -31,7 +31,22 @@ def _group(
     sw_size_tokens: int = -1,
     copy_format: int = 10,
 ) -> RegisteredGroup:
-    """Build compact transfer metadata for planner contract tests."""
+    """Build compact transfer metadata for planner contract tests.
+
+    Args:
+        object_group_id: Storage object-group namespace.
+        engine_group_id: Engine block-ID address space.
+        layer_indices: Registered layer indices assigned to the group.
+        tokens_per_block: Logical tokens represented by one block.
+        slots_per_block: Physical slots stored by one block.
+        blocks_per_chunk: Full engine blocks per LMCache chunk.
+        copy_blocks_per_chunk: Trailing blocks copied after window trimming.
+        sw_size_tokens: Sliding Window size, or ``-1`` for full attention.
+        copy_format: Native copy-format test identifier.
+
+    Returns:
+        A validated-shape transfer group suitable for planner tests.
+    """
     return RegisteredGroup(
         object_group_id=object_group_id,
         engine_group_id=engine_group_id,

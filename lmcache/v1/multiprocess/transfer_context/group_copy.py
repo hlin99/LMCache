@@ -168,7 +168,12 @@ class RegisteredGroup:
 
     @property
     def objects_in_window(self) -> int | None:
-        """Return retained object count for retrieve, or ``None`` for full attention."""
+        """Return the number of trailing objects needed by Sliding Window.
+
+        Retrieve can omit older stored objects once they fall outside the
+        configured window. Full-attention groups return ``None`` because every
+        object remains valid.
+        """
         if self.sw_size_tokens < 0:
             return None
         return max(
@@ -188,6 +193,10 @@ class RegisteredGroup:
         Raises:
             ValueError: If the logical position cannot be represented exactly
                 in the group's compressed physical geometry.
+
+        Example:
+            A group with eight logical tokens and two physical slots per block
+            converts an eight-token skip to two slots.
         """
         if logical_skip < 0:
             raise ValueError("logical_skip must be non-negative")

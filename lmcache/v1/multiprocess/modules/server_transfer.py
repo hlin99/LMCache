@@ -99,7 +99,7 @@ def _object_group_counts(obj_keys: list[ObjectKey]) -> list[int]:
         Counts indexed by object-group ID, or an empty list for opaque keys.
     """
     group_ids = [getattr(key, "object_group_id", None) for key in obj_keys]
-    if not group_ids or any(group_id is None for group_id in group_ids):
+    if not group_ids or None in group_ids:
         return []
     integer_ids = [cast(int, group_id) for group_id in group_ids]
     if min(integer_ids) < 0:
@@ -358,7 +358,7 @@ class PickleTransferStrategy(TransferStrategy):
             )
 
         try:
-            expected_writes: list[tuple[ObjectKey, torch.Tensor, torch.Tensor]] = []
+            validated_writes: list[tuple[ObjectKey, torch.Tensor, torch.Tensor]] = []
             for idx, obj_key in enumerate(obj_keys):
                 memory_obj = reserved_dict.get(obj_key)
                 if memory_obj is None:
@@ -376,10 +376,10 @@ class PickleTransferStrategy(TransferStrategy):
                         f"{chunk_cpu.dtype}, expected {memory_obj.tensor.shape}/"
                         f"{memory_obj.tensor.dtype}"
                     )
-                expected_writes.append((obj_key, memory_obj.tensor, chunk_cpu))
+                validated_writes.append((obj_key, memory_obj.tensor, chunk_cpu))
 
             written_keys: list[ObjectKey] = []
-            for obj_key, destination, chunk_cpu in expected_writes:
+            for obj_key, destination, chunk_cpu in validated_writes:
                 destination.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         except Exception:

@@ -244,11 +244,12 @@ def _split_shm_buffers_by_group(
     """
     if out_buffers is None:
         return [None] * len(plans), [None] * len(plans)
-    if len(plans) > 1 and (
+    has_invalid_multi_group_counts = len(plans) > 1 and (
         server_group_counts is None
         or len(server_group_counts) != len(plans)
         or sum(server_group_counts) != len(out_buffers)
-    ):
+    )
+    if has_invalid_multi_group_counts:
         raise ValueError(
             "multi-group SHM prepare_store must return one exact slot count "
             f"per group; counts={server_group_counts}, buffers={len(out_buffers)}"

@@ -413,6 +413,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             group_block_sizes: list[int] = []
             group_use_mla: list[bool] = []
 
+            # Legacy structured payloads predate explicit group IDs, layer maps,
+            # exact shapes, and copy formats. Any such field selects strict
+            # validation while an all-default payload remains decodable.
             is_structured_v2 = any(
                 spec.layer_indices or spec.shape or spec.engine_kv_format >= 0
                 for spec in payload.group_layouts
