@@ -469,8 +469,9 @@ def uses_multi_group_transfer_metadata(
 
     .. deprecated:: 0.5.0
         Prefer ``requires_multi_component_shm`` for new call sites. This alias
-        is kept only for compatibility and is planned for removal in ``1.0.0``
-        after internal call-site migration is complete.
+        preserves the same historical behavior (``True`` for multiple object
+        groups or kernel groups), and is planned for removal in ``1.0.0`` after
+        internal call-site migration is complete.
     """
     return requires_multi_component_shm(transfer_metadata)
 

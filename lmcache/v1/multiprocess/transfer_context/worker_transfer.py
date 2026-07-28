@@ -358,7 +358,7 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
 
 
 def _is_object_major_pickle_payload(payload: Any) -> bool:
-    """Return whether payload is object-major ``list[list[tensor]]``.
+    """Return whether payload has object-major nested-list structure.
 
     Args:
         payload: Candidate retrieve payload.
@@ -1177,7 +1177,10 @@ class EngineDrivenTransferContext(TransferContext):
         )
         if use_metadata_pickle_path:
             if transfer_metadata is None:
-                raise RuntimeError("multi-group transfer metadata is unexpectedly None")
+                raise RuntimeError(
+                    "transfer metadata is unexpectedly None after metadata-driven "
+                    "path check"
+                )
             cpu_chunks = _gather_multi_group_pickle_chunks(
                 kv_caches=kv_caches,
                 block_ids=block_ids,
@@ -1231,7 +1234,8 @@ class EngineDrivenTransferContext(TransferContext):
                 if _has_metadata_pickle_payload(transfer_metadata, src_buffers):
                     if transfer_metadata is None:
                         raise RuntimeError(
-                            "multi-group transfer metadata is unexpectedly None"
+                            "transfer metadata is unexpectedly None after "
+                            "metadata-driven payload check"
                         )
                     parsed_payload: list[list[torch.Tensor]] = []
                     for payload_object in src_buffers:

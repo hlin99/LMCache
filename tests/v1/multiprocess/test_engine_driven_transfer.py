@@ -3390,7 +3390,7 @@ def test_worker_single_component_metadata_pickle_store_uses_metadata_path(
     def _fake_gather(
         _kv: dict[str, torch.Tensor],
         block_ids: list[int],
-        _bpc: int,
+        _blocks_per_chunk: int,
         **_kwargs: Any,
     ) -> list[torch.Tensor]:
         gathered_block_ids.append(list(block_ids))
