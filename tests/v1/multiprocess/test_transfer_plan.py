@@ -45,7 +45,10 @@ def test_has_sufficient_block_ids_group_mismatch_raises() -> None:
     ],
 )
 def test_select_block_ids_for_window(
-    block_ids, total_blocks_per_chunk, keep_blocks_per_chunk, expected
+    block_ids: list[int],
+    total_blocks_per_chunk: int,
+    keep_blocks_per_chunk: int,
+    expected: list[int],
 ) -> None:
     """Selection keeps either full windows or each chunk's trailing window."""
     original = list(block_ids)
@@ -138,7 +141,7 @@ def test_batched_iteration_with_skip_preserves_original_indices() -> None:
     ],
 )
 def test_batched_iteration_with_skip_invalid_arguments(
-    batch_size, skip_count, message
+    batch_size: int, skip_count: int, message: str
 ) -> None:
     """Public argument validation raises ValueError."""
     with pytest.raises(ValueError, match=message):
