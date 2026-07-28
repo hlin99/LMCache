@@ -1187,6 +1187,125 @@ def test_server_store_and_retrieve_cpu_chunks(
     assert torch.allclose(recovered_chunks[0], payload)
 
 
+@pytest.mark.parametrize(
+    ("returned_obj_count", "held_keys"),
+    [
+        pytest.param(1, ["obj1"], id="fewer-than-requested"),
+        pytest.param(3, ["obj1", "obj2"], id="more-than-requested"),
+    ],
+)
+def test_server_prepare_retrieve_releases_locks_once_on_prefetch_count_mismatch(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+    returned_obj_count: int,
+    held_keys: list[str],
+) -> None:
+    """Count mismatch after prefetch returns failure and releases held locks once."""
+    mock_storage = MagicMock()
+    obj_keys = ["obj1", "obj2"]
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    returned_objs = [memory_obj for _ in range(returned_obj_count)]
+
+    @contextmanager
+    def _read_prefetched_results(_keys: Any) -> Any:
+        assert _keys == obj_keys
+        try:
+            yield returned_objs
+        except Exception:
+            mock_storage.finish_read_prefetched(held_keys)
+            raise
+
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h1", b"h2"]
+    module, _, _, _ = server_module_factory(
+        object_keys=obj_keys,
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=20)
+    )
+
+    response = module.prepare_retrieve(_default_key(tokens=16), 20)
+
+    assert response == PrepareRetrieveResponse(success=False, data=b"", context={})
+    mock_storage.finish_read_prefetched.assert_called_once_with(held_keys)
+
+
+def test_server_prepare_retrieve_releases_locks_once_on_missing_tensor_component(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Missing tensor component during retrieve releases held locks exactly once."""
+    mock_storage = MagicMock()
+    obj_keys = ["obj1", "obj2"]
+    good_memory_obj = MagicMock()
+    good_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    bad_memory_obj = MagicMock()
+    bad_memory_obj.tensor = None
+
+    @contextmanager
+    def _read_prefetched_results(_keys: Any) -> Any:
+        assert _keys == obj_keys
+        try:
+            yield [good_memory_obj, bad_memory_obj]
+        except Exception:
+            mock_storage.finish_read_prefetched(obj_keys)
+            raise
+
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h1", b"h2"]
+    module, _, _, _ = server_module_factory(
+        object_keys=obj_keys,
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=21)
+    )
+
+    response = module.prepare_retrieve(_default_key(tokens=16), 21)
+
+    assert response == PrepareRetrieveResponse(success=False, data=b"", context={})
+    mock_storage.finish_read_prefetched.assert_called_once_with(obj_keys)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"not-a-pickle", id="malformed"),
+        pytest.param(pickle.dumps([torch.zeros(2, 2, 8, 16)])[:-2], id="truncated"),
+    ],
+)
+def test_server_commit_store_rejects_invalid_pickle_without_reservation(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+    payload: bytes,
+) -> None:
+    """Malformed pickle payload is rejected before any write reservation."""
+    mock_storage = MagicMock()
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+    module, _, _, _ = server_module_factory(
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=22)
+    )
+
+    result = module.commit_store(_default_key(), 22, payload)
+
+    assert result is False
+    mock_storage.reserve_write.assert_not_called()
+    mock_storage.finish_write.assert_not_called()
+    mock_storage.delete.assert_not_called()
+    mock_storage.rollback_write.assert_not_called()
+
+
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,

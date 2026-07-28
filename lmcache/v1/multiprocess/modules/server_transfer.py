@@ -34,6 +34,10 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
     return str(dtype).split(".")[-1]
 
 
+class _RetrieveValidationError(Exception):
+    """Internal signal for invalid retrieve payloads after successful prefetch."""
+
+
 def create_transfer_strategy(
     storage_manager: "StorageManager",
     *,
@@ -209,7 +213,17 @@ class PickleTransferStrategy(TransferStrategy):
             ``True`` when every reserved object is written successfully.
         """
         obj_keys = resolve_obj_keys(key)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        try:
+            chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        except (
+            pickle.PickleError,
+            EOFError,
+            AttributeError,
+            ImportError,
+            IndexError,
+        ):
+            logger.exception("Failed to deserialize engine-driven store payload")
+            return False
         reserved_dict = self._storage_manager.reserve_write(
             obj_keys, context.layout_desc, "new"
         )
@@ -246,19 +260,21 @@ class PickleTransferStrategy(TransferStrategy):
         try:
             read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
             with read_ctx as maybe_memory_objs:
-                if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
+                if not maybe_memory_objs:
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
-                prefetched_keys = obj_keys[: len(maybe_memory_objs)]
+                if len(maybe_memory_objs) != len(obj_keys):
+                    raise _RetrieveValidationError
                 chunks = []
                 for memory_obj in maybe_memory_objs:
                     if memory_obj.tensor is None:
-                        return PrepareRetrieveResponse(
-                            success=False, data=b"", context={}
-                        )
+                        raise _RetrieveValidationError
                     chunks.append(memory_obj.tensor.cpu().clone())
+                prefetched_keys = obj_keys.copy()
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
+        except _RetrieveValidationError:
+            return PrepareRetrieveResponse(success=False, data=b"", context={})
         finally:
             if prefetched_keys:
                 self._storage_manager.finish_read_prefetched(prefetched_keys)
