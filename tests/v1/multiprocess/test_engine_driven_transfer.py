@@ -269,7 +269,17 @@ def _build_exception_cleanup_prefetch_reader(
     held_keys: list[str],
     release: Callable[[list[str]], None],
 ) -> Callable[[Any], Iterator[list[Any]]]:
-    """Build a mock read-prefetched context manager that releases on exceptions."""
+    """Build a mock read-prefetched context manager with exception cleanup.
+
+    Args:
+        returned_objs: Objects yielded by the context manager.
+        held_keys: Keys released when an exception is raised by the caller.
+        release: Callback used to release held keys.
+
+    Returns:
+        Callable compatible with ``read_prefetched_results`` that yields
+        ``returned_objs`` and invokes ``release(held_keys)`` on exceptions.
+    """
 
     @contextmanager
     def _read_prefetched_results(_keys: Any) -> Iterator[list[Any]]:

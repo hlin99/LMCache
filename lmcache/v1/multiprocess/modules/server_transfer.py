@@ -35,7 +35,12 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 
 
 class _PostPrefetchValidationError(Exception):
-    """Internal signal for invalid objects discovered after successful prefetch."""
+    """Signal invalid prefetched data so context cleanup releases held read locks.
+
+    Raised when post-prefetch validation fails (e.g. count mismatch or missing
+    tensor component). The exception path triggers ``read_prefetched_results`` context
+    cleanup, ensuring held read locks are released exactly once.
+    """
 
 
 def create_transfer_strategy(
@@ -222,8 +227,10 @@ class PickleTransferStrategy(TransferStrategy):
             ImportError,
             IndexError,
         ):
-            # Corrupted/truncated payloads and missing referenced types/modules
-            # must fail before any reserve_write side effect.
+            # pickle.PickleError/EOFError: malformed or truncated payloads.
+            # AttributeError/ImportError: missing referenced classes/modules.
+            # IndexError: malformed pickle op stream edge case.
+            # All deserialization failures must happen before reserve_write.
             logger.exception("Failed to deserialize engine-driven store payload")
             return False
         reserved_dict = self._storage_manager.reserve_write(
