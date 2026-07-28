@@ -143,6 +143,10 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
             ``object_group_layout_shapes``. Empty for legacy mode.
         num_chunks_in_sw: Attention-window size in LMCache chunks for each
             object group (``-1`` = full attention). Empty for legacy mode.
+        transfer_metadata_bytes: Pickle-serialized
+            :class:`~lmcache.v1.multiprocess.transfer_plan.KVTransferMetadata`
+            containing kernel-group geometry, engine-group mapping, and
+            object-group metadata. Empty bytes in legacy single-group mode.
     """
 
     instance_id: int
@@ -158,6 +162,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     object_group_layout_shapes: list[list[list[int]]] = []
     object_group_layout_dtype_strs: list[list[str]] = []
     num_chunks_in_sw: list[int] = []
+    transfer_metadata_bytes: bytes = b""
 
 
 @dataclass

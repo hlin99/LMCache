@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
+import pickle
 
 # Third Party
 import torch
@@ -34,6 +35,7 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     scatter_cpu_to_paged_kv,
 )
 from lmcache.v1.multiprocess.transfer_plan import (
+    KVTransferMetadata,
     build_object_group_layout_desc,
     export_kv_transfer_metadata,
 )
@@ -128,6 +130,7 @@ def _build_multi_group_wire_fields(
     list[int],
     list[MemoryLayoutDesc],
     AttnWindowDesc,
+    KVTransferMetadata | None,
 ]:
     """Build wire-format multi-group fields for the registration payload.
 
@@ -153,29 +156,35 @@ def _build_multi_group_wire_fields(
              object_group_layout_dtype_strs,
              num_chunks_in_sw,
              object_group_layout_descs,
-             attn_desc)
+             attn_desc,
+             transfer_metadata)
 
         ``object_group_layout_shapes[g][k]`` is the flat integer list for
         kernel group ``k`` in object group ``g``.
         ``object_group_layout_dtype_strs[g][k]`` is the dtype string for the
-        same entry.  The final two elements are the server-local copies of the
-        same information.
+        same entry.  ``transfer_metadata`` is a full immutable snapshot of
+        kernel-group geometry, engine-group mapping, and object-group metadata
+        for use by downstream transfer planning; ``None`` in legacy mode.
     """
     # First Party
     from lmcache.v1.distributed.api import DEFAULT_ATTN_WINDOW_DESC
 
     if not engine_group_infos:
-        return [], [], [], [], [], DEFAULT_ATTN_WINDOW_DESC
+        return [], [], [], [], [], DEFAULT_ATTN_WINDOW_DESC, None
 
     # Import KVLayerGroupsManager and format discovery lazily to avoid
     # introducing a hard dependency on the GPU connector at module load time.
     # First Party
     from lmcache.v1.gpu_connector.utils import normalize_and_discover_per_layer_formats
     from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+    from lmcache.v1.multiprocess.group_view import engine_group_layer_indices
 
     tensors = list(kv_caches.values())
     kv_caches_norm, engine_kv_formats = normalize_and_discover_per_layer_formats(
-        tensors, EngineType.VLLM, layout_hints=layout_hints
+        tensors,
+        engine_group_layer_indices(engine_group_infos),
+        EngineType.VLLM,
+        layout_hints=layout_hints,
     )
     tokens_per_chunk = blocks_in_chunk * block_size
     manager = KVLayerGroupsManager(
@@ -208,6 +217,7 @@ def _build_multi_group_wire_fields(
         wire_num_chunks_in_sw,
         object_group_layout_descs,
         attn_desc,
+        transfer_metadata,
     )
 
 
@@ -700,12 +710,18 @@ class EngineDrivenTransferContext(TransferContext):
             wire_num_chunks_in_sw,
             object_group_layout_descs,
             attn_desc,
+            transfer_metadata,
         ) = _build_multi_group_wire_fields(
             kv_caches,
             engine_group_infos,
             blocks_in_chunk,
             block_size,
             layout_hints,
+        )
+
+        # Pickle the full KVTransferMetadata so the server can store it.
+        transfer_metadata_bytes = (
+            pickle.dumps(transfer_metadata) if transfer_metadata is not None else b""
         )
 
         future = send_request(
@@ -725,6 +741,7 @@ class EngineDrivenTransferContext(TransferContext):
                     object_group_layout_shapes=wire_obj_shapes,
                     object_group_layout_dtype_strs=wire_obj_dtype_strs,
                     num_chunks_in_sw=wire_num_chunks_in_sw,
+                    transfer_metadata_bytes=transfer_metadata_bytes,
                 )
             ],
         )
@@ -741,6 +758,7 @@ class EngineDrivenTransferContext(TransferContext):
             use_mla=use_mla_flag,
             object_group_layout_descs=object_group_layout_descs,
             attn_desc=attn_desc,
+            transfer_metadata=transfer_metadata,
         )
         self._engine_driven_context = create_engine_driven_context(
             metadata,

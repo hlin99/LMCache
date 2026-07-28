@@ -1987,3 +1987,416 @@ def test_decode_multi_group_payload_fields_multi_group() -> None:
     assert descs[1].shapes[0] == torch.Size([1, 2, 8, 32])
     assert descs[1].dtypes[0] == torch.float16
     assert attn_desc.num_chunks_in_sw == [-1, 3]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3: Worker-side multi-group registration tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_fake_transfer_metadata() -> Any:
+    """Build a minimal KVTransferMetadata test double using real lmc_ops types.
+
+    Returns:
+        A KVTransferMetadata with one kernel group and one object group.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.transfer_plan import (
+        KernelGroupTransferMetadata,
+        KVTransferMetadata,
+        ObjectGroupTransferMetadata,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    kg = KernelGroupTransferMetadata(
+        kernel_group_id=0,
+        engine_group_id=0,
+        layer_indices=(0, 1),
+        blocks_per_chunk=2,
+        blocks_per_window=2,
+        slots_per_chunk_in_window=8,
+        kv_size=2,
+        num_layers=2,
+        hidden_dim_size=16,
+        slots_per_block=4,
+        tokens_per_block=4,
+        dtype=torch.float32,
+        engine_kv_format=lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+    )
+    og = ObjectGroupTransferMetadata(
+        object_group_id=0,
+        kernel_group_ids=(0,),
+        sw_size_chunks=-1,
+    )
+    return KVTransferMetadata(
+        num_chunks_in_sw=(-1,),
+        tokens_per_chunk=8,
+        kernel_groups=(kg,),
+        object_groups=(og,),
+    )
+
+
+def test_build_multi_group_wire_fields_returns_transfer_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_build_multi_group_wire_fields returns KVTransferMetadata in position 6."""
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+    from lmcache.v1.multiprocess.transfer_plan import KVTransferMetadata
+
+    fake_tm = _make_fake_transfer_metadata()
+    fake_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+    )
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "export_kv_transfer_metadata",
+        lambda *_a, **_kw: fake_tm,
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "build_object_group_layout_desc",
+        lambda *_a, **_kw: fake_layout,
+    )
+
+    def _fake_normalize(
+        tensors: Any,
+        layer_index_groups: Any,
+        engine_type: Any,
+        layout_hints: Any = None,
+    ) -> Any:
+        return tensors, [MagicMock()] * len(tensors)
+
+    monkeypatch.setattr(
+        "lmcache.v1.gpu_connector.utils.normalize_and_discover_per_layer_formats",
+        _fake_normalize,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.kv_layer_groups.KVLayerGroupsManager",
+        MagicMock(return_value=MagicMock()),
+    )
+
+    engine_group_infos = [EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))]
+    kv_caches = _make_kv_caches(num_layers=2)
+
+    result = worker_transfer._build_multi_group_wire_fields(
+        kv_caches,
+        engine_group_infos,
+        blocks_in_chunk=2,
+        block_size=4,
+        layout_hints=None,
+    )
+
+    assert len(result) == 7
+    returned_tm = result[6]
+    assert isinstance(returned_tm, KVTransferMetadata)
+    assert returned_tm is fake_tm
+
+
+def test_build_multi_group_wire_fields_calls_engine_group_layer_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_build_multi_group_wire_fields passes engine_group_layer_indices to normalize."""
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.multiprocess.group_view import (
+        EngineGroupInfo,
+        engine_group_layer_indices,
+    )
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+
+    fake_tm = _make_fake_transfer_metadata()
+    fake_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "export_kv_transfer_metadata",
+        lambda *_a, **_kw: fake_tm,
+    )
+    monkeypatch.setattr(
+        worker_transfer,
+        "build_object_group_layout_desc",
+        lambda *_a, **_kw: fake_layout,
+    )
+
+    captured_layer_idx_groups: list[Any] = []
+
+    def _fake_normalize(
+        tensors: Any,
+        layer_index_groups: Any,
+        engine_type: Any,
+        layout_hints: Any = None,
+    ) -> Any:
+        captured_layer_idx_groups.append(layer_index_groups)
+        return tensors, [MagicMock()] * len(tensors)
+
+    monkeypatch.setattr(
+        "lmcache.v1.gpu_connector.utils.normalize_and_discover_per_layer_formats",
+        _fake_normalize,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.kv_layer_groups.KVLayerGroupsManager",
+        MagicMock(return_value=MagicMock()),
+    )
+
+    engine_group_infos = [EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))]
+    kv_caches = _make_kv_caches(num_layers=2)
+
+    worker_transfer._build_multi_group_wire_fields(
+        kv_caches,
+        engine_group_infos,
+        blocks_in_chunk=2,
+        block_size=4,
+        layout_hints=None,
+    )
+
+    expected_indices = engine_group_layer_indices(engine_group_infos)
+    assert len(captured_layer_idx_groups) == 1
+    assert captured_layer_idx_groups[0] == expected_indices
+
+
+def test_build_multi_group_wire_fields_legacy_returns_none_transfer_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty engine_group_infos returns None as the transfer_metadata element."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import worker_transfer
+
+    kv_caches = _make_kv_caches(num_layers=2)
+    result = worker_transfer._build_multi_group_wire_fields(
+        kv_caches,
+        engine_group_infos=[],
+        blocks_in_chunk=2,
+        block_size=4,
+        layout_hints=None,
+    )
+
+    assert len(result) == 7
+    assert result[6] is None
+
+
+def test_worker_register_multi_group_stores_transfer_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker register() stores KVTransferMetadata in EngineDrivenContextMetadata."""
+    # First Party
+    from lmcache.v1.distributed.api import DEFAULT_ATTN_WINDOW_DESC, MemoryLayoutDesc
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    from lmcache.v1.multiprocess.transfer_plan import KVTransferMetadata
+    import lmcache.c_ops as lmc_ops
+
+    fake_tm = _make_fake_transfer_metadata()
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_a, **_kw: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            2,
+        ),
+    )
+
+    captured_metadata: list[Any] = []
+
+    def _fake_create(metadata: Any, *_a: Any, **_kw: Any) -> MagicMock:
+        captured_metadata.append(metadata)
+        return MagicMock()
+
+    monkeypatch.setattr(worker_transfer, "create_engine_driven_context", _fake_create)
+
+    fixed_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+    )
+    group_info = EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))
+    monkeypatch.setattr(
+        worker_transfer,
+        "_build_multi_group_wire_fields",
+        lambda *_a, **_kw: (
+            [group_info],
+            [[[2, 2, 8, 16]]],
+            [["float32"]],
+            [-1],
+            [fixed_layout],
+            DEFAULT_ATTN_WINDOW_DESC,
+            fake_tm,
+        ),
+    )
+
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=[group_info],
+    )
+
+    assert len(captured_metadata) == 1
+    meta = captured_metadata[0]
+    assert isinstance(meta, EngineDrivenContextMetadata)
+    assert isinstance(meta.transfer_metadata, KVTransferMetadata)
+    assert meta.transfer_metadata is fake_tm
+
+
+def test_worker_register_sends_transfer_metadata_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker register() pickles transfer_metadata into the wire payload."""
+    # First Party
+    from lmcache.v1.distributed.api import DEFAULT_ATTN_WINDOW_DESC, MemoryLayoutDesc
+    from lmcache.v1.multiprocess.custom_types import (
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+    from lmcache.v1.multiprocess.transfer_plan import KVTransferMetadata
+    import lmcache.c_ops as lmc_ops
+
+    fake_tm = _make_fake_transfer_metadata()
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_a, **_kw: (
+            4,
+            2,
+            16,
+            "float32",
+            lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            2,
+        ),
+    )
+    monkeypatch.setattr(worker_transfer, "create_engine_driven_context", MagicMock())
+
+    fixed_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+    )
+    group_info = EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))
+    monkeypatch.setattr(
+        worker_transfer,
+        "_build_multi_group_wire_fields",
+        lambda *_a, **_kw: (
+            [group_info],
+            [[[2, 2, 8, 16]]],
+            [["float32"]],
+            [-1],
+            [fixed_layout],
+            DEFAULT_ATTN_WINDOW_DESC,
+            fake_tm,
+        ),
+    )
+
+    captured_payloads: list[Any] = []
+
+    def _fake_send(_mq_client: Any, _req_type: Any, args: Any) -> MagicMock:
+        captured_payloads.extend(args)
+        future = MagicMock()
+        future.result.return_value = RegisterEngineDrivenContextResponse()
+        return future
+
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=_fake_send,
+        engine_group_infos=[group_info],
+    )
+
+    assert len(captured_payloads) == 1
+    payload = captured_payloads[0]
+    assert isinstance(payload, RegisterEngineDrivenContextPayload)
+    assert payload.transfer_metadata_bytes != b""
+    decoded = pickle.loads(payload.transfer_metadata_bytes)
+    assert isinstance(decoded, KVTransferMetadata)
+    assert decoded.tokens_per_chunk == fake_tm.tokens_per_chunk
+    assert decoded.num_chunks_in_sw == fake_tm.num_chunks_in_sw
+
+
+def test_server_register_stores_transfer_metadata_from_payload(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Server round-trip: transfer_metadata_bytes is deserialized and stored."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_plan import KVTransferMetadata
+
+    fake_tm = _make_fake_transfer_metadata()
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=50,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_bytes=pickle.dumps(fake_tm),
+    )
+    module.register_kv_cache_engine_driven_context(payload)
+
+    with module._lock:
+        entry = module._engine_driven_contexts.get(50)
+    assert entry is not None
+    stored_tm = entry.metadata.transfer_metadata
+    assert isinstance(stored_tm, KVTransferMetadata)
+    assert stored_tm.tokens_per_chunk == fake_tm.tokens_per_chunk
+    assert stored_tm.num_chunks_in_sw == fake_tm.num_chunks_in_sw
+    assert len(stored_tm.kernel_groups) == 1
+    assert stored_tm.kernel_groups[0].kernel_group_id == 0
+    assert stored_tm.kernel_groups[0].engine_group_id == 0
+    assert stored_tm.kernel_groups[0].dtype == torch.float32
+    assert len(stored_tm.object_groups) == 1
+    assert stored_tm.object_groups[0].kernel_group_ids == (0,)
+
+
+def test_server_register_legacy_transfer_metadata_is_none(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Legacy registration (no transfer_metadata_bytes) stores None."""
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=51)
+    )
+
+    with module._lock:
+        entry = module._engine_driven_contexts.get(51)
+    assert entry is not None
+    assert entry.metadata.transfer_metadata is None

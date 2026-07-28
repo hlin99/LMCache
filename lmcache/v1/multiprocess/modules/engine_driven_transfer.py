@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
+import pickle
 import threading
 import time
 
@@ -443,6 +444,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload, legacy_layout_desc
         )
 
+        # Deserialize the full KVTransferMetadata snapshot when present.
+        transfer_metadata = None
+        if payload.transfer_metadata_bytes:
+            transfer_metadata = pickle.loads(payload.transfer_metadata_bytes)
+
         # Primary layout is object group 0.
         primary_layout_desc = (
             object_group_layout_descs[0]
@@ -456,6 +462,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             use_mla=payload.use_mla,
             object_group_layout_descs=object_group_layout_descs,
             attn_desc=attn_desc,
+            transfer_metadata=transfer_metadata,
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the

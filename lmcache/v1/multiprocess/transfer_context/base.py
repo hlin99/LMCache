@@ -40,6 +40,7 @@ from lmcache.v1.multiprocess.mq import MessageQueueClient
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.multiprocess.transfer_plan import KVTransferMetadata
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
@@ -123,6 +124,10 @@ class EngineDrivenContextMetadata:
             callers should fall back to ``layout_desc``.
         attn_desc: Cross-chunk attention windows for all object groups. Defaults
             to single full-attention group matching legacy behaviour.
+        transfer_metadata: Full shared KV transfer metadata snapshot containing
+            kernel-group geometry, engine-group mapping, and object-group
+            metadata required by downstream transfer planning (Step 4+). ``None``
+            in legacy single-group mode.
     """
 
     layout_desc: MemoryLayoutDesc
@@ -130,6 +135,7 @@ class EngineDrivenContextMetadata:
     use_mla: bool
     object_group_layout_descs: list[MemoryLayoutDesc] = field(default_factory=list)
     attn_desc: AttnWindowDesc = field(default_factory=lambda: DEFAULT_ATTN_WINDOW_DESC)
+    transfer_metadata: "KVTransferMetadata | None" = None
 
 
 class EngineDrivenContext(ABC):
