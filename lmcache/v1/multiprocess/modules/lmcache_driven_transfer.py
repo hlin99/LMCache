@@ -120,6 +120,8 @@ def downsample_and_stage_block_ids(
         This function has some coupled logic with transfer_kv_per_object_group below.
         The caller need to make sure that the block ids seen by
         transfer_kv_per_object_group are produced by this function.
+        This function mutates ``block_ids`` in-place to preserve existing
+        caller-visible behavior.
 
     Example:
         If a model have 2 kernel groups, one is full attention with block size 32,

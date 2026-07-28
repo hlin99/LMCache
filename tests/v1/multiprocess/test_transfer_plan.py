@@ -102,6 +102,18 @@ def test_downsample_block_ids_multi_group_and_no_input_mutation() -> None:
     assert source == source_snapshot
 
 
+def test_downsample_block_ids_invalid_inputs_raise() -> None:
+    """Invalid group counts and geometry raise ValueError."""
+    with pytest.raises(ValueError, match="zip"):
+        downsample_block_ids(
+            [[1, 2, 3, 4]],
+            blocks_per_chunk=[2],
+            blocks_per_window=[1, 1],
+        )
+    with pytest.raises(ValueError, match="multiple"):
+        downsample_block_ids([[1, 2, 3]], blocks_per_chunk=[2], blocks_per_window=[1])
+
+
 def test_compute_num_objects_to_skip_cases() -> None:
     """Skip count covers store/full-attention/sliding-window retrieve cases."""
     assert (
@@ -131,6 +143,20 @@ def test_batched_iteration_with_skip_preserves_original_indices() -> None:
         (4, (4, 5, 6)),
         (7, (7, 8, 9)),
     ]
+
+
+def test_batched_iteration_with_skip_overlong_skip_yields_nothing() -> None:
+    """Skipping past the tail exhausts iteration without yielding batches."""
+    assert (
+        list(
+            batched_iteration_with_skip(
+                list(range(10)),
+                batch_size=3,
+                skip_count=15,
+            )
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(

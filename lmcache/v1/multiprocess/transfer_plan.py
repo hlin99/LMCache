@@ -122,6 +122,10 @@ def compute_num_objects_to_skip(
 
     Raises:
         ValueError: If ``sw_size_chunks`` or ``num_objects`` is negative.
+
+    Note:
+        ``sw_size_chunks=0`` is treated as keeping no chunks in retrieve mode,
+        so all objects are skipped.
     """
     if sw_size_chunks < 0:
         raise ValueError("sw_size_chunks must be non-negative")
