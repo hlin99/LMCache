@@ -230,10 +230,9 @@ class PickleTransferStrategy(TransferStrategy):
             ImportError,
             IndexError,
         ):
-            # pickle.PickleError/EOFError: malformed or truncated payloads.
-            # AttributeError/ImportError: missing referenced classes/modules.
-            # IndexError: malformed pickle op stream edge case.
-            # All deserialization failures must happen before reserve_write.
+            # Deserialization failures (malformed/truncated payloads, unresolved
+            # referenced symbols/modules, malformed opcode stream) must happen
+            # before any reserve_write side effect.
             logger.exception("Failed to deserialize engine-driven store payload")
             return False
         reserved_dict = self._storage_manager.reserve_write(
@@ -268,11 +267,13 @@ class PickleTransferStrategy(TransferStrategy):
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return serialized pickle payload."""
         obj_keys = resolve_obj_keys(key)
-        retrieved_successfully = False
+        prefetch_validated = False
         try:
             read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
             with read_ctx as maybe_memory_objs:
                 if not maybe_memory_objs:
+                    # ``read_prefetched_results`` yielded None/empty and owns its
+                    # cleanup in this branch; no extra release is needed here.
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
                 if len(maybe_memory_objs) != len(obj_keys):
                     raise _PostPrefetchValidationError
@@ -281,14 +282,14 @@ class PickleTransferStrategy(TransferStrategy):
                     if memory_obj.tensor is None:
                         raise _PostPrefetchValidationError
                     chunks.append(memory_obj.tensor.cpu().clone())
-                retrieved_successfully = True
+                prefetch_validated = True
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
         except _PostPrefetchValidationError:
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         finally:
-            if retrieved_successfully:
+            if prefetch_validated:
                 self._storage_manager.finish_read_prefetched(obj_keys)
 
     def commit_retrieve(

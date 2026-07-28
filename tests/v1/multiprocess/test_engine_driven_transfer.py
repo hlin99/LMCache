@@ -262,9 +262,10 @@ def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
 INSTANCE_ID_PREFETCH_COUNT_MISMATCH = 20
 INSTANCE_ID_MISSING_TENSOR_COMPONENT = 21
 INSTANCE_ID_INVALID_PICKLE_STORE = 22
+TEST_CPU_CHUNK_SHAPE = (2, 2, 8, 16)
 
 
-def _build_exception_cleanup_prefetch_reader(
+def _mock_prefetch_context_with_cleanup(
     returned_objs: list[Any],
     held_keys: list[str],
     release: Callable[[list[str]], None],
@@ -1235,14 +1236,21 @@ def test_server_prepare_retrieve_releases_locks_once_on_prefetch_count_mismatch(
     returned_obj_count: int,
     held_keys: list[str],
 ) -> None:
-    """Count mismatch after prefetch returns failure and releases held locks once."""
+    """Validate mismatch count path releases held locks exactly once.
+
+    Args:
+        stub_native_storage_ops: Fixture stubbing native storage operations.
+        server_module_factory: Fixture creating a server module with mocked storage.
+        returned_obj_count: Number of objects returned by mocked prefetch context.
+        held_keys: Keys that represent held read locks during the mocked context.
+    """
     mock_storage = MagicMock()
     obj_keys = ["obj1", "obj2"]
     memory_obj = MagicMock()
-    memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    memory_obj.tensor = torch.zeros(TEST_CPU_CHUNK_SHAPE)
     returned_objs = [memory_obj for _ in range(returned_obj_count)]
     mock_storage.read_prefetched_results.side_effect = (
-        _build_exception_cleanup_prefetch_reader(
+        _mock_prefetch_context_with_cleanup(
             returned_objs=returned_objs,
             held_keys=held_keys,
             release=mock_storage.finish_read_prefetched,
@@ -1271,15 +1279,20 @@ def test_server_prepare_retrieve_releases_locks_once_on_missing_tensor_component
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Missing tensor component during retrieve releases held locks exactly once."""
+    """Validate missing tensor component path releases held locks exactly once.
+
+    Args:
+        stub_native_storage_ops: Fixture stubbing native storage operations.
+        server_module_factory: Fixture creating a server module with mocked storage.
+    """
     mock_storage = MagicMock()
     obj_keys = ["obj1", "obj2"]
     good_memory_obj = MagicMock()
-    good_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
+    good_memory_obj.tensor = torch.zeros(TEST_CPU_CHUNK_SHAPE)
     bad_memory_obj = MagicMock()
     bad_memory_obj.tensor = None
     mock_storage.read_prefetched_results.side_effect = (
-        _build_exception_cleanup_prefetch_reader(
+        _mock_prefetch_context_with_cleanup(
             returned_objs=[good_memory_obj, bad_memory_obj],
             held_keys=obj_keys,
             release=mock_storage.finish_read_prefetched,
@@ -1308,7 +1321,9 @@ def test_server_prepare_retrieve_releases_locks_once_on_missing_tensor_component
     "payload",
     [
         pytest.param(b"not-a-pickle", id="malformed"),
-        pytest.param(pickle.dumps([torch.zeros(2, 2, 8, 16)])[:-2], id="truncated"),
+        pytest.param(
+            pickle.dumps([torch.zeros(TEST_CPU_CHUNK_SHAPE)])[:-2], id="truncated"
+        ),
     ],
 )
 def test_server_commit_store_rejects_invalid_pickle_without_reservation(
@@ -1316,7 +1331,13 @@ def test_server_commit_store_rejects_invalid_pickle_without_reservation(
     server_module_factory: ServerModuleFactory,
     payload: bytes,
 ) -> None:
-    """Malformed pickle payload is rejected before any write reservation."""
+    """Validate invalid pickle payload fails before any storage side effects.
+
+    Args:
+        stub_native_storage_ops: Fixture stubbing native storage operations.
+        server_module_factory: Fixture creating a server module with mocked storage.
+        payload: Malformed or truncated pickle payload passed to commit_store.
+    """
     mock_storage = MagicMock()
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h"]
