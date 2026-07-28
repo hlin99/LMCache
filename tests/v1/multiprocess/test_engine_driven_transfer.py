@@ -1808,7 +1808,16 @@ def _make_multi_group_payload(
         dtype_str=dtype_str,
         use_mla=False,
         engine_group_infos=[
-            EngineGroupInfo(engine_group_id=0, layer_indices=tuple(range(total_layers)))
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=tuple(
+                    range(
+                        og_id * num_layers_per_group,
+                        (og_id + 1) * num_layers_per_group,
+                    )
+                ),
+            )
+            for og_id in range(num_object_groups)
         ],
         object_group_layout_shapes=obj_shapes,
         object_group_layout_dtype_strs=obj_dtype_strs,
@@ -2389,7 +2398,7 @@ def test_server_register_rejects_layer_absent_from_engine_group(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Layer in kernel group absent from engine_group_infos raises ValueError."""
+    """Kernel group layer_indices mismatching engine_group_infos raises ValueError."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         KernelGroupTransferMetadataWire,
@@ -2401,7 +2410,7 @@ def test_server_register_rejects_layer_absent_from_engine_group(
 
     module, _, _, _ = server_module_factory(chunk_size=8)
 
-    # Kernel group includes layer 5 but engine_group_infos only lists layers (0, 1).
+    # Kernel group has layer_indices=[0, 5] but engine_group_infos lists (0, 1).
     wire = KVTransferMetadataWire(
         num_chunks_in_sw=[-1],
         tokens_per_chunk=8,
@@ -2409,7 +2418,7 @@ def test_server_register_rejects_layer_absent_from_engine_group(
             KernelGroupTransferMetadataWire(
                 kernel_group_id=0,
                 engine_group_id=0,
-                layer_indices=[0, 5],  # layer 5 not in engine_group_infos
+                layer_indices=[0, 5],  # mismatches engine_group_infos (0, 1)
                 blocks_per_chunk=2,
                 blocks_per_window=2,
                 slots_per_chunk_in_window=8,
@@ -2443,7 +2452,7 @@ def test_server_register_rejects_layer_absent_from_engine_group(
         num_chunks_in_sw=[-1],
         transfer_metadata_wire=wire,
     )
-    with pytest.raises(ValueError, match="layer_index"):
+    with pytest.raises(ValueError, match="layer_indices"):
         module.register_kv_cache_engine_driven_context(payload)
 
 
@@ -2451,7 +2460,7 @@ def test_server_register_rejects_engine_group_layer_coverage_gap(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Layer declared in engine_group_infos but absent from kernel groups raises."""
+    """engine_group_infos layer_indices longer than kernel group's raises ValueError."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         KernelGroupTransferMetadataWire,
@@ -2463,7 +2472,7 @@ def test_server_register_rejects_engine_group_layer_coverage_gap(
 
     module, _, _, _ = server_module_factory(chunk_size=8)
 
-    # engine_group_infos claims layer 1 but kernel group only covers layer 0.
+    # engine_group_infos claims (0, 1) but kernel group only covers (0,) → mismatch.
     wire = KVTransferMetadataWire(
         num_chunks_in_sw=[-1],
         tokens_per_chunk=8,
@@ -2471,7 +2480,7 @@ def test_server_register_rejects_engine_group_layer_coverage_gap(
             KernelGroupTransferMetadataWire(
                 kernel_group_id=0,
                 engine_group_id=0,
-                layer_indices=[0],  # layer 1 missing
+                layer_indices=[0],  # engine_group_infos expects [0, 1]
                 blocks_per_chunk=2,
                 blocks_per_window=2,
                 slots_per_chunk_in_window=8,
@@ -2508,7 +2517,7 @@ def test_server_register_rejects_engine_group_layer_coverage_gap(
         num_chunks_in_sw=[-1],
         transfer_metadata_wire=wire,
     )
-    with pytest.raises(ValueError, match="absent from all"):
+    with pytest.raises(ValueError, match="layer_indices"):
         module.register_kv_cache_engine_driven_context(payload)
 
 
@@ -3103,3 +3112,92 @@ def test_server_register_legacy_transfer_metadata_is_none(
         entry = module._engine_driven_contexts.get(51)
     assert entry is not None
     assert entry.metadata.transfer_metadata is None
+
+
+def test_server_register_rejects_swapped_layer_membership(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Two kernel groups with same engine_group_id but swapped layers must be rejected.
+
+    engine_group_infos and kernel_groups must correspond one-to-one in list
+    order.  Swapping the layer_indices in engine_group_infos so that index 0
+    lists the layers of kernel group 1 and vice-versa must raise ValueError.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # Two kernel groups, both with engine_group_id=0 but distinct layer sets.
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1, -1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=[0, 1],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            ),
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=1,
+                engine_group_id=0,
+                layer_indices=[2, 3],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            ),
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0, kernel_group_ids=[0], sw_size_chunks=-1
+            ),
+            ObjectGroupTransferMetadataWire(
+                object_group_id=1, kernel_group_ids=[1], sw_size_chunks=-1
+            ),
+        ],
+    )
+    # engine_group_infos has layer sets swapped relative to kernel group order.
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=52,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=4,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=(2, 3)),  # swapped
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1)),  # swapped
+        ],
+        object_group_layout_shapes=[[[2, 2, 8, 16]], [[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"], ["float32"]],
+        num_chunks_in_sw=[-1, -1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="layer_indices"):
+        module.register_kv_cache_engine_driven_context(payload)

@@ -234,10 +234,10 @@ def _validate_transfer_metadata_consistency(
     4. Every kernel-group ID referenced by an object group is a valid index.
     5. Each object-group's ``sw_size_chunks`` matches
        ``num_chunks_in_sw[object_group_id]``.
-    6. Every kernel-group's ``engine_group_id`` is present in
-       ``engine_group_infos``, and every layer in every kernel group appears in
-       the corresponding ``EngineGroupInfo`` entry; conversely all layers in
-       ``engine_group_infos`` appear in at least one kernel group.
+    6. ``engine_group_infos`` and kernel groups correspond one-to-one in list
+       order: counts must match, each pair must share the same
+       ``engine_group_id``, and each pair's ``layer_indices`` must be identical
+       in value and order.
     7. Layouts rebuilt from ``build_object_group_layout_desc`` match
        ``object_group_layout_descs`` element-by-element.
 
@@ -305,44 +305,28 @@ def _validate_transfer_metadata_consistency(
                 f"num_chunks_in_sw[{og.object_group_id}] ({expected_sw})"
             )
 
-    # 6. engine_group_infos consistency.
+    # 6. engine_group_infos vs kernel groups: one-to-one positional correspondence.
     if engine_group_infos:
-        valid_engine_group_ids = {eg.engine_group_id for eg in engine_group_infos}
-        # Build per-engine-group layer sets from the payload's engine_group_infos.
-        eg_layers_by_id: dict[int, set[int]] = {}
-        for eg in engine_group_infos:
-            eg_layers_by_id.setdefault(eg.engine_group_id, set()).update(
-                eg.layer_indices
+        if len(engine_group_infos) != num_kernel_groups:
+            raise ValueError(
+                f"engine_group_infos has {len(engine_group_infos)} entries but "
+                f"transfer_metadata has {num_kernel_groups} kernel groups; "
+                "they must correspond one-to-one in list order"
             )
-        # Validate kernel groups and accumulate their layers by engine_group_id.
-        all_kg_layers_by_eg: dict[int, set[int]] = {}
-        for kg in transfer_metadata.kernel_groups:
-            if kg.engine_group_id not in valid_engine_group_ids:
+        for idx, (egi, kg) in enumerate(
+            zip(engine_group_infos, transfer_metadata.kernel_groups)
+        ):
+            if egi.engine_group_id != kg.engine_group_id:
                 raise ValueError(
-                    f"kernel_group {kg.kernel_group_id} references "
-                    f"engine_group_id {kg.engine_group_id} which is not in "
-                    f"engine_group_infos (valid: {sorted(valid_engine_group_ids)})"
+                    f"engine_group_infos[{idx}].engine_group_id "
+                    f"({egi.engine_group_id}) does not match "
+                    f"kernel_groups[{idx}].engine_group_id ({kg.engine_group_id})"
                 )
-            eg_layer_set = eg_layers_by_id.get(kg.engine_group_id, set())
-            for layer_idx in kg.layer_indices:
-                if layer_idx not in eg_layer_set:
-                    raise ValueError(
-                        f"kernel_group {kg.kernel_group_id}: layer_index "
-                        f"{layer_idx} for engine_group_id {kg.engine_group_id} "
-                        "is not listed in engine_group_infos for that engine group"
-                    )
-            all_kg_layers_by_eg.setdefault(kg.engine_group_id, set()).update(
-                kg.layer_indices
-            )
-        # All layers declared in engine_group_infos must appear in kernel groups.
-        for eg_id, eg_layer_set in eg_layers_by_id.items():
-            kg_layer_set = all_kg_layers_by_eg.get(eg_id, set())
-            missing = eg_layer_set - kg_layer_set
-            if missing:
+            if tuple(egi.layer_indices) != kg.layer_indices:
                 raise ValueError(
-                    f"engine_group_id {eg_id} layers {sorted(missing)} are "
-                    "declared in engine_group_infos but absent from all "
-                    "kernel groups"
+                    f"engine_group_infos[{idx}].layer_indices "
+                    f"({list(egi.layer_indices)}) does not match "
+                    f"kernel_groups[{idx}].layer_indices ({list(kg.layer_indices)})"
                 )
 
     # 7. Rebuild layouts from transfer_metadata and compare with payload descs.
