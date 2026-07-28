@@ -40,12 +40,13 @@ from lmcache.v1.multiprocess.transfer_context.base import (
 )
 from lmcache.v1.multiprocess.transfer_plan import (
     KVTransferMetadata,
+    build_object_group_layout_desc,
     compute_num_objects_to_skip,
     downsample_block_ids,
+    export_kv_transfer_metadata,
     has_sufficient_block_ids,
     recalculate_blocks_to_skip,
-    build_object_group_layout_desc,
-    export_kv_transfer_metadata,
+    uses_multi_group_transfer_metadata,
 )
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.event_ipc import (
@@ -355,16 +356,6 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
     return block_ids[0]
 
 
-def _uses_multi_group_transfer_metadata(
-    transfer_metadata: KVTransferMetadata | None,
-) -> bool:
-    """Return whether transfer metadata represents multi-group transfer."""
-    return transfer_metadata is not None and (
-        len(transfer_metadata.object_groups) > 1
-        or len(transfer_metadata.kernel_groups) > 1
-    )
-
-
 def _engine_group_block_ids_for_kernel_group(
     block_ids: list[list[int]],
     kernel_group_id: int,
@@ -540,6 +531,7 @@ def _scatter_multi_group_pickle_chunks(
         kernel_group_id: []
         for kernel_group_id in range(len(transfer_metadata.kernel_groups))
     }
+    first_selected_chunk_idx_by_kernel_group: dict[int, int] = {}
     for object_group in transfer_metadata.object_groups:
         num_objects_to_skip = compute_num_objects_to_skip(
             object_group.sw_size_chunks,
@@ -562,6 +554,13 @@ def _scatter_multi_group_pickle_chunks(
                 object_group.kernel_group_ids,
                 strict=True,
             ):
+                previous_first_idx = first_selected_chunk_idx_by_kernel_group.get(
+                    kernel_group_id
+                )
+                if previous_first_idx is None or num_objects_to_skip < previous_first_idx:
+                    first_selected_chunk_idx_by_kernel_group[kernel_group_id] = (
+                        num_objects_to_skip
+                    )
                 group_metadata = transfer_metadata.kernel_groups[kernel_group_id]
                 full_block_ids = per_kernel_group_block_ids[kernel_group_id][
                     : num_chunks * group_metadata.blocks_per_chunk
@@ -590,6 +589,15 @@ def _scatter_multi_group_pickle_chunks(
         if not chunks:
             continue
         group_metadata = transfer_metadata.kernel_groups[kernel_group_id]
+        first_selected_chunk_idx = first_selected_chunk_idx_by_kernel_group.get(
+            kernel_group_id,
+            0,
+        )
+        local_skip_first_n_tokens = max(
+            0,
+            skip_first_n_tokens
+            - first_selected_chunk_idx * transfer_metadata.tokens_per_chunk,
+        )
         blocks_to_skip = recalculate_blocks_to_skip(
             group_metadata.blocks_per_chunk,
             group_metadata.blocks_per_window,
@@ -603,7 +611,7 @@ def _scatter_multi_group_pickle_chunks(
             per_kernel_group_blocks[kernel_group_id][blocks_to_skip:],
             chunks,
             group_metadata.blocks_per_window,
-            skip_first_n_tokens=skip_first_n_tokens,
+            skip_first_n_tokens=local_skip_first_n_tokens,
             layout_hints=layout_hints,
             engine_kv_format=group_metadata.engine_kv_format,
         )
@@ -1110,7 +1118,7 @@ class EngineDrivenTransferContext(TransferContext):
         transfer_metadata = (
             self._engine_driven_context.metadata.transfer_metadata
         )
-        is_multi_group = _uses_multi_group_transfer_metadata(transfer_metadata)
+        is_multi_group = uses_multi_group_transfer_metadata(transfer_metadata)
         torch_dev.synchronize()
         result = self._engine_driven_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
@@ -1181,7 +1189,7 @@ class EngineDrivenTransferContext(TransferContext):
                 transfer_metadata = (
                     self._engine_driven_context.metadata.transfer_metadata
                 )
-                if _uses_multi_group_transfer_metadata(transfer_metadata):
+                if uses_multi_group_transfer_metadata(transfer_metadata):
                     if transfer_metadata is None:
                         raise RuntimeError(
                             "multi-group transfer metadata is unexpectedly None"

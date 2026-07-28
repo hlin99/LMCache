@@ -430,6 +430,24 @@ def compute_num_objects_to_skip(
     return max(0, num_objects - sw_size_chunks)
 
 
+def uses_multi_group_transfer_metadata(
+    transfer_metadata: KVTransferMetadata | None,
+) -> bool:
+    """Return whether transfer metadata requires grouped transfer handling.
+
+    Args:
+        transfer_metadata: Optional immutable transfer metadata snapshot.
+
+    Returns:
+        ``True`` when metadata contains more than one object group or more than
+        one kernel group; otherwise ``False``.
+    """
+    return transfer_metadata is not None and (
+        len(transfer_metadata.object_groups) > 1
+        or len(transfer_metadata.kernel_groups) > 1
+    )
+
+
 def batched_iteration_with_skip(
     sequence: Sequence[ItemT],
     batch_size: int,

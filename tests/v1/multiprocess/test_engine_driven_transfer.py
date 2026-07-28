@@ -3342,6 +3342,83 @@ def test_worker_multi_group_pickle_store_uses_deterministic_group_chunk_order(
     ]
 
 
+def test_worker_multi_group_pickle_retrieve_uses_local_skip_after_window_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sliding-window retrieve converts global skip to local selected-chunk skip."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        _scatter_multi_group_pickle_chunks,
+    )
+    from lmcache.v1.multiprocess.transfer_plan import (
+        KVTransferMetadata,
+        KernelGroupTransferMetadata,
+        ObjectGroupTransferMetadata,
+    )
+    from lmcache.v1.platform.ops_types import EngineKVFormat
+
+    transfer_metadata = KVTransferMetadata(
+        num_chunks_in_sw=(2,),
+        tokens_per_chunk=8,
+        kernel_groups=(
+            KernelGroupTransferMetadata(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=(0, 1),
+                blocks_per_chunk=4,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=4,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=2,
+                tokens_per_block=4,
+                dtype=torch.float32,
+                engine_kv_format=EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            ),
+        ),
+        object_groups=(
+            ObjectGroupTransferMetadata(
+                object_group_id=0,
+                kernel_group_ids=(0,),
+                sw_size_chunks=2,
+            ),
+        ),
+    )
+    scatter_skip_values: list[int] = []
+
+    def _fake_scatter(
+        _kv: dict[str, torch.Tensor],
+        _block_ids: list[int],
+        _chunks: list[torch.Tensor],
+        _blocks_per_chunk: int,
+        *,
+        skip_first_n_tokens: int = 0,
+        **_kwargs: Any,
+    ) -> None:
+        scatter_skip_values.append(skip_first_n_tokens)
+
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.transfer_context.worker_transfer.scatter_cpu_to_paged_kv",
+        _fake_scatter,
+    )
+
+    _scatter_multi_group_pickle_chunks(
+        kv_caches=_make_kv_caches(num_layers=2, num_blocks=12, block_size=4),
+        block_ids=[[idx for idx in range(12)]],
+        payload_objects=[
+            [torch.zeros(1, dtype=torch.float32)],
+            [torch.zeros(1, dtype=torch.float32)],
+        ],
+        transfer_metadata=transfer_metadata,
+        key=_default_key(tokens=24),
+        skip_first_n_tokens=12,
+        layout_hints=None,
+    )
+
+    assert scatter_skip_values == [4]
+
+
 def test_server_shm_rejects_multi_group_metadata_but_legacy_shm_unchanged(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
@@ -3370,6 +3447,100 @@ def test_server_shm_rejects_multi_group_metadata_but_legacy_shm_unchanged(
     module.register_kv_cache_engine_driven_context(_default_register_payload(instance_id=72))
     response = module.prepare_store(_default_key(tokens=8), 72)
     assert response.context.get("slots")
+
+
+def test_server_shm_rejects_single_object_group_with_multi_kernel_groups(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """SHM rejects single-object-group payloads that pack multiple kernel groups."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    mock_storage = MagicMock()
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=_make_storage_manager_config(
+            shm_name="lmcache_test_pool",
+            pool_size=1024,
+        ),
+        mock_storage=mock_storage,
+    )
+
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=[0, 1],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            ),
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=1,
+                engine_group_id=1,
+                layer_indices=[2, 3],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            ),
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0,
+                kernel_group_ids=[0, 1],
+                sw_size_chunks=-1,
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=73,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=4,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1)),
+            EngineGroupInfo(engine_group_id=1, layer_indices=(2, 3)),
+        ],
+        object_group_layout_shapes=[[[2, 2, 8, 16], [2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32", "float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    module.register_kv_cache_engine_driven_context(payload)
+
+    with pytest.raises(ValueError, match="does not support multi-group"):
+        module.prepare_store(_default_key(tokens=8), 73)
+    with pytest.raises(ValueError, match="does not support multi-group"):
+        module.prepare_retrieve(_default_key(tokens=8), 73)
+    mock_storage.reserve_write.assert_not_called()
+    mock_storage.unsafe_read.assert_not_called()
 
 
 def _make_pickle_strategy_multi_group_context(

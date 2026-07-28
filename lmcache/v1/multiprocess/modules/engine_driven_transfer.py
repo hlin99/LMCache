@@ -42,6 +42,7 @@ from lmcache.v1.multiprocess.transfer_plan import (
     KVTransferMetadata,
     ObjectGroupTransferMetadata,
     build_object_group_layout_desc,
+    uses_multi_group_transfer_metadata,
 )
 
 # Local
@@ -803,8 +804,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         entry, strategy = self._resolve_for_transfer(instance_id)
         if (
             isinstance(strategy, ShmTransferStrategy)
-            and entry.metadata.transfer_metadata is not None
-            and len(entry.metadata.transfer_metadata.object_groups) > 1
+            and uses_multi_group_transfer_metadata(entry.metadata.transfer_metadata)
         ):
             raise ValueError(
                 "engine-driven SHM transport does not support multi-group "
@@ -884,8 +884,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         entry, strategy = self._resolve_for_transfer(instance_id)
         if (
             isinstance(strategy, ShmTransferStrategy)
-            and entry.metadata.transfer_metadata is not None
-            and len(entry.metadata.transfer_metadata.object_groups) > 1
+            and uses_multi_group_transfer_metadata(entry.metadata.transfer_metadata)
         ):
             raise ValueError(
                 "engine-driven SHM transport does not support multi-group "
