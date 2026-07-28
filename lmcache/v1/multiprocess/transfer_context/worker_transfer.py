@@ -380,7 +380,16 @@ def _has_metadata_pickle_payload(
     transfer_metadata: KVTransferMetadata | None,
     src_buffers: Any,
 ) -> bool:
-    """Return whether retrieve should use metadata-driven pickle scatter."""
+    """Return whether retrieve should use metadata-driven pickle scatter.
+
+    Args:
+        transfer_metadata: Optional transfer metadata for the current request.
+        src_buffers: Worker retrieve payload produced by the server transport.
+
+    Returns:
+        ``True`` when transfer metadata is present and the payload is object-major
+        ``list[list[tensor]]``, which indicates metadata-driven pickle scatter.
+    """
     return uses_metadata_driven_transfer(
         transfer_metadata
     ) and _is_object_major_pickle_payload(src_buffers)

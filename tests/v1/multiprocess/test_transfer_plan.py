@@ -409,7 +409,7 @@ def test_metadata_driven_and_shm_component_predicates() -> None:
         KernelGroupTransferMetadata,
         ObjectGroupTransferMetadata,
     )
-    import lmcache.c_ops as lmc_ops
+    from lmcache.v1.platform.ops_types import EngineKVFormat
 
     kernel_group = KernelGroupTransferMetadata(
         kernel_group_id=0,
@@ -424,7 +424,7 @@ def test_metadata_driven_and_shm_component_predicates() -> None:
         slots_per_block=4,
         tokens_per_block=4,
         dtype=torch.float32,
-        engine_kv_format=lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        engine_kv_format=EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
     )
     single_component_metadata = KVTransferMetadata(
         num_chunks_in_sw=(-1,),

@@ -3271,7 +3271,7 @@ def test_worker_multi_group_pickle_store_uses_deterministic_group_chunk_order(
     def _fake_gather(
         _kv: dict[str, torch.Tensor],
         block_ids: list[int],
-        _bpc: int,
+        _blocks_per_chunk: int,
         **_kwargs: Any,
     ) -> list[torch.Tensor]:
         gathered_block_ids.append(list(block_ids))
