@@ -430,10 +430,24 @@ def compute_num_objects_to_skip(
     return max(0, num_objects - sw_size_chunks)
 
 
-def uses_multi_group_transfer_metadata(
+def uses_metadata_driven_transfer(
     transfer_metadata: KVTransferMetadata | None,
 ) -> bool:
-    """Return whether transfer metadata requires grouped transfer handling.
+    """Return whether transfer should use metadata-driven pickle handling.
+
+    Args:
+        transfer_metadata: Optional immutable transfer metadata snapshot.
+
+    Returns:
+        ``True`` when transfer metadata is present, otherwise ``False``.
+    """
+    return transfer_metadata is not None
+
+
+def requires_multi_component_shm(
+    transfer_metadata: KVTransferMetadata | None,
+) -> bool:
+    """Return whether transfer metadata exceeds current SHM component support.
 
     Args:
         transfer_metadata: Optional immutable transfer metadata snapshot.
@@ -446,6 +460,13 @@ def uses_multi_group_transfer_metadata(
         len(transfer_metadata.object_groups) > 1
         or len(transfer_metadata.kernel_groups) > 1
     )
+
+
+def uses_multi_group_transfer_metadata(
+    transfer_metadata: KVTransferMetadata | None,
+) -> bool:
+    """Backward-compatible alias for ``requires_multi_component_shm``."""
+    return requires_multi_component_shm(transfer_metadata)
 
 
 def batched_iteration_with_skip(

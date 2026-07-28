@@ -19,7 +19,9 @@ from lmcache.v1.multiprocess.transfer_plan import (
     export_kv_transfer_metadata,
     has_sufficient_block_ids,
     recalculate_blocks_to_skip,
+    requires_multi_component_shm,
     select_block_ids_for_window,
+    uses_metadata_driven_transfer,
 )
 
 
@@ -397,6 +399,63 @@ def test_compute_num_objects_to_skip_cases() -> None:
         compute_num_objects_to_skip(sw_size_chunks=1, num_objects=7, is_retrieve=True)
         == 6
     )
+
+
+def test_metadata_driven_and_shm_component_predicates() -> None:
+    """Metadata-driven and SHM-capability predicates have distinct semantics."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_plan import (
+        KVTransferMetadata,
+        KernelGroupTransferMetadata,
+        ObjectGroupTransferMetadata,
+    )
+    import lmcache.c_ops as lmc_ops
+
+    kernel_group = KernelGroupTransferMetadata(
+        kernel_group_id=0,
+        engine_group_id=0,
+        layer_indices=(0, 1),
+        blocks_per_chunk=2,
+        blocks_per_window=2,
+        slots_per_chunk_in_window=8,
+        kv_size=2,
+        num_layers=2,
+        hidden_dim_size=16,
+        slots_per_block=4,
+        tokens_per_block=4,
+        dtype=torch.float32,
+        engine_kv_format=lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+    )
+    single_component_metadata = KVTransferMetadata(
+        num_chunks_in_sw=(-1,),
+        tokens_per_chunk=8,
+        kernel_groups=(kernel_group,),
+        object_groups=(
+            ObjectGroupTransferMetadata(
+                object_group_id=0,
+                kernel_group_ids=(0,),
+                sw_size_chunks=-1,
+            ),
+        ),
+    )
+    assert uses_metadata_driven_transfer(single_component_metadata) is True
+    assert requires_multi_component_shm(single_component_metadata) is False
+
+    multi_component_metadata = replace(
+        single_component_metadata,
+        kernel_groups=(kernel_group, replace(kernel_group, kernel_group_id=1)),
+        object_groups=(
+            ObjectGroupTransferMetadata(
+                object_group_id=0,
+                kernel_group_ids=(0, 1),
+                sw_size_chunks=-1,
+            ),
+        ),
+    )
+    assert uses_metadata_driven_transfer(multi_component_metadata) is True
+    assert requires_multi_component_shm(multi_component_metadata) is True
+    assert uses_metadata_driven_transfer(None) is False
+    assert requires_multi_component_shm(None) is False
 
 
 @pytest.mark.parametrize("sw_size_chunks", [0, -2])

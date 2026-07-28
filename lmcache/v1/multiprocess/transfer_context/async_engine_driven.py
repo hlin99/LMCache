@@ -18,8 +18,8 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
     _single_group_block_ids,
-    _uses_multi_group_transfer_metadata,
 )
+from lmcache.v1.multiprocess.transfer_plan import uses_metadata_driven_transfer
 
 logger = init_logger(__name__)
 
@@ -192,7 +192,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 "Call register() before submit_store()."
             )
         transfer_metadata = self._engine_driven_context.metadata.transfer_metadata
-        if _uses_multi_group_transfer_metadata(transfer_metadata):
+        if uses_metadata_driven_transfer(transfer_metadata):
             return super().submit_store(
                 _request_id,
                 key,

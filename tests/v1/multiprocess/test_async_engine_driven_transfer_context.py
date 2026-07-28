@@ -458,3 +458,64 @@ def test_prepare_store_runs_on_background_thread_not_forward_thread(
     prepare_gate.set()
     t.join(timeout=1)
     ctx.close()
+
+
+def test_submit_store_falls_back_to_sync_when_metadata_driven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async context delegates to sync submit_store whenever metadata is present."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = SimpleNamespace(  # type: ignore[assignment]
+        metadata=SimpleNamespace(transfer_metadata=object()),
+        close=lambda: None,
+    )
+
+    fallback_called = {"value": False}
+
+    def _fake_super_submit_store(
+        self: object,
+        request_id: str,
+        key: object,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        event: object,
+        blocks_in_chunk: int,
+    ) -> object:
+        del (
+            self,
+            request_id,
+            key,
+            instance_id,
+            kv_caches,
+            block_ids,
+            event,
+            blocks_in_chunk,
+        )
+        fallback_called["value"] = True
+        future = async_engine_driven.MessagingFuture()
+        future.set_result(True)
+        return future
+
+    monkeypatch.setattr(
+        async_engine_driven.EngineDrivenTransferContext,
+        "submit_store",
+        _fake_super_submit_store,
+    )
+
+    result = ctx.submit_store(
+        "r1",
+        object(),
+        1,
+        {"k": torch.zeros(1)},
+        [[0]],
+        _FakeEvent(gather_gate),
+        1,
+    ).result(timeout=1)
+    assert result is True
+    assert fallback_called["value"] is True
+    ctx.close()

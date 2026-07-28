@@ -3342,6 +3342,117 @@ def test_worker_multi_group_pickle_store_uses_deterministic_group_chunk_order(
     ]
 
 
+def test_worker_single_component_metadata_pickle_store_uses_metadata_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single-group metadata still uses metadata-driven pickle gather ordering."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        EngineDrivenTransferContext,
+    )
+    from lmcache.v1.multiprocess.transfer_plan import (
+        KVTransferMetadata,
+        KernelGroupTransferMetadata,
+        ObjectGroupTransferMetadata,
+    )
+    from lmcache.v1.platform.ops_types import EngineKVFormat
+
+    transfer_metadata = KVTransferMetadata(
+        num_chunks_in_sw=(2,),
+        tokens_per_chunk=8,
+        kernel_groups=(
+            KernelGroupTransferMetadata(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=(0, 1),
+                blocks_per_chunk=4,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=4,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=2,
+                tokens_per_block=4,
+                dtype=torch.float32,
+                engine_kv_format=EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            ),
+        ),
+        object_groups=(
+            ObjectGroupTransferMetadata(
+                object_group_id=0,
+                kernel_group_ids=(0,),
+                sw_size_chunks=2,
+            ),
+        ),
+    )
+    gathered_block_ids: list[list[int]] = []
+
+    def _fake_gather(
+        _kv: dict[str, torch.Tensor],
+        block_ids: list[int],
+        _bpc: int,
+        **_kwargs: Any,
+    ) -> list[torch.Tensor]:
+        gathered_block_ids.append(list(block_ids))
+        return [torch.tensor(block_ids, dtype=torch.int64)]
+
+    class _FakeContext:
+        def __init__(self) -> None:
+            self.metadata = EngineDrivenContextMetadata(
+                layout_desc=MemoryLayoutDesc(
+                    shapes=[torch.Size([2, 2, 8, 16])],
+                    dtypes=[torch.float32],
+                ),
+                block_size=4,
+                use_mla=False,
+                transfer_metadata=transfer_metadata,
+            )
+            self.committed: list[list[torch.Tensor]] = []
+
+        def prepare_store(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def commit_store(self, key: Any, instance_id: int, chunks: Any) -> bool:
+            del key, instance_id
+            self.committed = chunks
+            return True
+
+        def prepare_retrieve(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def commit_retrieve(self, *_args: Any, **_kwargs: Any) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.transfer_context.worker_transfer.gather_paged_kv_to_cpu",
+        _fake_gather,
+    )
+
+    ctx = EngineDrivenTransferContext()
+    fake_context = _FakeContext()
+    ctx._engine_driven_context = fake_context  # noqa: SLF001
+
+    result = ctx.submit_store(
+        "req",
+        _default_key(tokens=16),
+        1,
+        _make_kv_caches(),
+        [[0, 1, 2, 3, 4, 5, 6, 7]],
+        MagicMock(),
+        4,
+    ).result()
+
+    assert result is True
+    assert gathered_block_ids == [[2, 3], [6, 7]]
+    assert [payload[0].tolist() for payload in fake_context.committed] == [
+        [2, 3],
+        [6, 7],
+    ]
+
+
 def test_worker_multi_group_pickle_retrieve_uses_local_skip_after_window_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3735,6 +3846,88 @@ def test_pickle_strategy_multi_group_retrieve_respects_sliding_window_keys() -> 
     mock_storage.finish_read_prefetched.assert_called_once_with(
         ["g0c0", "g0c1", "g0c2", "g1c2"]
     )
+
+
+def test_pickle_strategy_single_component_metadata_retrieve_keeps_object_payload_shape(
+) -> None:
+    """Single-group metadata retrieve keeps object-major payload (no legacy flatten)."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
+    from lmcache.v1.multiprocess.transfer_plan import (
+        KVTransferMetadata,
+        KernelGroupTransferMetadata,
+        ObjectGroupTransferMetadata,
+    )
+    from lmcache.v1.platform.ops_types import EngineKVFormat
+
+    context = EngineDrivenContextMetadata(
+        layout_desc=MemoryLayoutDesc(
+            shapes=[torch.Size([2, 2, 8, 16])],
+            dtypes=[torch.float32],
+        ),
+        block_size=4,
+        use_mla=False,
+        object_group_layout_descs=[
+            MemoryLayoutDesc(
+                shapes=[torch.Size([2, 2, 8, 16])],
+                dtypes=[torch.float32],
+            ),
+        ],
+        transfer_metadata=KVTransferMetadata(
+            num_chunks_in_sw=(2,),
+            tokens_per_chunk=8,
+            kernel_groups=(
+                KernelGroupTransferMetadata(
+                    kernel_group_id=0,
+                    engine_group_id=0,
+                    layer_indices=(0, 1),
+                    blocks_per_chunk=4,
+                    blocks_per_window=2,
+                    slots_per_chunk_in_window=4,
+                    kv_size=2,
+                    num_layers=2,
+                    hidden_dim_size=16,
+                    slots_per_block=2,
+                    tokens_per_block=4,
+                    dtype=torch.float32,
+                    engine_kv_format=EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+                ),
+            ),
+            object_groups=(
+                ObjectGroupTransferMetadata(
+                    object_group_id=0,
+                    kernel_group_ids=(0,),
+                    sw_size_chunks=2,
+                ),
+            ),
+        ),
+    )
+
+    tensor = torch.ones(2, 2, 8, 16)
+    memory_obj = MagicMock()
+    memory_obj.get_tensor.side_effect = lambda idx: tensor if idx == 0 else None
+
+    @contextmanager
+    def _read_prefetched_results(_obj_keys: list[str]) -> Iterator[Any]:
+        yield [memory_obj]
+
+    mock_storage = MagicMock()
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    strategy = PickleTransferStrategy(mock_storage)
+
+    response = strategy.prepare_retrieve(
+        _default_key(tokens=8),
+        1,
+        context,
+        lambda _key, _groups: [["obj0"]],
+    )
+    assert response.success is True
+    payload = pickle.loads(response.data)
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    assert isinstance(payload[0], list)
+    assert len(payload[0]) == 1
+    assert torch.allclose(payload[0][0], tensor)
 
 
 def test_pickle_strategy_legacy_single_group_dense_payload_regression() -> None:

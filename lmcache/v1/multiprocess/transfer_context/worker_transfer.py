@@ -46,7 +46,8 @@ from lmcache.v1.multiprocess.transfer_plan import (
     export_kv_transfer_metadata,
     has_sufficient_block_ids,
     recalculate_blocks_to_skip,
-    uses_multi_group_transfer_metadata,
+    requires_multi_component_shm,
+    uses_metadata_driven_transfer,
 )
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.event_ipc import (
@@ -1118,11 +1119,12 @@ class EngineDrivenTransferContext(TransferContext):
         transfer_metadata = (
             self._engine_driven_context.metadata.transfer_metadata
         )
-        is_multi_group = uses_multi_group_transfer_metadata(transfer_metadata)
+        is_metadata_driven = uses_metadata_driven_transfer(transfer_metadata)
+        needs_multi_component_shm = requires_multi_component_shm(transfer_metadata)
         torch_dev.synchronize()
         result = self._engine_driven_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
-        if is_multi_group and out_buffers is not None:
+        if needs_multi_component_shm and out_buffers is not None:
             raise RuntimeError(
                 "engine-driven SHM transport does not support multi-group "
                 "transfer metadata; use pickle transport"
@@ -1132,13 +1134,9 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        if is_multi_group:
+        if is_metadata_driven and out_buffers is None and chunk_indices is None:
             if transfer_metadata is None:
                 raise RuntimeError("multi-group transfer metadata is unexpectedly None")
-            if out_buffers is not None or chunk_indices is not None:
-                raise RuntimeError(
-                    "multi-group pickle store does not support SHM store buffers"
-                )
             cpu_chunks = _gather_multi_group_pickle_chunks(
                 kv_caches=kv_caches,
                 block_ids=block_ids,
@@ -1189,19 +1187,20 @@ class EngineDrivenTransferContext(TransferContext):
                 transfer_metadata = (
                     self._engine_driven_context.metadata.transfer_metadata
                 )
-                if uses_multi_group_transfer_metadata(transfer_metadata):
+                if (
+                    uses_metadata_driven_transfer(transfer_metadata)
+                    and isinstance(src_buffers, list)
+                    and all(
+                        isinstance(payload_object, list)
+                        for payload_object in src_buffers
+                    )
+                ):
                     if transfer_metadata is None:
                         raise RuntimeError(
                             "multi-group transfer metadata is unexpectedly None"
                         )
-                    if not isinstance(src_buffers, list):
-                        raise ValueError("multi-group retrieve payload is malformed")
                     parsed_payload: list[list[torch.Tensor]] = []
                     for payload_object in src_buffers:
-                        if not isinstance(payload_object, list):
-                            raise ValueError(
-                                "multi-group retrieve payload object is malformed"
-                            )
                         if not all(
                             isinstance(part, torch.Tensor)
                             for part in payload_object
