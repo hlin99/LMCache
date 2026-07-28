@@ -268,7 +268,7 @@ def _run_object_group_transfer_plan(
     num_objects_to_skip = compute_num_objects_to_skip(
         sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
     )
-    if is_h2d and num_objects_to_skip > 0:
+    if num_objects_to_skip > 0:
         logger.debug(
             "Detected sliding window for object group %d: "
             "skipping the first %d objects in the batch",
@@ -408,7 +408,7 @@ def transfer_kv_per_object_group(
     num_objects_to_skip = compute_num_objects_to_skip(
         sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
     )
-    if is_h2d and num_objects_to_skip > 0:
+    if num_objects_to_skip > 0:
         logger.debug(
             "Detected sliding window for object group %d: "
             "skipping the first %d objects in the batch",

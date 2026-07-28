@@ -135,6 +135,10 @@ def test_compute_num_objects_to_skip_cases() -> None:
         compute_num_objects_to_skip(sw_size_chunks=3, num_objects=7, is_retrieve=True)
         == 4
     )
+    assert (
+        compute_num_objects_to_skip(sw_size_chunks=1, num_objects=7, is_retrieve=True)
+        == 6
+    )
 
 
 @pytest.mark.parametrize("sw_size_chunks", [0, -2])

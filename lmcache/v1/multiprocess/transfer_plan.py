@@ -125,7 +125,7 @@ def compute_num_objects_to_skip(
         ValueError: If ``sw_size_chunks`` is 0 or less than -1, or if
             ``num_objects`` is negative.
     """
-    if sw_size_chunks == 0 or sw_size_chunks < -1:
+    if sw_size_chunks != -1 and sw_size_chunks < 1:
         raise ValueError("sw_size_chunks must be -1 (full) or at least one")
     if num_objects < 0:
         raise ValueError("num_objects must be non-negative")
