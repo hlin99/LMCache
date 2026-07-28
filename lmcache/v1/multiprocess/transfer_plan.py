@@ -5,7 +5,7 @@
 from itertools import islice
 from typing import Generator, Sequence, TypeVar
 
-T = TypeVar("T")
+ItemT = TypeVar("ItemT")
 
 
 def has_sufficient_block_ids(
@@ -137,10 +137,10 @@ def compute_num_objects_to_skip(
 
 
 def batched_iteration_with_skip(
-    sequence: Sequence[T],
+    sequence: Sequence[ItemT],
     batch_size: int,
     skip_count: int,
-) -> Generator[tuple[int, tuple[T, ...]], None, None]:
+) -> Generator[tuple[int, tuple[ItemT, ...]], None, None]:
     """Iterate over a sequence in batches after skipping a leading prefix.
 
     Args:

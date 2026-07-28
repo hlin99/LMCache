@@ -29,12 +29,15 @@ def test_has_sufficient_block_ids_variants() -> None:
     assert has_sufficient_block_ids(
         [[1, 2, 3, 4, 10], [9, 8, 7, 6, 5, 4, 3]], blocks_per_chunk, num_chunks
     )
+    assert has_sufficient_block_ids([[], []], blocks_per_chunk, num_chunks=0)
 
 
 def test_has_sufficient_block_ids_group_mismatch_raises() -> None:
     """Mismatched group counts are rejected via strict zip semantics."""
     with pytest.raises(ValueError, match="zip"):
         has_sufficient_block_ids([[1, 2]], [2, 3], num_chunks=1)
+    with pytest.raises(ValueError, match="at least one"):
+        has_sufficient_block_ids([[1, 2]], [0], num_chunks=1)
 
 
 @pytest.mark.parametrize(
@@ -128,6 +131,10 @@ def test_compute_num_objects_to_skip_cases() -> None:
         compute_num_objects_to_skip(sw_size_chunks=3, num_objects=7, is_retrieve=True)
         == 4
     )
+    assert (
+        compute_num_objects_to_skip(sw_size_chunks=0, num_objects=7, is_retrieve=True)
+        == 7
+    )
 
 
 def test_batched_iteration_with_skip_preserves_original_indices() -> None:
@@ -181,3 +188,11 @@ def test_recalculate_blocks_to_skip_cases() -> None:
     assert recalculate_blocks_to_skip(4, 2, 3) == 1
     assert recalculate_blocks_to_skip(4, 2, 4) == 2
     assert recalculate_blocks_to_skip(4, 2, 9) == 4
+
+
+def test_recalculate_blocks_to_skip_invalid_inputs_raise() -> None:
+    """Invalid geometry and negative skip values raise ValueError."""
+    with pytest.raises(ValueError, match="less than or equal"):
+        recalculate_blocks_to_skip(2, 3, 0)
+    with pytest.raises(ValueError, match="non-negative"):
+        recalculate_blocks_to_skip(4, 2, -1)
