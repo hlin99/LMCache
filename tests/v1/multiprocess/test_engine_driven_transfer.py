@@ -2,7 +2,7 @@
 # Standard
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol
 from unittest.mock import MagicMock, PropertyMock, patch
 import os
 import pickle
@@ -269,7 +269,7 @@ def _mock_prefetch_context_with_cleanup(
     returned_objs: list[Any],
     held_keys: list[str],
     release: Callable[[list[str]], None],
-) -> Callable[[Any], Iterator[list[Any]]]:
+) -> Callable[[Any], ContextManager[list[Any]]]:
     """Build a mock read-prefetched context manager with exception cleanup.
 
     Args:
@@ -286,7 +286,7 @@ def _mock_prefetch_context_with_cleanup(
     """
 
     @contextmanager
-    def _read_prefetched_results(_keys: Any) -> Iterator[list[Any]]:
+    def _read_prefetched_results(_keys_unused: Any) -> Iterator[list[Any]]:
         try:
             yield returned_objs
         except Exception:

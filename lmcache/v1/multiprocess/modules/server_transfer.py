@@ -220,6 +220,8 @@ class PickleTransferStrategy(TransferStrategy):
 
         Returns:
             ``True`` when every reserved object is written successfully.
+            Returns ``False`` when payload deserialization fails before any
+            storage reservation.
         """
         obj_keys = resolve_obj_keys(key)
         try:
@@ -267,7 +269,13 @@ class PickleTransferStrategy(TransferStrategy):
         instance_id: int,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
-        """Read prefetched objects and return serialized pickle payload."""
+        """Read prefetched objects and return serialized pickle payload.
+
+        Notes:
+            When ``read_prefetched_results`` yields None/empty, storage-manager
+            context cleanup already released held reads; this method must not call
+            ``finish_read_prefetched`` for that branch.
+        """
         obj_keys = resolve_obj_keys(key)
         should_release_locks = False
         try:
