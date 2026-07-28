@@ -18,6 +18,7 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
     _single_group_block_ids,
+    _uses_multi_group_transfer_metadata,
 )
 
 logger = init_logger(__name__)
@@ -189,6 +190,17 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             raise RuntimeError(
                 "Engine-driven transfer context is not registered. "
                 "Call register() before submit_store()."
+            )
+        transfer_metadata = self._engine_driven_context.metadata.transfer_metadata
+        if _uses_multi_group_transfer_metadata(transfer_metadata):
+            return super().submit_store(
+                _request_id,
+                key,
+                instance_id,
+                kv_caches,
+                block_ids,
+                _event,
+                blocks_in_chunk,
             )
         completion: MessagingFuture[bool] = MessagingFuture()
         engine_driven_context = self._engine_driven_context

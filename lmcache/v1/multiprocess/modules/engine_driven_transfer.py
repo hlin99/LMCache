@@ -46,6 +46,7 @@ from lmcache.v1.multiprocess.transfer_plan import (
 
 # Local
 from .server_transfer import (
+    ShmTransferStrategy,
     TransferStrategy,
     create_transfer_strategy,
 )
@@ -314,7 +315,11 @@ def _validate_transfer_metadata_consistency(
                 "they must correspond one-to-one in list order"
             )
         for idx, (egi, kg) in enumerate(
-            zip(engine_group_infos, transfer_metadata.kernel_groups)
+            zip(
+                engine_group_infos,
+                transfer_metadata.kernel_groups,
+                strict=True,
+            )
         ):
             if egi.engine_group_id != kg.engine_group_id:
                 raise ValueError(
@@ -607,6 +612,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         non-GPU transfers."""
         return self._ctx.resolve_obj_keys(key, [0])[0]
 
+    def _resolve_obj_keys(
+        self, key: IPCCacheServerKey, object_group_ids: list[int]
+    ) -> list[list[ObjectKey]]:
+        """Resolve object keys for the requested object groups."""
+        return self._ctx.resolve_obj_keys(key, object_group_ids)
+
     def register_kv_cache_engine_driven_context(
         self,
         payload: RegisterEngineDrivenContextPayload,
@@ -790,11 +801,20 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             PrepareStoreResponse with empty slots for pickle mode.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
+        if (
+            isinstance(strategy, ShmTransferStrategy)
+            and entry.metadata.transfer_metadata is not None
+            and len(entry.metadata.transfer_metadata.object_groups) > 1
+        ):
+            raise ValueError(
+                "engine-driven SHM transport does not support multi-group "
+                "transfer metadata; use pickle transport"
+            )
         response = strategy.prepare_store(
             key=key,
             instance_id=instance_id,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=self._resolve_obj_keys,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
@@ -829,7 +849,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id=instance_id,
             cpu_data=cpu_data,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=self._resolve_obj_keys,
         )
         if st is not None and result:
             num_tokens = (
@@ -861,11 +881,21 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
+        if (
+            isinstance(strategy, ShmTransferStrategy)
+            and entry.metadata.transfer_metadata is not None
+            and len(entry.metadata.transfer_metadata.object_groups) > 1
+        ):
+            raise ValueError(
+                "engine-driven SHM transport does not support multi-group "
+                "transfer metadata; use pickle transport"
+            )
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            context=entry.metadata,
+            resolve_obj_keys=self._resolve_obj_keys,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["retrieve_start_time"] = time.perf_counter()

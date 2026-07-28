@@ -40,6 +40,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
 )
 from lmcache.v1.multiprocess.transfer_plan import (
     KVTransferMetadata,
+    compute_num_objects_to_skip,
+    downsample_block_ids,
+    has_sufficient_block_ids,
+    recalculate_blocks_to_skip,
     build_object_group_layout_desc,
     export_kv_transfer_metadata,
 )
@@ -349,6 +353,260 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
             "engine-driven transfer does not support hybrid KV cache groups"
         )
     return block_ids[0]
+
+
+def _uses_multi_group_transfer_metadata(
+    transfer_metadata: KVTransferMetadata | None,
+) -> bool:
+    """Return whether transfer metadata represents multi-group transfer."""
+    return transfer_metadata is not None and (
+        len(transfer_metadata.object_groups) > 1
+        or len(transfer_metadata.kernel_groups) > 1
+    )
+
+
+def _engine_group_block_ids_for_kernel_group(
+    block_ids: list[list[int]],
+    kernel_group_id: int,
+    transfer_metadata: KVTransferMetadata,
+) -> list[int]:
+    """Resolve the engine block-id list for one kernel group."""
+    kernel_group = transfer_metadata.kernel_groups[kernel_group_id]
+    engine_group_id = kernel_group.engine_group_id
+    if engine_group_id < 0 or engine_group_id >= len(block_ids):
+        raise ValueError(
+            f"kernel_group_id={kernel_group_id} references engine_group_id="
+            f"{engine_group_id}, but block_ids has {len(block_ids)} groups"
+        )
+    return block_ids[engine_group_id]
+
+
+def _kernel_group_kv_caches(
+    kv_caches: dict[str, torch.Tensor],
+    layer_indices: tuple[int, ...],
+) -> dict[str, torch.Tensor]:
+    """Return per-layer KV tensors for one kernel group in metadata order."""
+    kv_tensors = list(kv_caches.values())
+    return {
+        f"layer_{layer_idx}": kv_tensors[layer_idx]
+        for layer_idx in layer_indices
+    }
+
+
+def _num_chunks_for_transfer(
+    key: Any,
+    transfer_metadata: KVTransferMetadata,
+) -> int:
+    """Compute expected chunk count for this key and transfer metadata."""
+    num_tokens = max(0, int(key.end) - int(key.start))
+    tokens_per_chunk = transfer_metadata.tokens_per_chunk
+    if tokens_per_chunk < 1:
+        raise ValueError(
+            "transfer_metadata.tokens_per_chunk must be positive, "
+            f"got {tokens_per_chunk}"
+        )
+    return (num_tokens + tokens_per_chunk - 1) // tokens_per_chunk
+
+
+def _gather_multi_group_pickle_chunks(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[list[int]],
+    transfer_metadata: KVTransferMetadata,
+    key: Any,
+    layout_hints: LayoutHints | None,
+) -> list[list[torch.Tensor]]:
+    """Gather multi-group pickle payload in deterministic object/chunk order."""
+    num_chunks = _num_chunks_for_transfer(key, transfer_metadata)
+    if num_chunks == 0:
+        return []
+
+    per_kernel_group_block_ids = [
+        _engine_group_block_ids_for_kernel_group(
+            block_ids,
+            kernel_group_id,
+            transfer_metadata,
+        )
+        for kernel_group_id in range(len(transfer_metadata.kernel_groups))
+    ]
+    blocks_per_chunk = [
+        group_metadata.blocks_per_chunk
+        for group_metadata in transfer_metadata.kernel_groups
+    ]
+    if not has_sufficient_block_ids(
+        per_kernel_group_block_ids,
+        blocks_per_chunk,
+        num_chunks,
+    ):
+        raise ValueError(
+            "insufficient block IDs for engine-driven multi-group store request"
+        )
+
+    payload_objects: list[list[torch.Tensor]] = []
+    for object_group in transfer_metadata.object_groups:
+        for chunk_idx in range(num_chunks):
+            object_parts: list[torch.Tensor] = []
+            for kernel_group_id in object_group.kernel_group_ids:
+                group_metadata = transfer_metadata.kernel_groups[kernel_group_id]
+                full_block_ids = per_kernel_group_block_ids[kernel_group_id][
+                    : num_chunks * group_metadata.blocks_per_chunk
+                ]
+                window_block_ids = downsample_block_ids(
+                    [full_block_ids],
+                    [group_metadata.blocks_per_chunk],
+                    [group_metadata.blocks_per_window],
+                )[0]
+                start_idx = chunk_idx * group_metadata.blocks_per_window
+                end_idx = start_idx + group_metadata.blocks_per_window
+                if end_idx > len(window_block_ids):
+                    raise ValueError(
+                        "insufficient windowed block IDs for "
+                        f"kernel_group_id={kernel_group_id}, chunk_idx={chunk_idx}"
+                    )
+                chunk_block_ids = window_block_ids[start_idx:end_idx]
+                gathered = gather_paged_kv_to_cpu(
+                    _kernel_group_kv_caches(
+                        kv_caches,
+                        group_metadata.layer_indices,
+                    ),
+                    chunk_block_ids,
+                    group_metadata.blocks_per_window,
+                    layout_hints=layout_hints,
+                    engine_kv_format=group_metadata.engine_kv_format,
+                )
+                if len(gathered) != 1:
+                    raise RuntimeError(
+                        "expected one gathered object per kernel-group chunk, got "
+                        f"{len(gathered)}"
+                    )
+                object_parts.append(gathered[0])
+            payload_objects.append(object_parts)
+    return payload_objects
+
+
+def _scatter_multi_group_pickle_chunks(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[list[int]],
+    payload_objects: list[list[torch.Tensor]],
+    transfer_metadata: KVTransferMetadata,
+    key: Any,
+    skip_first_n_tokens: int,
+    layout_hints: LayoutHints | None,
+) -> None:
+    """Scatter multi-group pickle payload from deterministic object/chunk order."""
+    num_chunks = _num_chunks_for_transfer(key, transfer_metadata)
+    if num_chunks == 0:
+        if payload_objects:
+            raise ValueError("retrieve payload is non-empty for zero-chunk request")
+        return
+
+    per_kernel_group_block_ids = [
+        _engine_group_block_ids_for_kernel_group(
+            block_ids,
+            kernel_group_id,
+            transfer_metadata,
+        )
+        for kernel_group_id in range(len(transfer_metadata.kernel_groups))
+    ]
+    blocks_per_chunk = [
+        group_metadata.blocks_per_chunk
+        for group_metadata in transfer_metadata.kernel_groups
+    ]
+    if not has_sufficient_block_ids(
+        per_kernel_group_block_ids,
+        blocks_per_chunk,
+        num_chunks,
+    ):
+        raise ValueError(
+            "insufficient block IDs for engine-driven multi-group retrieve request"
+        )
+
+    expected_num_payload_objects = sum(
+        num_chunks
+        - compute_num_objects_to_skip(object_group.sw_size_chunks, num_chunks, True)
+        for object_group in transfer_metadata.object_groups
+    )
+    if len(payload_objects) != expected_num_payload_objects:
+        raise ValueError(
+            f"retrieve payload has {len(payload_objects)} objects, expected "
+            f"{expected_num_payload_objects}"
+        )
+
+    payload_idx = 0
+    per_kernel_group_chunks: dict[int, list[torch.Tensor]] = {
+        kernel_group_id: []
+        for kernel_group_id in range(len(transfer_metadata.kernel_groups))
+    }
+    per_kernel_group_blocks: dict[int, list[int]] = {
+        kernel_group_id: []
+        for kernel_group_id in range(len(transfer_metadata.kernel_groups))
+    }
+    for object_group in transfer_metadata.object_groups:
+        num_objects_to_skip = compute_num_objects_to_skip(
+            object_group.sw_size_chunks,
+            num_chunks,
+            True,
+        )
+        for chunk_idx in range(num_objects_to_skip, num_chunks):
+            if payload_idx >= len(payload_objects):
+                raise ValueError("retrieve payload ended before all required objects")
+            object_parts = payload_objects[payload_idx]
+            payload_idx += 1
+            if len(object_parts) != len(object_group.kernel_group_ids):
+                raise ValueError(
+                    "retrieve payload object has wrong kernel-group count "
+                    f"(got {len(object_parts)}, expected "
+                    f"{len(object_group.kernel_group_ids)})"
+                )
+            for object_part, kernel_group_id in zip(
+                object_parts,
+                object_group.kernel_group_ids,
+                strict=True,
+            ):
+                group_metadata = transfer_metadata.kernel_groups[kernel_group_id]
+                full_block_ids = per_kernel_group_block_ids[kernel_group_id][
+                    : num_chunks * group_metadata.blocks_per_chunk
+                ]
+                window_block_ids = downsample_block_ids(
+                    [full_block_ids],
+                    [group_metadata.blocks_per_chunk],
+                    [group_metadata.blocks_per_window],
+                )[0]
+                start_idx = chunk_idx * group_metadata.blocks_per_window
+                end_idx = start_idx + group_metadata.blocks_per_window
+                if end_idx > len(window_block_ids):
+                    raise ValueError(
+                        "insufficient windowed block IDs for "
+                        f"kernel_group_id={kernel_group_id}, chunk_idx={chunk_idx}"
+                    )
+                per_kernel_group_chunks[kernel_group_id].append(object_part)
+                per_kernel_group_blocks[kernel_group_id].extend(
+                    window_block_ids[start_idx:end_idx]
+                )
+
+    if payload_idx != len(payload_objects):
+        raise ValueError("retrieve payload contains excess objects")
+
+    for kernel_group_id, chunks in per_kernel_group_chunks.items():
+        if not chunks:
+            continue
+        group_metadata = transfer_metadata.kernel_groups[kernel_group_id]
+        blocks_to_skip = recalculate_blocks_to_skip(
+            group_metadata.blocks_per_chunk,
+            group_metadata.blocks_per_window,
+            0,
+        )
+        scatter_cpu_to_paged_kv(
+            _kernel_group_kv_caches(
+                kv_caches,
+                group_metadata.layer_indices,
+            ),
+            per_kernel_group_blocks[kernel_group_id][blocks_to_skip:],
+            chunks,
+            group_metadata.blocks_per_window,
+            skip_first_n_tokens=skip_first_n_tokens,
+            layout_hints=layout_hints,
+            engine_kv_format=group_metadata.engine_kv_format,
+        )
 
 
 def _get_kv_device(kv_caches: dict[str, torch.Tensor]) -> torch.device:
@@ -849,23 +1107,47 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
+        transfer_metadata = (
+            self._engine_driven_context.metadata.transfer_metadata
+        )
+        is_multi_group = _uses_multi_group_transfer_metadata(transfer_metadata)
         torch_dev.synchronize()
         result = self._engine_driven_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
+        if is_multi_group and out_buffers is not None:
+            raise RuntimeError(
+                "engine-driven SHM transport does not support multi-group "
+                "transfer metadata; use pickle transport"
+            )
         # All chunks already in cache — nothing to gather or commit.
         if chunk_indices is not None and len(chunk_indices) == 0:
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
+        if is_multi_group:
+            if transfer_metadata is None:
+                raise RuntimeError("multi-group transfer metadata is unexpectedly None")
+            if out_buffers is not None or chunk_indices is not None:
+                raise RuntimeError(
+                    "multi-group pickle store does not support SHM store buffers"
+                )
+            cpu_chunks = _gather_multi_group_pickle_chunks(
+                kv_caches=kv_caches,
+                block_ids=block_ids,
+                transfer_metadata=transfer_metadata,
+                key=key,
+                layout_hints=self._layout_hints,
+            )
+        else:
+            cpu_chunks = gather_paged_kv_to_cpu(
+                kv_caches,
+                _single_group_block_ids(block_ids),
+                blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=self._engine_kv_format,
+                out=out_buffers,
+                chunk_indices=chunk_indices,
+            )
         if out_buffers is not None:
             # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
@@ -896,15 +1178,49 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
+                transfer_metadata = (
+                    self._engine_driven_context.metadata.transfer_metadata
                 )
+                if _uses_multi_group_transfer_metadata(transfer_metadata):
+                    if transfer_metadata is None:
+                        raise RuntimeError(
+                            "multi-group transfer metadata is unexpectedly None"
+                        )
+                    if not isinstance(src_buffers, list):
+                        raise ValueError("multi-group retrieve payload is malformed")
+                    parsed_payload: list[list[torch.Tensor]] = []
+                    for payload_object in src_buffers:
+                        if not isinstance(payload_object, list):
+                            raise ValueError(
+                                "multi-group retrieve payload object is malformed"
+                            )
+                        if not all(
+                            isinstance(part, torch.Tensor)
+                            for part in payload_object
+                        ):
+                            raise ValueError(
+                                "multi-group retrieve payload contains non-tensor parts"
+                            )
+                        parsed_payload.append(payload_object)
+                    _scatter_multi_group_pickle_chunks(
+                        kv_caches=kv_caches,
+                        block_ids=block_ids,
+                        payload_objects=parsed_payload,
+                        transfer_metadata=transfer_metadata,
+                        key=key,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                    )
+                else:
+                    scatter_cpu_to_paged_kv(
+                        kv_caches,
+                        _single_group_block_ids(block_ids),
+                        src_buffers,
+                        blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=self._engine_kv_format,
+                    )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False
