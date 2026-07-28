@@ -49,7 +49,7 @@ class _PostPrefetchValidationError(Exception):
 
     This private control-flow exception is raised only inside
     ``_PickleLifecycleExecutor.retrieve`` and caught there immediately.
-    It carries no message or extra state.
+    It carries an optional descriptive message for logging/debugging.
     """
 
 
@@ -281,17 +281,30 @@ class _PickleLifecycleExecutor:
                     if not maybe_memory_objs:
                         # Context yielded None (some keys missing); its own cleanup
                         # releases any partial read locks for this group.
-                        raise _PostPrefetchValidationError
+                        raise _PostPrefetchValidationError(
+                            f"prefetch returned no objects for group "
+                            f"{group.object_group_id} "
+                            f"(expected {len(selected_obj_keys)} keys)"
+                        )
                     if len(maybe_memory_objs) != len(selected_obj_keys):
                         # Count mismatch: raise so context releases this group's locks.
-                        raise _PostPrefetchValidationError
+                        raise _PostPrefetchValidationError(
+                            f"prefetch count mismatch for group "
+                            f"{group.object_group_id}: "
+                            f"expected {len(selected_obj_keys)}, "
+                            f"got {len(maybe_memory_objs)}"
+                        )
                     for memory_obj in maybe_memory_objs:
                         payload_object: list[torch.Tensor] = []
                         for tensor_idx in range(len(group.layout_desc.shapes)):
                             memory_tensor = _memory_tensor(memory_obj, tensor_idx)
                             if memory_tensor is None:
                                 # Missing tensor component: raise so context releases.
-                                raise _PostPrefetchValidationError
+                                raise _PostPrefetchValidationError(
+                                    f"missing tensor component {tensor_idx} in "
+                                    f"prefetched object for group "
+                                    f"{group.object_group_id}"
+                                )
                             payload_object.append(memory_tensor.cpu().clone())
                         group_payload.append(payload_object)
                 # Context exited normally; caller now owns these read locks.
