@@ -64,8 +64,8 @@ def test_select_block_ids_for_window(
     assert block_ids == original
 
 
-def test_select_block_ids_for_window_invalid_geometry_and_incomplete_chunks() -> None:
-    """Invalid geometry and incomplete chunks raise ValueError."""
+def test_select_block_ids_for_window_invalid_geometry() -> None:
+    """Invalid geometry raises ValueError."""
     with pytest.raises(ValueError, match="at least one"):
         select_block_ids_for_window(
             [1, 2], total_blocks_per_chunk=0, keep_blocks_per_chunk=1
@@ -78,6 +78,10 @@ def test_select_block_ids_for_window_invalid_geometry_and_incomplete_chunks() ->
         select_block_ids_for_window(
             [1, 2], total_blocks_per_chunk=1, keep_blocks_per_chunk=2
         )
+
+
+def test_select_block_ids_for_window_incomplete_chunks() -> None:
+    """Incomplete chunk data raises ValueError."""
     with pytest.raises(ValueError, match="multiple"):
         select_block_ids_for_window(
             [1, 2, 3], total_blocks_per_chunk=2, keep_blocks_per_chunk=1
