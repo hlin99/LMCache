@@ -278,10 +278,11 @@ def _mock_prefetch_context_with_cleanup(
         release: Callback used to release held keys.
 
     Returns:
-        Callable compatible with ``read_prefetched_results`` that yields
-        ``returned_objs`` and invokes ``release(held_keys)`` only when an
-        exception propagates out of the context, mirroring the cleanup contract
-        used by ``StorageManager.read_prefetched_results``.
+        Callable compatible with ``read_prefetched_results``; when invoked, it
+        returns a context manager that yields ``returned_objs`` and invokes
+        ``release(held_keys)`` only when an exception propagates out of the
+        context, mirroring the cleanup contract used by
+        ``StorageManager.read_prefetched_results``.
     """
 
     @contextmanager

@@ -43,6 +43,7 @@ class _PostPrefetchValidationError(Exception):
 
     This private control-flow exception is raised only inside
     ``PickleTransferStrategy.prepare_retrieve`` and caught there immediately.
+    It carries no message or extra state.
     """
 
 
@@ -230,9 +231,10 @@ class PickleTransferStrategy(TransferStrategy):
             ImportError,
             IndexError,
         ):
-            # Deserialization failures (malformed/truncated payloads, unresolved
-            # referenced symbols/modules, malformed opcode stream) must happen
-            # before any reserve_write side effect.
+            # pickle.PickleError / EOFError: malformed or truncated payload bytes.
+            # AttributeError / ImportError: unresolved classes or modules.
+            # IndexError: malformed opcode/data stream edge cases.
+            # All decode failures must happen before any reserve_write side effect.
             logger.exception("Failed to deserialize engine-driven store payload")
             return False
         reserved_dict = self._storage_manager.reserve_write(
@@ -267,7 +269,7 @@ class PickleTransferStrategy(TransferStrategy):
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return serialized pickle payload."""
         obj_keys = resolve_obj_keys(key)
-        prefetch_validated = False
+        should_release_locks = False
         try:
             read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
             with read_ctx as maybe_memory_objs:
@@ -282,14 +284,14 @@ class PickleTransferStrategy(TransferStrategy):
                     if memory_obj.tensor is None:
                         raise _PostPrefetchValidationError
                     chunks.append(memory_obj.tensor.cpu().clone())
-                prefetch_validated = True
+                should_release_locks = True
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
         except _PostPrefetchValidationError:
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         finally:
-            if prefetch_validated:
+            if should_release_locks:
                 self._storage_manager.finish_read_prefetched(obj_keys)
 
     def commit_retrieve(
