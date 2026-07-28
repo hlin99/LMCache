@@ -34,8 +34,8 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
     return str(dtype).split(".")[-1]
 
 
-class _RetrieveValidationError(Exception):
-    """Internal signal for invalid retrieve payloads after successful prefetch."""
+class _PostPrefetchValidationError(Exception):
+    """Internal signal for invalid objects discovered after successful prefetch."""
 
 
 def create_transfer_strategy(
@@ -222,6 +222,8 @@ class PickleTransferStrategy(TransferStrategy):
             ImportError,
             IndexError,
         ):
+            # Corrupted/truncated payloads and missing referenced types/modules
+            # must fail before any reserve_write side effect.
             logger.exception("Failed to deserialize engine-driven store payload")
             return False
         reserved_dict = self._storage_manager.reserve_write(
@@ -263,17 +265,17 @@ class PickleTransferStrategy(TransferStrategy):
                 if not maybe_memory_objs:
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
                 if len(maybe_memory_objs) != len(obj_keys):
-                    raise _RetrieveValidationError
+                    raise _PostPrefetchValidationError
                 chunks = []
                 for memory_obj in maybe_memory_objs:
                     if memory_obj.tensor is None:
-                        raise _RetrieveValidationError
+                        raise _PostPrefetchValidationError
                     chunks.append(memory_obj.tensor.cpu().clone())
                 prefetched_keys = obj_keys.copy()
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
-        except _RetrieveValidationError:
+        except _PostPrefetchValidationError:
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         finally:
             if prefetched_keys:

@@ -259,6 +259,29 @@ def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
     )
 
 
+INSTANCE_ID_PREFETCH_COUNT_MISMATCH = 20
+INSTANCE_ID_MISSING_TENSOR_COMPONENT = 21
+INSTANCE_ID_INVALID_PICKLE_STORE = 22
+
+
+def _build_exception_cleanup_prefetch_reader(
+    returned_objs: list[Any],
+    held_keys: list[str],
+    release: Callable[[list[str]], None],
+) -> Callable[[Any], Iterator[list[Any]]]:
+    """Build a mock read-prefetched context manager that releases on exceptions."""
+
+    @contextmanager
+    def _read_prefetched_results(_keys: Any) -> Iterator[list[Any]]:
+        try:
+            yield returned_objs
+        except Exception:
+            release(held_keys)
+            raise
+
+    return _read_prefetched_results
+
+
 def test_wrap_kv_caches_wraps_all_tensors() -> None:
     """Verify wrap_kv_caches wraps all provided KV tensors."""
     # First Party
@@ -1206,17 +1229,13 @@ def test_server_prepare_retrieve_releases_locks_once_on_prefetch_count_mismatch(
     memory_obj = MagicMock()
     memory_obj.tensor = torch.zeros(2, 2, 8, 16)
     returned_objs = [memory_obj for _ in range(returned_obj_count)]
-
-    @contextmanager
-    def _read_prefetched_results(_keys: Any) -> Any:
-        assert _keys == obj_keys
-        try:
-            yield returned_objs
-        except Exception:
-            mock_storage.finish_read_prefetched(held_keys)
-            raise
-
-    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    mock_storage.read_prefetched_results.side_effect = (
+        _build_exception_cleanup_prefetch_reader(
+            returned_objs=returned_objs,
+            held_keys=held_keys,
+            release=mock_storage.finish_read_prefetched,
+        )
+    )
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h1", b"h2"]
     module, _, _, _ = server_module_factory(
@@ -1225,10 +1244,12 @@ def test_server_prepare_retrieve_releases_locks_once_on_prefetch_count_mismatch(
         mock_session=mock_session,
     )
     module.register_kv_cache_engine_driven_context(
-        _default_register_payload(instance_id=20)
+        _default_register_payload(instance_id=INSTANCE_ID_PREFETCH_COUNT_MISMATCH)
     )
 
-    response = module.prepare_retrieve(_default_key(tokens=16), 20)
+    response = module.prepare_retrieve(
+        _default_key(tokens=16), INSTANCE_ID_PREFETCH_COUNT_MISMATCH
+    )
 
     assert response == PrepareRetrieveResponse(success=False, data=b"", context={})
     mock_storage.finish_read_prefetched.assert_called_once_with(held_keys)
@@ -1245,17 +1266,13 @@ def test_server_prepare_retrieve_releases_locks_once_on_missing_tensor_component
     good_memory_obj.tensor = torch.zeros(2, 2, 8, 16)
     bad_memory_obj = MagicMock()
     bad_memory_obj.tensor = None
-
-    @contextmanager
-    def _read_prefetched_results(_keys: Any) -> Any:
-        assert _keys == obj_keys
-        try:
-            yield [good_memory_obj, bad_memory_obj]
-        except Exception:
-            mock_storage.finish_read_prefetched(obj_keys)
-            raise
-
-    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    mock_storage.read_prefetched_results.side_effect = (
+        _build_exception_cleanup_prefetch_reader(
+            returned_objs=[good_memory_obj, bad_memory_obj],
+            held_keys=obj_keys,
+            release=mock_storage.finish_read_prefetched,
+        )
+    )
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h1", b"h2"]
     module, _, _, _ = server_module_factory(
@@ -1264,10 +1281,12 @@ def test_server_prepare_retrieve_releases_locks_once_on_missing_tensor_component
         mock_session=mock_session,
     )
     module.register_kv_cache_engine_driven_context(
-        _default_register_payload(instance_id=21)
+        _default_register_payload(instance_id=INSTANCE_ID_MISSING_TENSOR_COMPONENT)
     )
 
-    response = module.prepare_retrieve(_default_key(tokens=16), 21)
+    response = module.prepare_retrieve(
+        _default_key(tokens=16), INSTANCE_ID_MISSING_TENSOR_COMPONENT
+    )
 
     assert response == PrepareRetrieveResponse(success=False, data=b"", context={})
     mock_storage.finish_read_prefetched.assert_called_once_with(obj_keys)
@@ -1294,10 +1313,12 @@ def test_server_commit_store_rejects_invalid_pickle_without_reservation(
         mock_session=mock_session,
     )
     module.register_kv_cache_engine_driven_context(
-        _default_register_payload(instance_id=22)
+        _default_register_payload(instance_id=INSTANCE_ID_INVALID_PICKLE_STORE)
     )
 
-    result = module.commit_store(_default_key(), 22, payload)
+    result = module.commit_store(
+        _default_key(), INSTANCE_ID_INVALID_PICKLE_STORE, payload
+    )
 
     assert result is False
     mock_storage.reserve_write.assert_not_called()
