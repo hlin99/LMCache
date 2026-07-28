@@ -278,7 +278,9 @@ def _build_exception_cleanup_prefetch_reader(
 
     Returns:
         Callable compatible with ``read_prefetched_results`` that yields
-        ``returned_objs`` and invokes ``release(held_keys)`` on exceptions.
+        ``returned_objs`` and invokes ``release(held_keys)`` only when an
+        exception propagates out of the context, mirroring the cleanup contract
+        used by ``StorageManager.read_prefetched_results``.
     """
 
     @contextmanager

@@ -40,6 +40,9 @@ class _PostPrefetchValidationError(Exception):
     Raised when post-prefetch validation fails (e.g. count mismatch or missing
     tensor component). The exception path triggers ``read_prefetched_results`` context
     cleanup, ensuring held read locks are released exactly once.
+
+    This private control-flow exception is raised only inside
+    ``PickleTransferStrategy.prepare_retrieve`` and caught there immediately.
     """
 
 
@@ -265,7 +268,7 @@ class PickleTransferStrategy(TransferStrategy):
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return serialized pickle payload."""
         obj_keys = resolve_obj_keys(key)
-        prefetched_keys: list[ObjectKey] = []
+        retrieved_successfully = False
         try:
             read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
             with read_ctx as maybe_memory_objs:
@@ -278,15 +281,15 @@ class PickleTransferStrategy(TransferStrategy):
                     if memory_obj.tensor is None:
                         raise _PostPrefetchValidationError
                     chunks.append(memory_obj.tensor.cpu().clone())
-                prefetched_keys = obj_keys.copy()
+                retrieved_successfully = True
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
         except _PostPrefetchValidationError:
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         finally:
-            if prefetched_keys:
-                self._storage_manager.finish_read_prefetched(prefetched_keys)
+            if retrieved_successfully:
+                self._storage_manager.finish_read_prefetched(obj_keys)
 
     def commit_retrieve(
         self,
