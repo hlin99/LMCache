@@ -73,7 +73,7 @@ def test_gpu_register_inserts_unlatched_entry(monkeypatch) -> None:
         gpu_mod, "create_cache_context", lambda *a, **kw: MagicMock(num_layers=2)
     )
     metadata = MagicMock()
-    metadata.attn_desc = MagicMock()
+    metadata.build_attn_desc.return_value = MagicMock()
     monkeypatch.setattr(
         gpu_mod, "export_kv_transfer_metadata", lambda *a, **kw: metadata
     )
@@ -96,7 +96,7 @@ def test_gpu_noop_register_refreshes_without_latching(monkeypatch) -> None:
     create = MagicMock(return_value=MagicMock(num_layers=2))
     monkeypatch.setattr(gpu_mod, "create_cache_context", create)
     metadata = MagicMock()
-    metadata.attn_desc = MagicMock()
+    metadata.build_attn_desc.return_value = MagicMock()
     monkeypatch.setattr(
         gpu_mod, "export_kv_transfer_metadata", lambda *a, **kw: metadata
     )

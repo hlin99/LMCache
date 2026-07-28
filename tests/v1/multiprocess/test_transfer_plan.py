@@ -261,7 +261,7 @@ def test_export_kv_transfer_metadata_preserves_order_and_geometry() -> None:
     )
 
     assert metadata.tokens_per_chunk == 16
-    assert metadata.attn_desc.num_chunks_in_sw == [2, -1]
+    assert metadata.num_chunks_in_sw == (2, -1)
     assert [group.kernel_group_id for group in metadata.kernel_groups] == [0, 1]
     assert [group.engine_group_id for group in metadata.kernel_groups] == [2, 7]
     assert metadata.kernel_groups[0].layer_indices == (0, 2)
@@ -273,6 +273,28 @@ def test_export_kv_transfer_metadata_preserves_order_and_geometry() -> None:
     assert metadata.object_groups[0].sw_size_chunks == 2
     assert metadata.object_groups[1].kernel_group_ids == (0,)
     assert metadata.object_groups[1].sw_size_chunks == -1
+
+
+def test_export_kv_transfer_metadata_windows_snapshot_is_immutable() -> None:
+    """Exported window metadata is immutable and detached from manager state."""
+    # Standard
+    from typing import cast
+
+    # First Party
+    from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+
+    manager = _fake_manager()
+    metadata = export_kv_transfer_metadata(
+        cast(KVLayerGroupsManager, manager),
+        tokens_per_chunk=16,
+    )
+
+    manager.get_attn_desc().num_chunks_in_sw[0] = 99
+    assert metadata.num_chunks_in_sw == (2, -1)
+
+    exported_attn_desc = metadata.build_attn_desc()
+    exported_attn_desc.num_chunks_in_sw[0] = 88
+    assert metadata.num_chunks_in_sw == (2, -1)
 
 
 def test_build_object_group_layout_desc_preserves_kernel_group_order() -> None:

@@ -75,7 +75,6 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
     # First Party
     import lmcache.c_ops as lmc_ops
     from lmcache.utils import EngineType
-    from lmcache.v1.distributed.api import AttnWindowDesc
     from lmcache.v1.distributed.api import MemoryLayoutDesc
     from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
     from lmcache.v1.multiprocess.modules import (
@@ -108,7 +107,7 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
         return _FakeGPUContext()
 
     transfer_metadata = KVTransferMetadata(
-        attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1]),
+        num_chunks_in_sw=(-1,),
         tokens_per_chunk=16,
         kernel_groups=(
             KernelGroupTransferMetadata(

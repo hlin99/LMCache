@@ -261,8 +261,7 @@ def _run_object_group_transfer_plan(
         for slot in range(max_batch_size)
     ]
 
-    attn_desc = transfer_metadata.attn_desc
-    sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
+    sw_size_chunks = object_group_metadata.sw_size_chunks
     num_objects_to_skip = compute_num_objects_to_skip(
         sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
     )
@@ -405,8 +404,7 @@ def transfer_kv_per_object_group(
     kernel_group_ids = object_group_metadata.kernel_group_ids
     is_h2d = direction == lmc_ops.TransferDirection.H2D
 
-    attn_desc = transfer_metadata.attn_desc
-    sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
+    sw_size_chunks = object_group_metadata.sw_size_chunks
     num_objects_to_skip = compute_num_objects_to_skip(
         sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
     )
@@ -831,7 +829,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             self._ctx.chunk_size,
             object_group_id=0,
         )
-        attn_desc = transfer_metadata.attn_desc
+        attn_desc = transfer_metadata.build_attn_desc()
         self._ctx.layout_desc_registry.register(
             model_name, world_size, layout_desc, attn_desc
         )

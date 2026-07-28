@@ -73,14 +73,18 @@ class ObjectGroupTransferMetadata:
 class KVTransferMetadata:
     """Immutable transfer metadata for all object/kernel groups."""
 
-    attn_desc: AttnWindowDesc
-    """Attention-window descriptor in object-group order."""
+    num_chunks_in_sw: tuple[int, ...]
+    """Attention-window chunk counts in object-group order."""
     tokens_per_chunk: int
     """LMCache chunk size in logical tokens used to derive per-group geometry."""
     kernel_groups: tuple[KernelGroupTransferMetadata, ...]
     """Kernel-group metadata in deterministic kernel-group index order."""
     object_groups: tuple[ObjectGroupTransferMetadata, ...]
     """Object-group metadata in deterministic object-group index order."""
+
+    def build_attn_desc(self) -> AttnWindowDesc:
+        """Build a defensive AttnWindowDesc copy for external APIs."""
+        return AttnWindowDesc(num_chunks_in_sw=list(self.num_chunks_in_sw))
 
 
 def export_kv_transfer_metadata(
@@ -105,6 +109,7 @@ def export_kv_transfer_metadata(
         )
 
     attn_desc = manager.get_attn_desc()
+    num_chunks_in_sw = tuple(attn_desc.num_chunks_in_sw)
     kernel_groups: list[KernelGroupTransferMetadata] = []
     for kernel_group_id, group in enumerate(manager.kernel_groups):
         if group.engine_kv_format is None:
@@ -175,7 +180,7 @@ def export_kv_transfer_metadata(
             )
         )
 
-    if len(attn_desc.num_chunks_in_sw) != len(manager.object_groups):
+    if len(num_chunks_in_sw) != len(manager.object_groups):
         raise ValueError(
             "attention-window metadata length does not match object-group count"
         )
@@ -183,7 +188,7 @@ def export_kv_transfer_metadata(
     num_kernel_groups = len(kernel_groups)
     object_groups: list[ObjectGroupTransferMetadata] = []
     for object_group_id, object_group in enumerate(manager.object_groups):
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
+        sw_size_chunks = num_chunks_in_sw[object_group_id]
         if sw_size_chunks == 0 or sw_size_chunks < -1:
             raise ValueError(
                 f"object group {object_group_id} has invalid sw_size_chunks "
@@ -209,7 +214,7 @@ def export_kv_transfer_metadata(
         )
 
     return KVTransferMetadata(
-        attn_desc=attn_desc,
+        num_chunks_in_sw=num_chunks_in_sw,
         tokens_per_chunk=tokens_per_chunk,
         kernel_groups=tuple(kernel_groups),
         object_groups=tuple(object_groups),

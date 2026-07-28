@@ -193,7 +193,6 @@ def test_server_store_and_retrieve_delegate_event_ordering(
     """Server imports, waits, records, and exports through the event backend."""
     # First Party
     import lmcache.c_ops as lmc_ops
-    from lmcache.v1.distributed.api import AttnWindowDesc
     from lmcache.v1.multiprocess.modules import lmcache_driven_transfer
     from lmcache.v1.multiprocess.transfer_plan import (
         KVTransferMetadata,
@@ -271,7 +270,7 @@ def test_server_store_and_retrieve_delegate_event_ordering(
         model_name="model",
         world_size=1,
         transfer_metadata=KVTransferMetadata(
-            attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1]),
+            num_chunks_in_sw=(-1,),
             tokens_per_chunk=1,
             kernel_groups=(
                 KernelGroupTransferMetadata(
