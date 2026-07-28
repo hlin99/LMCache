@@ -149,6 +149,10 @@ def batched_iteration_with_skip(
     Raises:
         ValueError: If ``batch_size`` is less than 1 or ``skip_count`` is
             negative.
+
+    Note:
+        If ``skip_count`` exceeds ``len(sequence)``, the iterator is exhausted
+        and no batches are yielded.
     """
     if batch_size < 1:
         raise ValueError("batch size must be at least one")

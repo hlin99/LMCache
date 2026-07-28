@@ -147,11 +147,11 @@ def downsample_and_stage_block_ids(
                 kernel_group_id
             )
         )
-        tokens_per_window = min(
+        tokens_per_chunk_capped = min(
             cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
         )
         blocks_per_window.append(
-            cache_context.calculate_num_blocks(tokens_per_window, kernel_group_id)
+            cache_context.calculate_num_blocks(tokens_per_chunk_capped, kernel_group_id)
         )
         blocks_per_chunk.append(
             cache_context.calculate_num_blocks(
