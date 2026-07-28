@@ -7,7 +7,6 @@ from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
-import pickle
 
 # Third Party
 import torch
@@ -20,7 +19,12 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    KernelGroupTransferMetadataWire,
+    KVTransferMetadataWire,
+    ObjectGroupTransferMetadataWire,
+    RegisterEngineDrivenContextPayload,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -115,6 +119,58 @@ def _build_engine_driven_context() -> "TransferContext":
 
     logger.info("Using EngineDrivenTransferContext (sync) for store path")
     return EngineDrivenTransferContext()
+
+
+def _kv_transfer_metadata_to_wire(
+    transfer_metadata: KVTransferMetadata,
+) -> KVTransferMetadataWire:
+    """Convert a :class:`~lmcache.v1.multiprocess.transfer_plan.KVTransferMetadata`
+    to its msgspec wire DTO.
+
+    Replaces pickle-based serialization with a structured, msgspec-compatible
+    representation that survives cross-process transmission without requiring
+    pickle hooks.
+
+    Args:
+        transfer_metadata: Immutable transfer metadata snapshot to convert.
+
+    Returns:
+        A :class:`KVTransferMetadataWire` with all non-primitive fields reduced
+        to primitive types (``dtype`` → ``dtype_str``, ``engine_kv_format`` →
+        ``engine_kv_format_int``).
+    """
+    kernel_groups_wire = [
+        KernelGroupTransferMetadataWire(
+            kernel_group_id=kg.kernel_group_id,
+            engine_group_id=kg.engine_group_id,
+            layer_indices=list(kg.layer_indices),
+            blocks_per_chunk=kg.blocks_per_chunk,
+            blocks_per_window=kg.blocks_per_window,
+            slots_per_chunk_in_window=kg.slots_per_chunk_in_window,
+            kv_size=kg.kv_size,
+            num_layers=kg.num_layers,
+            hidden_dim_size=kg.hidden_dim_size,
+            slots_per_block=kg.slots_per_block,
+            tokens_per_block=kg.tokens_per_block,
+            dtype_str=str(kg.dtype).removeprefix("torch."),
+            engine_kv_format_int=int(kg.engine_kv_format),
+        )
+        for kg in transfer_metadata.kernel_groups
+    ]
+    object_groups_wire = [
+        ObjectGroupTransferMetadataWire(
+            object_group_id=og.object_group_id,
+            kernel_group_ids=list(og.kernel_group_ids),
+            sw_size_chunks=og.sw_size_chunks,
+        )
+        for og in transfer_metadata.object_groups
+    ]
+    return KVTransferMetadataWire(
+        num_chunks_in_sw=list(transfer_metadata.num_chunks_in_sw),
+        tokens_per_chunk=transfer_metadata.tokens_per_chunk,
+        kernel_groups=kernel_groups_wire,
+        object_groups=object_groups_wire,
+    )
 
 
 def _build_multi_group_wire_fields(
@@ -719,9 +775,12 @@ class EngineDrivenTransferContext(TransferContext):
             layout_hints,
         )
 
-        # Pickle the full KVTransferMetadata so the server can store it.
-        transfer_metadata_bytes = (
-            pickle.dumps(transfer_metadata) if transfer_metadata is not None else b""
+        # Convert KVTransferMetadata to a structured msgspec wire DTO so the
+        # server can reconstruct it without pickle.
+        transfer_metadata_wire = (
+            _kv_transfer_metadata_to_wire(transfer_metadata)
+            if transfer_metadata is not None
+            else None
         )
 
         future = send_request(
@@ -741,7 +800,7 @@ class EngineDrivenTransferContext(TransferContext):
                     object_group_layout_shapes=wire_obj_shapes,
                     object_group_layout_dtype_strs=wire_obj_dtype_strs,
                     num_chunks_in_sw=wire_num_chunks_in_sw,
-                    transfer_metadata_bytes=transfer_metadata_bytes,
+                    transfer_metadata_wire=transfer_metadata_wire,
                 )
             ],
         )

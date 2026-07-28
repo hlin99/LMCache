@@ -2256,13 +2256,14 @@ def test_worker_register_multi_group_stores_transfer_metadata(
     assert meta.transfer_metadata is fake_tm
 
 
-def test_worker_register_sends_transfer_metadata_bytes(
+def test_worker_register_sends_transfer_metadata_wire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Worker register() pickles transfer_metadata into the wire payload."""
+    """Worker register() converts transfer_metadata to a wire DTO in the payload."""
     # First Party
     from lmcache.v1.distributed.api import DEFAULT_ATTN_WINDOW_DESC, MemoryLayoutDesc
     from lmcache.v1.multiprocess.custom_types import (
+        KVTransferMetadataWire,
         RegisterEngineDrivenContextPayload,
     )
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -2270,7 +2271,6 @@ def test_worker_register_sends_transfer_metadata_bytes(
         EngineDrivenTransferContext,
         worker_transfer,
     )
-    from lmcache.v1.multiprocess.transfer_plan import KVTransferMetadata
     import lmcache.c_ops as lmc_ops
 
     fake_tm = _make_fake_transfer_metadata()
@@ -2331,20 +2331,23 @@ def test_worker_register_sends_transfer_metadata_bytes(
     assert len(captured_payloads) == 1
     payload = captured_payloads[0]
     assert isinstance(payload, RegisterEngineDrivenContextPayload)
-    assert payload.transfer_metadata_bytes != b""
-    decoded = pickle.loads(payload.transfer_metadata_bytes)
-    assert isinstance(decoded, KVTransferMetadata)
-    assert decoded.tokens_per_chunk == fake_tm.tokens_per_chunk
-    assert decoded.num_chunks_in_sw == fake_tm.num_chunks_in_sw
+    assert isinstance(payload.transfer_metadata_wire, KVTransferMetadataWire)
+    assert payload.transfer_metadata_wire.tokens_per_chunk == fake_tm.tokens_per_chunk
+    assert payload.transfer_metadata_wire.num_chunks_in_sw == list(
+        fake_tm.num_chunks_in_sw
+    )
 
 
 def test_server_register_stores_transfer_metadata_from_payload(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Server round-trip: transfer_metadata_bytes is deserialized and stored."""
+    """Server round-trip: transfer_metadata_wire is deserialized and stored."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
         RegisterEngineDrivenContextPayload,
     )
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -2352,6 +2355,37 @@ def test_server_register_stores_transfer_metadata_from_payload(
 
     fake_tm = _make_fake_transfer_metadata()
     module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # Build the wire DTO from the fake metadata (mirrors what the worker sends).
+    kg = fake_tm.kernel_groups[0]
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=list(fake_tm.num_chunks_in_sw),
+        tokens_per_chunk=fake_tm.tokens_per_chunk,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=kg.kernel_group_id,
+                engine_group_id=kg.engine_group_id,
+                layer_indices=list(kg.layer_indices),
+                blocks_per_chunk=kg.blocks_per_chunk,
+                blocks_per_window=kg.blocks_per_window,
+                slots_per_chunk_in_window=kg.slots_per_chunk_in_window,
+                kv_size=kg.kv_size,
+                num_layers=kg.num_layers,
+                hidden_dim_size=kg.hidden_dim_size,
+                slots_per_block=kg.slots_per_block,
+                tokens_per_block=kg.tokens_per_block,
+                dtype_str=str(kg.dtype).removeprefix("torch."),
+                engine_kv_format_int=int(kg.engine_kv_format),
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=fake_tm.object_groups[0].object_group_id,
+                kernel_group_ids=list(fake_tm.object_groups[0].kernel_group_ids),
+                sw_size_chunks=fake_tm.object_groups[0].sw_size_chunks,
+            )
+        ],
+    )
 
     payload = RegisterEngineDrivenContextPayload(
         instance_id=50,
@@ -2366,7 +2400,7 @@ def test_server_register_stores_transfer_metadata_from_payload(
         object_group_layout_shapes=[[[2, 2, 8, 16]]],
         object_group_layout_dtype_strs=[["float32"]],
         num_chunks_in_sw=[-1],
-        transfer_metadata_bytes=pickle.dumps(fake_tm),
+        transfer_metadata_wire=wire,
     )
     module.register_kv_cache_engine_driven_context(payload)
 
@@ -2389,7 +2423,7 @@ def test_server_register_legacy_transfer_metadata_is_none(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Legacy registration (no transfer_metadata_bytes) stores None."""
+    """Legacy registration (no transfer_metadata_wire) stores None."""
     module, _, _, _ = server_module_factory(chunk_size=8)
 
     module.register_kv_cache_engine_driven_context(

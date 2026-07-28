@@ -3,7 +3,6 @@
 
 # Standard
 from dataclasses import dataclass
-import pickle
 import threading
 import time
 
@@ -21,6 +20,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
+    KVTransferMetadataWire,
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext, ShmPoolInfo
@@ -36,6 +36,11 @@ from lmcache.v1.multiprocess.protocols.engine import (
     RegisterEngineDrivenContextResponse,
 )
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
+from lmcache.v1.multiprocess.transfer_plan import (
+    KernelGroupTransferMetadata,
+    KVTransferMetadata,
+    ObjectGroupTransferMetadata,
+)
 
 # Local
 from .server_transfer import (
@@ -44,6 +49,88 @@ from .server_transfer import (
 )
 
 logger = init_logger(__name__)
+
+
+def _kv_transfer_metadata_from_wire(
+    wire: KVTransferMetadataWire,
+) -> KVTransferMetadata:
+    """Reconstruct a :class:`~lmcache.v1.multiprocess.transfer_plan.KVTransferMetadata`
+    from its msgspec wire DTO.
+
+    Converts primitive wire-format fields back to their runtime types:
+    ``dtype_str`` → ``torch.dtype``, ``engine_kv_format_int`` →
+    :class:`~lmcache.v1.platform.ops_types.EngineKVFormat`.
+
+    Args:
+        wire: The deserialized wire DTO received from the worker.
+
+    Returns:
+        A fully reconstructed immutable :class:`KVTransferMetadata` snapshot.
+
+    Raises:
+        ValueError: If any ``dtype_str`` is not a valid torch dtype name or
+            any ``engine_kv_format_int`` is not a valid ``EngineKVFormat``
+            value.
+    """
+    # Use the native lmc_ops enum when available (same int values as the pure
+    # Python ops_types.EngineKVFormat, so both work with C++ op calls).
+    try:
+        import lmcache.c_ops as lmc_ops
+
+        _EngineKVFormat = lmc_ops.EngineKVFormat
+    except ImportError:
+        from lmcache.v1.platform.ops_types import EngineKVFormat
+
+        _EngineKVFormat = EngineKVFormat  # type: ignore[assignment]
+
+    kernel_groups_out: list[KernelGroupTransferMetadata] = []
+    for kgw in wire.kernel_groups:
+        dtype = getattr(torch, kgw.dtype_str, None)
+        if dtype is None or not isinstance(dtype, torch.dtype):
+            raise ValueError(
+                f"kernel group {kgw.kernel_group_id}: invalid dtype_str "
+                f"'{kgw.dtype_str}'"
+            )
+        try:
+            engine_kv_format = _EngineKVFormat(kgw.engine_kv_format_int)
+        except ValueError as exc:
+            raise ValueError(
+                f"kernel group {kgw.kernel_group_id}: invalid "
+                f"engine_kv_format_int {kgw.engine_kv_format_int}"
+            ) from exc
+        kernel_groups_out.append(
+            KernelGroupTransferMetadata(
+                kernel_group_id=kgw.kernel_group_id,
+                engine_group_id=kgw.engine_group_id,
+                layer_indices=tuple(kgw.layer_indices),
+                blocks_per_chunk=kgw.blocks_per_chunk,
+                blocks_per_window=kgw.blocks_per_window,
+                slots_per_chunk_in_window=kgw.slots_per_chunk_in_window,
+                kv_size=kgw.kv_size,
+                num_layers=kgw.num_layers,
+                hidden_dim_size=kgw.hidden_dim_size,
+                slots_per_block=kgw.slots_per_block,
+                tokens_per_block=kgw.tokens_per_block,
+                dtype=dtype,
+                engine_kv_format=engine_kv_format,
+            )
+        )
+
+    object_groups_out = tuple(
+        ObjectGroupTransferMetadata(
+            object_group_id=ogw.object_group_id,
+            kernel_group_ids=tuple(ogw.kernel_group_ids),
+            sw_size_chunks=ogw.sw_size_chunks,
+        )
+        for ogw in wire.object_groups
+    )
+
+    return KVTransferMetadata(
+        num_chunks_in_sw=tuple(wire.num_chunks_in_sw),
+        tokens_per_chunk=wire.tokens_per_chunk,
+        kernel_groups=tuple(kernel_groups_out),
+        object_groups=object_groups_out,
+    )
 
 
 def _decode_multi_group_payload_fields(
@@ -121,7 +208,6 @@ def _decode_multi_group_payload_fields(
         )
 
     return object_group_layout_descs, attn_desc
-
 
 @dataclass
 class EngineDrivenContextEntry:
@@ -444,10 +530,32 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload, legacy_layout_desc
         )
 
-        # Deserialize the full KVTransferMetadata snapshot when present.
+        # Reconstruct the full KVTransferMetadata from the structured wire DTO.
+        # Validates consistency with object-group layouts and num_chunks_in_sw.
         transfer_metadata = None
-        if payload.transfer_metadata_bytes:
-            transfer_metadata = pickle.loads(payload.transfer_metadata_bytes)
+        if payload.transfer_metadata_wire is not None:
+            wire = payload.transfer_metadata_wire
+            num_og = len(wire.object_groups)
+            # Cross-check wire consistency with the other multi-group fields.
+            if object_group_layout_descs and len(object_group_layout_descs) != num_og:
+                raise ValueError(
+                    f"transfer_metadata_wire has {num_og} object groups but "
+                    f"object_group_layout_shapes has "
+                    f"{len(object_group_layout_descs)}"
+                )
+            if payload.num_chunks_in_sw and len(payload.num_chunks_in_sw) != num_og:
+                raise ValueError(
+                    f"transfer_metadata_wire has {num_og} object groups but "
+                    f"num_chunks_in_sw has {len(payload.num_chunks_in_sw)}"
+                )
+            if payload.num_chunks_in_sw and list(wire.num_chunks_in_sw) != list(
+                payload.num_chunks_in_sw
+            ):
+                raise ValueError(
+                    "transfer_metadata_wire.num_chunks_in_sw does not match "
+                    "payload.num_chunks_in_sw"
+                )
+            transfer_metadata = _kv_transfer_metadata_from_wire(wire)
 
         # Primary layout is object group 0.
         primary_layout_desc = (
