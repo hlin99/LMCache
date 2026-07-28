@@ -468,7 +468,9 @@ def uses_multi_group_transfer_metadata(
     """Backward-compatible alias for ``requires_multi_component_shm``.
 
     .. deprecated::
-        Prefer ``requires_multi_component_shm`` for new call sites.
+        Prefer ``requires_multi_component_shm`` for new call sites. This alias
+        is kept only for compatibility and will be removed after internal
+        call-site migration is complete.
     """
     return requires_multi_component_shm(transfer_metadata)
 

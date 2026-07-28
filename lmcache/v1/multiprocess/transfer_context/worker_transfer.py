@@ -360,14 +360,30 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
 def _is_object_major_pickle_payload(payload: Any) -> bool:
     """Return whether payload is object-major ``list[list[tensor]]``.
 
-    Empty payloads are accepted because retrieve can legitimately select zero
-    objects for transfer.
+    Args:
+        payload: Candidate retrieve payload.
+
+    Returns:
+        ``True`` when payload is a list whose elements are lists. Empty payloads
+        are accepted because retrieve can legitimately select zero objects for
+        transfer.
+
     """
     if not isinstance(payload, list):
         return False
     if not payload:
         return True
     return all(isinstance(payload_object, list) for payload_object in payload)
+
+
+def _has_metadata_pickle_payload(
+    transfer_metadata: KVTransferMetadata | None,
+    src_buffers: Any,
+) -> bool:
+    """Return whether retrieve should use metadata-driven pickle scatter."""
+    return uses_metadata_driven_transfer(
+        transfer_metadata
+    ) and _is_object_major_pickle_payload(src_buffers)
 
 
 def _engine_group_block_ids_for_kernel_group(
@@ -1147,10 +1163,10 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        should_use_metadata_pickle_gather = (
+        use_metadata_pickle_path = (
             is_metadata_driven and out_buffers is None and chunk_indices is None
         )
-        if should_use_metadata_pickle_gather:
+        if use_metadata_pickle_path:
             if transfer_metadata is None:
                 raise RuntimeError("multi-group transfer metadata is unexpectedly None")
             cpu_chunks = _gather_multi_group_pickle_chunks(
@@ -1203,10 +1219,7 @@ class EngineDrivenTransferContext(TransferContext):
                 transfer_metadata = (
                     self._engine_driven_context.metadata.transfer_metadata
                 )
-                if (
-                    uses_metadata_driven_transfer(transfer_metadata)
-                    and _is_object_major_pickle_payload(src_buffers)
-                ):
+                if _has_metadata_pickle_payload(transfer_metadata, src_buffers):
                     if transfer_metadata is None:
                         raise RuntimeError(
                             "multi-group transfer metadata is unexpectedly None"

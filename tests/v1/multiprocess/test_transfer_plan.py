@@ -454,6 +454,7 @@ def test_metadata_driven_and_shm_component_predicates() -> None:
     )
     assert uses_metadata_driven_transfer(multi_component_metadata) is True
     assert requires_multi_component_shm(multi_component_metadata) is True
+    # Both predicates must treat missing metadata as disabled.
     assert uses_metadata_driven_transfer(None) is False
     assert requires_multi_component_shm(None) is False
 
