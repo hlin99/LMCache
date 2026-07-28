@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 # First Party
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.platform.base.ipc_wrapper import (  # noqa: E402,F401
     DeviceIPCWrapper,
 )
@@ -127,11 +128,21 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         instance_id: Worker instance identifier (typically PID).
         model_name: Model name associated with this worker.
         world_size: Worker world size used in cache keys.
-        block_size: Tokens per paged block.
-        num_layers: Number of model layers.
-        hidden_dim_size: Flattened hidden dimension per token.
-        dtype_str: Torch dtype name (e.g. ``"float16"``).
-        use_mla: Whether the worker KV format is MLA.
+        block_size: Tokens per paged block (from kernel group 0 for multi-group).
+        num_layers: Number of model layers (legacy single-group; total for multi-group).
+        hidden_dim_size: Flattened hidden dimension per token (kernel group 0).
+        dtype_str: Torch dtype name (e.g. ``"float16"``; kernel group 0).
+        use_mla: Whether the worker KV format is MLA (kernel group 0).
+        engine_group_infos: Engine-neutral KV cache group metadata in
+            kernel-group order. Empty for single-group (legacy) registrations.
+        object_group_layout_shapes: Per-object-group, per-kernel-group tensor
+            shapes as ``list[int]``. Outer index: object group; middle index:
+            kernel group; inner: shape dimensions. Empty for legacy mode.
+        object_group_layout_dtype_strs: Per-object-group, per-kernel-group torch
+            dtype strings (e.g. ``"float16"``). Parallel to
+            ``object_group_layout_shapes``. Empty for legacy mode.
+        num_chunks_in_sw: Attention-window size in LMCache chunks for each
+            object group (``-1`` = full attention). Empty for legacy mode.
     """
 
     instance_id: int
@@ -142,6 +153,11 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    # Step 3: multi-group fields (empty = legacy single-group mode)
+    engine_group_infos: list[EngineGroupInfo] = []
+    object_group_layout_shapes: list[list[list[int]]] = []
+    object_group_layout_dtype_strs: list[list[str]] = []
+    num_chunks_in_sw: list[int] = []
 
 
 @dataclass

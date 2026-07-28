@@ -1658,3 +1658,332 @@ def test_engine_driven_context_shm_close_is_idempotent() -> None:
     finally:
         shm_munmap(addr, 4096)
         shm_unlink(shm_name)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3: Engine-driven registration multi-group metadata tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_multi_group_payload(
+    instance_id: int = 1,
+    model_name: str = "m",
+    world_size: int = 1,
+    num_object_groups: int = 2,
+    chunk_size: int = 8,
+    block_size: int = 4,
+    dtype_str: str = "float32",
+) -> "RegisterEngineDrivenContextPayload":
+    """Build a multi-group registration payload for Step 3 server-side tests.
+
+    Args:
+        instance_id: Worker instance identifier.
+        model_name: Model name.
+        world_size: World size.
+        num_object_groups: Number of object groups to simulate.
+        chunk_size: Chunk size (tokens) used to derive shapes.
+        block_size: Tokens per paged block.
+        dtype_str: Torch dtype string.
+
+    Returns:
+        A RegisterEngineDrivenContextPayload with multi-group layout fields.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    # Build per-object-group shapes: single kernel group per object group,
+    # each with shape [2, 2, chunk_size, 16].
+    obj_shapes = [[[2, 2, chunk_size, 16]] for _ in range(num_object_groups)]
+    obj_dtype_strs = [[dtype_str] for _ in range(num_object_groups)]
+    num_chunks_in_sw = [-1] * num_object_groups
+
+    return RegisterEngineDrivenContextPayload(
+        instance_id=instance_id,
+        model_name=model_name,
+        world_size=world_size,
+        block_size=block_size,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str=dtype_str,
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=obj_shapes,
+        object_group_layout_dtype_strs=obj_dtype_strs,
+        num_chunks_in_sw=num_chunks_in_sw,
+    )
+
+
+def test_server_register_multi_group_retains_all_object_group_layouts(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Multi-group registration: server retains all object-group layouts."""
+    chunk_size = 8
+    num_object_groups = 2
+    module, _, _, ctx = server_module_factory(chunk_size=chunk_size)
+
+    payload = _make_multi_group_payload(
+        instance_id=10,
+        chunk_size=chunk_size,
+        num_object_groups=num_object_groups,
+    )
+    module.register_kv_cache_engine_driven_context(payload)
+
+    with module._lock:
+        entry = module._engine_driven_contexts.get(10)
+    assert entry is not None
+    meta = entry.metadata
+    assert len(meta.object_group_layout_descs) == num_object_groups
+    for og_idx, desc in enumerate(meta.object_group_layout_descs):
+        assert len(desc.shapes) == 1
+        assert desc.shapes[0] == torch.Size([2, 2, chunk_size, 16])
+        assert desc.dtypes[0] == torch.float32
+
+
+def test_server_register_multi_group_attn_desc(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Multi-group registration: server retains per-object-group AttnWindowDesc."""
+    # First Party
+    from lmcache.v1.distributed.api import AttnWindowDesc
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    chunk_size = 8
+    module, _, _, ctx = server_module_factory(chunk_size=chunk_size)
+
+    # Two object groups: first full-attention (-1), second sliding-window (2).
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=11,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=4,
+        hidden_dim_size=16,
+        dtype_str="float16",
+        use_mla=False,
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1, 2, 3))
+        ],
+        object_group_layout_shapes=[
+            [[2, 2, chunk_size, 16]],  # object group 0
+            [[2, 2, chunk_size, 16]],  # object group 1
+        ],
+        object_group_layout_dtype_strs=[["float16"], ["float16"]],
+        num_chunks_in_sw=[-1, 2],
+    )
+    module.register_kv_cache_engine_driven_context(payload)
+
+    with module._lock:
+        entry = module._engine_driven_contexts.get(11)
+    assert entry is not None
+    attn_desc = entry.metadata.attn_desc
+    assert isinstance(attn_desc, AttnWindowDesc)
+    assert attn_desc.num_chunks_in_sw == [-1, 2]
+
+
+def test_server_register_multi_group_uses_object_group_0_as_primary_layout(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Multi-group registration: layout registry receives object-group-0 layout."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    chunk_size = 16
+    module, _, _, ctx = server_module_factory(chunk_size=chunk_size)
+
+    # Object group 0 has float32 shape, object group 1 has float16 shape.
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=12,
+        model_name="model_x",
+        world_size=2,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=32,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[
+            [[2, 2, chunk_size, 32]],  # object group 0 (primary)
+            [[2, 2, chunk_size, 32]],  # object group 1
+        ],
+        object_group_layout_dtype_strs=[["float32"], ["float16"]],
+        num_chunks_in_sw=[-1, -1],
+    )
+    module.register_kv_cache_engine_driven_context(payload)
+
+    layout = ctx.layout_desc_registry.find("model_x", 2)
+    assert layout is not None
+    assert layout.shapes[0] == torch.Size([2, 2, chunk_size, 32])
+    assert layout.dtypes[0] == torch.float32
+
+
+def test_server_register_legacy_single_group_unchanged(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Legacy single-group (no multi-group fields) registration is unchanged.
+
+    Verifies backward compatibility: the server falls back to the flat-fields
+    path and produces the same layout as before Step 3.
+    """
+    chunk_size = 16
+    module, _, _, ctx = server_module_factory(chunk_size=chunk_size)
+
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=20)
+    )
+
+    with module._lock:
+        entry = module._engine_driven_contexts.get(20)
+    assert entry is not None
+    meta = entry.metadata
+    # Legacy mode: no multi-group layouts stored.
+    assert meta.object_group_layout_descs == []
+    # Legacy mode: default full-attention.
+    assert meta.attn_desc.num_chunks_in_sw == [-1]
+    # Layout from the flat payload fields.
+    layout = ctx.layout_desc_registry.find("m", 1)
+    assert layout is not None
+    assert layout.shapes[0] == torch.Size([2, 2, chunk_size, 16])
+
+
+def test_server_register_multi_group_rejects_mismatched_field_lengths(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Mismatched multi-group field lengths raise ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+
+    module, _, _, _ = server_module_factory()
+
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=30,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        # shapes has 2 groups, dtypes has only 1 → mismatch
+        object_group_layout_shapes=[[[2, 2, 8, 16]], [[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1, -1],
+    )
+    with pytest.raises(ValueError, match="object_group_layout_shapes"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_multi_group_rejects_invalid_dtype(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Invalid dtype string in multi-group layout field raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+
+    module, _, _, _ = server_module_factory()
+
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=31,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["not_a_dtype"]],
+        num_chunks_in_sw=[-1],
+    )
+    with pytest.raises(ValueError, match="dtype string"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_multi_group_rejects_mismatched_num_chunks_in_sw(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """num_chunks_in_sw length mismatch with object groups raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+
+    module, _, _, _ = server_module_factory()
+
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=32,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        object_group_layout_shapes=[[[2, 2, 8, 16]], [[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"], ["float32"]],
+        num_chunks_in_sw=[-1],  # only 1 entry for 2 object groups
+    )
+    with pytest.raises(ValueError, match="num_chunks_in_sw"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_decode_multi_group_payload_fields_legacy_fallback() -> None:
+    """_decode_multi_group_payload_fields: legacy payload returns defaults."""
+    # First Party
+    from lmcache.v1.distributed.api import DEFAULT_ATTN_WINDOW_DESC
+    from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
+        _decode_multi_group_payload_fields,
+    )
+
+    legacy_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+    )
+    payload = _default_register_payload(instance_id=1)
+    descs, attn_desc = _decode_multi_group_payload_fields(payload, legacy_layout)
+
+    assert descs == []
+    assert attn_desc == DEFAULT_ATTN_WINDOW_DESC
+
+
+def test_decode_multi_group_payload_fields_multi_group() -> None:
+    """_decode_multi_group_payload_fields: multi-group payload decoded correctly."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+    from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
+        _decode_multi_group_payload_fields,
+    )
+
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=1,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        object_group_layout_shapes=[
+            [[2, 2, 8, 16]],  # object group 0: 1 kernel group
+            [[1, 2, 8, 32]],  # object group 1: 1 kernel group
+        ],
+        object_group_layout_dtype_strs=[["float32"], ["float16"]],
+        num_chunks_in_sw=[-1, 3],
+    )
+    legacy_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+    )
+    descs, attn_desc = _decode_multi_group_payload_fields(payload, legacy_layout)
+
+    assert len(descs) == 2
+    assert descs[0].shapes[0] == torch.Size([2, 2, 8, 16])
+    assert descs[0].dtypes[0] == torch.float32
+    assert descs[1].shapes[0] == torch.Size([1, 2, 8, 32])
+    assert descs[1].dtypes[0] == torch.float16
+    assert attn_desc.num_chunks_in_sw == [-1, 3]

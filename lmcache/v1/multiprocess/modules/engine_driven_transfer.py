@@ -13,6 +13,8 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.distributed.api import (
+    DEFAULT_ATTN_WINDOW_DESC,
+    AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
 )
@@ -41,6 +43,83 @@ from .server_transfer import (
 )
 
 logger = init_logger(__name__)
+
+
+def _decode_multi_group_payload_fields(
+    payload: RegisterEngineDrivenContextPayload,
+    legacy_layout_desc: MemoryLayoutDesc,
+) -> tuple[list[MemoryLayoutDesc], AttnWindowDesc]:
+    """Decode multi-group layout fields from a registration payload.
+
+    Returns the per-object-group layout descriptors and attention-window
+    descriptor encoded in ``payload``.  When the multi-group fields are absent
+    (legacy single-group registration), falls back to wrapping
+    ``legacy_layout_desc`` in a single-entry list with full-attention semantics.
+
+    Args:
+        payload: The decoded registration payload from the worker.
+        legacy_layout_desc: Single-group layout built from the flat payload
+            fields; used when ``payload.object_group_layout_shapes`` is empty.
+
+    Returns:
+        A tuple ``(object_group_layout_descs, attn_desc)`` where
+        ``object_group_layout_descs`` has one entry per object group and
+        ``attn_desc`` describes the attention window for each.
+
+    Raises:
+        ValueError: If the ``object_group_layout_shapes`` and
+            ``object_group_layout_dtype_strs`` fields have different lengths,
+            or if any dtype string is not a valid torch dtype name.
+    """
+    if not payload.object_group_layout_shapes:
+        # Legacy single-group mode: wrap existing layout in single-element list.
+        return [], DEFAULT_ATTN_WINDOW_DESC
+
+    shapes_per_group = payload.object_group_layout_shapes
+    dtypes_per_group = payload.object_group_layout_dtype_strs
+
+    if len(shapes_per_group) != len(dtypes_per_group):
+        raise ValueError(
+            f"object_group_layout_shapes has {len(shapes_per_group)} entries "
+            f"but object_group_layout_dtype_strs has {len(dtypes_per_group)}"
+        )
+
+    object_group_layout_descs: list[MemoryLayoutDesc] = []
+    for og_idx, (group_shapes, group_dtype_strs) in enumerate(
+        zip(shapes_per_group, dtypes_per_group, strict=True)
+    ):
+        if len(group_shapes) != len(group_dtype_strs):
+            raise ValueError(
+                f"object group {og_idx}: {len(group_shapes)} shapes but "
+                f"{len(group_dtype_strs)} dtype strings"
+            )
+        dtypes: list[torch.dtype] = []
+        for dt_str in group_dtype_strs:
+            dt = getattr(torch, dt_str, None)
+            if dt is None or not isinstance(dt, torch.dtype):
+                raise ValueError(
+                    f"object group {og_idx}: invalid dtype string '{dt_str}'"
+                )
+            dtypes.append(dt)
+        sizes = [torch.Size(s) for s in group_shapes]
+        object_group_layout_descs.append(MemoryLayoutDesc(shapes=sizes, dtypes=dtypes))
+
+    # Build AttnWindowDesc from the wire num_chunks_in_sw field; fall back
+    # to one full-attention group if it was not sent (should not happen with
+    # a well-formed multi-group payload, but guard defensively).
+    if payload.num_chunks_in_sw:
+        if len(payload.num_chunks_in_sw) != len(object_group_layout_descs):
+            raise ValueError(
+                f"num_chunks_in_sw has {len(payload.num_chunks_in_sw)} entries "
+                f"but {len(object_group_layout_descs)} object groups were decoded"
+            )
+        attn_desc = AttnWindowDesc(num_chunks_in_sw=list(payload.num_chunks_in_sw))
+    else:
+        attn_desc = AttnWindowDesc(
+            num_chunks_in_sw=[-1] * len(object_group_layout_descs)
+        )
+
+    return object_group_layout_descs, attn_desc
 
 
 @dataclass
@@ -303,13 +382,24 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
     ) -> RegisterEngineDrivenContextResponse:
         """Register non-CUDA KV layout metadata for non-GPU context mode.
 
+        Supports two modes:
+
+        * **Legacy single-group** (``payload.object_group_layout_shapes`` is
+          empty): builds a single :class:`~lmcache.v1.distributed.api.MemoryLayoutDesc`
+          from the flat fields and registers it with full-attention semantics.
+          Preserves all pre-Step-3 behaviour unchanged.
+        * **Multi-group** (``payload.object_group_layout_shapes`` is non-empty):
+          reconstructs all per-object-group layouts from the serialised wire
+          fields, uses the provided ``AttnWindowDesc``, and stores the full
+          multi-group layout list on the context entry.  Object group 0 is
+          still used as the primary layout for the layout-registry registration.
+
         Args:
-            payload: Struct containing all registration fields
-                (instance_id, model_name, world_size, block_size,
-                num_layers, hidden_dim_size, dtype_str, use_mla).
+            payload: Struct containing all registration fields.
 
         Raises:
-            ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
+            ValueError: If ``payload.dtype_str`` is not a valid torch dtype
+                name, or if the multi-group layout fields are inconsistent.
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
@@ -335,7 +425,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
             )
 
-        shape = (
+        # Build legacy single-group layout from flat fields (always needed as
+        # primary layout and for backward compatibility).
+        legacy_shape = (
             torch.Size(
                 [payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
             )
@@ -344,11 +436,26 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 [2, payload.num_layers, self._ctx.chunk_size, payload.hidden_dim_size]
             )
         )
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        legacy_layout_desc = MemoryLayoutDesc(shapes=[legacy_shape], dtypes=[dtype])
+
+        # Step 3: decode multi-group fields when the payload carries them.
+        object_group_layout_descs, attn_desc = _decode_multi_group_payload_fields(
+            payload, legacy_layout_desc
+        )
+
+        # Primary layout is object group 0.
+        primary_layout_desc = (
+            object_group_layout_descs[0]
+            if object_group_layout_descs
+            else legacy_layout_desc
+        )
+
         metadata = EngineDrivenContextMetadata(
-            layout_desc=layout_desc,
+            layout_desc=primary_layout_desc,
             block_size=payload.block_size,
             use_mla=payload.use_mla,
+            object_group_layout_descs=object_group_layout_descs,
+            attn_desc=attn_desc,
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
@@ -374,14 +481,16 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             self._strategies[payload.instance_id] = strategy
 
         logger.info(
-            "Registered non-GPU context for instance %d (model=%s, world_size=%d)",
+            "Registered non-GPU context for instance %d (model=%s, world_size=%d, "
+            "num_object_groups=%d)",
             payload.instance_id,
             payload.model_name,
             payload.world_size,
+            len(object_group_layout_descs) if object_group_layout_descs else 1,
         )
 
         self._ctx.layout_desc_registry.register(
-            payload.model_name, payload.world_size, layout_desc
+            payload.model_name, payload.world_size, primary_layout_desc, attn_desc
         )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size

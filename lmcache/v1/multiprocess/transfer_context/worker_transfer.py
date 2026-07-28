@@ -14,7 +14,10 @@ import torch
 # First Party
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
-from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
+    MemoryLayoutDesc,
+)
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
 from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -29,6 +32,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     create_engine_driven_context,
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
+)
+from lmcache.v1.multiprocess.transfer_plan import (
+    build_object_group_layout_desc,
+    export_kv_transfer_metadata,
 )
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
 from lmcache.v1.platform.base.event_ipc import (
@@ -106,6 +113,102 @@ def _build_engine_driven_context() -> "TransferContext":
 
     logger.info("Using EngineDrivenTransferContext (sync) for store path")
     return EngineDrivenTransferContext()
+
+
+def _build_multi_group_wire_fields(
+    kv_caches: dict[str, torch.Tensor],
+    engine_group_infos: Sequence[EngineGroupInfo],
+    blocks_in_chunk: int,
+    block_size: int,
+    layout_hints: "LayoutHints | None",
+) -> tuple[
+    list[EngineGroupInfo],
+    list[list[list[int]]],
+    list[list[str]],
+    list[int],
+    list[MemoryLayoutDesc],
+    AttnWindowDesc,
+]:
+    """Build wire-format multi-group fields for the registration payload.
+
+    When ``engine_group_infos`` is empty (legacy single-group mode) returns
+    empty lists and the default full-attention descriptor so the payload is
+    backward-compatible.  When non-empty, constructs a
+    :class:`~lmcache.v1.kv_layer_groups.KVLayerGroupsManager` and exports
+    shared transfer metadata via :func:`export_kv_transfer_metadata`.
+
+    Args:
+        kv_caches: Per-layer KV tensor mapping keyed by layer name.
+        engine_group_infos: Engine KV-group metadata. Non-empty triggers the
+            multi-group metadata export path.
+        blocks_in_chunk: Number of engine blocks per LMCache chunk.
+        block_size: Detected tokens per paged block (from ``compute_kv_layout``).
+        layout_hints: Optional engine layout hints passed to format detection.
+
+    Returns:
+        A tuple of::
+
+            (engine_group_infos,
+             object_group_layout_shapes,
+             object_group_layout_dtype_strs,
+             num_chunks_in_sw,
+             object_group_layout_descs,
+             attn_desc)
+
+        ``object_group_layout_shapes[g][k]`` is the flat integer list for
+        kernel group ``k`` in object group ``g``.
+        ``object_group_layout_dtype_strs[g][k]`` is the dtype string for the
+        same entry.  The final two elements are the server-local copies of the
+        same information.
+    """
+    # First Party
+    from lmcache.v1.distributed.api import DEFAULT_ATTN_WINDOW_DESC
+
+    if not engine_group_infos:
+        return [], [], [], [], [], DEFAULT_ATTN_WINDOW_DESC
+
+    # Import KVLayerGroupsManager and format discovery lazily to avoid
+    # introducing a hard dependency on the GPU connector at module load time.
+    # First Party
+    from lmcache.v1.gpu_connector.utils import normalize_and_discover_per_layer_formats
+    from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+
+    tensors = list(kv_caches.values())
+    kv_caches_norm, engine_kv_formats = normalize_and_discover_per_layer_formats(
+        tensors, EngineType.VLLM, layout_hints=layout_hints
+    )
+    tokens_per_chunk = blocks_in_chunk * block_size
+    manager = KVLayerGroupsManager(
+        kv_caches_norm,
+        engine_kv_formats,
+        engine_group_infos=list(engine_group_infos),
+        lmcache_tokens_per_chunk=tokens_per_chunk,
+    )
+    transfer_metadata = export_kv_transfer_metadata(manager, tokens_per_chunk)
+
+    num_object_groups = len(transfer_metadata.object_groups)
+    object_group_layout_descs: list[MemoryLayoutDesc] = [
+        build_object_group_layout_desc(transfer_metadata, tokens_per_chunk, og_id)
+        for og_id in range(num_object_groups)
+    ]
+    wire_shapes: list[list[list[int]]] = [
+        [list(s) for s in desc.shapes] for desc in object_group_layout_descs
+    ]
+    wire_dtype_strs: list[list[str]] = [
+        [str(dt).removeprefix("torch.") for dt in desc.dtypes]
+        for desc in object_group_layout_descs
+    ]
+    wire_num_chunks_in_sw = list(transfer_metadata.num_chunks_in_sw)
+    attn_desc = transfer_metadata.build_attn_desc()
+
+    return (
+        list(engine_group_infos),
+        wire_shapes,
+        wire_dtype_strs,
+        wire_num_chunks_in_sw,
+        object_group_layout_descs,
+        attn_desc,
+    )
 
 
 class MPTransferMode(str, Enum):
@@ -536,14 +639,33 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` is accepted to satisfy the base interface but
-        is currently a no-op: the non-GPU transfer path does not support
-        hybrid KV cache groups and rejects multi-group transfers at store /
-        retrieve time (see ``_single_group_block_ids``).
+        When ``engine_group_infos`` is non-empty, builds a
+        :class:`~lmcache.v1.kv_layer_groups.KVLayerGroupsManager` and exports
+        shared transfer metadata so the server receives the full ordered
+        kernel-group and object-group structure. When empty (legacy single-group
+        mode), falls back to the flat single-group registration path.
+
+        Data-transfer paths (gather/scatter) are unchanged; this registration
+        step is control-plane only.
+
+        Args:
+            instance_id: Worker process instance identifier.
+            kv_caches: Worker KV-cache tensors keyed by layer name.
+            model_name: Model identifier used by the server.
+            world_size: Tensor-parallel world size.
+            blocks_in_chunk: Engine blocks per LMCache chunk.
+            mq_client: Message-queue client used for requests.
+            mq_timeout: Timeout for the registration response.
+            send_request: Request sender used by this context.
+            layout_hints: Optional KV-layout metadata.
+            engine_group_infos: Engine KV-group metadata. When non-empty, the
+                full per-group transfer metadata is included in the registration
+                payload so the server can retain multi-group layouts.
+
+        Raises:
+            TimeoutError: If server registration does not complete before
+                ``mq_timeout``.
         """
-        # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
-        # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
-        # on the CUDA path. The non-CUDA path is yet to be implemented.
         (
             block_size,
             num_layers,
@@ -568,6 +690,24 @@ class EngineDrivenTransferContext(TransferContext):
         dtype = getattr(torch, dtype_str)
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
 
+        # Step 3: when engine_group_infos is provided, export shared
+        # transfer metadata so the server receives the full multi-group
+        # registration information.
+        (
+            wire_engine_group_infos,
+            wire_obj_shapes,
+            wire_obj_dtype_strs,
+            wire_num_chunks_in_sw,
+            object_group_layout_descs,
+            attn_desc,
+        ) = _build_multi_group_wire_fields(
+            kv_caches,
+            engine_group_infos,
+            blocks_in_chunk,
+            block_size,
+            layout_hints,
+        )
+
         future = send_request(
             mq_client,
             RequestType.REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT,
@@ -581,6 +721,10 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    engine_group_infos=wire_engine_group_infos,
+                    object_group_layout_shapes=wire_obj_shapes,
+                    object_group_layout_dtype_strs=wire_obj_dtype_strs,
+                    num_chunks_in_sw=wire_num_chunks_in_sw,
                 )
             ],
         )
@@ -595,6 +739,8 @@ class EngineDrivenTransferContext(TransferContext):
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
+            object_group_layout_descs=object_group_layout_descs,
+            attn_desc=attn_desc,
         )
         self._engine_driven_context = create_engine_driven_context(
             metadata,
