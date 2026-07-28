@@ -39,6 +39,20 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 ResolveObjKeysFn = Callable[[IPCCacheServerKey, list[int]], list[list[ObjectKey]]]
 
 
+class _PostPrefetchValidationError(Exception):
+    """Signal invalid prefetched data so context cleanup releases held read locks.
+
+    Raised when post-prefetch validation fails (e.g. count mismatch or missing
+    tensor component). The exception path triggers ``read_prefetched_results``
+    context cleanup, ensuring held read locks for the current group are released
+    exactly once.
+
+    This private control-flow exception is raised only inside
+    ``_PickleLifecycleExecutor.retrieve`` and caught there immediately.
+    It carries no message or extra state.
+    """
+
+
 @dataclass(frozen=True)
 class _ResolvedObjectGroup:
     """Object-group transfer inputs resolved for one request."""
@@ -68,7 +82,9 @@ def _ordered_layout_descs(
 ) -> list[MemoryLayoutDesc]:
     """Return per-object-group layouts in object-group ID order."""
     if context.object_group_layout_descs:
-        return [context.object_group_layout_descs[group_id] for group_id in object_group_ids]
+        return [
+            context.object_group_layout_descs[group_id] for group_id in object_group_ids
+        ]
     if object_group_ids == [0]:
         return [context.layout_desc]
     raise ValueError("missing object-group layout descriptors for multi-group transfer")
@@ -111,7 +127,9 @@ def _resolve_object_groups(
     ]
 
 
-def _select_windowed_obj_keys_for_retrieve(group: _ResolvedObjectGroup) -> list[ObjectKey]:
+def _select_windowed_obj_keys_for_retrieve(
+    group: _ResolvedObjectGroup,
+) -> list[ObjectKey]:
     """Select retrieve keys for one object group using its sliding-window size."""
     num_objects_to_skip = compute_num_objects_to_skip(
         group.sw_size_chunks,
@@ -128,7 +146,9 @@ def _normalize_store_payload(payload: list[Any]) -> list[list[torch.Tensor]] | N
     if all(isinstance(payload_object, list) for payload_object in payload):
         normalized_payload: list[list[torch.Tensor]] = []
         for payload_object in payload:
-            if not all(isinstance(component, torch.Tensor) for component in payload_object):
+            if not all(
+                isinstance(component, torch.Tensor) for component in payload_object
+            ):
                 return None
             normalized_payload.append(payload_object)
         return normalized_payload
@@ -213,7 +233,9 @@ class _PickleLifecycleExecutor:
                     for tensor_idx, component in enumerate(payload_object):
                         memory_tensor = _memory_tensor(memory_obj, tensor_idx)
                         if memory_tensor is None:
-                            raise ValueError("reserved memory object missing tensor component")
+                            raise ValueError(
+                                "reserved memory object missing tensor component"
+                            )
                         memory_tensor.copy_(component)
 
             if payload_idx != len(payload_objects):
@@ -231,7 +253,19 @@ class _PickleLifecycleExecutor:
         resolved_groups: list[_ResolvedObjectGroup],
         flatten_single_component_payload: bool,
     ) -> PrepareRetrieveResponse:
-        """Read prefetched objects and serialize object-major pickle payload."""
+        """Read prefetched objects and serialize object-major pickle payload.
+
+        Notes:
+            Each group's read locks are managed by a ``read_prefetched_results``
+            context manager.  When post-prefetch validation fails for a group,
+            ``_PostPrefetchValidationError`` is raised inside the context so its
+            exception path releases that group's locks.  Keys from groups that
+            were already successfully read are accumulated in ``prefetched_keys``
+            and released via ``finish_read_prefetched`` in the outer ``finally``.
+            Only groups that exit their context normally without exception have
+            their keys entered into ``prefetched_keys``; the outer ``finally``
+            does not overlap with the context's own cleanup.
+        """
         payload_objects: list[list[torch.Tensor]] = []
         prefetched_keys: list[ObjectKey] = []
         try:
@@ -239,29 +273,33 @@ class _PickleLifecycleExecutor:
                 selected_obj_keys = _select_windowed_obj_keys_for_retrieve(group)
                 if not selected_obj_keys:
                     continue
-                read_ctx = self._storage_manager.read_prefetched_results(selected_obj_keys)
+                read_ctx = self._storage_manager.read_prefetched_results(
+                    selected_obj_keys
+                )
+                group_payload: list[list[torch.Tensor]] = []
                 with read_ctx as maybe_memory_objs:
-                    if (
-                        not maybe_memory_objs
-                        or len(maybe_memory_objs) != len(selected_obj_keys)
-                    ):
-                        return PrepareRetrieveResponse(success=False, data=b"", context={})
-                    prefetched_keys.extend(selected_obj_keys)
+                    if not maybe_memory_objs:
+                        # Context yielded None (some keys missing); its own cleanup
+                        # releases any partial read locks for this group.
+                        raise _PostPrefetchValidationError
+                    if len(maybe_memory_objs) != len(selected_obj_keys):
+                        # Count mismatch: raise so context releases this group's locks.
+                        raise _PostPrefetchValidationError
                     for memory_obj in maybe_memory_objs:
                         payload_object: list[torch.Tensor] = []
                         for tensor_idx in range(len(group.layout_desc.shapes)):
                             memory_tensor = _memory_tensor(memory_obj, tensor_idx)
                             if memory_tensor is None:
-                                return PrepareRetrieveResponse(
-                                    success=False,
-                                    data=b"",
-                                    context={},
-                                )
+                                # Missing tensor component: raise so context releases.
+                                raise _PostPrefetchValidationError
                             payload_object.append(memory_tensor.cpu().clone())
-                        payload_objects.append(payload_object)
+                        group_payload.append(payload_object)
+                # Context exited normally; caller now owns these read locks.
+                prefetched_keys.extend(selected_obj_keys)
+                payload_objects.extend(group_payload)
             serialized_payload: list[torch.Tensor] | list[list[torch.Tensor]]
             if flatten_single_component_payload:
-                serialized_payload = [payload_object[0] for payload_object in payload_objects]
+                serialized_payload = [po[0] for po in payload_objects]
             else:
                 serialized_payload = payload_objects
             return PrepareRetrieveResponse(
@@ -269,6 +307,8 @@ class _PickleLifecycleExecutor:
                 data=pickle.dumps(serialized_payload),
                 context={},
             )
+        except _PostPrefetchValidationError:
+            return PrepareRetrieveResponse(success=False, data=b"", context={})
         finally:
             if prefetched_keys:
                 self._storage_manager.finish_read_prefetched(prefetched_keys)
@@ -449,8 +489,24 @@ class PickleTransferStrategy(TransferStrategy):
 
         Returns:
             ``True`` when every reserved object is written successfully.
+            Returns ``False`` when payload deserialization fails before any
+            storage reservation.
         """
-        payload = pickle.loads(cpu_data)
+        try:
+            payload = pickle.loads(cpu_data)
+        except (
+            pickle.PickleError,
+            EOFError,
+            AttributeError,
+            ImportError,
+            IndexError,
+        ):
+            # pickle.PickleError / EOFError: malformed or truncated payload bytes.
+            # AttributeError / ImportError: unresolved classes or modules.
+            # IndexError: malformed opcode/data stream edge cases.
+            # All decode failures must happen before any reserve_write side effect.
+            logger.exception("Failed to deserialize engine-driven store payload")
+            return False
         if not isinstance(payload, list):
             return False
         payload_objects = _normalize_store_payload(payload)

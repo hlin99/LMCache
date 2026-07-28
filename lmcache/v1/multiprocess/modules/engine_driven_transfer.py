@@ -236,10 +236,9 @@ def _validate_transfer_metadata_consistency(
     4. Every kernel-group ID referenced by an object group is a valid index.
     5. Each object-group's ``sw_size_chunks`` matches
        ``num_chunks_in_sw[object_group_id]``.
-    6. ``engine_group_infos`` and kernel groups correspond one-to-one in list
-       order: counts must match, each pair must share the same
-       ``engine_group_id``, and each pair's ``layer_indices`` must be identical
-       in value and order.
+    6. ``engine_group_infos`` and kernel groups describe the same engine groups
+       and layer ordering.  Multiple kernel groups may represent one engine
+       group when that engine group is split by transfer identity.
     7. Layouts rebuilt from ``build_object_group_layout_desc`` match
        ``object_group_layout_descs`` element-by-element.
 
@@ -307,32 +306,41 @@ def _validate_transfer_metadata_consistency(
                 f"num_chunks_in_sw[{og.object_group_id}] ({expected_sw})"
             )
 
-    # 6. engine_group_infos vs kernel groups: one-to-one positional correspondence.
+    # 6. Engine-group metadata may be split into multiple kernel groups when
+    # layers in one engine block address space need different copy kernels.
     if engine_group_infos:
-        if len(engine_group_infos) != num_kernel_groups:
+        info_layers_by_engine_group: dict[int, list[int]] = {}
+        info_engine_group_order: list[int] = []
+        for info in engine_group_infos:
+            if info.engine_group_id not in info_layers_by_engine_group:
+                info_layers_by_engine_group[info.engine_group_id] = []
+                info_engine_group_order.append(info.engine_group_id)
+            info_layers_by_engine_group[info.engine_group_id].extend(info.layer_indices)
+
+        kernel_layers_by_engine_group: dict[int, list[int]] = {}
+        kernel_engine_group_order: list[int] = []
+        for kernel_group in transfer_metadata.kernel_groups:
+            if kernel_group.engine_group_id not in kernel_layers_by_engine_group:
+                kernel_layers_by_engine_group[kernel_group.engine_group_id] = []
+                kernel_engine_group_order.append(kernel_group.engine_group_id)
+            kernel_layers_by_engine_group[kernel_group.engine_group_id].extend(
+                kernel_group.layer_indices
+            )
+
+        if info_engine_group_order != kernel_engine_group_order:
             raise ValueError(
-                f"engine_group_infos has {len(engine_group_infos)} entries but "
-                f"transfer_metadata has {num_kernel_groups} kernel groups; "
-                "they must correspond one-to-one in list order"
+                "engine_group_infos and transfer_metadata kernel groups have "
+                "different engine_group_id ordering"
             )
-        for idx, (egi, kg) in enumerate(
-            zip(
-                engine_group_infos,
-                transfer_metadata.kernel_groups,
-                strict=True,
-            )
-        ):
-            if egi.engine_group_id != kg.engine_group_id:
+
+        for engine_group_id in info_engine_group_order:
+            info_layers = info_layers_by_engine_group[engine_group_id]
+            kernel_layers = kernel_layers_by_engine_group[engine_group_id]
+            if info_layers != kernel_layers:
                 raise ValueError(
-                    f"engine_group_infos[{idx}].engine_group_id "
-                    f"({egi.engine_group_id}) does not match "
-                    f"kernel_groups[{idx}].engine_group_id ({kg.engine_group_id})"
-                )
-            if tuple(egi.layer_indices) != kg.layer_indices:
-                raise ValueError(
-                    f"engine_group_infos[{idx}].layer_indices "
-                    f"({list(egi.layer_indices)}) does not match "
-                    f"kernel_groups[{idx}].layer_indices ({list(kg.layer_indices)})"
+                    f"engine_group_id {engine_group_id}: engine_group_infos "
+                    f"layer_indices ({info_layers}) do not match kernel groups "
+                    f"layer_indices ({kernel_layers})"
                 )
 
     # 7. Rebuild layouts from transfer_metadata and compare with payload descs.
@@ -802,9 +810,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             PrepareStoreResponse with empty slots for pickle mode.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        if (
-            isinstance(strategy, ShmTransferStrategy)
-            and requires_multi_component_shm(entry.metadata.transfer_metadata)
+        if isinstance(strategy, ShmTransferStrategy) and requires_multi_component_shm(
+            entry.metadata.transfer_metadata
         ):
             raise ValueError(
                 "engine-driven SHM transport does not support multi-group "
@@ -882,9 +889,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 instance ID.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        if (
-            isinstance(strategy, ShmTransferStrategy)
-            and requires_multi_component_shm(entry.metadata.transfer_metadata)
+        if isinstance(strategy, ShmTransferStrategy) and requires_multi_component_shm(
+            entry.metadata.transfer_metadata
         ):
             raise ValueError(
                 "engine-driven SHM transport does not support multi-group "

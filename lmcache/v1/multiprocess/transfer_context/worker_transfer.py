@@ -417,10 +417,7 @@ def _kernel_group_kv_caches(
 ) -> dict[str, torch.Tensor]:
     """Return per-layer KV tensors for one kernel group in metadata order."""
     kv_tensors = list(kv_caches.values())
-    return {
-        f"layer_{layer_idx}": kv_tensors[layer_idx]
-        for layer_idx in layer_indices
-    }
+    return {f"layer_{layer_idx}": kv_tensors[layer_idx] for layer_idx in layer_indices}
 
 
 def _num_chunks_for_transfer(
@@ -596,7 +593,10 @@ def _scatter_multi_group_pickle_chunks(
                 previous_first_idx = first_selected_chunk_idx_by_kernel_group.get(
                     kernel_group_id
                 )
-                if previous_first_idx is None or num_objects_to_skip < previous_first_idx:
+                if (
+                    previous_first_idx is None
+                    or num_objects_to_skip < previous_first_idx
+                ):
                     first_selected_chunk_idx_by_kernel_group[kernel_group_id] = (
                         num_objects_to_skip
                     )
@@ -1154,9 +1154,7 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
-        transfer_metadata = (
-            self._engine_driven_context.metadata.transfer_metadata
-        )
+        transfer_metadata = self._engine_driven_context.metadata.transfer_metadata
         is_metadata_driven = uses_metadata_driven_transfer(transfer_metadata)
         needs_multi_component_shm = requires_multi_component_shm(transfer_metadata)
         torch_dev.synchronize()
@@ -1240,8 +1238,7 @@ class EngineDrivenTransferContext(TransferContext):
                     parsed_payload: list[list[torch.Tensor]] = []
                     for payload_object in src_buffers:
                         if not all(
-                            isinstance(part, torch.Tensor)
-                            for part in payload_object
+                            isinstance(part, torch.Tensor) for part in payload_object
                         ):
                             raise ValueError(
                                 "multi-group retrieve payload contains non-tensor parts"

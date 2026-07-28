@@ -37,6 +37,7 @@ class _FakeStoreContext:
         self.layout_desc = SimpleNamespace(
             shapes=[torch.Size([2, 1, 1, 1])], dtypes=[torch.float32]
         )
+        self.metadata = SimpleNamespace(transfer_metadata=None)
 
     def prepare_store(
         self, _key: object, _instance_id: int
