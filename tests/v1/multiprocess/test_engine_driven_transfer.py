@@ -1665,6 +1665,85 @@ def test_engine_driven_context_shm_close_is_idempotent() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _make_multi_group_wire_dto(
+    num_object_groups: int,
+    chunk_size: int,
+    block_size: int,
+    hidden_dim_size: int,
+    dtype_strs: list[str],
+    num_chunks_in_sw_list: list[int],
+    num_layers_per_group: int = 2,
+    engine_kv_format_int: int = 0,
+) -> "Any":
+    """Build a minimal, internally-consistent KVTransferMetadataWire for tests.
+
+    Assigns distinct layer indices to each kernel group: group ``g`` gets
+    layers ``[g * num_layers_per_group, ..., (g+1) * num_layers_per_group - 1]``.
+    All kernel groups use ``engine_group_id=0``.
+
+    Args:
+        num_object_groups: Number of object groups (and kernel groups) to create.
+        chunk_size: LMCache chunk size in tokens (== server chunk size).
+        block_size: Tokens per paged block (tokens_per_block == slots_per_block,
+            so compress_ratio == 1).
+        hidden_dim_size: Hidden dimension width per slot.
+        dtype_strs: Per-object-group dtype strings (must have ``num_object_groups``
+            elements).
+        num_chunks_in_sw_list: Per-object-group sliding-window chunk count (``-1``
+            for full attention).
+        num_layers_per_group: Layers covered by each kernel group.
+        engine_kv_format_int: Integer value of ``EngineKVFormat``; defaults to 0
+            (``NL_X_TWO_NB_BS_NH_HS``).
+
+    Returns:
+        A ``KVTransferMetadataWire`` consistent with ``num_object_groups``
+        object groups, where each object group wraps exactly one kernel group.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+    )
+
+    blocks_per_chunk = chunk_size // block_size
+    kernel_groups = []
+    object_groups = []
+    for og_id in range(num_object_groups):
+        layer_start = og_id * num_layers_per_group
+        layer_indices = list(range(layer_start, layer_start + num_layers_per_group))
+        kernel_groups.append(
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=og_id,
+                engine_group_id=0,
+                layer_indices=layer_indices,
+                blocks_per_chunk=blocks_per_chunk,
+                blocks_per_window=blocks_per_chunk,
+                slots_per_chunk_in_window=chunk_size,
+                kv_size=2,
+                num_layers=num_layers_per_group,
+                hidden_dim_size=hidden_dim_size,
+                slots_per_block=block_size,
+                tokens_per_block=block_size,
+                dtype_str=dtype_strs[og_id],
+                engine_kv_format_int=engine_kv_format_int,
+            )
+        )
+        object_groups.append(
+            ObjectGroupTransferMetadataWire(
+                object_group_id=og_id,
+                kernel_group_ids=[og_id],
+                sw_size_chunks=num_chunks_in_sw_list[og_id],
+            )
+        )
+    return KVTransferMetadataWire(
+        num_chunks_in_sw=list(num_chunks_in_sw_list),
+        tokens_per_chunk=chunk_size,
+        kernel_groups=kernel_groups,
+        object_groups=object_groups,
+    )
+
+
 def _make_multi_group_payload(
     instance_id: int = 1,
     model_name: str = "m",
@@ -1676,41 +1755,65 @@ def _make_multi_group_payload(
 ) -> "RegisterEngineDrivenContextPayload":
     """Build a multi-group registration payload for Step 3 server-side tests.
 
+    Produces a fully consistent payload including ``transfer_metadata_wire`` and
+    ``engine_group_infos`` that cover all layer indices used by the wire DTO.
+
     Args:
         instance_id: Worker instance identifier.
         model_name: Model name.
         world_size: World size.
-        num_object_groups: Number of object groups to simulate.
+        num_object_groups: Number of object groups to simulate.  Each group uses
+            2 distinct layers, so the engine-group-info layer list grows with
+            ``num_object_groups``.
         chunk_size: Chunk size (tokens) used to derive shapes.
         block_size: Tokens per paged block.
-        dtype_str: Torch dtype string.
+        dtype_str: Torch dtype string (applied to all object groups).
 
     Returns:
-        A RegisterEngineDrivenContextPayload with multi-group layout fields.
+        A RegisterEngineDrivenContextPayload with multi-group layout fields and
+        a consistent ``transfer_metadata_wire``.
     """
     # First Party
     from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
+    num_layers_per_group = 2
+    total_layers = num_object_groups * num_layers_per_group
     # Build per-object-group shapes: single kernel group per object group,
-    # each with shape [2, 2, chunk_size, 16].
-    obj_shapes = [[[2, 2, chunk_size, 16]] for _ in range(num_object_groups)]
+    # each with shape [2, num_layers_per_group, chunk_size, 16].
+    # compress_ratio=1 → num_slots=chunk_size → shape=(kv_size=2, nl=2, chunk_size, 16).
+    obj_shapes = [
+        [[2, num_layers_per_group, chunk_size, 16]] for _ in range(num_object_groups)
+    ]
     obj_dtype_strs = [[dtype_str] for _ in range(num_object_groups)]
     num_chunks_in_sw = [-1] * num_object_groups
+
+    wire = _make_multi_group_wire_dto(
+        num_object_groups=num_object_groups,
+        chunk_size=chunk_size,
+        block_size=block_size,
+        hidden_dim_size=16,
+        dtype_strs=[dtype_str] * num_object_groups,
+        num_chunks_in_sw_list=num_chunks_in_sw,
+        num_layers_per_group=num_layers_per_group,
+    )
 
     return RegisterEngineDrivenContextPayload(
         instance_id=instance_id,
         model_name=model_name,
         world_size=world_size,
         block_size=block_size,
-        num_layers=2,
+        num_layers=total_layers,
         hidden_dim_size=16,
         dtype_str=dtype_str,
         use_mla=False,
-        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=tuple(range(total_layers)))
+        ],
         object_group_layout_shapes=obj_shapes,
         object_group_layout_dtype_strs=obj_dtype_strs,
         num_chunks_in_sw=num_chunks_in_sw,
+        transfer_metadata_wire=wire,
     )
 
 
@@ -1755,6 +1858,15 @@ def test_server_register_multi_group_attn_desc(
     module, _, _, ctx = server_module_factory(chunk_size=chunk_size)
 
     # Two object groups: first full-attention (-1), second sliding-window (2).
+    # Two kernel groups split 4 layers (0-1 and 2-3) with float16, compress_ratio=1.
+    wire = _make_multi_group_wire_dto(
+        num_object_groups=2,
+        chunk_size=chunk_size,
+        block_size=4,
+        hidden_dim_size=16,
+        dtype_strs=["float16", "float16"],
+        num_chunks_in_sw_list=[-1, 2],
+    )
     payload = RegisterEngineDrivenContextPayload(
         instance_id=11,
         model_name="m",
@@ -1773,6 +1885,7 @@ def test_server_register_multi_group_attn_desc(
         ],
         object_group_layout_dtype_strs=[["float16"], ["float16"]],
         num_chunks_in_sw=[-1, 2],
+        transfer_metadata_wire=wire,
     )
     module.register_kv_cache_engine_driven_context(payload)
 
@@ -1796,23 +1909,35 @@ def test_server_register_multi_group_uses_object_group_0_as_primary_layout(
     chunk_size = 16
     module, _, _, ctx = server_module_factory(chunk_size=chunk_size)
 
-    # Object group 0 has float32 shape, object group 1 has float16 shape.
+    # Object group 0 has float32 kernel group, object group 1 has float16.
+    # Two kernel groups split 4 layers (0-1 → float32, 2-3 → float16).
+    wire = _make_multi_group_wire_dto(
+        num_object_groups=2,
+        chunk_size=chunk_size,
+        block_size=4,
+        hidden_dim_size=32,
+        dtype_strs=["float32", "float16"],
+        num_chunks_in_sw_list=[-1, -1],
+    )
     payload = RegisterEngineDrivenContextPayload(
         instance_id=12,
         model_name="model_x",
         world_size=2,
         block_size=4,
-        num_layers=2,
+        num_layers=4,
         hidden_dim_size=32,
         dtype_str="float32",
         use_mla=False,
-        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1, 2, 3))
+        ],
         object_group_layout_shapes=[
             [[2, 2, chunk_size, 32]],  # object group 0 (primary)
             [[2, 2, chunk_size, 32]],  # object group 1
         ],
         object_group_layout_dtype_strs=[["float32"], ["float16"]],
         num_chunks_in_sw=[-1, -1],
+        transfer_metadata_wire=wire,
     )
     module.register_kv_cache_engine_driven_context(payload)
 
@@ -1932,6 +2057,550 @@ def test_server_register_multi_group_rejects_mismatched_num_chunks_in_sw(
     )
     with pytest.raises(ValueError, match="num_chunks_in_sw"):
         module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_multi_group_rejects_missing_wire(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Multi-group registration without transfer_metadata_wire raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=33,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=4,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1, 2, 3))
+        ],
+        object_group_layout_shapes=[[[2, 2, 8, 16]], [[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"], ["float32"]],
+        num_chunks_in_sw=[-1, -1],
+        # transfer_metadata_wire intentionally absent
+    )
+    with pytest.raises(ValueError, match="transfer_metadata_wire"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_tokens_per_chunk_mismatch(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """tokens_per_chunk != server chunk_size raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    chunk_size = 8
+    module, _, _, _ = server_module_factory(chunk_size=chunk_size)
+
+    # Build a wire with tokens_per_chunk=16 but server expects 8.
+    wire = _make_multi_group_wire_dto(
+        num_object_groups=1,
+        chunk_size=16,  # wrong
+        block_size=4,
+        hidden_dim_size=16,
+        dtype_strs=["float32"],
+        num_chunks_in_sw_list=[-1],
+    )
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=34,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[[[2, 2, 16, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="tokens_per_chunk"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_kernel_group_id_out_of_order(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Kernel-group ID not matching list index raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # kernel_group_id=1 but placed at index 0.
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=1,  # wrong: should be 0
+                engine_group_id=0,
+                layer_indices=[0, 1],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0, kernel_group_ids=[0], sw_size_chunks=-1
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=35,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="kernel_group_id"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_invalid_kernel_group_reference(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Object group referencing non-existent kernel group raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # Object group references kernel_group_id=5 which doesn't exist.
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=[0, 1],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0,
+                kernel_group_ids=[5],  # invalid: only 1 kernel group (index 0)
+                sw_size_chunks=-1,
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=36,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="kernel_group_id"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_sw_size_chunks_mismatch(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """sw_size_chunks != num_chunks_in_sw raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # num_chunks_in_sw says 3 but object group sw_size_chunks says -1.
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[3],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=[0, 1],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0,
+                kernel_group_ids=[0],
+                sw_size_chunks=-1,  # mismatch: num_chunks_in_sw[0]=3
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=37,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[3],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="sw_size_chunks"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_invalid_engine_group_id(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Kernel group referencing engine_group_id absent from engine_group_infos."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # Kernel group claims engine_group_id=1 but engine_group_infos only has id 0.
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=1,  # not in engine_group_infos
+                layer_indices=[0, 1],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0, kernel_group_ids=[0], sw_size_chunks=-1
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=38,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="engine_group_id"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_layer_absent_from_engine_group(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Layer in kernel group absent from engine_group_infos raises ValueError."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # Kernel group includes layer 5 but engine_group_infos only lists layers (0, 1).
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=[0, 5],  # layer 5 not in engine_group_infos
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0, kernel_group_ids=[0], sw_size_chunks=-1
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=39,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="layer_index"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_engine_group_layer_coverage_gap(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Layer declared in engine_group_infos but absent from kernel groups raises."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # engine_group_infos claims layer 1 but kernel group only covers layer 0.
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=[0],  # layer 1 missing
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=1,
+                hidden_dim_size=16,
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0, kernel_group_ids=[0], sw_size_chunks=-1
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=40,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))  # claims 2 layers
+        ],
+        # Shape for 1 layer at 8 tokens: (2, 1, 8, 16)
+        object_group_layout_shapes=[[[2, 1, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="absent from all"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_server_register_rejects_layout_mismatch_from_wire(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Layout rebuilt from transfer_metadata differs from payload shapes."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        KernelGroupTransferMetadataWire,
+        KVTransferMetadataWire,
+        ObjectGroupTransferMetadataWire,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+    module, _, _, _ = server_module_factory(chunk_size=8)
+
+    # Wire describes hidden_dim=32 but payload shape claims hidden_dim=16.
+    wire = KVTransferMetadataWire(
+        num_chunks_in_sw=[-1],
+        tokens_per_chunk=8,
+        kernel_groups=[
+            KernelGroupTransferMetadataWire(
+                kernel_group_id=0,
+                engine_group_id=0,
+                layer_indices=[0, 1],
+                blocks_per_chunk=2,
+                blocks_per_window=2,
+                slots_per_chunk_in_window=8,
+                kv_size=2,
+                num_layers=2,
+                hidden_dim_size=32,  # hidden_dim=32
+                slots_per_block=4,
+                tokens_per_block=4,
+                dtype_str="float32",
+                engine_kv_format_int=0,
+            )
+        ],
+        object_groups=[
+            ObjectGroupTransferMetadataWire(
+                object_group_id=0, kernel_group_ids=[0], sw_size_chunks=-1
+            )
+        ],
+    )
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=41,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        engine_group_infos=[EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))],
+        # Payload claims hidden_dim=16 but wire says 32 → shape mismatch
+        object_group_layout_shapes=[[[2, 2, 8, 16]]],
+        object_group_layout_dtype_strs=[["float32"]],
+        num_chunks_in_sw=[-1],
+        transfer_metadata_wire=wire,
+    )
+    with pytest.raises(ValueError, match="layout rebuilt from transfer_metadata"):
+        module.register_kv_cache_engine_driven_context(payload)
+
+
+def test_validate_transfer_metadata_consistency_function() -> None:
+    """Unit test of _validate_transfer_metadata_consistency directly."""
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
+        _kv_transfer_metadata_from_wire,
+        _validate_transfer_metadata_consistency,
+    )
+
+    wire = _make_multi_group_wire_dto(
+        num_object_groups=1,
+        chunk_size=8,
+        block_size=4,
+        hidden_dim_size=16,
+        dtype_strs=["float32"],
+        num_chunks_in_sw_list=[-1],
+    )
+    tm = _kv_transfer_metadata_from_wire(wire)
+    layout_descs = [
+        MemoryLayoutDesc(shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32])
+    ]
+    engine_group_infos = [EngineGroupInfo(engine_group_id=0, layer_indices=(0, 1))]
+
+    # Valid call should not raise.
+    _validate_transfer_metadata_consistency(tm, engine_group_infos, layout_descs, 8)
 
 
 def test_decode_multi_group_payload_fields_legacy_fallback() -> None:

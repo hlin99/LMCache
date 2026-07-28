@@ -29,6 +29,7 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ThreadPoolType,
 )
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.base import RequestType
 from lmcache.v1.multiprocess.protocols.engine import (
     PrepareRetrieveResponse,
@@ -40,6 +41,7 @@ from lmcache.v1.multiprocess.transfer_plan import (
     KernelGroupTransferMetadata,
     KVTransferMetadata,
     ObjectGroupTransferMetadata,
+    build_object_group_layout_desc,
 )
 
 # Local
@@ -75,10 +77,12 @@ def _kv_transfer_metadata_from_wire(
     # Use the native lmc_ops enum when available (same int values as the pure
     # Python ops_types.EngineKVFormat, so both work with C++ op calls).
     try:
+        # First Party
         import lmcache.c_ops as lmc_ops
 
         _EngineKVFormat = lmc_ops.EngineKVFormat
     except ImportError:
+        # First Party
         from lmcache.v1.platform.ops_types import EngineKVFormat
 
         _EngineKVFormat = EngineKVFormat  # type: ignore[assignment]
@@ -208,6 +212,162 @@ def _decode_multi_group_payload_fields(
         )
 
     return object_group_layout_descs, attn_desc
+
+
+def _validate_transfer_metadata_consistency(
+    transfer_metadata: KVTransferMetadata,
+    engine_group_infos: list[EngineGroupInfo],
+    object_group_layout_descs: list[MemoryLayoutDesc],
+    chunk_size: int,
+) -> None:
+    """Validate internal consistency of a reconstructed :class:`KVTransferMetadata`.
+
+    Checks that the wire-format transfer metadata is self-consistent and
+    consistent with the other multi-group registration fields.  Raises
+    :exc:`ValueError` as soon as the first inconsistency is found.
+
+    Checks performed:
+
+    1. ``tokens_per_chunk`` matches the server's ``chunk_size``.
+    2. Kernel-group IDs are contiguous from 0 (match their list index).
+    3. Object-group IDs are contiguous from 0 (match their list index).
+    4. Every kernel-group ID referenced by an object group is a valid index.
+    5. Each object-group's ``sw_size_chunks`` matches
+       ``num_chunks_in_sw[object_group_id]``.
+    6. Every kernel-group's ``engine_group_id`` is present in
+       ``engine_group_infos``, and every layer in every kernel group appears in
+       the corresponding ``EngineGroupInfo`` entry; conversely all layers in
+       ``engine_group_infos`` appear in at least one kernel group.
+    7. Layouts rebuilt from ``build_object_group_layout_desc`` match
+       ``object_group_layout_descs`` element-by-element.
+
+    Args:
+        transfer_metadata: The reconstructed transfer metadata to validate.
+        engine_group_infos: Engine-group topology from the registration payload.
+        object_group_layout_descs: Decoded per-object-group layout descriptors
+            from the registration payload.
+        chunk_size: Server chunk size in tokens; must equal
+            ``transfer_metadata.tokens_per_chunk``.
+
+    Raises:
+        ValueError: If any consistency check fails.
+    """
+    # 1. tokens_per_chunk must match the server chunk size.
+    if transfer_metadata.tokens_per_chunk != chunk_size:
+        raise ValueError(
+            f"transfer_metadata_wire.tokens_per_chunk "
+            f"({transfer_metadata.tokens_per_chunk}) does not match "
+            f"server chunk_size ({chunk_size})"
+        )
+
+    num_kernel_groups = len(transfer_metadata.kernel_groups)
+    num_object_groups = len(transfer_metadata.object_groups)
+
+    # 2. Kernel-group IDs must be contiguous from 0.
+    for idx, kg in enumerate(transfer_metadata.kernel_groups):
+        if kg.kernel_group_id != idx:
+            raise ValueError(
+                f"kernel_group at index {idx} has kernel_group_id "
+                f"{kg.kernel_group_id}, expected {idx}"
+            )
+
+    # 3. Object-group IDs must be contiguous from 0.
+    for idx, og in enumerate(transfer_metadata.object_groups):
+        if og.object_group_id != idx:
+            raise ValueError(
+                f"object_group at index {idx} has object_group_id "
+                f"{og.object_group_id}, expected {idx}"
+            )
+
+    # 4. Object-group kernel_group_ids must reference valid kernel groups.
+    for og in transfer_metadata.object_groups:
+        for kg_id in og.kernel_group_ids:
+            if kg_id < 0 or kg_id >= num_kernel_groups:
+                raise ValueError(
+                    f"object_group {og.object_group_id} references invalid "
+                    f"kernel_group_id {kg_id} "
+                    f"(num_kernel_groups={num_kernel_groups})"
+                )
+
+    # 5. sw_size_chunks must match num_chunks_in_sw for each object group.
+    if len(transfer_metadata.num_chunks_in_sw) != num_object_groups:
+        raise ValueError(
+            f"transfer_metadata.num_chunks_in_sw has "
+            f"{len(transfer_metadata.num_chunks_in_sw)} entries but "
+            f"{num_object_groups} object groups"
+        )
+    for og in transfer_metadata.object_groups:
+        expected_sw = transfer_metadata.num_chunks_in_sw[og.object_group_id]
+        if og.sw_size_chunks != expected_sw:
+            raise ValueError(
+                f"object_group {og.object_group_id}: sw_size_chunks "
+                f"({og.sw_size_chunks}) does not match "
+                f"num_chunks_in_sw[{og.object_group_id}] ({expected_sw})"
+            )
+
+    # 6. engine_group_infos consistency.
+    if engine_group_infos:
+        valid_engine_group_ids = {eg.engine_group_id for eg in engine_group_infos}
+        # Build per-engine-group layer sets from the payload's engine_group_infos.
+        eg_layers_by_id: dict[int, set[int]] = {}
+        for eg in engine_group_infos:
+            eg_layers_by_id.setdefault(eg.engine_group_id, set()).update(
+                eg.layer_indices
+            )
+        # Validate kernel groups and accumulate their layers by engine_group_id.
+        all_kg_layers_by_eg: dict[int, set[int]] = {}
+        for kg in transfer_metadata.kernel_groups:
+            if kg.engine_group_id not in valid_engine_group_ids:
+                raise ValueError(
+                    f"kernel_group {kg.kernel_group_id} references "
+                    f"engine_group_id {kg.engine_group_id} which is not in "
+                    f"engine_group_infos (valid: {sorted(valid_engine_group_ids)})"
+                )
+            eg_layer_set = eg_layers_by_id.get(kg.engine_group_id, set())
+            for layer_idx in kg.layer_indices:
+                if layer_idx not in eg_layer_set:
+                    raise ValueError(
+                        f"kernel_group {kg.kernel_group_id}: layer_index "
+                        f"{layer_idx} for engine_group_id {kg.engine_group_id} "
+                        "is not listed in engine_group_infos for that engine group"
+                    )
+            all_kg_layers_by_eg.setdefault(kg.engine_group_id, set()).update(
+                kg.layer_indices
+            )
+        # All layers declared in engine_group_infos must appear in kernel groups.
+        for eg_id, eg_layer_set in eg_layers_by_id.items():
+            kg_layer_set = all_kg_layers_by_eg.get(eg_id, set())
+            missing = eg_layer_set - kg_layer_set
+            if missing:
+                raise ValueError(
+                    f"engine_group_id {eg_id} layers {sorted(missing)} are "
+                    "declared in engine_group_infos but absent from all "
+                    "kernel groups"
+                )
+
+    # 7. Rebuild layouts from transfer_metadata and compare with payload descs.
+    if object_group_layout_descs:
+        if len(object_group_layout_descs) != num_object_groups:
+            raise ValueError(
+                f"object_group_layout_descs has {len(object_group_layout_descs)} "
+                f"entries but transfer_metadata has {num_object_groups} object groups"
+            )
+        for og_id, payload_desc in enumerate(object_group_layout_descs):
+            rebuilt = build_object_group_layout_desc(
+                transfer_metadata, chunk_size, og_id
+            )
+            shapes_match = rebuilt.shapes == payload_desc.shapes
+            dtypes_match = rebuilt.dtypes == payload_desc.dtypes
+            if not shapes_match or not dtypes_match:
+                raise ValueError(
+                    f"object_group {og_id}: layout rebuilt from transfer_metadata "
+                    f"does not match payload layout: "
+                    f"rebuilt shapes={list(rebuilt.shapes)}, "
+                    f"payload shapes={list(payload_desc.shapes)}; "
+                    f"rebuilt dtypes={rebuilt.dtypes}, "
+                    f"payload dtypes={payload_desc.dtypes}"
+                )
+
 
 @dataclass
 class EngineDrivenContextEntry:
@@ -476,17 +636,20 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
           from the flat fields and registers it with full-attention semantics.
           Preserves all pre-Step-3 behaviour unchanged.
         * **Multi-group** (``payload.object_group_layout_shapes`` is non-empty):
-          reconstructs all per-object-group layouts from the serialised wire
-          fields, uses the provided ``AttnWindowDesc``, and stores the full
-          multi-group layout list on the context entry.  Object group 0 is
-          still used as the primary layout for the layout-registry registration.
+          requires ``payload.transfer_metadata_wire`` to be present.  Reconstructs
+          all per-object-group layouts from the serialised wire fields, validates
+          their consistency with ``engine_group_infos`` and the server chunk size,
+          and stores the full multi-group layout list on the context entry.  Object
+          group 0 is still used as the primary layout for the layout-registry
+          registration.
 
         Args:
             payload: Struct containing all registration fields.
 
         Raises:
-            ValueError: If ``payload.dtype_str`` is not a valid torch dtype
-                name, or if the multi-group layout fields are inconsistent.
+            ValueError: If ``payload.dtype_str`` is not a valid torch dtype name,
+                if multi-group fields are present but ``transfer_metadata_wire`` is
+                absent, or if any consistency check on the transfer metadata fails.
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
@@ -530,32 +693,28 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload, legacy_layout_desc
         )
 
-        # Reconstruct the full KVTransferMetadata from the structured wire DTO.
-        # Validates consistency with object-group layouts and num_chunks_in_sw.
+        # Reject multi-group registration without the full metadata wire DTO.
+        if payload.object_group_layout_shapes and (
+            payload.transfer_metadata_wire is None
+        ):
+            raise ValueError(
+                "multi-group registration (object_group_layout_shapes is non-empty) "
+                "requires transfer_metadata_wire but it is absent"
+            )
+
+        # Reconstruct the full KVTransferMetadata from the structured wire DTO
+        # and run cross-field consistency checks.
         transfer_metadata = None
         if payload.transfer_metadata_wire is not None:
-            wire = payload.transfer_metadata_wire
-            num_og = len(wire.object_groups)
-            # Cross-check wire consistency with the other multi-group fields.
-            if object_group_layout_descs and len(object_group_layout_descs) != num_og:
-                raise ValueError(
-                    f"transfer_metadata_wire has {num_og} object groups but "
-                    f"object_group_layout_shapes has "
-                    f"{len(object_group_layout_descs)}"
-                )
-            if payload.num_chunks_in_sw and len(payload.num_chunks_in_sw) != num_og:
-                raise ValueError(
-                    f"transfer_metadata_wire has {num_og} object groups but "
-                    f"num_chunks_in_sw has {len(payload.num_chunks_in_sw)}"
-                )
-            if payload.num_chunks_in_sw and list(wire.num_chunks_in_sw) != list(
-                payload.num_chunks_in_sw
-            ):
-                raise ValueError(
-                    "transfer_metadata_wire.num_chunks_in_sw does not match "
-                    "payload.num_chunks_in_sw"
-                )
-            transfer_metadata = _kv_transfer_metadata_from_wire(wire)
+            transfer_metadata = _kv_transfer_metadata_from_wire(
+                payload.transfer_metadata_wire
+            )
+            _validate_transfer_metadata_consistency(
+                transfer_metadata,
+                list(payload.engine_group_infos),
+                object_group_layout_descs,
+                self._ctx.chunk_size,
+            )
 
         # Primary layout is object group 0.
         primary_layout_desc = (
