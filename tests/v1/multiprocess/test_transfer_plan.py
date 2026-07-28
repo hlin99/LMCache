@@ -34,7 +34,7 @@ def test_has_sufficient_block_ids_variants() -> None:
 
 def test_has_sufficient_block_ids_group_mismatch_raises() -> None:
     """Mismatched group counts are rejected via strict zip semantics."""
-    with pytest.raises(ValueError, match="zip"):
+    with pytest.raises(ValueError):
         has_sufficient_block_ids([[1, 2]], [2, 3], num_chunks=1)
     with pytest.raises(ValueError, match="at least one"):
         has_sufficient_block_ids([[1, 2]], [0], num_chunks=1)

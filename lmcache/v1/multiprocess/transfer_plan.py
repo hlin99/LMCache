@@ -128,9 +128,9 @@ def compute_num_objects_to_skip(
         so all objects are skipped.
     """
     if sw_size_chunks < 0:
-        raise ValueError("sw_size_chunks must be non-negative")
+        raise ValueError("sw_size_chunks must be at least zero")
     if num_objects < 0:
-        raise ValueError("num_objects must be non-negative")
+        raise ValueError("num_objects must be at least zero")
     if not is_retrieve:
         return 0
     return max(0, num_objects - sw_size_chunks)

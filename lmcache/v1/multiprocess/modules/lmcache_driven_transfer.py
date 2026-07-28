@@ -149,11 +149,11 @@ def downsample_and_stage_block_ids(
                 kernel_group_id
             )
         )
-        effective_window_tokens = min(
+        windowed_chunk_tokens = min(
             cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
         )
         blocks_per_window.append(
-            cache_context.calculate_num_blocks(effective_window_tokens, kernel_group_id)
+            cache_context.calculate_num_blocks(windowed_chunk_tokens, kernel_group_id)
         )
         blocks_per_chunk.append(
             cache_context.calculate_num_blocks(
@@ -165,6 +165,7 @@ def downsample_and_stage_block_ids(
         blocks_per_chunk,
         blocks_per_window,
     )
+    # Preserve the original list identity for caller-observable in-place behavior.
 
     # Stage the cut block ids into GPU tensors
     block_ids_gpu = cache_context.stage_block_ids(block_ids)
