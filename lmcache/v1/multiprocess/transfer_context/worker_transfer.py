@@ -358,9 +358,15 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
 
 
 def _is_object_major_pickle_payload(payload: Any) -> bool:
-    """Return whether payload is object-major ``list[list[tensor]]``."""
+    """Return whether payload is object-major ``list[list[tensor]]``.
+
+    Empty payloads are accepted because retrieve can legitimately select zero
+    objects for transfer.
+    """
     if not isinstance(payload, list):
         return False
+    if not payload:
+        return True
     return all(isinstance(payload_object, list) for payload_object in payload)
 
 
