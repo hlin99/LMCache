@@ -357,6 +357,13 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
     return block_ids[0]
 
 
+def _is_object_major_pickle_payload(payload: Any) -> bool:
+    """Return whether payload is object-major ``list[list[tensor]]``."""
+    if not isinstance(payload, list):
+        return False
+    return all(isinstance(payload_object, list) for payload_object in payload)
+
+
 def _engine_group_block_ids_for_kernel_group(
     block_ids: list[list[int]],
     kernel_group_id: int,
@@ -1134,7 +1141,10 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        if is_metadata_driven and out_buffers is None and chunk_indices is None:
+        should_use_metadata_pickle_gather = (
+            is_metadata_driven and out_buffers is None and chunk_indices is None
+        )
+        if should_use_metadata_pickle_gather:
             if transfer_metadata is None:
                 raise RuntimeError("multi-group transfer metadata is unexpectedly None")
             cpu_chunks = _gather_multi_group_pickle_chunks(
@@ -1189,11 +1199,7 @@ class EngineDrivenTransferContext(TransferContext):
                 )
                 if (
                     uses_metadata_driven_transfer(transfer_metadata)
-                    and isinstance(src_buffers, list)
-                    and all(
-                        isinstance(payload_object, list)
-                        for payload_object in src_buffers
-                    )
+                    and _is_object_major_pickle_payload(src_buffers)
                 ):
                     if transfer_metadata is None:
                         raise RuntimeError(

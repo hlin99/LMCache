@@ -465,7 +465,11 @@ def requires_multi_component_shm(
 def uses_multi_group_transfer_metadata(
     transfer_metadata: KVTransferMetadata | None,
 ) -> bool:
-    """Backward-compatible alias for ``requires_multi_component_shm``."""
+    """Backward-compatible alias for ``requires_multi_component_shm``.
+
+    Deprecated:
+        Prefer ``requires_multi_component_shm`` for new call sites.
+    """
     return requires_multi_component_shm(transfer_metadata)
 
 
