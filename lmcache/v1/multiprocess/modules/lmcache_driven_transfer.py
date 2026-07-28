@@ -264,12 +264,11 @@ def _run_object_group_transfer_plan(
     ]
 
     attn_desc = kv_groups_manager.get_attn_desc()
-    num_objects_to_skip = 0
-    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
-        num_objects_to_skip = compute_num_objects_to_skip(
-            sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
-        )
+    sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
+    num_objects_to_skip = compute_num_objects_to_skip(
+        sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
+    )
+    if is_h2d and num_objects_to_skip > 0:
         logger.debug(
             "Detected sliding window for object group %d: "
             "skipping the first %d objects in the batch",
@@ -405,12 +404,11 @@ def transfer_kv_per_object_group(
     is_h2d = direction == lmc_ops.TransferDirection.H2D
 
     attn_desc = kv_groups_manager.get_attn_desc()
-    num_objects_to_skip = 0
-    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
-        num_objects_to_skip = compute_num_objects_to_skip(
-            sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
-        )
+    sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
+    num_objects_to_skip = compute_num_objects_to_skip(
+        sw_size_chunks, len(memory_objs), is_retrieve=is_h2d
+    )
+    if is_h2d and num_objects_to_skip > 0:
         logger.debug(
             "Detected sliding window for object group %d: "
             "skipping the first %d objects in the batch",

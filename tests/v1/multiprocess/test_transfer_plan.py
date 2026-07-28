@@ -128,17 +128,26 @@ def test_compute_num_objects_to_skip_cases() -> None:
         == 0
     )
     assert (
-        compute_num_objects_to_skip(sw_size_chunks=8, num_objects=7, is_retrieve=True)
+        compute_num_objects_to_skip(sw_size_chunks=-1, num_objects=7, is_retrieve=True)
         == 0
     )
     assert (
         compute_num_objects_to_skip(sw_size_chunks=3, num_objects=7, is_retrieve=True)
         == 4
     )
-    assert (
-        compute_num_objects_to_skip(sw_size_chunks=0, num_objects=7, is_retrieve=True)
-        == 7
-    )
+
+
+@pytest.mark.parametrize("sw_size_chunks", [0, -2])
+def test_compute_num_objects_to_skip_invalid_sw_size_chunks_raise(
+    sw_size_chunks: int,
+) -> None:
+    """Invalid attention-window values are rejected."""
+    with pytest.raises(ValueError, match="must be -1 \\(full\\) or at least one"):
+        compute_num_objects_to_skip(
+            sw_size_chunks=sw_size_chunks,
+            num_objects=7,
+            is_retrieve=True,
+        )
 
 
 def test_batched_iteration_with_skip_preserves_original_indices() -> None:

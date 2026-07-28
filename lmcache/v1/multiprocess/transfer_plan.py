@@ -113,7 +113,8 @@ def compute_num_objects_to_skip(
     """Compute how many leading objects should be skipped for transfer.
 
     Args:
-        sw_size_chunks: Sliding-window size in chunks for the object group.
+        sw_size_chunks: Attention-window size in chunks for the object group.
+            ``-1`` means full attention and ``>=1`` means sliding window.
         num_objects: Number of objects in the transfer list.
         is_retrieve: Whether the transfer direction is retrieve (H2D).
 
@@ -121,16 +122,15 @@ def compute_num_objects_to_skip(
         Number of leading objects to skip.
 
     Raises:
-        ValueError: If ``sw_size_chunks`` or ``num_objects`` is negative.
-
-    Note:
-        ``sw_size_chunks=0`` is treated as keeping no chunks in retrieve mode,
-        so all objects are skipped.
+        ValueError: If ``sw_size_chunks`` is 0 or less than -1, or if
+            ``num_objects`` is negative.
     """
-    if sw_size_chunks < 0:
-        raise ValueError("sw_size_chunks must be non-negative")
+    if sw_size_chunks == 0 or sw_size_chunks < -1:
+        raise ValueError("sw_size_chunks must be -1 (full) or at least one")
     if num_objects < 0:
         raise ValueError("num_objects must be non-negative")
+    if sw_size_chunks == -1:
+        return 0
     if not is_retrieve:
         return 0
     return max(0, num_objects - sw_size_chunks)
