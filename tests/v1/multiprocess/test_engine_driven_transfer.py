@@ -3372,10 +3372,12 @@ def test_server_shm_rejects_multi_group_metadata_but_legacy_shm_unchanged(
     assert response.context.get("slots")
 
 
-def test_pickle_strategy_multi_group_payload_validation_and_write_cleanup() -> None:
-    """Malformed/excess multi-group pickle payload fails closed with clean release."""
+def _make_pickle_strategy_multi_group_context(
+    *,
+    second_group_sw_size_chunks: int = -1,
+) -> EngineDrivenContextMetadata:
+    """Build a two-group metadata context used by pickle-strategy unit tests."""
     # First Party
-    from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
     from lmcache.v1.multiprocess.transfer_plan import (
         KVTransferMetadata,
         KernelGroupTransferMetadata,
@@ -3427,11 +3429,11 @@ def test_pickle_strategy_multi_group_payload_validation_and_write_cleanup() -> N
             ObjectGroupTransferMetadata(
                 object_group_id=1,
                 kernel_group_ids=(1,),
-                sw_size_chunks=-1,
+                sw_size_chunks=second_group_sw_size_chunks,
             ),
         ),
     )
-    context = EngineDrivenContextMetadata(
+    return EngineDrivenContextMetadata(
         layout_desc=MemoryLayoutDesc(
             shapes=[torch.Size([2, 2, 8, 16])],
             dtypes=[torch.float32],
@@ -3451,23 +3453,17 @@ def test_pickle_strategy_multi_group_payload_validation_and_write_cleanup() -> N
         transfer_metadata=transfer_metadata,
     )
 
+
+def test_pickle_strategy_multi_group_malformed_payload_fails_before_reserve() -> None:
+    """Malformed multi-group payload fails before any write reservation is attempted."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
+
+    context = _make_pickle_strategy_multi_group_context()
     mock_storage = MagicMock()
-
-    def _reserve(obj_keys: list[str], *_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        reserved = {}
-        for key in obj_keys:
-            tensor = torch.zeros(2, 2, 8, 16)
-            memory_obj = MagicMock()
-            memory_obj.get_tensor.side_effect = (
-                lambda idx, t=tensor: t if idx == 0 else None
-            )
-            reserved[key] = memory_obj
-        return reserved
-
-    mock_storage.reserve_write.side_effect = _reserve
     strategy = PickleTransferStrategy(mock_storage)
 
-    key = _default_key(tokens=8)
+    key = _default_key(tokens=16)
     resolver = lambda _key, _groups: [["obj0"], ["obj1"]]
 
     malformed_payload = pickle.dumps([[torch.zeros(2, 2, 8, 16)], "bad"])
@@ -3475,9 +3471,10 @@ def test_pickle_strategy_multi_group_payload_validation_and_write_cleanup() -> N
         strategy.commit_store(key, 1, malformed_payload, context, resolver)
         is False
     )
-    mock_storage.finish_write.assert_called_once()
+    mock_storage.reserve_write.assert_not_called()
+    mock_storage.finish_write.assert_not_called()
+    mock_storage.delete_l1_keys.assert_not_called()
 
-    mock_storage.finish_write.reset_mock()
     excess_payload = pickle.dumps(
         [
             [torch.zeros(2, 2, 8, 16)],
@@ -3486,4 +3483,121 @@ def test_pickle_strategy_multi_group_payload_validation_and_write_cleanup() -> N
         ]
     )
     assert strategy.commit_store(key, 1, excess_payload, context, resolver) is False
+    mock_storage.reserve_write.assert_not_called()
     mock_storage.finish_write.assert_not_called()
+    mock_storage.delete_l1_keys.assert_not_called()
+
+
+def test_pickle_strategy_multi_group_copy_failure_rolls_back_reserved_keys() -> None:
+    """Copy failure force-rolls back reserved keys instead of finishing write."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
+
+    context = _make_pickle_strategy_multi_group_context()
+    good_memory_obj = MagicMock()
+    good_tensor = torch.zeros(2, 2, 8, 16)
+    good_memory_obj.get_tensor.side_effect = lambda idx: good_tensor if idx == 0 else None
+
+    bad_memory_obj = MagicMock()
+    bad_tensor = torch.zeros(1)
+    bad_memory_obj.get_tensor.side_effect = lambda idx: bad_tensor if idx == 0 else None
+
+    mock_storage = MagicMock()
+    mock_storage.reserve_write.side_effect = [
+        {"obj0": good_memory_obj},
+        {"obj1": bad_memory_obj},
+    ]
+
+    strategy = PickleTransferStrategy(mock_storage)
+    key = _default_key(tokens=16)
+    resolver = lambda _key, _groups: [["obj0"], ["obj1"]]
+    payload = pickle.dumps(
+        [[torch.ones(2, 2, 8, 16)], [torch.ones(2, 2, 8, 16)]]
+    )
+
+    assert strategy.commit_store(key, 1, payload, context, resolver) is False
+    mock_storage.finish_write.assert_not_called()
+    mock_storage.delete_l1_keys.assert_called_once_with(["obj0", "obj1"], force=True)
+
+
+def test_pickle_strategy_multi_group_retrieve_respects_sliding_window_keys() -> None:
+    """Retrieve selects tail keys per object group using sw_size_chunks."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
+
+    context = _make_pickle_strategy_multi_group_context(second_group_sw_size_chunks=1)
+    mock_storage = MagicMock()
+
+    memory_by_key: dict[str, Any] = {}
+    for idx, key in enumerate(["g0c0", "g0c1", "g0c2", "g1c0", "g1c1", "g1c2"]):
+        tensor = torch.full((2, 2, 8, 16), float(idx))
+        memory_obj = MagicMock()
+        memory_obj.get_tensor.side_effect = lambda component_idx, t=tensor: (
+            t if component_idx == 0 else None
+        )
+        memory_by_key[key] = memory_obj
+
+    @contextmanager
+    def _read_prefetched_results(obj_keys: list[str]) -> Iterator[Any]:
+        yield [memory_by_key[obj_key] for obj_key in obj_keys]
+
+    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    strategy = PickleTransferStrategy(mock_storage)
+
+    key = _default_key(tokens=24)
+    resolver = lambda _key, _groups: [
+        ["g0c0", "g0c1", "g0c2"],
+        ["g1c0", "g1c1", "g1c2"],
+    ]
+
+    response = strategy.prepare_retrieve(key, 1, context, resolver)
+    assert response.success is True
+    payload_objects: list[list[torch.Tensor]] = pickle.loads(response.data)
+    assert len(payload_objects) == 4
+    assert torch.allclose(payload_objects[0][0], torch.full((2, 2, 8, 16), 0.0))
+    assert torch.allclose(payload_objects[1][0], torch.full((2, 2, 8, 16), 1.0))
+    assert torch.allclose(payload_objects[2][0], torch.full((2, 2, 8, 16), 2.0))
+    assert torch.allclose(payload_objects[3][0], torch.full((2, 2, 8, 16), 5.0))
+
+    queried_keys = [call.args[0] for call in mock_storage.read_prefetched_results.call_args_list]
+    assert queried_keys == [["g0c0", "g0c1", "g0c2"], ["g1c2"]]
+    mock_storage.finish_read_prefetched.assert_called_once_with(
+        ["g0c0", "g0c1", "g0c2", "g1c2"]
+    )
+
+
+def test_pickle_strategy_legacy_single_group_dense_payload_regression() -> None:
+    """Legacy dense single-group list[tensor] payload remains supported."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
+
+    context = EngineDrivenContextMetadata(
+        layout_desc=MemoryLayoutDesc(
+            shapes=[torch.Size([2, 2, 8, 16])],
+            dtypes=[torch.float32],
+        ),
+        block_size=4,
+        use_mla=False,
+    )
+
+    memory_obj_0 = MagicMock()
+    memory_obj_0.tensor = torch.zeros(2, 2, 8, 16)
+    memory_obj_1 = MagicMock()
+    memory_obj_1.tensor = torch.zeros(2, 2, 8, 16)
+
+    mock_storage = MagicMock()
+    mock_storage.reserve_write.return_value = {
+        "obj0": memory_obj_0,
+        "obj1": memory_obj_1,
+    }
+    strategy = PickleTransferStrategy(mock_storage)
+
+    payload = [torch.ones(2, 2, 8, 16), torch.full((2, 2, 8, 16), 2.0)]
+    key = _default_key(tokens=16)
+    resolver = lambda _key, _groups: [["obj0", "obj1"]]
+
+    assert strategy.commit_store(key, 1, pickle.dumps(payload), context, resolver) is True
+    assert torch.allclose(memory_obj_0.tensor, payload[0])
+    assert torch.allclose(memory_obj_1.tensor, payload[1])
+    mock_storage.finish_write.assert_called_once_with(["obj0", "obj1"])
+    mock_storage.delete_l1_keys.assert_not_called()
