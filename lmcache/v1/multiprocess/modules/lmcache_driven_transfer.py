@@ -160,18 +160,19 @@ def downsample_and_stage_block_ids(
                 cache_context.lmcache_tokens_per_chunk, kernel_group_id
             )
         )
+    # Preserve the original list identity for caller-observable in-place behavior.
     block_ids[:] = downsample_block_ids(
         block_ids,
         blocks_per_chunk,
         blocks_per_window,
     )
-    # Preserve the original list identity for caller-observable in-place behavior.
 
     # Stage the cut block ids into GPU tensors
     block_ids_gpu = cache_context.stage_block_ids(block_ids)
     return block_ids_gpu
 
 
+# Compatibility alias for existing underscore-prefixed callers/tests.
 _recalculate_blocks_to_skip = recalculate_blocks_to_skip
 
 

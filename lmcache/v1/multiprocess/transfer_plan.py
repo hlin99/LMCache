@@ -209,5 +209,8 @@ def recalculate_blocks_to_skip(
 
     full_windows_to_skip = blocks_to_skip // blocks_per_chunk
     tail_blocks = blocks_to_skip % blocks_per_chunk
+    # For the partial tail chunk, drop the discarded prefix
+    # (blocks_per_chunk - blocks_per_window) and keep only overlap in the
+    # retained trailing window coordinate space.
     tail_blocks_to_skip = tail_blocks - (blocks_per_chunk - blocks_per_window)
     return full_windows_to_skip * blocks_per_window + max(0, tail_blocks_to_skip)
