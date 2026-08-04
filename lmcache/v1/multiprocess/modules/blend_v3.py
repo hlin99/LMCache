@@ -74,12 +74,6 @@ logger = init_logger(__name__)
 #: call sites), so the log costs nothing after the first occurrence of each.
 _NOOP_REASONS_SEEN: set[str] = set()
 
-# Plan-then-execute retrieve: one native call enqueues all fill/rope/scatter
-# in a single GIL release, with the plan encoded as numpy int64 tables (one
-# pybind crossing). The Python wave loop stays as fallback for c_ops builds
-# that predate the op (and for inputs the planner declines).
-_HAS_NATIVE_RETRIEVE_PLAN = hasattr(lmc_ops, "execute_cb_retrieve_plan_flat")
-
 # torch dtype -> at::ScalarType (rope dispatch); missing -> Python fallback.
 _TORCH_TO_AT_SCALAR = {
     torch.float16: 5,  # at::ScalarType::Half
@@ -2010,16 +2004,19 @@ class BlendV3Module(InstanceLivenessTarget):
         runs: "list[list[tuple[CBMatchResult, Any]]]",
         max_batch: int,
     ) -> "tuple[list[Any], tuple[Any, Any, Any, Any], list[torch.Tensor]] | None":
-        """Build the whole native retrieve plan: eligibility gates, cached
-        invariant specs stamped with this request's slot mappings, and the
+        """Build the flat retrieve plan: eligibility gates, cached invariant
+        specs stamped with this request's slot mappings, and the
         numpy-vectorized int64 work tables for
         ``execute_cb_retrieve_plan_flat`` (layouts in the pybind docstring).
+        The plan is consumed by ``lmc_ops.execute_cb_retrieve_plan_flat``
+        which dispatches to either the native C++/CUDA executor or the serial
+        torch-based fallback in ``torch_ops``.
 
         Returns:
             ``(group_specs, (staging, ropes, scatters, step_offsets),
             keepalive)`` or ``None`` -> Python fallback loop.
         """
-        if not _HAS_NATIVE_RETRIEVE_PLAN or max_batch < 2:
+        if max_batch < 2:
             return None
         pairs = [pair for run in runs for pair in run]
         if not pairs:
@@ -2497,9 +2494,11 @@ class BlendV3Module(InstanceLivenessTarget):
 
                     max_batch = gpu_context.max_batch_size
 
-                    # Fast path: one native call for the whole request; the
-                    # per-wave Python loop is the fallback (returns None on old
-                    # c_ops, non-lazy objects, max_batch < 2, or size mismatch).
+                    # Fast path: one unified call for the whole request via
+                    # lmc_ops.execute_cb_retrieve_plan_flat (torch fallback or
+                    # native, depending on backend). The per-wave Python loop
+                    # is the fallback when the planner declines (non-lazy
+                    # objects, max_batch < 2, or size mismatch).
                     _stage_t = time.perf_counter()
                     native_flat = self._build_cb_retrieve_plan_flat(
                         gpu_context, rope_state, cpu_block_tables, runs, max_batch
