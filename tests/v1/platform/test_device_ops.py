@@ -3,8 +3,7 @@
 
 These tests are the acceptance gate for the DeviceOps hierarchy.  They stay
 platform-agnostic by exercising the torch baseline, the ``DeviceSpec``
-dispatch, the ``lmcache.c_ops`` shim, and instance-level ``bind_native``
-without requiring any compiled accelerator module.
+dispatch and the ``lmcache.c_ops`` shim without requiring any compiled accelerator module.
 """
 
 # Standard
@@ -33,7 +32,6 @@ _OP_NAMES: tuple[str, ...] = tuple(
         name
         for name, member in vars(DeviceOps).items()
         if not name.startswith("_")
-        and name not in ("ensure_native", "bind_native")
         and inspect.isfunction(member)
     )
 )
@@ -97,16 +95,15 @@ def test_musa_overrides_transfer_and_stream_ordering_ops() -> None:
         "lmcache.v1.platform.musa.device_ops",
         reason="musa platform package unavailable",
     )
-    overridden = [
+    overridden = {
         name
         for name in _OP_NAMES
         if getattr(musa_mod.MusaDeviceOps, name) is not getattr(DeviceOps, name)
-    ]
-    assert overridden == [
-        "multi_layer_block_kv_transfer",
+    }
+    assert {
         "record_completion_on_stream",
         "record_event_on_stream",
-    ]
+    }.issubset(overridden)
 
 
 def test_musa_override_dispatches_native_first(
@@ -167,65 +164,19 @@ def test_musa_override_dispatches_native_first(
     assert captured["direction"] == TransferDirection.D2H
 
 
-# -- bind_native -----------------------------------------------------------
+def test_cuda_ops_overrides_multi_layer_block_kv_transfer() -> None:
+    """CudaDeviceOps owns the tensor-first/native transfer adapter."""
+    from lmcache.v1.platform.cuda.device_ops import CudaDeviceOps
 
-
-class _FakeNativeModule:
-    """Stand-in compiled module: a couple of real ops + a non-OPS symbol."""
-
-    @staticmethod
-    def multi_layer_kv_transfer(*a: Any, **k: Any) -> str:
-        return "native-mlt"
-
-    @staticmethod
-    def calculate_cdf(*a: Any, **k: Any) -> str:
-        return "native-cdf"
-
-    @staticmethod
-    def not_in_ops(*a: Any, **k: Any) -> str:
-        return "ignored"
-
-
-def test_bind_native_shadows_baseline_for_present_ops() -> None:
-    """bind_native rebinds ops found in the module on that instance only."""
-    ops = DeviceOps()
-    ops.bind_native(_FakeNativeModule())
-
-    assert ops.multi_layer_kv_transfer() == "native-mlt"  # type: ignore[call-arg]
-    assert ops.calculate_cdf(None, 0) == "native-cdf"  # type: ignore[call-arg]
-
-    # Other instances still see the torch baseline.
-    other = DeviceOps()
-    assert other.multi_layer_kv_transfer is not ops.multi_layer_kv_transfer  # type: ignore[attr-defined]
-
-
-def test_bind_native_discovers_all_public_symbols() -> None:
-    """bind_native auto-discovers all public symbols from the native module."""
-    ops = DeviceOps()
-    ops.bind_native(_FakeNativeModule())
-    # Extra symbols on the module are now bound (auto-discovery).
-    assert "not_in_ops" in vars(ops)
-
-
-def test_bind_native_rebinds_types() -> None:
-    """bind_native updates type instance attributes from the module."""
-
-    class FakeTypes:
-        class TransferDirection:
-            pass
-
-        class EngineKVFormat:
-            pass
-
-    ops = DeviceOps()
-    ops.bind_native(FakeTypes())
-
-    assert ops.TransferDirection is FakeTypes.TransferDirection
-    assert ops.EngineKVFormat is FakeTypes.EngineKVFormat
-    assert ops.GPUKVFormat is FakeTypes.EngineKVFormat  # alias
+    assert (
+        CudaDeviceOps.multi_layer_block_kv_transfer
+        is not DeviceOps.multi_layer_block_kv_transfer
+    )
 
 
 # -- Shim ------------------------------------------------------------------
+
+
 
 
 def test_c_ops_shim_has_all_ops_and_types() -> None:

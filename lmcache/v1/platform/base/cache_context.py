@@ -101,6 +101,11 @@ class BaseCacheContext(ABC):
         ...
 
     @abstractmethod
+    def get_kernel_group_kv_tensors(self, kernel_group_idx: int) -> torch.Tensor | list:
+        """Returns the KV-cache tensors for *kernel_group_idx*."""
+        ...
+
+    @abstractmethod
     def get_temp_kernel_group_buffer(
         self, batch_idx: int, kernel_group_idx: int
     ) -> torch.Tensor:

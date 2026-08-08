@@ -408,6 +408,30 @@ def get_group_data_ptrs(
     return get_spec(kv_caches, engine_kv_format).data_ptrs(layer_indices)
 
 
+def get_group_tensors(
+    kv_caches: DiscoverableKVCache,
+    engine_kv_format: "lmc_ops.EngineKVFormat",
+    layer_indices: list[int],
+) -> "torch.Tensor | list":
+    """Return tensors for a group of layers in kernel-expected order.
+
+    Tensor-first counterpart to :func:`get_group_data_ptrs`. Returns actual
+    data tensors rather than raw device pointers.
+
+    Args:
+        kv_caches: Full kv_caches structure.
+        engine_kv_format: Format returned by :func:`normalize_kv_and_discover_format`.
+        layer_indices: 0-based layer indices in the group, in kernel order.
+
+    Returns:
+        Tensors in the appropriate structure for the format.
+
+    Raises:
+        ValueError: If *engine_kv_format* is not recognized.
+    """
+    return get_spec(kv_caches, engine_kv_format).tensors(layer_indices)
+
+
 def assert_is_vllm_flash_attn_or_flash_infer(
     engine_kv_format: "lmc_ops.EngineKVFormat",
 ):

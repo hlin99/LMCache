@@ -62,3 +62,7 @@ class NB_NL_TWO_NH_BS_HS_Spec(KVFormatSpec):
     def data_ptrs(self, layer_indices: list[int]) -> list[int]:
         tensor = cast(torch.Tensor, self.kv_caches)
         return [tensor.data_ptr()]
+
+    def tensors(self, layer_indices: list[int]) -> torch.Tensor:
+        return cast(torch.Tensor, self.kv_caches)
+

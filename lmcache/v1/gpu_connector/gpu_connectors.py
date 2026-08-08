@@ -21,7 +21,7 @@ from lmcache.v1.gpu_connector.utils import (
     get_block_size,
     get_device,
     get_elements_per_layer,
-    get_group_data_ptrs,
+    get_group_tensors,
     get_head_size,
     get_num_blocks,
     get_num_layers,
@@ -169,12 +169,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         """
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
-        self.kv_cache_pointers = torch.empty(
-            num_layers, dtype=torch.int64, device="cpu"
-        )
-        # Not sure we need a dict here. Maybe a single GPU connector always
-        # works with a single device?
-        self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
+        self.kv_cache_tensors_on_gpu: dict[int, list[torch.Tensor]] = {}
 
         self.kvcaches: Optional[List[torch.Tensor]] = None
 
@@ -241,28 +236,24 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             layout_hints=layout_hints,
         )
 
-    def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
+    def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> list[torch.Tensor]:
         self.device = kv_caches[0].device
         assert self.device.type == "cuda", "The device should be CUDA."
         idx = self.device.index
-        if idx in self.kv_cache_pointers_on_gpu:
-            return self.kv_cache_pointers_on_gpu[idx]
+        if idx in self.kv_cache_tensors_on_gpu:
+            return self.kv_cache_tensors_on_gpu[idx]
 
         self.engine_kv_format, kv_caches = normalize_kv_and_discover_format(
             kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
         )
 
-        self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
-        self.kv_cache_pointers_on_gpu[idx] = torch.empty(
-            self.num_layers, dtype=torch.int64, device=self.device
-        )
-        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
+        self.kv_cache_tensors_on_gpu[idx] = kv_caches
         self.num_blocks = get_num_blocks(kv_caches, self.engine_kv_format)
         self.block_size = get_block_size(kv_caches, self.engine_kv_format)
         self.page_buffer_size = self.num_blocks * self.block_size
         self.head_size = get_head_size(kv_caches, self.engine_kv_format)
 
-        return self.kv_cache_pointers_on_gpu[idx]
+        return self.kv_cache_tensors_on_gpu[idx]
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -308,7 +299,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        kv_cache_tensors = self._initialize_pointers(self.kvcaches)
 
         # avoid read/write stream race condition for shared block
         # this will only be potentially non-zero for the first
@@ -318,7 +309,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         lmc_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
-            kv_cache_pointers,
+            kv_cache_tensors,
             slot_mapping[start:end],
             self.device,
             self.page_buffer_size,
@@ -360,13 +351,13 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        kv_cache_tensors = self._initialize_pointers(self.kvcaches)
 
         with torch.cuda.stream(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
-                    kv_cache_pointers,
+                    kv_cache_tensors,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
                     self.page_buffer_size,
@@ -381,7 +372,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
                 lmc_ops.multi_layer_kv_transfer(
                     tmp_gpu_buffer,
-                    kv_cache_pointers,
+                    kv_cache_tensors,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
                     self.page_buffer_size,
@@ -436,7 +427,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.kvcaches: Optional[List[torch.Tensor]] = None
 
         self.init = False
-        self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
+        self.group_kv_cache_tensors_on_gpu: Optional[list[torch.Tensor | list]] = None
         self.group_tmp_buffer: Optional[list[torch.Tensor]] = None
 
         self.store_stream = torch.cuda.Stream()
@@ -455,7 +446,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
     def _initialize_kv_cache_pointers(self):
         """Discover KV-cache layout, build the layer-groups manager, and
-        capture per-group GPU pointer tensors.
+        capture per-group GPU KV tensors.
 
         All layout-adjacent work lives here: the connector already owns
         ``layout_hints`` and the actual ``self.kvcaches`` tensors, so the
@@ -515,19 +506,15 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 for shape, dtype in zip(tmp_buf_shapes, tmp_buf_dtypes, strict=True)
             ]
 
-        self.group_kv_cache_pointers_on_gpu = []
+        self.group_kv_cache_tensors_on_gpu = []
         for group in klg_manager.kernel_groups:
-            ptrs = get_group_data_ptrs(
+            tensors = get_group_tensors(
                 self.kvcaches, self.engine_kv_format, group.layer_indices
             )
-            cpu = torch.empty(len(ptrs), dtype=torch.int64, device="cpu")
-            cpu.numpy()[:] = ptrs
-            gpu = torch.empty(len(ptrs), dtype=torch.int64, device=self.device)
-            gpu.copy_(cpu)
-            self.group_kv_cache_pointers_on_gpu.append(gpu)
+            self.group_kv_cache_tensors_on_gpu.append(tensors)
 
         self.init = True
-        logger.info("init kv cache pointers success in VLLMPagedMemGPUConnectorV3")
+        logger.info("init kv cache tensors success in VLLMPagedMemGPUConnectorV3")
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -543,7 +530,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches is not None
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
-        assert self.group_kv_cache_pointers_on_gpu is not None
+        assert self.group_kv_cache_tensors_on_gpu is not None
 
         # avoid read/write stream race condition for shared block
         # this will only be potentially non-zero for the first
@@ -551,12 +538,12 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
-        for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
+        for i, kv_cache_tensors in enumerate(self.group_kv_cache_tensors_on_gpu):
             memory_obj_tensor = memory_obj.get_tensor(i)
             assert memory_obj_tensor is not None
             lmc_ops.multi_layer_kv_transfer(
                 memory_obj_tensor,
-                kv_cache_pointer,
+                kv_cache_tensors,
                 slot_mapping[start:end],
                 self.device,
                 self.page_buffer_size,
@@ -577,17 +564,17 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches is not None
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
-        assert self.group_kv_cache_pointers_on_gpu is not None
+        assert self.group_kv_cache_tensors_on_gpu is not None
         with torch.cuda.stream(self.store_stream):
             if not self.use_gpu or end - start != self.chunk_size:
-                for i, kv_cache_pointer in enumerate(
-                    self.group_kv_cache_pointers_on_gpu
+                for i, kv_cache_tensors in enumerate(
+                    self.group_kv_cache_tensors_on_gpu
                 ):
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
                     lmc_ops.multi_layer_kv_transfer(
                         memory_obj_tensor,
-                        kv_cache_pointer,
+                        kv_cache_tensors,
                         slot_mapping[start:end],
                         self.device,
                         self.page_buffer_size,
@@ -599,13 +586,13 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             else:
                 # kvcaches -> gpu_buffer -> memobj
                 assert self.group_tmp_buffer is not None
-                for i, kv_cache_pointer in enumerate(
-                    self.group_kv_cache_pointers_on_gpu
+                for i, kv_cache_tensors in enumerate(
+                    self.group_kv_cache_tensors_on_gpu
                 ):
                     tmp_gpu_buffer = self.group_tmp_buffer[i][:, :, : end - start, :]
                     lmc_ops.multi_layer_kv_transfer(
                         tmp_gpu_buffer,
-                        kv_cache_pointer,
+                        kv_cache_tensors,
                         slot_mapping[start:end],
                         self.device,
                         self.page_buffer_size,
@@ -1455,16 +1442,14 @@ class SGLangGPUConnector(GPUConnectorInterface):
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
 
-        self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
+        self.kv_cache_tensors_on_gpu: dict[int, torch.Tensor | list] = {}
         self.page_buffer_size = 0
 
         self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
         self.num_kv_cache = num_layers if self.use_mla else num_layers * 2
-        self.kv_cache_pointers = torch.empty(
-            self.num_kv_cache, dtype=torch.int64, device="cpu"
-        )
+        self.kv_cache_tensors_on_gpu: dict[int, torch.Tensor | list] = {}
 
         if use_gpu:
             assert "chunk_size" in kwargs, (
@@ -1479,31 +1464,33 @@ class SGLangGPUConnector(GPUConnectorInterface):
             )
             logger.info("GPU buffer: %s", self.gpu_buffer.shape)
 
-    def _initialize_pointers(self, kv_caches: DiscoverableKVCache) -> torch.Tensor:
+    def _initialize_pointers(
+        self, kv_caches: DiscoverableKVCache
+    ) -> torch.Tensor | list:
         self.engine_kv_format, kv_caches = normalize_kv_and_discover_format(
             kv_caches, EngineType.SGLANG
         )
         num_layers = get_num_layers(kv_caches, self.engine_kv_format)
-        # SGLang registers every layer as one group; pass all indices in order.
-        ptrs = get_group_data_ptrs(
+        tensors = get_group_tensors(
             kv_caches, self.engine_kv_format, list(range(num_layers))
         )
-        assert len(ptrs) == self.num_kv_cache, (
-            f"Expected {self.num_kv_cache} KV cache pointers, got {len(ptrs)}"
+        flat_len = 1
+        if isinstance(tensors, list):
+            if tensors and isinstance(tensors[0], list):
+                flat_len = sum(len(group) for group in tensors)
+            else:
+                flat_len = len(tensors)
+        assert flat_len == self.num_kv_cache, (
+            f"Expected {self.num_kv_cache} KV cache tensors, got {flat_len}"
         )
-        self.kv_cache_pointers.numpy()[:] = ptrs
 
         device = get_device(kv_caches)
         assert device.type == "cuda", "The device should be CUDA."
         idx = device.index
-        if idx not in self.kv_cache_pointers_on_gpu:
-            self.kv_cache_pointers_on_gpu[idx] = torch.empty(
-                self.num_kv_cache, dtype=torch.int64, device=device
-            )
-        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
+        self.kv_cache_tensors_on_gpu[idx] = tensors
 
         self.page_buffer_size = get_page_buffer_size(kv_caches, self.engine_kv_format)
-        return self.kv_cache_pointers_on_gpu[idx]
+        return self.kv_cache_tensors_on_gpu[idx]
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -1549,10 +1536,10 @@ class SGLangGPUConnector(GPUConnectorInterface):
         kvcaches: DiscoverableKVCache = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(kvcaches)
+        kv_cache_tensors = self._initialize_pointers(kvcaches)
         lmc_ops.multi_layer_kv_transfer_unilateral(
             memory_obj.tensor,
-            kv_cache_pointers,
+            kv_cache_tensors,
             slot_mapping[start - offset : end - offset],
             get_device(kvcaches),
             self.page_buffer_size,
@@ -1590,12 +1577,12 @@ class SGLangGPUConnector(GPUConnectorInterface):
         kvcaches: DiscoverableKVCache = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(kvcaches)
+        kv_cache_tensors = self._initialize_pointers(kvcaches)
 
         if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
             lmc_ops.multi_layer_kv_transfer_unilateral(
                 memory_obj.tensor,
-                kv_cache_pointers,
+                kv_cache_tensors,
                 slot_mapping[start:end],
                 get_device(kvcaches),
                 self.page_buffer_size,
@@ -1608,7 +1595,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
             tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
             lmc_ops.multi_layer_kv_transfer_unilateral(
                 tmp_gpu_buffer,
-                kv_cache_pointers,
+                kv_cache_tensors,
                 slot_mapping[start:end],
                 get_device(kvcaches),
                 self.page_buffer_size,
@@ -1667,7 +1654,7 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
 
-        self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
+        self.kv_cache_tensors_on_gpu: dict[int, torch.Tensor | list] = {}
         self.page_buffer_size = 0
 
         self.gpu_buffer: Optional[torch.Tensor] = None
@@ -1675,9 +1662,6 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
 
         self.num_kv_cache = num_layers if self.use_mla else num_layers * 2
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
-        self.kv_cache_pointers = torch.empty(
-            self.num_kv_cache, dtype=torch.int64, device="cpu"
-        )
         self.use_gpu = use_gpu
         self.gpu_buffer_allocator: Optional[GPUMemoryAllocator] = None
 
@@ -1988,7 +1972,7 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         self.store_stream = torch.cuda.Stream(device=device)
 
         self.kv_cache_tensor: Optional[torch.Tensor] = None
-        self.paged_buffer_ptrs: Optional[torch.Tensor] = None
+        self.paged_buffer_tensors: Optional[torch.Tensor | list] = None
         self.shape_desc: Optional["lmc_ops.PageBufferShapeDesc"] = None
         self._kv_format: Optional["lmc_ops.EngineKVFormat"] = None
         self.tokens_per_block: Optional[int] = None
@@ -2078,10 +2062,10 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         set_shape_desc_dtype(shape_desc, self.dtype)
         self.shape_desc = shape_desc
 
-        self.paged_buffer_ptrs = torch.tensor(
-            get_group_data_ptrs(normalized, kv_format, list(range(num_layers))),
-            dtype=torch.int64,
-            device=self.device,
+        self.paged_buffer_tensors = get_group_tensors(
+            normalized,
+            kv_format,
+            list(range(num_layers)),
         )
 
     def get_shape(self, num_tokens: int) -> torch.Size:
@@ -2103,7 +2087,7 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
 
     def _transfer(
         self,
-        tensor_ptr: int,
+        tensor: torch.Tensor,
         block_ids: List[int],
         direction: "lmc_ops.TransferDirection",
         stream: torch.cuda.Stream,
@@ -2111,8 +2095,8 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         with torch.cuda.stream(stream):
             block_ids_gpu = self._stage_block_ids(block_ids)
             lmc_ops.multi_layer_block_kv_transfer(
-                self.paged_buffer_ptrs,
-                [tensor_ptr],
+                self.paged_buffer_tensors,
+                [tensor],
                 block_ids_gpu,
                 self.device,
                 direction,
@@ -2129,7 +2113,7 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         if chunk_blocks is None or memory_obj.tensor is None:
             return
         self._transfer(
-            memory_obj.tensor.data_ptr(),
+            memory_obj.tensor,
             chunk_blocks,
             lmc_ops.TransferDirection.H2D,
             self.load_stream,
@@ -2142,7 +2126,7 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         if chunk_blocks is None or memory_obj.tensor is None:
             return
         self._transfer(
-            memory_obj.tensor.data_ptr(),
+            memory_obj.tensor,
             chunk_blocks,
             lmc_ops.TransferDirection.D2H,
             self.store_stream,
@@ -2168,14 +2152,14 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
             for i in range(0, len(valid), self._batch_size):
                 batch = valid[i : i + self._batch_size]
                 all_block_ids: List[int] = []
-                ptrs: List[int] = []
+                tensors: List[torch.Tensor] = []
                 for mo, blocks in batch:
                     all_block_ids.extend(blocks)
-                    ptrs.append(mo.tensor.data_ptr())  # type: ignore[union-attr]
+                    tensors.append(mo.tensor)  # type: ignore[arg-type]
                 block_ids_gpu = self._stage_block_ids(all_block_ids)
                 lmc_ops.multi_layer_block_kv_transfer(
-                    self.paged_buffer_ptrs,
-                    ptrs,
+                    self.paged_buffer_tensors,
+                    tensors,
                     block_ids_gpu,
                     self.device,
                     direction,

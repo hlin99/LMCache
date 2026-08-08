@@ -330,7 +330,7 @@ def test_musa_block_transfer_rejects_unvalidated_layout() -> None:
         dtype=torch.float32,
     )
 
-    with pytest.raises(ValueError, match="MUSA MP block transfer supports only"):
+    with pytest.raises(ValueError, match="Unsupported MUSA block transfer format"):
         lmc_ops.multi_layer_block_kv_transfer(
             [torch.zeros(1, 2, 1, 1, 1)],
             [torch.zeros(2, 1, 1, 1)],
@@ -339,7 +339,7 @@ def test_musa_block_transfer_rejects_unvalidated_layout() -> None:
             lmc_ops.TransferDirection.D2H,
             shape_desc,
             1,
-            lmc_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS,
+            999,
             0,
         )
 

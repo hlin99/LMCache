@@ -115,6 +115,11 @@ class _FakeContext(BaseCacheContext):
     ) -> torch.Tensor:  # pragma: no cover
         return torch.empty(0)
 
+    def get_kernel_group_kv_tensors(
+        self, kernel_group_idx: int
+    ) -> torch.Tensor | list:  # pragma: no cover
+        return []
+
     def get_temp_kernel_group_buffer(
         self, batch_idx: int, kernel_group_idx: int
     ) -> torch.Tensor:  # pragma: no cover

@@ -216,6 +216,21 @@ class KVFormatSpec(ABC):
         walks layers itself, so ``layer_indices`` is ignored).
         """
 
+    @abstractmethod
+    def tensors(self, layer_indices: list[int]) -> "torch.Tensor | list":
+        """Return tensors for ``layer_indices`` in kernel-expected order.
+
+        Per-layer formats: list[Tensor], one per layer.
+        SGLang two-list MHA (kv-list): [list[K-Tensor], list[V-Tensor]] (nested).
+        Cross-layer: a single Tensor.
+
+        Args:
+            layer_indices: 0-based layer indices in the group, in kernel order.
+
+        Returns:
+            Tensors in the appropriate structure for the format.
+        """
+
     def concrete_shape_str(self) -> str:
         """``describe_shape`` with real dims, e.g. ``80 x [2, 2048, 128, 8, 128]``."""
         return concrete_shape(

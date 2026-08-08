@@ -20,6 +20,7 @@ from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
     get_device,
     get_group_data_ptrs,
+    get_group_tensors,
     normalize_and_discover_per_layer_formats,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
@@ -340,6 +341,7 @@ class MUSACacheContext(BaseCacheContext):
         )
 
         self.group_kv_pointers_: list[torch.Tensor] = []
+        self.group_kv_tensors_: list[torch.Tensor | list] = []
         for group_idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups):
             pointers = get_group_data_ptrs(
                 self.kv_caches_,
@@ -348,6 +350,13 @@ class MUSACacheContext(BaseCacheContext):
             )
             self.group_kv_pointers_.append(
                 torch.tensor(pointers, dtype=torch.int64, device=self.device_)
+            )
+            self.group_kv_tensors_.append(
+                get_group_tensors(
+                    self.kv_caches_,
+                    self.get_engine_kv_format(group_idx),
+                    group.layer_indices,
+                )
             )
 
         self._temp_buffer = _TempMUSABuffer(
@@ -415,6 +424,10 @@ class MUSACacheContext(BaseCacheContext):
             layer in kernel order.
         """
         return self.group_kv_pointers_[kernel_group_idx]
+
+    def get_kernel_group_kv_tensors(self, kernel_group_idx: int) -> torch.Tensor | list:
+        """Return process-local MUSA KV tensors for a kernel group."""
+        return self.group_kv_tensors_[kernel_group_idx]
 
     def get_temp_kernel_group_buffer(
         self,

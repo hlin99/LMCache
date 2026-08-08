@@ -83,6 +83,11 @@ class NL_X_NB_BS_NH_TWO_HS_Spec(KVFormatSpec):
         layers = cast(list[torch.Tensor], self.kv_caches)
         return [layers[i].data_ptr() for i in layer_indices]
 
+    def tensors(self, layer_indices: list[int]) -> list[torch.Tensor]:
+        layers = cast(list[torch.Tensor], self.kv_caches)
+        return [layers[i] for i in layer_indices]
+
+
     def concrete_shape_str(self) -> str:
         # The base rendering pulls HS from head_size(), which is doubled here
         # (kv-packed D) and would double-count next to the literal 2 axis;

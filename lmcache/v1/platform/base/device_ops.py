@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The unified per-device ops abstraction (the ``lmcache.c_ops`` surface).
+"""The unified per-device ops abstraction over the torch baseline.
 
 :class:`DeviceOps` is a strategy base class whose every op is an instance
-method delegating to :mod:`lmcache.v1.platform.torch_ops`.  Accelerator
+method delegating to :mod:`lmcache.v1.platform.torch_ops`. Accelerator
 subclasses override individual methods with native kernels via normal OO
-polymorphism, or bulk-rebind via :meth:`DeviceOps.bind_native`.
+polymorphism.
 """
 
 # Future
@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     import torch
 
 # First Party
-from lmcache.logging import init_logger
 from lmcache.v1.platform import ops_types, torch_ops
 from lmcache.v1.platform.ops_types import (
     EngineKVFormat,
@@ -27,19 +26,14 @@ from lmcache.v1.platform.ops_types import (
     set_shape_desc_dtype,
 )
 
-logger = init_logger(__name__)
-
 
 class DeviceOps:
     """Strategy base: per-device ops resolved via normal instance MRO.
 
     Every op is an instance method delegating to the torch baseline in
-    :mod:`~lmcache.v1.platform.torch_ops`.  Accelerator subclasses either:
-
-    - Override individual methods (e.g. MUSA overrides
-      :meth:`multi_layer_block_kv_transfer`).
-    - Call :meth:`bind_native` in :meth:`ensure_native` to bulk-rebind
-      all ops the compiled extension exports.
+    :mod:`lmcache.v1.platform.torch_ops`. Accelerator subclasses override
+    the operations they can accelerate while all other behavior stays on the
+    shared torch implementation.
 
     The ``lmcache.c_ops`` shim forwards attribute access to a resolved
     singleton instance so module-level call sites keep working.
@@ -53,53 +47,6 @@ class DeviceOps:
     GPUKVFormat = EngineKVFormat  # back-compat alias
     PageBufferShapeDesc = PageBufferShapeDesc
     set_shape_desc_dtype = staticmethod(set_shape_desc_dtype)
-
-    def __init__(self) -> None:
-        self._native_bound: bool = False
-
-    # ── Lazy native binding ───────────────────────────────────────────
-
-    def ensure_native(self) -> None:
-        """Attempt to load and bind the compiled native extension.
-
-        Subclasses override this to import their compiled module and call
-        :meth:`bind_native`.  The base class is a no-op (pure torch).
-        Guarded by ``_native_bound`` so it runs at most once per instance.
-        """
-
-    def bind_native(self, module: object) -> None:
-        """Rebind ops and types from a compiled native module.
-
-        Walks the native module's public symbols.  For each callable or
-        type, binds it on this instance — replacing the torch fallback if
-        one exists, or adding a native-only symbol that has no pure-Python
-        equivalent.
-        """
-        bound_ops = 0
-        bound_types = 0
-        for name in dir(module):
-            if name.startswith("_"):
-                continue
-            native_sym = getattr(module, name, None)
-            if native_sym is None:
-                continue
-            if isinstance(native_sym, type):
-                setattr(self, name, native_sym)
-                bound_types += 1
-            elif callable(native_sym):
-                setattr(self, name, native_sym)
-                bound_ops += 1
-        # GPUKVFormat alias → EngineKVFormat on native side
-        ekf = getattr(module, "EngineKVFormat", None)
-        if ekf is not None:
-            self.GPUKVFormat = ekf
-        logger.debug(
-            "bind_native: %s <- %s (%d ops, %d types)",
-            type(self).__name__,
-            getattr(module, "__name__", repr(module)),
-            bound_ops,
-            bound_types,
-        )
 
     # ── Ops: memory alloc / free ─────────────────────────────────────
 
@@ -143,8 +90,8 @@ class DeviceOps:
 
     def multi_layer_block_kv_transfer(
         self,
-        paged_buffer_ptrs_tensor: "torch.Tensor | list",
-        lmcache_objects_ptrs: "list[int] | list[torch.Tensor]",
+        paged_buffer: "torch.Tensor | list",
+        lmcache_objects: "list[torch.Tensor]",
         block_ids: "torch.Tensor | list[int]",
         device: "torch.device | str",
         direction: ops_types.TransferDirection,
@@ -153,9 +100,22 @@ class DeviceOps:
         engine_kv_format: ops_types.EngineKVFormat,
         skip_prefix_n_blocks: int,
     ) -> None:
+        """Transfer KV blocks between engine paged buffers and LMCache objects.
+
+        Args:
+            paged_buffer: Engine KV tensors in the kernel-expected structure.
+            lmcache_objects: LMCache chunk tensors.
+            block_ids: Ordered engine block IDs for the transfer.
+            device: Target device for the transfer.
+            direction: Transfer direction.
+            shape_desc: Shape descriptor of the page buffer.
+            lmcache_chunk_size: Chunk size of LMCache objects.
+            engine_kv_format: GPU KV cache format.
+            skip_prefix_n_blocks: Number of leading blocks to skip.
+        """
         return torch_ops.multi_layer_block_kv_transfer(
-            paged_buffer_ptrs_tensor,
-            lmcache_objects_ptrs,
+            paged_buffer,
+            lmcache_objects,
             block_ids,
             device,
             direction,
@@ -221,22 +181,37 @@ class DeviceOps:
     def drain_recorded_events(self):
         return torch_ops.drain_recorded_events()
 
-    def record_completion_on_stream(self, *args, **kwargs):
-        return torch_ops.record_completion_on_stream(*args, **kwargs)
+    def record_completion_on_stream(self, stream_ptr, kind, payload):
+        return torch_ops.record_completion_on_stream(stream_ptr, kind, payload)
 
-    def record_event_on_stream(self, *args, **kwargs):
-        return torch_ops.record_event_on_stream(*args, **kwargs)
+    def record_event_on_stream(
+        self,
+        stream_ptr,
+        event_type_name,
+        session_id,
+        str_metadata,
+        int_metadata,
+    ):
+        return torch_ops.record_event_on_stream(
+            stream_ptr,
+            event_type_name,
+            session_id,
+            str_metadata,
+            int_metadata,
+        )
 
-    # ── Ops: misc ────────────────────────────────────────────────────
+    # ── Ops: memcpy ──────────────────────────────────────────────────
 
     def batched_memcpy(self, src_ptrs, dst_ptrs, sizes):
         return torch_ops.batched_memcpy(src_ptrs, dst_ptrs, sizes)
 
+    def lmcache_memcpy_async(self, dst, src, count):
+        return torch_ops.lmcache_memcpy_async(dst, src, count)
+
+    # ── Ops: misc / quant ────────────────────────────────────────────
+
     def get_gpu_pci_bus_id(self, device_id=0):
         return torch_ops.get_gpu_pci_bus_id(device_id)
-
-    def lmcache_memcpy_async(self, *args, **kwargs):
-        return torch_ops.lmcache_memcpy_async(*args, **kwargs)
 
     def rotary_embedding_k_fused(self, *args, **kwargs):
         return torch_ops.rotary_embedding_k_fused(*args, **kwargs)

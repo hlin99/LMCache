@@ -19,10 +19,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-import inspect
 
 # Third Party
-import numpy as np
 import torch
 
 # First Party
@@ -42,64 +40,6 @@ logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Global capability flag: does lmc_ops.multi_layer_block_kv_transfer accept
-# list[torch.Tensor] directly for lmcache_objects_ptrs, or only list[int]?
-#
-# We inspect the function signature once at import time. If the annotation
-# for ``lmcache_objects_ptrs`` includes ``Tensor``, the op can handle tensors
-# natively and we pass them through. Otherwise (annotation is list[int], or
-# inspect fails entirely) we must convert tensors to data pointers before
-# calling.
-# ---------------------------------------------------------------------------
-def _detect_block_transfer_accepts_tensor() -> bool:
-    """Return True if lmc_ops.multi_layer_block_kv_transfer accepts
-    list[torch.Tensor] for its lmcache_objects_ptrs parameter."""
-    try:
-        # First Party
-        import lmcache.c_ops as _lmc_ops
-
-        fn = _lmc_ops.multi_layer_block_kv_transfer
-
-        # Attempt: use inspect.signature (works on newer pybind11 builds)
-        # Assumptions: if lmcache_objects_ptrs accepts tensors,
-        # it's fallback path, and we do not convert tensors to ptrs explicitly.
-        # TODO: String matching on annotations is fragile. Wait for lmc_ops to
-        # expose a direct version flag (e.g., lmc_ops.__version__) or
-        # an explicit capability boolean.
-        try:
-            sig = inspect.signature(fn)
-            param = sig.parameters.get("lmcache_objects_ptrs")
-            if param is not None and param.annotation is not inspect.Parameter.empty:
-                ann_str = str(param.annotation)
-                if "Tensor" in ann_str:
-                    return True
-                # Annotation exists but no Tensor mention → ptr-only
-                return False
-        except (ValueError, TypeError):
-            pass
-
-    except Exception:
-        # Import failed or any other error → conservative: assume ptr-only
-        pass
-
-    # Default: inspect failed or lmc_ops not available → assume ptr-only
-    return False
-
-
-_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR: bool = _detect_block_transfer_accepts_tensor()
-"""If True, ``lmc_ops.multi_layer_block_kv_transfer`` accepts
-``list[torch.Tensor]`` directly for ``lmcache_objects_ptrs``.
-If False, callers must convert tensors to ``list[int]`` data pointers."""
-
-logger.info(
-    "multi_layer_block_kv_transfer mode: %s",
-    "tensor" if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR else "ptr",
-)
-
-
-def _tensors_to_ptrs(tensors: list[torch.Tensor]) -> list[int]:
-    """Convert a list of tensors to a list of their data_ptr() values."""
-    return [t.data_ptr() for t in tensors]
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +345,7 @@ def gather_paged_kv_to_cpu(
 
     # Determine if pinned memory is strictly required
     # (only for the compiled C++ path which does not accept tensor)
-    requires_pinned = not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR
+    requires_pinned = False
     needs_staging = False
     staged_chunks = []
 
@@ -470,68 +410,17 @@ def gather_paged_kv_to_cpu(
         )
 
     if selected_block_ids:
-        if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
-            # Python fallback: accepts tensor list directly for all params.
-            paged_arg = normalized
-            objs_arg = chunks
-            block_ids_arg = selected_block_ids
-
-            # call kernel in one shot
-            lmc_ops.multi_layer_block_kv_transfer(
-                paged_arg,
-                objs_arg,
-                block_ids_arg,
-                tensors[0].device,
-                lmc_ops.TransferDirection.D2H,
-                shape_desc,
-                chunk_tokens,
-                engine_kv_format,
-                0,
-            )
-
-        else:
-            # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-            _ptrs_np = np.array(
-                [t.data_ptr() for t in normalized],  # type: ignore[union-attr]
-                dtype=np.uint64,
-            ).view(np.int64)
-            paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
-
-            # This safely points to either the pre-pinned chunks
-            # OR the temporary staged_chunks
-            objs_arg = _tensors_to_ptrs(chunks)
-
-            block_ids_arg = torch.tensor(
-                selected_block_ids, dtype=torch.int64, device=tensors[0].device
-            )
-
-            # Split transfer to respect CUDA kernel's object count limitation
-            MAX_OBJECTS = 4
-            req_blocks_per_obj = blocks_per_chunk
-            total_objects = len(objs_arg)
-
-            for i in range(0, total_objects, MAX_OBJECTS):
-                # Slice object pointers and corresponding block IDs
-                batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-                start_block = i * req_blocks_per_obj
-                end_block = min(
-                    (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-                )
-                batch_blocks = block_ids_arg[start_block:end_block]
-
-                # Execute batched transfer
-                lmc_ops.multi_layer_block_kv_transfer(
-                    paged_arg,
-                    batch_objs_ptrs,
-                    batch_blocks,
-                    tensors[0].device,
-                    lmc_ops.TransferDirection.D2H,
-                    shape_desc,
-                    chunk_tokens,
-                    engine_kv_format,
-                    0,
-                )
+        lmc_ops.multi_layer_block_kv_transfer(
+            normalized,
+            chunks,
+            selected_block_ids,
+            tensors[0].device,
+            lmc_ops.TransferDirection.D2H,
+            shape_desc,
+            chunk_tokens,
+            engine_kv_format,
+            0,
+        )
 
     # --- Final reconciliation ---
     # If we used a staging buffer to protect unpinned shared memory,
@@ -655,80 +544,17 @@ def scatter_cpu_to_paged_kv(
     if not selected_block_ids:
         return
 
-    if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
-        # Python fallback: accepts tensor list directly for all params.
-        paged_arg = normalized
-        objs_arg = chunks
-        block_ids_arg = selected_block_ids
-
-        lmc_ops.multi_layer_block_kv_transfer(
-            paged_arg,
-            objs_arg,
-            block_ids_arg,
-            tensors[0].device,
-            lmc_ops.TransferDirection.H2D,
-            shape_desc,
-            chunk_tokens,
-            engine_kv_format,
-            skip_prefix_n_blocks,
-        )
-    else:
-        # assuming this is c ops path which requires pin memory
-        # TODO: may have a better approach here
-        # Defensive check: Ensure all incoming CPU chunks are pinned memory.
-        # Otherwise, the underlying CUDA kernel may throw an Illegal
-        # Memory Access error during H2D transfer.
-        if not all(chunk.is_pinned() for chunk in chunks):
-            logger.warning(
-                "Received unpinned CPU tensors in scatter_cpu_to_paged_kv. "
-                "Dynamically pinning memory now, which may incur additional"
-                "synchronization overhead."
-            )
-            chunks = [
-                chunk.pin_memory() if not chunk.is_pinned() else chunk
-                for chunk in chunks
-            ]
-
-        # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-        _ptrs_np = np.array(
-            [t.data_ptr() for t in normalized],  # type: ignore[union-attr]
-            dtype=np.uint64,
-        ).view(np.int64)
-        paged_arg = torch.from_numpy(_ptrs_np).to(device=tensors[0].device)
-        objs_arg = _tensors_to_ptrs(chunks)
-        block_ids_arg = torch.tensor(
-            selected_block_ids, dtype=torch.int64, device=tensors[0].device
-        )
-
-        # Batched transfer to satisfy cuda's limitation (max 4 objects)
-        MAX_OBJECTS = 4
-        req_blocks_per_obj = (
-            blocks_per_chunk  # Each chunk corresponds to one object's blocks
-        )
-        total_chunks = len(chunks)
-
-        for i in range(0, total_chunks, MAX_OBJECTS):
-            # Slice objects and block IDs for this batch
-            batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-            start_block = i * req_blocks_per_obj
-            end_block = min(
-                (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-            )
-            batch_blocks = block_ids_arg[start_block:end_block]
-
-            # Execute transfer for this batch
-            lmc_ops.multi_layer_block_kv_transfer(
-                paged_arg,
-                batch_objs_ptrs,
-                batch_blocks,
-                tensors[0].device,
-                lmc_ops.TransferDirection.H2D,
-                shape_desc,
-                chunk_tokens,
-                engine_kv_format,
-                skip_prefix_n_blocks if i == 0 else 0,
-            )
+    lmc_ops.multi_layer_block_kv_transfer(
+        normalized,
+        chunks,
+        selected_block_ids,
+        tensors[0].device,
+        lmc_ops.TransferDirection.H2D,
+        shape_desc,
+        chunk_tokens,
+        engine_kv_format,
+        skip_prefix_n_blocks,
+    )
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
     # WARNING: The caller MUST explicitly call `torch_dev.synchronize()`
