@@ -385,7 +385,7 @@ def scenario_load_and_reshape_flash(ops: Any, device: str) -> dict[str, torch.Te
 
     # 3. Extract (to CPU pinned)
     extracted_chunks = []
-    for chunk_id, slot_mapping_temp in enumerate(slot_mapping_chunked):
+    for _chunk_id, slot_mapping_temp in enumerate(slot_mapping_chunked):
         mem_obj_shape = (2, num_layers, len(slot_mapping_temp), num_heads * head_size)
         mem_obj_tensor = torch.zeros(mem_obj_shape, dtype=dtype, device=dst_device)
 
@@ -410,9 +410,9 @@ def scenario_load_and_reshape_flash(ops: Any, device: str) -> dict[str, torch.Te
     #    dim 0: K=0, V=1
     #    Original kv_cache layout: [num_blocks, block_size, num_heads, head_size]
     #    slot_mapping tells us which (block, offset) each token comes from
-    for chunk_id, slot_mapping_temp in enumerate(slot_mapping_chunked):
+    for _chunk_id, slot_mapping_temp in enumerate(slot_mapping_chunked):
         slots = slot_mapping_temp.cpu()
-        extracted = extracted_chunks[chunk_id].cpu()
+        extracted = extracted_chunks[_chunk_id].cpu()
 
         for layer_id in range(num_layers):
             orig_k = kv_cache_cpu[layer_id][
@@ -513,7 +513,7 @@ def scenario_reshape_and_cache_back_flash(
 
     # 5. Execute Operator (Load Back)
     current_token_offset = 0
-    for chunk_id, slot_chunk in enumerate(slot_mapping_chunked):
+    for _chunk_id, slot_chunk in enumerate(slot_mapping_chunked):
         chunk_len = len(slot_chunk)
 
         buffer_chunk = src_buffer[
@@ -1157,11 +1157,7 @@ def scenario_single_layer_kv_transfer_sgl(
 
 
 def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.Tensor]:
-    """Test multi_layer_kv_transfer for multiple paged KV formats and directions.
-
-    Tests both pointer mode (torch.Tensor of int64 pointers) and tensor list mode
-    (list[torch.Tensor]) for key_value_ptrs.
-    """
+    """Test multi_layer_kv_transfer for multiple paged KV formats and directions."""
     torch.manual_seed(42)
 
     num_layers = 2
@@ -1186,11 +1182,6 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
         (ops.EngineKVFormat.NL_X_NB_BS_HS, True, 1),  # vLLM MLA
         (ops.EngineKVFormat.NL_X_NBBS_ONE_HS, True, 1),  # SGLang MLA
     ]
-
-    # Decide mode based on the running device.
-    # The native CUDA/XPU backend only accepts a tensor of uint64 pointers;
-    # only the Python fallback supports list[Tensor].
-    use_tensor_list = device not in ("cpu", "cuda", "xpu")
 
     for engine_kv_format, is_mla, bs_arg in format_cases:
         k_or_v_size = 1 if is_mla else 2
@@ -1265,18 +1256,8 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
 
                 page_buffers.append(pb)
 
-            # ── 3. Prepare key_value_ptrs (pointer mode or tensor list mode) ──
-            key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]
-            if use_tensor_list:
-                # Tensor list mode: pass the tensor objects directly
-                key_value_ptrs = page_buffers
-            else:
-                # Pointer mode: create tensor of uint64 pointers
-                key_value_ptrs = torch.tensor(
-                    [pb.data_ptr() for pb in page_buffers],
-                    dtype=torch.uint64,
-                    device=device,
-                )
+            # ── 3. Prepare key_value_ptrs (tensor-first mode) ──
+            key_value_ptrs = page_buffers
 
             # ── 4. Execute ──
             xfer_dir = (
@@ -1316,7 +1297,7 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                             paged_val.to("cpu"),
                             msg=(
                                 f"Mismatch: {fmt_name} {dir_tag} "
-                                f"(tensor_list={use_tensor_list}), "
+                                f""
                                 f"kv={kv}, layer={ly}, token={t_id}"
                             ),
                         )
@@ -1355,14 +1336,7 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                     pb[1, s] = val + 700
             page_buffers.append(pb)
 
-        if use_tensor_list:
-            key_value_ptrs = page_buffers
-        else:
-            key_value_ptrs = torch.tensor(
-                [pb.data_ptr() for pb in page_buffers],
-                dtype=torch.uint64,
-                device=device,
-            )
+        key_value_ptrs = page_buffers
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
         ops.multi_layer_kv_transfer(
@@ -1385,11 +1359,7 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
 def scenario_multi_layer_kv_transfer_unilateral(
     ops: Any, device: str
 ) -> dict[str, torch.Tensor]:
-    """Test multi_layer_kv_transfer_unilateral for non-interleaved K/V pointers.
-
-    Tests both pointer mode (torch.Tensor of int64 pointers) and tensor list mode
-    (list[torch.Tensor]) for key_value_ptrs.
-    """
+    """Test multi_layer_kv_transfer_unilateral for non-interleaved K/V tensors."""
     torch.manual_seed(42)
 
     num_layers = 2
@@ -1419,11 +1389,6 @@ def scenario_multi_layer_kv_transfer_unilateral(
             True,
         ),  # SGLang MLA (delegates to multi_layer_kv_transfer)
     ]
-
-    # Decide mode based on the running device.
-    # The native CUDA/XPU backend only accepts a tensor of uint64 pointers;
-    # only the Python fallback supports list[Tensor].
-    use_tensor_list = device not in ("cpu", "cuda", "xpu")
 
     for engine_kv_format, is_mla in format_cases:
         k_or_v_size = 1 if is_mla else 2
@@ -1471,14 +1436,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                             pb[s] = val
                     page_buffers.append(pb)
 
-                if use_tensor_list:
-                    key_value_ptrs = page_buffers
-                else:
-                    key_value_ptrs = torch.tensor(
-                        [pb.data_ptr() for pb in page_buffers],
-                        dtype=torch.uint64,
-                        device=device,
-                    )
+                key_value_ptrs = page_buffers
             else:
                 # Non-MLA unilateral: separate K/V buffers
                 # ptrs: [K_l0, K_l1, ..., V_l0, V_l1, ...]
@@ -1502,27 +1460,11 @@ def scenario_multi_layer_kv_transfer_unilateral(
                                 pb[s] = val
                         buffers[(kv, ly)] = pb
 
-                if use_tensor_list:
-                    # Tensor list mode: [K_l0, K_l1, ..., V_l0, V_l1, ...]
-                    tensor_list = []
-                    for ly in range(num_layers):
-                        tensor_list.append(buffers[(0, ly)])
-                    for ly in range(num_layers):
-                        tensor_list.append(buffers[(1, ly)])
-                    key_value_ptrs = tensor_list
-                else:
-                    # Pointer mode
-                    ptr_list = []
-                    for ly in range(num_layers):
-                        ptr_list.append(buffers[(0, ly)].data_ptr())
-                    for ly in range(num_layers):
-                        ptr_list.append(buffers[(1, ly)].data_ptr())
-
-                    key_value_ptrs = torch.tensor(
-                        ptr_list,
-                        dtype=torch.uint64,
-                        device=device,
-                    ).contiguous()
+                key_value_ptrs = []
+                for ly in range(num_layers):
+                    key_value_ptrs.append(buffers[(0, ly)])
+                for ly in range(num_layers):
+                    key_value_ptrs.append(buffers[(1, ly)])
 
             # ── 3. Execute ──
             xfer_dir = (
@@ -1556,7 +1498,7 @@ def scenario_multi_layer_kv_transfer_unilateral(
                             paged_val.to("cpu"),
                             msg=(
                                 f"Mismatch: {engine_kv_format} {dir_tag} "
-                                f"(tensor_list={use_tensor_list}), "
+                                f""
                                 f"KV={kv}, layer={ly}, "
                                 f"token={t_id}, slot={s_idx}"
                             ),
@@ -1602,26 +1544,12 @@ def scenario_multi_layer_kv_transfer_unilateral(
                         pb[s] = val
                 buffers[(kv, ly)] = pb
 
-        key_value_ptrs: Union[list[torch.Tensor], torch.Tensor]  # type: ignore[no-redef]
-        if use_tensor_list:
-            # Tensor list mode: [K_l0, K_l1, ..., V_l0, V_l1, ...]
-            tensor_list = []
-            for ly in range(num_layers):
-                tensor_list.append(buffers[(0, ly)])
-            for ly in range(num_layers):
-                tensor_list.append(buffers[(1, ly)])
-            key_value_ptrs = tensor_list
-        else:
-            ptr_list = []
-            for ly in range(num_layers):
-                ptr_list.append(buffers[(0, ly)].data_ptr())
-            for ly in range(num_layers):
-                ptr_list.append(buffers[(1, ly)].data_ptr())
-            key_value_ptrs = torch.tensor(
-                ptr_list,
-                dtype=torch.uint64,
-                device=device,
-            ).contiguous()
+        key_value_ptrs: list[torch.Tensor]  # type: ignore[no-redef]
+        key_value_ptrs = []
+        for ly in range(num_layers):
+            key_value_ptrs.append(buffers[(0, ly)])
+        for ly in range(num_layers):
+            key_value_ptrs.append(buffers[(1, ly)])
 
         xfer_dir = ops.TransferDirection.D2H if direction else ops.TransferDirection.H2D
         ops.multi_layer_kv_transfer_unilateral(
@@ -1824,12 +1752,6 @@ def scenario_multi_layer_block_kv_transfer(
     """
     results = {}
 
-    # C++ bindings (cuda_c_ops, xpu_sycl_ops) expect uint64 pointer tensors for
-    # paged_buffer_ptrs_tensor and list[int] for lmcache_objects_ptrs.
-    # The Python fallback also supports both modes on cpu/cuda (pointer inputs
-    # are reconstructed internally via _tensor_from_ptr).
-    use_tensor_list = device not in ("cpu", "cuda")
-
     def _alloc_chunks(shape: tuple[int, ...], count: int) -> list[torch.Tensor]:
         chunks = [torch.zeros(shape, dtype=dtype) for _ in range(count)]
         if device in ("cuda"):
@@ -1865,14 +1787,8 @@ def scenario_multi_layer_block_kv_transfer(
     block_ids = list(range(num_blocks))
 
     ops.multi_layer_block_kv_transfer(
-        paged_layers
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks if use_tensor_list else [c.data_ptr() for c in d2h_chunks],
+        paged_layers,
+        d2h_chunks,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -1883,12 +1799,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d = [torch.zeros_like(layer) for layer in paged_layers]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d], dtype=torch.uint64, device=device
-        ),
-        d2h_chunks if use_tensor_list else [c.data_ptr() for c in d2h_chunks],
+        paged_h2d,
+        d2h_chunks,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -1918,16 +1830,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_layers_fi_nhd
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_fi_nhd],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_fi_nhd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_fi_nhd],
+        paged_layers_fi_nhd,
+        d2h_chunks_fi_nhd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -1938,16 +1842,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_fi_nhd = [torch.zeros_like(layer) for layer in paged_layers_fi_nhd]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_fi_nhd
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_fi_nhd],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_fi_nhd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_fi_nhd],
+        paged_h2d_fi_nhd,
+        d2h_chunks_fi_nhd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -1977,14 +1873,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_layers_hnd
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_hnd],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_hnd if use_tensor_list else [c.data_ptr() for c in d2h_chunks_hnd],
+        paged_layers_hnd,
+        d2h_chunks_hnd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -1995,14 +1885,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_hnd = [torch.zeros_like(layer) for layer in paged_layers_hnd]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_hnd
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_hnd],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_hnd if use_tensor_list else [c.data_ptr() for c in d2h_chunks_hnd],
+        paged_h2d_hnd,
+        d2h_chunks_hnd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2032,16 +1916,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_layers_fi_hnd
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_fi_hnd],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_fi_hnd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_fi_hnd],
+        paged_layers_fi_hnd,
+        d2h_chunks_fi_hnd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2052,16 +1928,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_fi_hnd = [torch.zeros_like(layer) for layer in paged_layers_fi_hnd]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_fi_hnd
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_fi_hnd],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_fi_hnd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_fi_hnd],
+        paged_h2d_fi_hnd,
+        d2h_chunks_fi_hnd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2096,14 +1964,8 @@ def scenario_multi_layer_block_kv_transfer(
     engine_kv_format_mla = ops.EngineKVFormat.NL_X_NB_BS_HS
     d2h_chunks_mla = _alloc_chunks((num_layers, chunk_tokens, mla_hidden), num_chunks)
     ops.multi_layer_block_kv_transfer(
-        paged_layers_mla
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_mla],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_mla if use_tensor_list else [c.data_ptr() for c in d2h_chunks_mla],
+        paged_layers_mla,
+        d2h_chunks_mla,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2114,14 +1976,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_mla = [torch.zeros_like(layer) for layer in paged_layers_mla]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_mla
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_mla],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_mla if use_tensor_list else [c.data_ptr() for c in d2h_chunks_mla],
+        paged_h2d_mla,
+        d2h_chunks_mla,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2149,16 +2005,8 @@ def scenario_multi_layer_block_kv_transfer(
         (num_layers, chunk_tokens, mla_hidden), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_layers_sglang_mla
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_sglang_mla],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_sglang_mla
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_sglang_mla],
+        paged_layers_sglang_mla,
+        d2h_chunks_sglang_mla,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2171,16 +2019,8 @@ def scenario_multi_layer_block_kv_transfer(
         torch.zeros_like(layer) for layer in paged_layers_sglang_mla
     ]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_sglang_mla
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_sglang_mla],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_sglang_mla
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_sglang_mla],
+        paged_h2d_sglang_mla,
+        d2h_chunks_sglang_mla,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2213,14 +2053,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_cross_nhd
-        if use_tensor_list
-        else torch.tensor(
-            [paged_cross_nhd.data_ptr()], dtype=torch.uint64, device=device
-        ),
-        d2h_chunks_cross_nhd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_cross_nhd],
+        paged_cross_nhd,
+        d2h_chunks_cross_nhd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2231,14 +2065,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_cross_nhd = torch.zeros_like(paged_cross_nhd)
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_cross_nhd
-        if use_tensor_list
-        else torch.tensor(
-            [paged_h2d_cross_nhd.data_ptr()], dtype=torch.uint64, device=device
-        ),
-        d2h_chunks_cross_nhd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_cross_nhd],
+        paged_h2d_cross_nhd,
+        d2h_chunks_cross_nhd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2268,14 +2096,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_cross_hnd
-        if use_tensor_list
-        else torch.tensor(
-            [paged_cross_hnd.data_ptr()], dtype=torch.uint64, device=device
-        ),
-        d2h_chunks_cross_hnd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_cross_hnd],
+        paged_cross_hnd,
+        d2h_chunks_cross_hnd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2286,14 +2108,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_cross_hnd = torch.zeros_like(paged_cross_hnd)
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_cross_hnd
-        if use_tensor_list
-        else torch.tensor(
-            [paged_h2d_cross_hnd.data_ptr()], dtype=torch.uint64, device=device
-        ),
-        d2h_chunks_cross_hnd
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_cross_hnd],
+        paged_h2d_cross_hnd,
+        d2h_chunks_cross_hnd,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2325,17 +2141,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_sglang_nbbs
-        if use_tensor_list
-        else torch.tensor(
-            [t.data_ptr() for t in paged_sglang_nbbs[0]]
-            + [t.data_ptr() for t in paged_sglang_nbbs[1]],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_sglang_nbbs
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_sglang_nbbs],
+        paged_sglang_nbbs,
+        d2h_chunks_sglang_nbbs,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2348,17 +2155,8 @@ def scenario_multi_layer_block_kv_transfer(
         [torch.zeros_like(t) for t in group] for group in paged_sglang_nbbs
     ]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_sglang_nbbs
-        if use_tensor_list
-        else torch.tensor(
-            [t.data_ptr() for t in paged_h2d_sglang_nbbs[0]]
-            + [t.data_ptr() for t in paged_h2d_sglang_nbbs[1]],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_sglang_nbbs
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_sglang_nbbs],
+        paged_h2d_sglang_nbbs,
+        d2h_chunks_sglang_nbbs,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2397,17 +2195,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_sglang_nb
-        if use_tensor_list
-        else torch.tensor(
-            [t.data_ptr() for t in paged_sglang_nb[0]]
-            + [t.data_ptr() for t in paged_sglang_nb[1]],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_sglang_nb
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_sglang_nb],
+        paged_sglang_nb,
+        d2h_chunks_sglang_nb,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2420,17 +2209,8 @@ def scenario_multi_layer_block_kv_transfer(
         [torch.zeros_like(t) for t in group] for group in paged_sglang_nb
     ]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_sglang_nb
-        if use_tensor_list
-        else torch.tensor(
-            [t.data_ptr() for t in paged_h2d_sglang_nb[0]]
-            + [t.data_ptr() for t in paged_h2d_sglang_nb[1]],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_sglang_nb
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_sglang_nb],
+        paged_h2d_sglang_nb,
+        d2h_chunks_sglang_nb,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2465,14 +2245,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_layers_skip
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_skip],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_skip if use_tensor_list else [c.data_ptr() for c in d2h_chunks_skip],
+        paged_layers_skip,
+        d2h_chunks_skip,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2483,14 +2257,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_skip = [torch.zeros_like(layer) for layer in paged_layers_skip]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_skip
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_skip],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_skip if use_tensor_list else [c.data_ptr() for c in d2h_chunks_skip],
+        paged_h2d_skip,
+        d2h_chunks_skip,
         torch.tensor(block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2534,16 +2302,8 @@ def scenario_multi_layer_block_kv_transfer(
         (2, num_layers, chunk_tokens, hidden_dim), num_chunks
     )
     ops.multi_layer_block_kv_transfer(
-        paged_layers_permuted
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_permuted],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_permuted
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_permuted],
+        paged_layers_permuted,
+        d2h_chunks_permuted,
         torch.tensor(permuted_block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2554,16 +2314,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_permuted = [torch.zeros_like(layer) for layer in paged_layers_permuted]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_permuted
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_permuted],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_permuted
-        if use_tensor_list
-        else [c.data_ptr() for c in d2h_chunks_permuted],
+        paged_h2d_permuted,
+        d2h_chunks_permuted,
         torch.tensor(permuted_block_ids, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2603,14 +2355,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     block_ids_mc = list(range(num_blocks_mc))
     ops.multi_layer_block_kv_transfer(
-        paged_layers_mc
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_layers_mc],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_mc if use_tensor_list else [c.data_ptr() for c in d2h_chunks_mc],
+        paged_layers_mc,
+        d2h_chunks_mc,
         torch.tensor(block_ids_mc, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.D2H,
@@ -2621,14 +2367,8 @@ def scenario_multi_layer_block_kv_transfer(
     )
     paged_h2d_mc = [torch.zeros_like(layer) for layer in paged_layers_mc]
     ops.multi_layer_block_kv_transfer(
-        paged_h2d_mc
-        if use_tensor_list
-        else torch.tensor(
-            [layer.data_ptr() for layer in paged_h2d_mc],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        d2h_chunks_mc if use_tensor_list else [c.data_ptr() for c in d2h_chunks_mc],
+        paged_h2d_mc,
+        d2h_chunks_mc,
         torch.tensor(block_ids_mc, dtype=torch.int64, device=device),
         torch.device(device),
         ops.TransferDirection.H2D,
@@ -2687,16 +2427,8 @@ def scenario_multi_layer_block_kv_transfer(
             (num_layers, chunk_tokens, num_heads * fused_hs), num_chunks
         )
         ops.multi_layer_block_kv_transfer(
-            paged_fused
-            if use_tensor_list
-            else torch.tensor(
-                [layer.data_ptr() for layer in paged_fused],
-                dtype=torch.uint64,
-                device=device,
-            ),
-            d2h_chunks_fused
-            if use_tensor_list
-            else [c.data_ptr() for c in d2h_chunks_fused],
+            paged_fused,
+            d2h_chunks_fused,
             torch.tensor(block_ids, dtype=torch.int64, device=device),
             torch.device(device),
             ops.TransferDirection.D2H,
@@ -2707,16 +2439,8 @@ def scenario_multi_layer_block_kv_transfer(
         )
         paged_fused_h2d = [torch.zeros_like(layer) for layer in paged_fused]
         ops.multi_layer_block_kv_transfer(
-            paged_fused_h2d
-            if use_tensor_list
-            else torch.tensor(
-                [layer.data_ptr() for layer in paged_fused_h2d],
-                dtype=torch.uint64,
-                device=device,
-            ),
-            d2h_chunks_fused
-            if use_tensor_list
-            else [c.data_ptr() for c in d2h_chunks_fused],
+            paged_fused_h2d,
+            d2h_chunks_fused,
             torch.tensor(block_ids, dtype=torch.int64, device=device),
             torch.device(device),
             ops.TransferDirection.H2D,
@@ -2788,7 +2512,7 @@ def scenario_record_drain_event(ops: Any, device: str) -> dict[str, torch.Tensor
     device_sync(device)
     events = ops.drain_recorded_events()
     assert len(events) == 5
-    for i, (name, sid, ts, str_meta, int_meta) in enumerate(events):
+    for i, (name, sid, ts, _str_meta, int_meta) in enumerate(events):
         assert name == f"mp.test.{i}"
         assert sid == f"sess-{i}"
         assert int_meta == {"idx": i}

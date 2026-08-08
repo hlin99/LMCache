@@ -11,6 +11,9 @@ address values and scales separately); every geometry accessor here matches
 the MLA spec.
 """
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.v1.gpu_connector.kv_format.specs.nl_x_nb_bs_hs import (
     NL_X_NB_BS_HS_Spec,
@@ -23,3 +26,6 @@ class NL_X_NB_BSV_BSS_Spec(NL_X_NB_BS_HS_Spec):
     attention_backends = ("vLLM MLA",)
     is_layer_list = True
     is_mla = True
+
+    def tensors(self, layer_indices: list[int]) -> list[torch.Tensor]:
+        return super().tensors(layer_indices)

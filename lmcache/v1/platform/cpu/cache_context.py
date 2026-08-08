@@ -30,6 +30,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
     get_group_data_ptrs,
+    get_group_tensors,
     normalize_and_discover_per_layer_formats,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
@@ -139,6 +140,14 @@ class CPUCacheContext(BaseCacheContext):
                     group.layer_indices,
                 ),
                 dtype=torch.long,
+            )
+            for idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups)
+        ]
+        self.group_kv_tensors_: list[torch.Tensor | list] = [
+            get_group_tensors(
+                self.kv_caches_,
+                self.get_engine_kv_format(idx),
+                group.layer_indices,
             )
             for idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups)
         ]
@@ -284,6 +293,10 @@ class CPUCacheContext(BaseCacheContext):
         Mirrors :meth:`GPUCacheContext.get_kernel_group_kv_pointers`.
         """
         return self.group_kv_pointers_[kernel_group_idx]
+
+    def get_kernel_group_kv_tensors(self, kernel_group_idx: int) -> torch.Tensor | list:
+        """Returns the KV tensors for the given kernel group."""
+        return self.group_kv_tensors_[kernel_group_idx]
 
     def get_kernel_group_shape_dtype(
         self,

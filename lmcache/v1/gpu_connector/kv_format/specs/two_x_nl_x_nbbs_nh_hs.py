@@ -68,3 +68,8 @@ class TWO_X_NL_X_NBBS_NH_HS_Spec(KVFormatSpec):
         return [k[i].data_ptr() for i in layer_indices] + [
             v[i].data_ptr() for i in layer_indices
         ]
+
+    def tensors(self, layer_indices: list[int]) -> list[list[torch.Tensor]]:
+        k, v = cast(list[list[torch.Tensor]], self.kv_caches)
+        return [[k[i] for i in layer_indices], [v[i] for i in layer_indices]]
+

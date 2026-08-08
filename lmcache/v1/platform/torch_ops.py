@@ -556,7 +556,7 @@ def free_numa_ptr(ptr: int, size: int | None = None) -> None:
 
 def multi_layer_kv_transfer(
     key_value: torch.Tensor,
-    key_value_ptrs: torch.Tensor | list[torch.Tensor],
+    key_value_ptrs: list[torch.Tensor],
     slot_mapping: torch.Tensor,
     paged_memory_device: torch.device,
     page_buffer_size: int,
@@ -570,10 +570,13 @@ def multi_layer_kv_transfer(
     Fully vectorized Python fallback for multi_layer_kv_transfer.
     Eliminates ALL token- and KV-level Python loops.
     """
-    if not isinstance(key_value_ptrs, (torch.Tensor, list)):
+    if not isinstance(key_value_ptrs, list):
         raise TypeError(
-            f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
+            "Expected list[torch.Tensor], but got "
+            f"{type(key_value_ptrs).__name__}"
         )
+    if not all(isinstance(tensor, torch.Tensor) for tensor in key_value_ptrs):
+        raise TypeError("key_value_ptrs must contain only torch.Tensor entries")
 
     # TODO: Implement head_size support for HND layouts (NL_X_TWO_NB_NH_BS_HS,
     # NL_X_NB_TWO_NH_BS_HS) as next step.
@@ -611,36 +614,16 @@ def multi_layer_kv_transfer(
     is_flash_infer = int(engine_kv_format) == int(EngineKVFormat.NL_X_NB_TWO_BS_NH_HS)
 
     num_layers = key_value.size(1)
-    hidden_size = key_value.size(3)
 
     # For the flash_infer interleaved layout, pre-compute block-level indices.
     if is_flash_infer:
         block_indices = valid_slots // block_size
         block_offsets = valid_slots % block_size
 
-    # Determine the physical shape of the underlying paged tensor
-    # (used when wrapping a raw pointer).
-    layer_shape: Tuple[int, ...]
-
-    if is_mla:
-        layer_shape = (page_buffer_size, hidden_size)
-    elif is_flash_infer:
-        num_blocks = page_buffer_size // block_size
-        layer_shape = (num_blocks, 2, block_size, hidden_size)
-    else:
-        layer_shape = (2, page_buffer_size, hidden_size)
-
     # 3. Iterate over layers — the only remaining Python-level loop.
     for layer_id in range(num_layers):
         # --- A. Obtain the physical device-memory view for this layer. ---
-        if isinstance(key_value_ptrs, list):
-            paged_tensor = key_value_ptrs[layer_id]
-        else:
-            ptr = int(key_value_ptrs[layer_id].item())
-            # Convert a raw device pointer into a PyTorch tensor view.
-            paged_tensor = _tensor_from_ptr(
-                ptr, layer_shape, key_value.dtype, paged_memory_device
-            )
+        paged_tensor = key_value_ptrs[layer_id]
 
         # --- B. Vectorized bulk data transfer. ---
         if is_mla:
@@ -687,7 +670,7 @@ def multi_layer_kv_transfer(
 
 def multi_layer_kv_transfer_unilateral(
     key_value: torch.Tensor,
-    key_value_ptrs: torch.Tensor | list[torch.Tensor],
+    key_value_ptrs: list[torch.Tensor],
     slot_mapping: torch.Tensor,
     paged_memory_device: torch.device,
     page_buffer_size: int,
@@ -704,8 +687,7 @@ def multi_layer_kv_transfer_unilateral(
     For MLA, delegates to multi_layer_kv_transfer (same as C++ implementation).
 
     key_value_ptrs:
-        - If torch.Tensor: int64 tensor containing raw memory pointers.
-        - If list[torch.Tensor]: list of tensor objects.
+        list of paged-buffer tensor objects in K-then-V layer order.
 
     key_value layout:
         - Standard: [2, num_layers, num_tokens, hidden_size]
@@ -732,8 +714,13 @@ def multi_layer_kv_transfer_unilateral(
         )
     # ── Non-MLA path: unilateral (separate K/V buffers per layer) ──
     num_layers = key_value.size(1)
-    hidden_size = key_value.size(3)
-    layer_shape = (page_buffer_size, hidden_size)
+    if not isinstance(key_value_ptrs, list):
+        raise TypeError(
+            "key_value_ptrs must be list[torch.Tensor], not "
+            + type(key_value_ptrs).__name__
+        )
+    if not all(isinstance(tensor, torch.Tensor) for tensor in key_value_ptrs):
+        raise TypeError("key_value_ptrs must contain only torch.Tensor entries")
 
     kv_device = key_value.device
     slots_kv = slot_mapping.to(dtype=torch.long).to(kv_device)
@@ -746,13 +733,7 @@ def multi_layer_kv_transfer_unilateral(
     for layer_id in range(num_layers):
         for kv_idx in range(2):  # 0 = K, 1 = V
             buffer_idx = layer_id + kv_idx * num_layers
-            if isinstance(key_value_ptrs, list):
-                paged_tensor = key_value_ptrs[buffer_idx]
-            else:
-                ptr = int(key_value_ptrs[buffer_idx].item())
-                paged_tensor = _tensor_from_ptr(
-                    ptr, layer_shape, key_value.dtype, paged_memory_device
-                )
+            paged_tensor = key_value_ptrs[buffer_idx]
 
             if int(direction) == int(TransferDirection.H2D):
                 lmc_valid = key_value[kv_idx, layer_id, valid_mask_kv, :]
@@ -875,43 +856,36 @@ def _per_layer_paged_shape(
 
 
 def _infer_kv_dtype(
-    paged_buffer_ptrs_tensor: object,
-    lmcache_objects_ptrs: object,
+    paged_buffer: object,
+    lmcache_objects: object,
     shape_desc: "PageBufferShapeDesc",
 ) -> torch.dtype:
-    """Infer the KV element dtype from whichever inputs carry it.
+    """Infer the KV element dtype from whichever tensor inputs carry it.
 
     Inference order (first match wins):
-    1. ``shape_desc.dtype`` — authoritative when set (requires the
-       ``set_shape_desc_dtype`` helper from PR #3514; correctly distinguishes
-       float16 vs bfloat16 which share ``element_size == 2``).
-    2. ``paged_buffer_ptrs_tensor`` — if it is a non-pointer tensor or a list
-       of tensors (including nested SGLang MHA lists), the dtype of the first
-       tensor is used.
-    3. ``lmcache_objects_ptrs`` — if it is a list of tensors, the dtype of the
-       first chunk tensor is used.
-    4. ``shape_desc.element_size`` — looked up in :data:`_ELEMENT_SIZE_TO_DTYPE`
-       (ambiguous for 2-byte types; kept only as last-resort fallback).
+    1. ``shape_desc.dtype`` — authoritative when set.
+    2. ``paged_buffer`` — if it is a tensor or tensor list, the dtype of the
+       first tensor is used.
+    3. ``lmcache_objects`` — if it is a list of tensors, the dtype of the first
+       chunk tensor is used.
+    4. ``shape_desc.element_size`` — looked up in :data:`_ELEMENT_SIZE_TO_DTYPE`.
     5. ``torch.bfloat16`` — silent default when no other source is available.
     """
-    # Prefer shape_desc.dtype — it is exact and avoids the element_size ambiguity.
     if shape_desc is not None:
         sd_dtype = getattr(shape_desc, "dtype", None)
         if sd_dtype is not None:
             return sd_dtype
-    if isinstance(paged_buffer_ptrs_tensor, list) and paged_buffer_ptrs_tensor:
-        first = paged_buffer_ptrs_tensor[0]
+    if isinstance(paged_buffer, list) and paged_buffer:
+        first = paged_buffer[0]
         if isinstance(first, list) and first and isinstance(first[0], torch.Tensor):
             return first[0].dtype
         if isinstance(first, torch.Tensor):
             return first.dtype
-    if isinstance(paged_buffer_ptrs_tensor, torch.Tensor) and not _is_ptr_tensor(
-        paged_buffer_ptrs_tensor
-    ):
-        return paged_buffer_ptrs_tensor.dtype
-    if isinstance(lmcache_objects_ptrs, list) and lmcache_objects_ptrs:
-        if isinstance(lmcache_objects_ptrs[0], torch.Tensor):
-            return lmcache_objects_ptrs[0].dtype
+    if isinstance(paged_buffer, torch.Tensor):
+        return paged_buffer.dtype
+    if isinstance(lmcache_objects, list) and lmcache_objects:
+        if isinstance(lmcache_objects[0], torch.Tensor):
+            return lmcache_objects[0].dtype
     if shape_desc is not None and shape_desc.element_size > 0:
         dtype = _ELEMENT_SIZE_TO_DTYPE.get(shape_desc.element_size)
         if dtype is None:
@@ -925,7 +899,7 @@ def _infer_kv_dtype(
 
 
 def _normalize_paged_layers(
-    paged_buffer_ptrs_tensor: "torch.Tensor | list",
+    paged_buffer: "torch.Tensor | list",
     engine_kv_format: EngineKVFormat,
     shape_desc: "PageBufferShapeDesc | None" = None,
     device: "torch.device | str | None" = None,
@@ -933,127 +907,67 @@ def _normalize_paged_layers(
 ) -> "torch.Tensor | list[torch.Tensor] | list[list[torch.Tensor]]":
     """Normalize paged buffer input based on GPU KV format.
 
-    Accepts either tensor-form inputs (list / Tensor) or a 1-D pointer tensor
-    (int64 / uint64).  When a pointer tensor is provided *shape_desc*, *device*,
-    and *dtype* must be supplied so the tensors can be reconstructed via
-    :func:`_tensor_from_ptr`.
+    Accepts only tensor-form inputs.
 
     Returns:
         - Single ``torch.Tensor`` for cross-layer formats.
         - ``list[list[torch.Tensor]]`` (2 x NL) for SGLang MHA formats.
         - ``list[torch.Tensor]`` (per-layer) for all other formats.
     """
+    del shape_desc, device, dtype
     if is_cross_layer(engine_kv_format):
-        if isinstance(paged_buffer_ptrs_tensor, torch.Tensor):
-            if _is_ptr_tensor(paged_buffer_ptrs_tensor):
-                # 1-D pointer tensor with a single entry → reconstruct full tensor.
-                if shape_desc is None or device is None or dtype is None:
-                    raise ValueError(
-                        "_normalize_paged_layers: shape_desc, device, and dtype are "
-                        "required when paged_buffer_ptrs_tensor is a pointer tensor"
-                    )
-                nb = int(shape_desc.nb)
-                nl = int(shape_desc.nl)
-                bs = int(shape_desc.bs)
-                nh = int(shape_desc.nh)
-                hs = int(shape_desc.hs)
-                if _is_hnd_format(engine_kv_format):
-                    shape: tuple[int, ...] = (nb, nl, 2, nh, bs, hs)
-                else:
-                    shape = (nb, nl, 2, bs, nh, hs)
-                ptr = int(paged_buffer_ptrs_tensor[0].item())
-                return _tensor_from_ptr(ptr, shape, dtype, device)
-            return paged_buffer_ptrs_tensor
+        if isinstance(paged_buffer, torch.Tensor):
+            if _is_ptr_tensor(paged_buffer):
+                raise TypeError(
+                    "paged_buffer must be a Tensor or list of Tensors, "
+                    "not a pointer tensor"
+                )
+            return paged_buffer
         raise TypeError(
             "Cross-layer formats require a single torch.Tensor input; "
-            "got: " + type(paged_buffer_ptrs_tensor).__name__
+            "got: " + type(paged_buffer).__name__
         )
     if is_kv_list(engine_kv_format):
-        if _is_ptr_tensor(paged_buffer_ptrs_tensor):
-            # 1-D pointer tensor [K_L0,...,K_LN-1, V_L0,...,V_LN-1] → nested list.
-            if shape_desc is None or device is None or dtype is None:
-                raise ValueError(
-                    "_normalize_paged_layers: shape_desc, device, and dtype are "
-                    "required when paged_buffer_ptrs_tensor is a pointer tensor"
-                )
-            nb = int(shape_desc.nb)
-            nl = int(shape_desc.nl)
-            bs = int(shape_desc.bs)
-            nh = int(shape_desc.nh)
-            hs = int(shape_desc.hs)
-            is_flat = _is_pbs_fused_format(engine_kv_format)
-            per_layer_shape: tuple[int, ...] = (
-                (nb * bs, nh, hs) if is_flat else (nb, bs, nh, hs)
+        if isinstance(paged_buffer, torch.Tensor) and _is_ptr_tensor(paged_buffer):
+            raise TypeError(
+                "paged_buffer must be a Tensor or list of Tensors, not a pointer tensor"
             )
-            ptrs = [int(p.item()) for p in paged_buffer_ptrs_tensor]
-            k_tensors = [
-                _tensor_from_ptr(ptrs[i], per_layer_shape, dtype, device)
-                for i in range(nl)
-            ]
-            v_tensors = [
-                _tensor_from_ptr(ptrs[nl + i], per_layer_shape, dtype, device)
-                for i in range(nl)
-            ]
-            return [k_tensors, v_tensors]
-        if isinstance(paged_buffer_ptrs_tensor, list):
-            # Already nested [[K tensors], [V tensors]]
+        if isinstance(paged_buffer, list):
             if (
-                len(paged_buffer_ptrs_tensor) == 2
-                and isinstance(paged_buffer_ptrs_tensor[0], list)
+                len(paged_buffer) == 2
+                and isinstance(paged_buffer[0], list)
                 and all(
-                    isinstance(t, torch.Tensor)
-                    for group in paged_buffer_ptrs_tensor
-                    for t in group
+                    isinstance(t, torch.Tensor) for group in paged_buffer for t in group
                 )
             ):
-                return paged_buffer_ptrs_tensor
-            # Flat list [K_L0, ..., K_LN-1, V_L0, ..., V_LN-1]
-            if all(isinstance(t, torch.Tensor) for t in paged_buffer_ptrs_tensor):
-                if len(paged_buffer_ptrs_tensor) % 2 != 0:
+                return paged_buffer
+            if all(isinstance(t, torch.Tensor) for t in paged_buffer):
+                if len(paged_buffer) % 2 != 0:
                     raise ValueError(
                         "Flat SGLang MHA list must have even length (2*NL)"
                     )
-                half = len(paged_buffer_ptrs_tensor) // 2
-                return [
-                    paged_buffer_ptrs_tensor[:half],
-                    paged_buffer_ptrs_tensor[half:],
-                ]
+                half = len(paged_buffer) // 2
+                return [paged_buffer[:half], paged_buffer[half:]]
         raise TypeError(
-            "SGLang MHA formats require a list[list[torch.Tensor]], a flat "
-            "list[torch.Tensor] (2*NL entries), or a 1-D pointer tensor; "
-            "got: " + type(paged_buffer_ptrs_tensor).__name__
+            "SGLang MHA formats require a list[list[torch.Tensor]] or a flat "
+            "list[torch.Tensor] (2*NL entries); got: " + type(paged_buffer).__name__
         )
-    # Per-layer formats
-    if _is_ptr_tensor(paged_buffer_ptrs_tensor):
-        # 1-D pointer tensor [ptr_L0, ..., ptr_LN-1] → list of per-layer tensors.
-        if shape_desc is None or device is None or dtype is None:
-            raise ValueError(
-                "_normalize_paged_layers: shape_desc, device, and dtype are "
-                "required when paged_buffer_ptrs_tensor is a pointer tensor"
-            )
-        nb = int(shape_desc.nb)
-        bs = int(shape_desc.bs)
-        nh = int(shape_desc.nh)
-        hs = int(shape_desc.hs)
-        per_shape = _per_layer_paged_shape(engine_kv_format, nb, bs, nh, hs)
-        return [
-            _tensor_from_ptr(int(p.item()), per_shape, dtype, device)
-            for p in paged_buffer_ptrs_tensor
-        ]
-    if isinstance(paged_buffer_ptrs_tensor, list):
-        if not all(isinstance(t, torch.Tensor) for t in paged_buffer_ptrs_tensor):
-            raise TypeError(
-                "paged_buffer_ptrs_tensor list must contain torch.Tensor entries"
-            )
-        return paged_buffer_ptrs_tensor
+    if isinstance(paged_buffer, torch.Tensor) and _is_ptr_tensor(paged_buffer):
+        raise TypeError(
+            "paged_buffer must be a Tensor or list of Tensors, not a pointer tensor"
+        )
+    if isinstance(paged_buffer, list):
+        if not all(isinstance(t, torch.Tensor) for t in paged_buffer):
+            raise TypeError("paged_buffer list must contain torch.Tensor entries")
+        return paged_buffer
     raise TypeError(
-        "paged_buffer_ptrs_tensor must be a list[torch.Tensor] or 1-D pointer tensor; "
-        "got: " + type(paged_buffer_ptrs_tensor).__name__
+        "paged_buffer must be a list[torch.Tensor] or torch.Tensor; got: "
+        + type(paged_buffer).__name__
     )
 
 
 def _normalize_lmcache_objects(
-    lmcache_objects_ptrs: "list[int] | list[torch.Tensor]",
+    lmcache_objects: "list[int] | list[torch.Tensor]",
     shape_desc: "PageBufferShapeDesc | None" = None,
     lmcache_chunk_size: "int | None" = None,
     engine_kv_format: "EngineKVFormat | None" = None,
@@ -1061,55 +975,29 @@ def _normalize_lmcache_objects(
 ) -> list[torch.Tensor]:
     """Normalize LMCache object inputs to chunk tensors.
 
-    Accepts either a list of chunk tensors or a ``list[int]`` of raw CPU pointers.
-    When a pointer list is provided *shape_desc*, *lmcache_chunk_size*,
-    *engine_kv_format*, and *dtype* must be supplied so the tensors can be
-    reconstructed via :func:`_tensor_from_ptr` on the CPU.
+    Accepts only a list of chunk tensors.
     """
-    if not isinstance(lmcache_objects_ptrs, list):
+    del shape_desc, lmcache_chunk_size, engine_kv_format, dtype
+    if not isinstance(lmcache_objects, list):
         raise TypeError(
-            "lmcache_objects_ptrs must be a list[torch.Tensor] or list[int]; "
-            "got: " + type(lmcache_objects_ptrs).__name__
+            "lmcache_objects must be list[torch.Tensor], not "
+            + type(lmcache_objects).__name__
         )
-    if not lmcache_objects_ptrs:
+    if not lmcache_objects:
         return []
-    if isinstance(lmcache_objects_ptrs[0], torch.Tensor):
-        return lmcache_objects_ptrs  # type: ignore[return-value]
-    if isinstance(lmcache_objects_ptrs[0], int):
-        # Pointer mode: reconstruct chunk tensors (always on CPU).
-        if (
-            shape_desc is None
-            or lmcache_chunk_size is None
-            or engine_kv_format is None
-            or dtype is None
-        ):
-            raise ValueError(
-                "_normalize_lmcache_objects: shape_desc, lmcache_chunk_size, "
-                "engine_kv_format, and dtype are required when lmcache_objects_ptrs "
-                "contains raw int pointers"
-            )
-        nl = int(shape_desc.nl)
-        nh = int(shape_desc.nh)
-        hs = int(shape_desc.hs)
-        chunk_tokens = lmcache_chunk_size
-        if is_mla(engine_kv_format):
-            chunk_shape: tuple[int, ...] = (nl, chunk_tokens, hs)
-        elif _is_fused_kv_format(engine_kv_format):
-            # Single plane: hs is the packed 2 * head_size.
-            chunk_shape = (nl, chunk_tokens, nh * hs)
-        else:
-            chunk_shape = (2, nl, chunk_tokens, nh * hs)
-        return [
-            _tensor_from_ptr(ptr, chunk_shape, dtype, "cpu")
-            for ptr in lmcache_objects_ptrs
-        ]
+    if isinstance(lmcache_objects[0], torch.Tensor):
+        return lmcache_objects  # type: ignore[return-value]
+    if isinstance(lmcache_objects[0], int):
+        raise TypeError("lmcache_objects must be list[torch.Tensor], not list[int]")
     raise TypeError(
-        "lmcache_objects_ptrs must be a list[torch.Tensor] or list[int]; "
-        "got list containing: " + type(lmcache_objects_ptrs[0]).__name__
+        "lmcache_objects must be list[torch.Tensor], got list containing: "
+        + type(lmcache_objects[0]).__name__
     )
 
 
-def _to_block_id_list(block_ids: torch.Tensor | list[int]) -> list[int]:
+def _to_block_id_list(
+    block_ids: torch.Tensor | list[int],
+) -> list[int]:
     """Convert block IDs from tensor/list form into a Python ``list[int]``."""
     if isinstance(block_ids, torch.Tensor):
         return [int(x) for x in block_ids.to(dtype=torch.int64).cpu().tolist()]
@@ -1119,8 +1007,8 @@ def _to_block_id_list(block_ids: torch.Tensor | list[int]) -> list[int]:
 
 
 def multi_layer_block_kv_transfer(
-    paged_buffer_ptrs_tensor: "torch.Tensor | list",
-    lmcache_objects_ptrs: list[int] | list[torch.Tensor],
+    paged_buffer: "torch.Tensor | list",
+    lmcache_objects: list[torch.Tensor],
     block_ids: torch.Tensor | list[int],
     device: torch.device | str,
     direction: TransferDirection,
@@ -1136,8 +1024,8 @@ def multi_layer_block_kv_transfer(
     fallback backends.
 
     Args:
-        paged_buffer_ptrs_tensor: Paged buffer pointers or tensors.
-        lmcache_objects_ptrs: LMCache object pointers or chunk tensors.
+        paged_buffer: Paged buffer tensors in kernel-expected structure.
+        lmcache_objects: LMCache chunk tensors.
         block_ids: Ordered engine block IDs for the transfer.
         device: Target device for the transfer.
         direction: Transfer direction (H2D or D2H).
@@ -1168,17 +1056,17 @@ def multi_layer_block_kv_transfer(
         raise ValueError(f"Unsupported transfer direction: {direction!r}")
 
     kv_dtype = _infer_kv_dtype(
-        paged_buffer_ptrs_tensor, lmcache_objects_ptrs, shape_desc
+        paged_buffer, lmcache_objects, shape_desc
     )
     normalized = _normalize_paged_layers(
-        paged_buffer_ptrs_tensor,
+        paged_buffer,
         engine_kv_format,
         shape_desc=shape_desc,
         device=device,
         dtype=kv_dtype,
     )
     object_tensors = _normalize_lmcache_objects(
-        lmcache_objects_ptrs,
+        lmcache_objects,
         shape_desc=shape_desc,
         lmcache_chunk_size=lmcache_chunk_size,
         engine_kv_format=engine_kv_format,

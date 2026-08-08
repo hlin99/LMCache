@@ -100,14 +100,12 @@ class DeviceSpec:
     def get_ops(self) -> DeviceOps:
         """Return the cached :class:`DeviceOps` singleton for this spec.
 
-        Lazy-initialized on first access.  Calls :meth:`ensure_native`
-        so native ops are bound before the instance is used.  The same
-        instance is reused process-wide for a given spec.
+        Lazy-initialized on first access. The same instance is reused
+        process-wide for a given spec.
         """
         ops = self._ops_cache
         if ops is None:
             ops = self.ops_cls()
-            ops.ensure_native()
             self._ops_cache = ops
         return ops
 

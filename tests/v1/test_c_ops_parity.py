@@ -219,7 +219,7 @@ _EXCLUDED_FUNCS: set[str] = {
 }
 
 # Plan types (StagingCopy, LaunchVar, BatchStep, KernelGroupSpec)
-# are native-only with no torch fallback — auto-discovered by bind_native.
+# are native-only with no torch fallback — provided by native backends only.
 # NOTE: these previously had signature-only stubs (raised NotImplementedError
 # unconditionally) — not real fallbacks.
 _EXCLUDED_DESCS: set[str] = {

@@ -31,7 +31,7 @@ def _install_c_ops_shim() -> None:
     """Register ``lmcache.c_ops`` as the resolved :class:`DeviceOps` instance.
 
     Resolves the singleton :class:`DeviceOps` instance for the detected
-    device (which calls :meth:`ensure_native` internally), then registers
+    device, then registers
     a PEP 562 shim module that forwards attribute access to it.
     """
     # First Party
