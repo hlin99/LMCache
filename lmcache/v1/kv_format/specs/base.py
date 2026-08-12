@@ -9,8 +9,8 @@ device kernels in ``csrc/engine_kv_format.h``; Python call sites read them from
 the spec via ``get_spec_class`` instead of re-listing formats inline, and
 ``tests/v1/kv_format/test_kv_format_classification.py`` pins the two sides
 together. The enum is the single source of truth for which formats exist;
-engine identity lives only in detection. The format -> spec table is in
-``registry.py``.
+engine identity lives only in the separate probe classes colocated with specs.
+The format -> spec table is in ``registry.py``.
 """
 
 # Standard

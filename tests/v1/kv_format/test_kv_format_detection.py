@@ -14,7 +14,7 @@ import torch
 
 # First Party
 from lmcache.utils import EngineType
-from lmcache.v1.kv_format import detect_format, extract_kv_cache_shapes
+from lmcache.v1.kv_format import detect_format, extract_kv_cache_shapes, get_probes
 import lmcache.lmcache_native as lmcache_native
 
 NB, NL, BS, NH, HS = 7, 5, 3, 2, 4
@@ -61,6 +61,19 @@ def test_vllm_mla():
     kv = [_t(NB, BS, HS) for _ in range(NL)]
     fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
     assert fmt == F.NL_X_NB_BS_HS
+
+
+def test_vllm_dsa_indexer_is_not_claimed_by_generic_mla():
+    kv = [torch.zeros((NB, BS, 132), dtype=torch.uint8) for _ in range(NL)]
+    fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+    assert fmt == F.NL_X_NB_BSV_BSS
+
+
+def test_vllm_ambiguous_shape_raises(monkeypatch):
+    monkeypatch.setattr(_VLLM_DEV, "cuda")
+    kv = [_t(2, 2, BS, NH, HS) for _ in range(NL)]
+    with pytest.raises(ValueError, match="ambiguous KV cache format"):
+        detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
 
 
 def test_vllm_blocks_first_fused_num_heads_2(monkeypatch):
@@ -117,6 +130,35 @@ def test_trtllm_cross_layer_6d():
     kv = _t(NB, NL, 2, NH, BS, HS)
     fmt, _ = detect_format(kv, EngineType.TRTLLM, {})
     assert fmt == F.NB_NL_TWO_NH_BS_HS
+
+
+def test_trtllm_flat_pool_is_normalized_by_probe():
+    flat = _t(NB, NL, 2, NH * BS * HS)
+    fmt, out = detect_format(
+        flat,
+        EngineType.TRTLLM,
+        {"num_kv_heads": NH, "tokens_per_block": BS, "head_dim": HS},
+    )
+    assert fmt == F.NB_NL_TWO_NH_BS_HS
+    assert tuple(out.shape) == (NB, NL, 2, NH, BS, HS)
+    assert out.data_ptr() == flat.data_ptr()
+
+
+def test_probe_registry_is_engine_scoped():
+    probes = get_probes(EngineType.VLLM)
+    formats = {probe.format_spec.engine_kv_format for probe in probes}
+    assert formats == {
+        F.NB_NL_TWO_BS_NH_HS,
+        F.NL_X_TWO_NB_BS_NH_HS,
+        F.NL_X_TWO_NB_NH_BS_HS,
+        F.NL_X_NB_TWO_BS_NH_HS,
+        F.NL_X_NB_TWO_NH_BS_HS,
+        F.NL_X_NB_BS_HS,
+        F.NL_X_NB_BSV_BSS,
+        F.NL_X_NB_BS_NH_CS,
+        F.NL_X_NB_NH_BS_CS,
+    }
+    assert all(probe.engine_type == EngineType.VLLM for probe in probes)
 
 
 def test_unsupported_structure_raises():

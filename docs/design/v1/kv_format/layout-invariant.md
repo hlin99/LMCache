@@ -40,14 +40,15 @@ kv_format/
 ├── types.py       # DiscoverableKVCache, LayoutHints (foundational types)
 ├── contiguity.py  # attempt_permute_to_contiguous_view (zero-copy view recovery)
 ├── detection.py   # detect_format() orchestration
+├── probes/        # engine-scoped probe interface + automatic registry
 ├── specs/         # geometry layer
 │   ├── base.py    #   KVFormatSpec ABC + shape_desc/concrete_shape rendering
 │   ├── registry.py #  auto-discovers the spec files; get_spec/get_spec_class
-│   └── <engine_kv_format>.py  #   one file per format
+│   └── <engine_kv_format>.py  #   one spec + its engine probe(s) per format
 └── detectors/     # per-engine detection layer
-    ├── base.py    #   EngineDetector ABC + measure_structure()
+    ├── base.py    #   EngineDetector probe dispatch
     ├── registry.py #  auto-discovers the detector files; get_detector
-    └── <engine>.py            #   one file per engine (a single discover())
+    └── <engine>.py            #   engine-wide hint preparation only
 ```
 
 - **One spec class per format — geometry plus static facts.** Each
@@ -95,14 +96,15 @@ kv_format/
   engine, per-/cross-layer, MLA/MHA, NHD/HND, fused/separate PBS — which a
   single inheritance spine cannot model without orphans). Add structure only
   when a concrete need appears.
-- **Detection is the one engine-aware layer.** `detect_format` does the
-  engine-agnostic contiguous-view recovery, then dispatches to the
-  `EngineDetector` for the `EngineType`. Each `detectors/<engine>.py` is one
-  `discover(kv, hints)` that reshapes the engine's raw layout into canonical
-  form *and* identifies the format in one step (returning `(format, kv)`);
-  `detectors/registry.py` auto-discovers them the same way `specs/` does. The
-  spec layer never sees `EngineType`. Adding an engine = just drop a new
-  detector file.
+- **Probes own engine-specific recognition and normalization.** Each format
+  module may colocate one or more `KVFormatProbe` subclasses with its spec. A
+  probe declares its `EngineType` and `format_spec`, recognizes that engine's
+  raw structure, and returns the canonical KV-cache structure or `None`.
+  `probes/registry.py` discovers probes through the spec registry, runs every
+  probe for the selected engine, and requires exactly one match. This avoids
+  order-dependent first-match behavior. `detectors/<engine>.py` contains only
+  engine-wide preparation that cannot belong to one format, such as resolving
+  vLLM's CPU HND override. Adding a format does not modify a detector.
 
 ## Adding a new format
 
@@ -110,17 +112,14 @@ kv_format/
    backend-agnostic definition shared by every accelerator backend), then
    register it in each backend's pybind module — `csrc/pybind.cpp` (CUDA)
    and `csrc/sycl/pybind_sycl.cpp` (SYCL/XPU).
-2. Add a branch in the engine's `detectors/<engine>.py` `discover()`. It keys
-   off `(list_depth, tensor_ndim)` from `measure_list_depth_until_tensor`,
-   returning `(format, kv)`; any reshape-via-hints (e.g. TRT-LLM's 4-D `view`'d
-   to 6-D) happens in the same method before the shape checks.
-3. Add a `KVFormatSpec` subclass as a new `specs/<engine_kv_format>.py` file
-   (named after the format, declaring its `engine_kv_format` and its static
-   facts — the structural flag plus any modifier that applies). `registry.py`
-   discovers it automatically — no other file changes. The ABC makes the
-   required accessors explicit (a spec missing one raises `TypeError` on first
-   `get_spec`, which the golden test triggers).
-4. Add a row to the golden tables in
+2. Add a `KVFormatSpec` subclass as a new `specs/<engine_kv_format>.py` file
+   (named after the format, declaring its `engine_kv_format` and static facts).
+   In the same file, add a `KVFormatProbe` for each serving engine that can
+   produce the format. A probe returns canonical KV caches when matched and
+   `None` otherwise; format-specific reshape-via-hints belongs in the probe.
+   Both registries discover the new classes automatically, so no detector or
+   registry logic changes.
+3. Add a row to the golden tables in
    `tests/v1/kv_format/test_kv_format_specs.py` and
    `test_kv_format_classification.py`, plus a detection case in
    `test_kv_format_detection.py`.
@@ -279,8 +278,8 @@ Format-dispatched raw indexing on `DiscoverableKVCache`
 (`kv_caches.shape[i]`, `kv_caches[0][j]`) is concentrated in the
 `kv_format` layer: each `specs/<format>.py` sets
 `# mypy: disable-error-code="union-attr,call-overload"` at the file level
-(the `detectors/` and `contiguity.py` files use `union-attr` alone, and the
-`utils.py` facade keeps the directive for its remaining structural helpers). The
+(while `contiguity.py` uses `union-attr` alone, and the `utils.py` facade keeps
+the directive for its remaining structural helpers). The
 `engine_kv_format` — or, in a spec, the class identity itself — is the
 proof the indexing is well-defined, but mypy can't carry that proof
 through a recursive Union without per-line casts. The file-level directive

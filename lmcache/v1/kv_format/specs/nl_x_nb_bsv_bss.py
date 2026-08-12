@@ -11,10 +11,16 @@ address values and scales separately); every geometry accessor here matches
 the MLA spec.
 """
 
+# Third Party
+import torch
+
 # First Party
+from lmcache.utils import EngineType
+from lmcache.v1.kv_format.probes.base import KVFormatProbe
 from lmcache.v1.kv_format.specs.nl_x_nb_bs_hs import (
     NL_X_NB_BS_HS_Spec,
 )
+from lmcache.v1.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -23,3 +29,25 @@ class NL_X_NB_BSV_BSS_Spec(NL_X_NB_BS_HS_Spec):
     attention_backends = ("vLLM MLA",)
     is_layer_list = True
     is_mla = True
+
+
+class NL_X_NB_BSV_BSS_Probe(KVFormatProbe):
+    engine_type = EngineType.VLLM
+    format_spec = NL_X_NB_BSV_BSS_Spec
+
+    @classmethod
+    def probe(
+        cls,
+        kv_caches: DiscoverableKVCache,
+        layout_hints: LayoutHints,
+    ) -> DiscoverableKVCache | None:
+        if (
+            isinstance(kv_caches, list)
+            and kv_caches
+            and isinstance(kv_caches[0], torch.Tensor)
+            and kv_caches[0].dim() == 3
+            and kv_caches[0].dtype == torch.uint8
+            and int(kv_caches[0].shape[-1]) == 132
+        ):
+            return kv_caches
+        return None

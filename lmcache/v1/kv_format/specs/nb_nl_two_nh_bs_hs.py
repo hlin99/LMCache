@@ -15,7 +15,10 @@ from typing import cast
 import torch
 
 # First Party
+from lmcache.utils import EngineType
+from lmcache.v1.kv_format.probes.base import KVFormatProbe
 from lmcache.v1.kv_format.specs.base import KVFormatSpec
+from lmcache.v1.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -62,3 +65,43 @@ class NB_NL_TWO_NH_BS_HS_Spec(KVFormatSpec):
     def data_ptrs(self, layer_indices: list[int]) -> list[int]:
         tensor = cast(torch.Tensor, self.kv_caches)
         return [tensor.data_ptr()]
+
+
+class NB_NL_TWO_NH_BS_HS_Probe(KVFormatProbe):
+    engine_type = EngineType.TRTLLM
+    format_spec = NB_NL_TWO_NH_BS_HS_Spec
+
+    @classmethod
+    def probe(
+        cls,
+        kv_caches: DiscoverableKVCache,
+        layout_hints: LayoutHints,
+    ) -> DiscoverableKVCache | None:
+        if isinstance(kv_caches, list) and len(kv_caches) == 1:
+            kv_caches = kv_caches[0]
+        if isinstance(kv_caches, torch.Tensor) and kv_caches.dim() == 4:
+            num_kv_heads = layout_hints.get("num_kv_heads")
+            tokens_per_block = layout_hints.get("tokens_per_block")
+            head_dim = layout_hints.get("head_dim")
+            if num_kv_heads is None or tokens_per_block is None or head_dim is None:
+                raise ValueError(
+                    "TRT-LLM discovery needs layout_hints with "
+                    "num_kv_heads, tokens_per_block, head_dim"
+                )
+            num_blocks, num_layers, kv_size, flat = kv_caches.shape
+            if flat != num_kv_heads * tokens_per_block * head_dim:
+                raise ValueError(
+                    f"TRT-LLM 4-D flat dim {flat} != num_kv_heads ({num_kv_heads}) "
+                    f"* tokens_per_block ({tokens_per_block}) * head_dim ({head_dim})"
+                )
+            kv_caches = kv_caches.view(
+                num_blocks,
+                num_layers,
+                kv_size,
+                num_kv_heads,
+                tokens_per_block,
+                head_dim,
+            )
+        if isinstance(kv_caches, torch.Tensor) and kv_caches.dim() == 6:
+            return kv_caches
+        return None
