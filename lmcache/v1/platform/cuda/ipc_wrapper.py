@@ -48,7 +48,7 @@ class CudaIPCWrapper(DeviceIPCWrapper):
 
     def __init__(self, tensor: torch.Tensor) -> None:
         # First Party
-        from lmcache.v1.gpu_connector.kv_format.contiguity import (
+        from lmcache.v1.kv_format.contiguity import (
             attempt_permute_to_contiguous_view,
         )
 

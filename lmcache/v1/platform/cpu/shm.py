@@ -225,7 +225,7 @@ def migrate_to_shm_and_wrap(tensor: torch.Tensor) -> CpuShmTensorWrapper:
     when the migrated tensor is garbage-collected.
     """
     # First Party
-    from lmcache.v1.gpu_connector.kv_format.contiguity import (
+    from lmcache.v1.kv_format.contiguity import (
         attempt_permute_to_contiguous_view,
     )
 

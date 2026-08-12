@@ -10,9 +10,6 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
-from lmcache.v1.gpu_connector.kv_format.contiguity import (
-    attempt_permute_to_contiguous_view,
-)
 from lmcache.v1.gpu_connector.utils import (
     DiscoverableKVCache,
     LayoutHints,
@@ -29,6 +26,9 @@ from lmcache.v1.gpu_connector.utils import (
     get_tokens_per_layer,
     normalize_and_discover_per_layer_formats,
     normalize_kv_and_discover_format,
+)
+from lmcache.v1.kv_format.contiguity import (
+    attempt_permute_to_contiguous_view,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator

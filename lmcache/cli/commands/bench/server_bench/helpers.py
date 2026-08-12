@@ -251,7 +251,7 @@ def _make_key(
 
 # The server's vLLM detector identifies MLA layers by tensor rank: each
 # layer must be rank-3 ``(NB, BS, HS)`` (see ``VLLM_Detector.discover``
-# in ``lmcache/v1/gpu_connector/kv_format/detectors/vllm.py``). Classical
+# in ``lmcache/v1/kv_format/detectors/vllm.py``). Classical
 # split-K/V is rank-5 ``(2, NB, BS, NH, HS)``. Sharing this shape recipe
 # across all allocation / gather / scatter helpers keeps the bench in
 # sync with the detector contract regardless of transfer mode.

@@ -21,7 +21,7 @@ F = lmcache_native.EngineKVFormat
 
 # The vLLM CPU-HND safeguard forces HND regardless of hint on a CPU host; bypass
 # it so the hint-driven NHD branch is exercised on any host.
-_VLLM_DEV = "lmcache.v1.gpu_connector.kv_format.detectors.vllm.torch_device_type"
+_VLLM_DEV = "lmcache.v1.kv_format.detectors.vllm.torch_device_type"
 
 
 def _t(*shape: int) -> torch.Tensor:

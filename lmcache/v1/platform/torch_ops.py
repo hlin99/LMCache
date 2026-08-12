@@ -42,7 +42,7 @@ from lmcache.v1.platform.ops_types import (
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.gpu_connector.kv_format.specs.base import KVFormatSpec
+    from lmcache.v1.kv_format.specs.base import KVFormatSpec
 
 # Store the tensor objects in memory so that they can be accessed
 # outside the scope of this file
@@ -391,7 +391,7 @@ def _format_spec(engine_kv_format: EngineKVFormat) -> "type[KVFormatSpec]":
     # ``lmcache.c_ops``, whose shim is installed only once this module (the
     # torch baseline behind it) has been imported.
     # First Party
-    from lmcache.v1.gpu_connector.kv_format.specs.registry import get_spec_class
+    from lmcache.v1.kv_format.specs.registry import get_spec_class
 
     return get_spec_class(engine_kv_format)
 

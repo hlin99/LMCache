@@ -716,7 +716,7 @@ def test_compute_kv_layout_and_gather_scatter_roundtrip(
     # Bypass the CPU-host HND safeguard so the layout hint drives detection
     # regardless of the host running the test.
     monkeypatch.setattr(
-        "lmcache.v1.gpu_connector.kv_format.detectors.vllm.torch_device_type",
+        "lmcache.v1.kv_format.detectors.vllm.torch_device_type",
         _vllm_detector_device_type(),
     )
 

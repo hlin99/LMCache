@@ -17,7 +17,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, lmcache_deprecate
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.gpu_connector.kv_format import (
+from lmcache.v1.kv_format import (
     concrete_shape,
     describe_shape,
     detect_format,
@@ -25,7 +25,7 @@ from lmcache.v1.gpu_connector.kv_format import (
     get_spec,
     get_spec_class,
 )
-from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache, LayoutHints
+from lmcache.v1.kv_format.types import DiscoverableKVCache, LayoutHints
 from lmcache.v1.platform.ops_types import set_shape_desc_dtype
 import lmcache.lmcache_native as lmcache_native
 
@@ -191,7 +191,7 @@ def normalize_kv_and_discover_format(
     """Normalize ``kv_caches`` into canonical form and discover its Engine KV format.
 
     Thin wrapper over
-    :func:`lmcache.v1.gpu_connector.kv_format.detect_format`; see that
+    :func:`lmcache.v1.kv_format.detect_format`; see that
     function for the full contract.
 
     Args:
