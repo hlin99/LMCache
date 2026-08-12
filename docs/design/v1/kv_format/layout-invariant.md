@@ -40,13 +40,12 @@ kv_format/
 ├── types.py       # DiscoverableKVCache, LayoutHints (foundational types)
 ├── contiguity.py  # attempt_permute_to_contiguous_view (zero-copy view recovery)
 ├── detection.py   # detect_format() orchestration
-├── probes/        # engine-scoped probe interface + automatic registry
-├── specs/         # geometry layer
+├── specs/         # geometry + detection layer
 │   ├── base.py    #   KVFormatSpec ABC + shape_desc/concrete_shape rendering
-│   ├── registry.py #  auto-discovers the spec files; get_spec/get_spec_class
-│   └── <engine_kv_format>.py  #   one spec + its engine probe(s) per format
+│   ├── registry.py #  auto-discovers specs; get_spec/get_spec_class/get_detectable_specs/detect_format_for_engine
+│   └── <engine_kv_format>.py  #   one spec per format (geometry + try_normalize)
 └── detectors/     # per-engine detection layer
-    ├── base.py    #   EngineDetector probe dispatch
+    ├── base.py    #   EngineDetector spec dispatch
     ├── registry.py #  auto-discovers the detector files; get_detector
     └── <engine>.py            #   engine-wide hint preparation only
 ```
@@ -96,12 +95,13 @@ kv_format/
   engine, per-/cross-layer, MLA/MHA, NHD/HND, fused/separate PBS — which a
   single inheritance spine cannot model without orphans). Add structure only
   when a concrete need appears.
-- **Probes own engine-specific recognition and normalization.** Each format
-  module may colocate one or more `KVFormatProbe` subclasses with its spec. A
-  probe declares its `EngineType` and `format_spec`, recognizes that engine's
-  raw structure, and returns the canonical KV-cache structure or `None`.
-  `probes/registry.py` discovers probes through the spec registry, runs every
-  probe for the selected engine, and requires exactly one match. This avoids
+- **Specs own engine-specific recognition and normalization.** Each active,
+  detectable spec declares its owning engine via a `engine_type` class attribute
+  and implements `try_normalize(kv_caches, layout_hints)` to recognize and
+  normalize that engine's raw structure, returning the canonical KV-cache
+  structure or `None`. `specs/registry.py` provides `get_detectable_specs` and
+  `detect_format_for_engine`, which gather all specs for the selected engine,
+  run each `try_normalize`, and require exactly one match. This avoids
   order-dependent first-match behavior. `detectors/<engine>.py` contains only
   engine-wide preparation that cannot belong to one format, such as resolving
   vLLM's CPU HND override. Adding a format does not modify a detector.
@@ -113,12 +113,13 @@ kv_format/
    register it in each backend's pybind module — `csrc/pybind.cpp` (CUDA)
    and `csrc/sycl/pybind_sycl.cpp` (SYCL/XPU).
 2. Add a `KVFormatSpec` subclass as a new `specs/<engine_kv_format>.py` file
-   (named after the format, declaring its `engine_kv_format` and static facts).
-   In the same file, add a `KVFormatProbe` for each serving engine that can
-   produce the format. A probe returns canonical KV caches when matched and
-   `None` otherwise; format-specific reshape-via-hints belongs in the probe.
-   Both registries discover the new classes automatically, so no detector or
-   registry logic changes.
+   (named after the format, declaring its `engine_kv_format`, static facts, and
+   `engine_type`). If the format is detectable, also set `engine_type` to the
+   owning `EngineType` and override `try_normalize` to recognize and normalize
+   that engine's raw structure, returning canonical KV caches on match and
+   `None` otherwise; format-specific reshape-via-hints belongs in `try_normalize`.
+   The spec and detection registries discover the new class automatically, so no
+   detector or registry logic changes.
 3. Add a row to the golden tables in
    `tests/v1/kv_format/test_kv_format_specs.py` and
    `test_kv_format_classification.py`, plus a detection case in
