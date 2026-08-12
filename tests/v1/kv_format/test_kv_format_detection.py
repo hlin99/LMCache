@@ -14,7 +14,11 @@ import torch
 
 # First Party
 from lmcache.utils import EngineType
-from lmcache.v1.kv_format import detect_format, extract_kv_cache_shapes, get_probes
+from lmcache.v1.kv_format import (
+    detect_format,
+    extract_kv_cache_shapes,
+    get_detectable_specs,
+)
 import lmcache.lmcache_native as lmcache_native
 
 NB, NL, BS, NH, HS = 7, 5, 3, 2, 4
@@ -132,7 +136,7 @@ def test_trtllm_cross_layer_6d():
     assert fmt == F.NB_NL_TWO_NH_BS_HS
 
 
-def test_trtllm_flat_pool_is_normalized_by_probe():
+def test_trtllm_flat_pool_is_normalized_by_spec():
     flat = _t(NB, NL, 2, NH * BS * HS)
     fmt, out = detect_format(
         flat,
@@ -144,9 +148,9 @@ def test_trtllm_flat_pool_is_normalized_by_probe():
     assert out.data_ptr() == flat.data_ptr()
 
 
-def test_probe_registry_is_engine_scoped():
-    probes = get_probes(EngineType.VLLM)
-    formats = {probe.format_spec.engine_kv_format for probe in probes}
+def test_detectable_specs_are_engine_scoped():
+    specs = get_detectable_specs(EngineType.VLLM)
+    formats = {spec.engine_kv_format for spec in specs}
     assert formats == {
         F.NB_NL_TWO_BS_NH_HS,
         F.NL_X_TWO_NB_BS_NH_HS,
@@ -158,7 +162,7 @@ def test_probe_registry_is_engine_scoped():
         F.NL_X_NB_BS_NH_CS,
         F.NL_X_NB_NH_BS_CS,
     }
-    assert all(probe.engine_type == EngineType.VLLM for probe in probes)
+    assert all(spec.engine_type == EngineType.VLLM for spec in specs)
 
 
 def test_unsupported_structure_raises():

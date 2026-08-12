@@ -15,7 +15,7 @@ class VLLM_Detector(EngineDetector):
     def discover(
         self, kv_caches: DiscoverableKVCache, layout_hints: LayoutHints
     ) -> "tuple[lmcache_native.EngineKVFormat | None, DiscoverableKVCache]":
-        """Resolve vLLM's layout hint before dispatching registered probes."""
+        """Resolve vLLM's layout hint before dispatching detectable specs."""
         resolved_hints = layout_hints.copy()
         kv_layout = resolved_hints.get("kv_layout")
         if torch_device_type == "cpu":

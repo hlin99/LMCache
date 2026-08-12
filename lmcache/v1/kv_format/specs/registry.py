@@ -13,8 +13,9 @@ import importlib
 import pkgutil
 
 # First Party
+from lmcache.utils import EngineType
 from lmcache.v1.kv_format.specs.base import KVFormatSpec
-from lmcache.v1.kv_format.types import DiscoverableKVCache
+from lmcache.v1.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -68,3 +69,57 @@ def get_spec(
 ) -> KVFormatSpec:
     """Return a spec instance wrapping *kv_caches* of *fmt*."""
     return get_spec_class(fmt)(kv_caches)
+
+
+def get_detectable_specs(engine_type: EngineType) -> tuple[type[KVFormatSpec], ...]:
+    """Return all specs detectable for a serving engine.
+
+    Args:
+        engine_type: Serving engine to query.
+
+    Returns:
+        An immutable tuple of spec classes whose ``engine_type`` matches,
+        sorted by their ``engine_kv_format`` integer value.
+    """
+    return tuple(
+        sorted(
+            (spec for spec in SPECS.values() if spec.engine_type == engine_type),
+            key=lambda spec: int(spec.engine_kv_format),
+        )
+    )
+
+
+def detect_format_for_engine(
+    kv_caches: "DiscoverableKVCache",
+    engine_type: EngineType,
+    layout_hints: "LayoutHints",
+) -> "tuple[lmcache_native.EngineKVFormat | None, DiscoverableKVCache]":
+    """Probe all detectable specs for an engine and require a unique match.
+
+    Args:
+        kv_caches: Raw KV-cache structure supplied by the serving engine.
+        engine_type: Serving engine that produced ``kv_caches``.
+        layout_hints: Engine-supplied layout and normalization hints (already
+            resolved by the engine detector before this is called).
+
+    Returns:
+        The uniquely matched format and its normalized KV caches. Returns
+        ``(None, kv_caches)`` when no spec matches.
+
+    Raises:
+        ValueError: More than one spec matches the same input, or
+            normalization fails.
+    """
+    matches: list[tuple[lmcache_native.EngineKVFormat, DiscoverableKVCache]] = []
+    for spec in get_detectable_specs(engine_type):
+        normalized = spec.try_normalize(kv_caches, layout_hints)
+        if normalized is not None:
+            matches.append((spec.engine_kv_format, normalized))
+    if len(matches) > 1:
+        formats = ", ".join(fmt.name for fmt, _normalized in matches)
+        raise ValueError(
+            f"ambiguous KV cache format for {engine_type}: matched {formats}"
+        )
+    if matches:
+        return matches[0]
+    return None, kv_caches

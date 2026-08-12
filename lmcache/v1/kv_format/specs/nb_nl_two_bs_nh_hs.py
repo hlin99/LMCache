@@ -15,13 +15,13 @@ import torch
 
 # First Party
 from lmcache.utils import EngineType
-from lmcache.v1.kv_format.probes.base import KVFormatProbe
 from lmcache.v1.kv_format.specs.base import KVFormatSpec
 from lmcache.v1.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.lmcache_native as lmcache_native
 
 
 class NB_NL_TWO_BS_NH_HS_Spec(KVFormatSpec):
+    engine_type = EngineType.VLLM
     engine_kv_format = lmcache_native.EngineKVFormat.NB_NL_TWO_BS_NH_HS
     attention_backends = ("vLLM CROSS_LAYER",)
     is_cross_layer = True
@@ -64,13 +64,8 @@ class NB_NL_TWO_BS_NH_HS_Spec(KVFormatSpec):
         tensor = cast(torch.Tensor, self.kv_caches)
         return [tensor.data_ptr()]
 
-
-class NB_NL_TWO_BS_NH_HS_Probe(KVFormatProbe):
-    engine_type = EngineType.VLLM
-    format_spec = NB_NL_TWO_BS_NH_HS_Spec
-
     @classmethod
-    def probe(
+    def try_normalize(
         cls,
         kv_caches: DiscoverableKVCache,
         layout_hints: LayoutHints,

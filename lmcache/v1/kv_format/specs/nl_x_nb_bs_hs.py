@@ -15,13 +15,13 @@ import torch
 
 # First Party
 from lmcache.utils import EngineType
-from lmcache.v1.kv_format.probes.base import KVFormatProbe
 from lmcache.v1.kv_format.specs.base import KVFormatSpec
 from lmcache.v1.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.lmcache_native as lmcache_native
 
 
 class NL_X_NB_BS_HS_Spec(KVFormatSpec):
+    engine_type = EngineType.VLLM
     engine_kv_format = lmcache_native.EngineKVFormat.NL_X_NB_BS_HS
     attention_backends = ("vLLM MLA",)
     is_layer_list = True
@@ -64,13 +64,8 @@ class NL_X_NB_BS_HS_Spec(KVFormatSpec):
         layers = cast(list[torch.Tensor], self.kv_caches)
         return [layers[i].data_ptr() for i in layer_indices]
 
-
-class NL_X_NB_BS_HS_Probe(KVFormatProbe):
-    engine_type = EngineType.VLLM
-    format_spec = NL_X_NB_BS_HS_Spec
-
     @classmethod
-    def probe(
+    def try_normalize(
         cls,
         kv_caches: DiscoverableKVCache,
         layout_hints: LayoutHints,

@@ -9,7 +9,7 @@ device kernels in ``csrc/engine_kv_format.h``; Python call sites read them from
 the spec via ``get_spec_class`` instead of re-listing formats inline, and
 ``tests/v1/kv_format/test_kv_format_classification.py`` pins the two sides
 together. The enum is the single source of truth for which formats exist;
-engine identity lives only in the separate probe classes colocated with specs.
+each active, detectable spec declares its owning engine in ``engine_type``.
 The format -> spec table is in ``registry.py``.
 """
 
@@ -22,7 +22,8 @@ from typing import ClassVar
 import torch
 
 # First Party
-from lmcache.v1.kv_format.types import DiscoverableKVCache
+from lmcache.utils import EngineType
+from lmcache.v1.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.lmcache_native as lmcache_native
 
 # A format's enum name *is* its shape: ``_``-joined tokens, with ``X`` marking a
@@ -93,8 +94,10 @@ class KVFormatSpec(ABC):
     """Pure geometry accessors for one ``EngineKVFormat``.
 
     Wraps an already-normalized ``kv_caches`` (from ``detect_format``) and
-    answers geometry questions about it. Layout only -- no engine identity,
-    since one format may come from many (engine, backend) pairs.
+    answers geometry questions about it. Layout plus engine ownership:
+    ``engine_type`` identifies which serving engine produces this format
+    (``None`` for deprecated compatibility formats that detection must not
+    produce).
 
     Class attributes: ``engine_kv_format`` (the format this describes, its
     identity), ``attention_backends`` (diagnostic labels; first is the
@@ -126,6 +129,7 @@ class KVFormatSpec(ABC):
     """
 
     engine_kv_format: ClassVar["lmcache_native.EngineKVFormat"]
+    engine_type: ClassVar["EngineType | None"] = None
     attention_backends: ClassVar[tuple[str, ...]] = ()
 
     # ── Static layout facts (see the class docstring) ──────────────────
@@ -225,3 +229,29 @@ class KVFormatSpec(ABC):
         return concrete_shape(
             self.engine_kv_format, lambda label: getattr(self, _ACCESSORS[label])()
         )
+
+    @classmethod
+    def try_normalize(
+        cls,
+        kv_caches: DiscoverableKVCache,
+        layout_hints: "LayoutHints",
+    ) -> "DiscoverableKVCache | None":
+        """Return normalized KV caches if this spec matches, otherwise ``None``.
+
+        The default implementation returns ``None`` (no match). Detectable
+        specs override this to recognize and normalize their raw input.
+
+        Args:
+            kv_caches: Raw KV-cache structure supplied by the serving engine.
+            layout_hints: Engine-supplied hints (already resolved by the
+                detector before this is called).
+
+        Returns:
+            The canonical KV-cache structure for this spec when matched,
+            otherwise ``None``.
+
+        Raises:
+            ValueError: The structure targets this format but violates a
+                required normalization invariant.
+        """
+        return None
