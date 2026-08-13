@@ -24,7 +24,10 @@ import re
 import pytest
 
 # First Party
-from lmcache.v1.platform import torch_ops as fallback
+from lmcache.v1.platform.base.device_ops import DeviceOps
+
+fallback = DeviceOps()
+assert type(fallback) is DeviceOps
 
 try:
     # First Party
@@ -38,16 +41,22 @@ except ImportError:
 # ── Helpers ──
 
 
-def _public_callables(module):
-    """Return {name: obj} for all public, non-dunder, non-enum callables."""
+def _public_callables(namespace):
+    """Return public, non-enum callables declared by a module or instance.
+
+    Module namespaces exclude re-exported callables. Instance namespaces expose
+    their public bound methods, whose ``__module__`` identifies the defining
+    class module rather than the instance.
+    """
+    module_name = getattr(namespace, "__name__", None)
     return {
         name: obj
-        for name, obj in inspect.getmembers(module)
+        for name, obj in inspect.getmembers(namespace)
         if not name.startswith("_")
         and callable(obj)
         and not inspect.isclass(obj)  # classes tested by descriptor/enum tests
         and not hasattr(obj, "__members__")  # exclude pybind11 enums
-        and getattr(obj, "__module__", None) == getattr(module, "__name__", None)
+        and (module_name is None or getattr(obj, "__module__", None) == module_name)
     }
 
 
@@ -209,26 +218,18 @@ def _has_real_names(params):
 
 # ── Discover the intersection automatically ──
 
-# Functions intentionally excluded from parity checks.
-# These are native-only with no torch fallback; call sites guard with hasattr.
-# NOTE: execute_object_group_transfer previously had a signature-only stub
-# (raised NotImplementedError unconditionally) — not a real fallback.
-_EXCLUDED_FUNCS: set[str] = {
-    "execute_object_group_transfer",
-    "execute_cb_retrieve_plan_flat",
-}
+# Functions temporarily excluded from parity checks.
+# Please add entries here sparingly: this list is a CI workaround for APIs with
+# special requirements, not a declaration that an op may remain native-only.
+# The goal is for every public c_ops function to have a working torch_ops
+# fallback; remove an entry once that fallback is implemented.
+_EXCLUDED_FUNCS: set[str] = set()
 
-# Plan types (StagingCopy, LaunchVar, BatchStep, KernelGroupSpec)
-# are native-only with no torch fallback — auto-discovered by bind_native.
-# NOTE: these previously had signature-only stubs (raised NotImplementedError
-# unconditionally) — not real fallbacks.
-_EXCLUDED_DESCS: set[str] = {
-    "StagingCopy",
-    "LaunchVar",
-    "BatchStep",
-    "KernelGroupSpec",
-    "CBGroupSpec",
-}
+# Descriptor classes temporarily excluded from parity checks.
+# Please add entries here sparingly for the same reason as _EXCLUDED_FUNCS:
+# exclusions are intended only to unblock CI for special cases, and each public
+# c_ops descriptor should ultimately have a working torch_ops fallback.
+_EXCLUDED_DESCS: set[str] = set()
 
 _fallback_callables = _public_callables(fallback)
 _c_ops_callables = _public_callables(c_ops) if HAS_C_OPS else {}
