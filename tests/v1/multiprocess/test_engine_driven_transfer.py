@@ -2,7 +2,7 @@
 # Standard
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol
 from unittest.mock import MagicMock, PropertyMock, patch
 import os
 import pickle
@@ -262,6 +262,43 @@ def _default_key(tokens: int = 8) -> "IPCCacheServerKey":
         end=tokens,
         request_id="req",
     )
+
+
+INSTANCE_ID_PREFETCH_COUNT_MISMATCH = 20
+INSTANCE_ID_MISSING_TENSOR_COMPONENT = 21
+INSTANCE_ID_INVALID_PICKLE_STORE = 22
+TEST_CPU_CHUNK_SHAPE = (2, 2, 8, 16)
+
+
+def _mock_prefetch_context_with_cleanup(
+    returned_objs: list[Any],
+    held_keys: list[str],
+    release: Callable[[list[str]], None],
+) -> Callable[[Any], ContextManager[list[Any]]]:
+    """Build a mock read-prefetched context manager with exception cleanup.
+
+    Args:
+        returned_objs: Objects yielded by the context manager.
+        held_keys: Keys released when an exception is raised by the caller.
+        release: Callback used to release held keys.
+
+    Returns:
+        Callable compatible with ``read_prefetched_results``; when invoked, it
+        returns a context manager that yields ``returned_objs`` and invokes
+        ``release(held_keys)`` only when an exception propagates out of the
+        context, mirroring the cleanup contract used by
+        ``StorageManager.read_prefetched_results``.
+    """
+
+    @contextmanager
+    def _read_prefetched_results(_keys_unused: Any) -> Iterator[list[Any]]:
+        try:
+            yield returned_objs
+        except Exception:
+            release(held_keys)
+            raise
+
+    return _read_prefetched_results
 
 
 def test_wrap_kv_caches_wraps_all_tensors() -> None:
@@ -1294,6 +1331,143 @@ def test_server_store_and_retrieve_cpu_chunks(
     recovered_chunks: list[torch.Tensor] = pickle.loads(cpu_data)
     assert len(recovered_chunks) == 1
     assert torch.allclose(recovered_chunks[0], payload)
+
+
+@pytest.mark.parametrize(
+    ("returned_obj_count", "held_keys"),
+    [
+        pytest.param(1, ["obj1"], id="fewer-than-requested"),
+        pytest.param(3, ["obj1", "obj2"], id="more-than-requested"),
+    ],
+)
+def test_server_prepare_retrieve_releases_locks_once_on_prefetch_count_mismatch(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+    returned_obj_count: int,
+    held_keys: list[str],
+) -> None:
+    """Validate mismatch count path releases held locks exactly once.
+
+    Args:
+        stub_native_storage_ops: Fixture stubbing native storage operations.
+        server_module_factory: Fixture creating a server module with mocked storage.
+        returned_obj_count: Number of objects returned by mocked prefetch context.
+        held_keys: Keys that represent held read locks during the mocked context.
+    """
+    mock_storage = MagicMock()
+    obj_keys = ["obj1", "obj2"]
+    memory_obj = MagicMock()
+    memory_obj.tensor = torch.zeros(TEST_CPU_CHUNK_SHAPE)
+    returned_objs = [memory_obj for _ in range(returned_obj_count)]
+    mock_storage.read_prefetched_results.side_effect = (
+        _mock_prefetch_context_with_cleanup(
+            returned_objs=returned_objs,
+            held_keys=held_keys,
+            release=mock_storage.finish_read_prefetched,
+        )
+    )
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h1", b"h2"]
+    module, _, _, _ = server_module_factory(
+        object_keys=obj_keys,
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=INSTANCE_ID_PREFETCH_COUNT_MISMATCH)
+    )
+
+    response = module.prepare_retrieve(
+        _default_key(tokens=16), INSTANCE_ID_PREFETCH_COUNT_MISMATCH
+    )
+
+    assert response == PrepareRetrieveResponse(success=False, data=b"", context={})
+    mock_storage.finish_read_prefetched.assert_called_once_with(held_keys)
+
+
+def test_server_prepare_retrieve_releases_locks_once_on_missing_tensor_component(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Validate missing tensor component path releases held locks exactly once.
+
+    Args:
+        stub_native_storage_ops: Fixture stubbing native storage operations.
+        server_module_factory: Fixture creating a server module with mocked storage.
+    """
+    mock_storage = MagicMock()
+    obj_keys = ["obj1", "obj2"]
+    good_memory_obj = MagicMock()
+    good_memory_obj.tensor = torch.zeros(TEST_CPU_CHUNK_SHAPE)
+    bad_memory_obj = MagicMock()
+    bad_memory_obj.tensor = None
+    mock_storage.read_prefetched_results.side_effect = (
+        _mock_prefetch_context_with_cleanup(
+            returned_objs=[good_memory_obj, bad_memory_obj],
+            held_keys=obj_keys,
+            release=mock_storage.finish_read_prefetched,
+        )
+    )
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h1", b"h2"]
+    module, _, _, _ = server_module_factory(
+        object_keys=obj_keys,
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=INSTANCE_ID_MISSING_TENSOR_COMPONENT)
+    )
+
+    response = module.prepare_retrieve(
+        _default_key(tokens=16), INSTANCE_ID_MISSING_TENSOR_COMPONENT
+    )
+
+    assert response == PrepareRetrieveResponse(success=False, data=b"", context={})
+    mock_storage.finish_read_prefetched.assert_called_once_with(obj_keys)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"not-a-pickle", id="malformed"),
+        pytest.param(
+            pickle.dumps([torch.zeros(TEST_CPU_CHUNK_SHAPE)])[:-2], id="truncated"
+        ),
+    ],
+)
+def test_server_commit_store_rejects_invalid_pickle_without_reservation(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+    payload: bytes,
+) -> None:
+    """Validate invalid pickle payload fails before any storage side effects.
+
+    Args:
+        stub_native_storage_ops: Fixture stubbing native storage operations.
+        server_module_factory: Fixture creating a server module with mocked storage.
+        payload: Malformed or truncated pickle payload passed to commit_store.
+    """
+    mock_storage = MagicMock()
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+    module, _, _, _ = server_module_factory(
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=INSTANCE_ID_INVALID_PICKLE_STORE)
+    )
+
+    result = module.commit_store(
+        _default_key(), INSTANCE_ID_INVALID_PICKLE_STORE, payload
+    )
+
+    assert result is False
+    mock_storage.reserve_write.assert_not_called()
+    mock_storage.finish_write.assert_not_called()
+    mock_storage.delete.assert_not_called()
+    mock_storage.rollback_write.assert_not_called()
 
 
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(
