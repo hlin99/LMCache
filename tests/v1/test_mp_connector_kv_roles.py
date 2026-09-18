@@ -358,6 +358,21 @@ def test_multi_connector_child_role_and_completion(
         (None, None),
         ({"request"} if peer_delays_free else None, None),
     ]
+    # Older vLLM versions call a child connector's get_finished(), whereas
+    # newer MultiConnector versions call get_transfer_results() directly.
+    # Keep both mocks aligned so this role contract is version-independent.
+    worker_peer.get_transfer_results.side_effect = [
+        SimpleNamespace(
+            finished_sending=set(),
+            finished_recving=set(),
+            failed_recving=set(),
+        ),
+        SimpleNamespace(
+            finished_sending={"request"} if peer_delays_free else set(),
+            finished_recving=set(),
+            failed_recving=set(),
+        ),
+    ]
     peer_factory = MagicMock(side_effect=[scheduler_peer, worker_peer])
 
     def connector_class(config: KVTransferConfig) -> Any:
