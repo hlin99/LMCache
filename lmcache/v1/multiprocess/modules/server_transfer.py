@@ -34,6 +34,19 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
     return str(dtype).split(".")[-1]
 
 
+class _PostPrefetchValidationError(Exception):
+    """Signal invalid prefetched data so context cleanup releases held read locks.
+
+    Raised when post-prefetch validation fails (e.g. count mismatch or missing
+    tensor component). The exception path triggers ``read_prefetched_results`` context
+    cleanup, ensuring held read locks are released exactly once.
+
+    This private control-flow exception is raised only inside
+    ``PickleTransferStrategy.prepare_retrieve`` and caught there immediately.
+    It carries no message or extra state.
+    """
+
+
 def create_transfer_strategy(
     storage_manager: "StorageManager",
     *,
@@ -207,9 +220,25 @@ class PickleTransferStrategy(TransferStrategy):
 
         Returns:
             ``True`` when every reserved object is written successfully.
+            Returns ``False`` when payload deserialization fails before any
+            storage reservation.
         """
         obj_keys = resolve_obj_keys(key)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        try:
+            chunks: list[torch.Tensor] = pickle.loads(cpu_data)
+        except (
+            pickle.PickleError,
+            EOFError,
+            AttributeError,
+            ImportError,
+            IndexError,
+        ):
+            # pickle.PickleError / EOFError: malformed or truncated payload bytes.
+            # AttributeError / ImportError: unresolved classes or modules.
+            # IndexError: malformed opcode/data stream edge cases.
+            # All decode failures must happen before any reserve_write side effect.
+            logger.exception("Failed to deserialize engine-driven store payload")
+            return False
         reserved_dict = self._storage_manager.reserve_write(
             obj_keys, context.layout_desc, "new"
         )
@@ -274,28 +303,38 @@ class PickleTransferStrategy(TransferStrategy):
         instance_id: int,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
-        """Read prefetched objects and return serialized pickle payload."""
+        """Read prefetched objects and return serialized pickle payload.
+
+        Notes:
+            When ``read_prefetched_results`` yields None/empty, storage-manager
+            context cleanup already released held reads; this method must not call
+            ``finish_read_prefetched`` for that branch.
+        """
         obj_keys = resolve_obj_keys(key)
-        prefetched_keys: list[ObjectKey] = []
+        should_release_locks = False
         try:
             read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
             with read_ctx as maybe_memory_objs:
-                if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
+                if not maybe_memory_objs:
+                    # ``read_prefetched_results`` yielded None/empty and owns its
+                    # cleanup in this branch; no extra release is needed here.
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
-                prefetched_keys = obj_keys[: len(maybe_memory_objs)]
+                if len(maybe_memory_objs) != len(obj_keys):
+                    raise _PostPrefetchValidationError
                 chunks = []
                 for memory_obj in maybe_memory_objs:
                     if memory_obj.tensor is None:
-                        return PrepareRetrieveResponse(
-                            success=False, data=b"", context={}
-                        )
+                        raise _PostPrefetchValidationError
                     chunks.append(memory_obj.tensor.cpu().clone())
+                should_release_locks = True
                 return PrepareRetrieveResponse(
                     success=True, data=pickle.dumps(chunks), context={}
                 )
+        except _PostPrefetchValidationError:
+            return PrepareRetrieveResponse(success=False, data=b"", context={})
         finally:
-            if prefetched_keys:
-                self._storage_manager.finish_read_prefetched(prefetched_keys)
+            if should_release_locks:
+                self._storage_manager.finish_read_prefetched(obj_keys)
 
     def commit_retrieve(
         self,
