@@ -1361,14 +1361,15 @@ void single_layer_kv_transfer_sgl(
  * @param direction H2D or D2H
  * @param host_buffer_offset the virtual offset in the lmcache memory allocator
  * @param host_buffer_alignments the alignment (i.e., cudaHostRegister
- * granularity) requirement of the host buffer. Must be power of two.
+ * granularity) requirement of the host buffer. Must be a positive power of two.
  */
 void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                           TransferDirection direction,
                           size_t host_buffer_offset,
                           size_t host_buffer_alignments) {
   // Check that host_buffer_alignments is power of two
-  TORCH_CHECK((host_buffer_alignments & (host_buffer_alignments - 1)) == 0,
+  TORCH_CHECK(host_buffer_alignments != 0 &&
+                  (host_buffer_alignments & (host_buffer_alignments - 1)) == 0,
               "host_buffer_alignments must be power of two");
 
   size_t offset = 0;

@@ -233,6 +233,27 @@ def scenario_rotary_embedding_k_fused(ops: Any, device: str) -> dict[str, torch.
     return results
 
 
+@pytest.mark.parametrize("module_name", ["lmcache.cuda_ops", "lmcache.xpu_ops"])
+@pytest.mark.parametrize("alignment", [0, 3, 63])
+@pytest.mark.parametrize("direction", [0, 1])
+def test_native_memcpy_async_rejects_invalid_alignment(
+    module_name: str, alignment: int, direction: int
+) -> None:
+    """Reject invalid alignment before accessing pointers, even for empty copies.
+
+    Args:
+        module_name: Native CUDA or SYCL extension to exercise.
+        alignment: Zero or a non-power-of-two host registration interval.
+        direction: H2D (0) or D2H (1).
+    """
+    ops = pytest.importorskip(module_name)
+    # An empty copy exposes the missing validation without hanging the old code.
+    with pytest.raises(
+        RuntimeError, match="host_buffer_alignments must be power of two"
+    ):
+        ops.lmcache_memcpy_async(0, 0, 0, direction, 0, alignment)
+
+
 def scenario_lmcache_memcpy_async(ops: Any, device: str) -> dict[str, torch.Tensor]:
     """Test lmcache_memcpy_async for H2D and D2H memory transfers.
 

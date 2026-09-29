@@ -993,7 +993,8 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                           TransferDirection direction,
                           size_t host_buffer_offset,
                           size_t host_buffer_alignments) {
-  TORCH_CHECK((host_buffer_alignments & (host_buffer_alignments - 1)) == 0,
+  TORCH_CHECK(host_buffer_alignments != 0 &&
+                  (host_buffer_alignments & (host_buffer_alignments - 1)) == 0,
               "host_buffer_alignments must be power of two");
 
   // SYCL USM memcpy infers direction from pointer allocation types;
