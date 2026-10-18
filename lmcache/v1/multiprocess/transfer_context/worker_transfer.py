@@ -38,7 +38,7 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
-from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
+from lmcache.v1.multiprocess.transfer_context.inline import EngineDrivenContextInline
 from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.platform import (
@@ -839,7 +839,7 @@ class EngineDrivenTransferContext(TransferContext):
         that group's block-id list (uniform coverage: every group stores and
         retrieves every chunk; sliding-window groups keep only the trailing
         window of each chunk). Works over both transports: SHM gathers into
-        server-reserved slots, pickle serializes a group-major payload.
+        server-reserved slots, inline sends a typed group-major envelope.
         Single-group registration keeps the legacy path (see
         ``_single_group_block_ids``).
         """
@@ -1186,8 +1186,8 @@ class EngineDrivenTransferContext(TransferContext):
                 f"got {len(block_ids)} block-id lists for "
                 f"{len(self._group_states)} registered groups"
             )
-        if isinstance(ctx, EngineDrivenContextPickle):
-            return self._submit_store_multigroup_pickle(ctx, key, kv_caches, block_ids)
+        if isinstance(ctx, EngineDrivenContextInline):
+            return self._submit_store_multigroup_inline(ctx, key, kv_caches, block_ids)
         device = _get_kv_device(kv_caches)
         synchronize_device(device)
         result = ctx.prepare_store_grouped(key, self._instance_id)
@@ -1219,23 +1219,23 @@ class EngineDrivenTransferContext(TransferContext):
         future.set_result(ok)
         return future
 
-    def _submit_store_multigroup_pickle(
+    def _submit_store_multigroup_inline(
         self,
-        ctx: "EngineDrivenContextPickle",
+        ctx: "EngineDrivenContextInline",
         key: Any,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
     ) -> MessagingFuture:
-        """Uniform-coverage store over pickle: group-major serialized payload.
+        """Uniform-coverage store over inline: one group-major envelope.
 
-        There are no server-reserved slots in pickle mode, so each group's
+        There are no server-reserved slots in inline mode, so each group's
         chunks are gathered into fresh CPU tensors and the whole
-        ``chunks[group][chunk]`` list is pickled in one COMMIT_STORE payload.
+        ``chunks[group][chunk]`` list is sent as one typed COMMIT_STORE envelope.
         """
         future: MessagingFuture[bool] = MessagingFuture()
         device = _get_kv_device(kv_caches)
         synchronize_device(device)
-        # Handshake only: the pickle strategy reserves nothing at prepare.
+        # Handshake only: the inline strategy reserves nothing at prepare.
         ctx.prepare_store(key, self._instance_id)
         group_chunks: list[list[torch.Tensor]] = []
         for gid, state in enumerate(self._group_states):
@@ -1257,22 +1257,41 @@ class EngineDrivenTransferContext(TransferContext):
         future.set_result(ok)
         return future
 
-    def _submit_retrieve_multigroup_pickle(
+    def _submit_retrieve_multigroup_inline(
         self,
-        ctx: "EngineDrivenContextPickle",
+        ctx: "EngineDrivenContextInline",
         key: Any,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
         event: IPCEvent | None,
         skip_first_n_tokens: int,
     ) -> MessagingFuture:
-        """Uniform-coverage retrieve over pickle: scatter a group-major payload."""
+        """Uniform-coverage retrieve over inline: scatter a group-major payload.
+
+        Each group's payload is validated against that group's registered
+        layout and the chunk count its block ids cover.
+        """
         future: MessagingFuture[bool] = MessagingFuture()
         device = _get_kv_device(kv_caches)
-        group_chunks = ctx.prepare_retrieve_multigroup(key, self._instance_id)
+        expected: list[tuple[torch.Size, torch.dtype, int]] = []
+        for gid, state in enumerate(self._group_states):
+            if len(block_ids[gid]) % state.blocks_in_chunk != 0:
+                raise ValueError(
+                    "Engine block count must be divisible by blocks_in_chunk: "
+                    f"group={gid}, blocks={len(block_ids[gid])}, "
+                    f"blocks_in_chunk={state.blocks_in_chunk}"
+                )
+            expected.append(
+                (
+                    state.layout_desc.shapes[0],
+                    state.layout_desc.dtypes[0],
+                    len(block_ids[gid]) // state.blocks_in_chunk,
+                )
+            )
+        group_chunks = ctx.prepare_retrieve_multigroup(key, self._instance_id, expected)
         if group_chunks is not None and len(group_chunks) != len(self._group_states):
             logger.error(
-                "pickle retrieve returned %d groups for %d registered groups",
+                "inline retrieve returned %d groups for %d registered groups",
                 len(group_chunks),
                 len(self._group_states),
             )
@@ -1319,8 +1338,8 @@ class EngineDrivenTransferContext(TransferContext):
                 f"got {len(block_ids)} block-id lists for "
                 f"{len(self._group_states)} registered groups"
             )
-        if isinstance(ctx, EngineDrivenContextPickle):
-            return self._submit_retrieve_multigroup_pickle(
+        if isinstance(ctx, EngineDrivenContextInline):
+            return self._submit_retrieve_multigroup_inline(
                 ctx, key, kv_caches, block_ids, event, skip_first_n_tokens
             )
         device = _get_kv_device(kv_caches)

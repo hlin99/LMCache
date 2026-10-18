@@ -7,9 +7,10 @@ Tests for engine-driven multi-group (uniform coverage) transfers.
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock
-import pickle as _pickle
+import pickle
 
 # Third Party
+import msgspec
 import pytest
 import torch
 
@@ -21,13 +22,18 @@ from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-from lmcache.v1.multiprocess.modules.server_transfer import PickleTransferStrategy
+from lmcache.v1.multiprocess.modules.server_transfer import InlineTransferStrategy
 from lmcache.v1.multiprocess.transfer_context import worker_transfer
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
     compute_kv_layout,
 )
-from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
+from lmcache.v1.multiprocess.transfer_context.inline import EngineDrivenContextInline
+from lmcache.v1.multiprocess.transfer_context.tensor_wire import (
+    decode_grouped_tensors,
+    encode_grouped_tensors,
+    encode_tensors,
+)
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
 )
@@ -91,7 +97,7 @@ def test_shm_strategy_multigroup_store_and_retrieve_roundtrip() -> None:
     )
     from lmcache.v1.distributed.storage_manager import StorageManager
     from lmcache.v1.multiprocess.modules.server_transfer import (
-        PickleTransferStrategy,
+        InlineTransferStrategy,
         ShmTransferStrategy,
     )
 
@@ -113,7 +119,7 @@ def test_shm_strategy_multigroup_store_and_retrieve_roundtrip() -> None:
             pending_reads={},
             pending_lock=__import__("threading").Lock(),
             transfer_key_factory=lambda key, iid: (iid, key),
-            fallback_strategy=PickleTransferStrategy(sm),
+            fallback_strategy=InlineTransferStrategy(sm),
         )
         metadata = _group_metadata()
         key = IPCCacheServerKey.from_token_ids(
@@ -342,22 +348,22 @@ def test_register_accepts_sliding_window_groups() -> None:
     assert payload.group_layouts[1].window_tokens == sw_tokens  # sliding window
 
 
-def _pickle_worker_ctx(monkeypatch):
-    """Worker context with two groups over a real pickle transfer context."""
+def _inline_worker_ctx(monkeypatch):
+    """Worker context with two groups over a real inline transfer context."""
     ctx, calls = _fanout_ctx(monkeypatch)
-    pctx = EngineDrivenContextPickle(
+    pctx = EngineDrivenContextInline(
         metadata=MagicMock(), req_client=MagicMock(), mq_timeout=0.1
     )
     ctx._engine_driven_context = pctx
     return ctx, pctx, calls
 
 
-def test_submit_store_multigroup_pickle_sends_group_major_payload(
+def test_submit_store_multigroup_inline_sends_group_major_payload(
     monkeypatch,
 ) -> None:
-    """Pickle store gathers each group into fresh CPU chunks (no slots) and
+    """Inline store gathers each group into fresh CPU chunks (no slots) and
     commits one group-major payload."""
-    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
     gathered = [["g0c0", "g0c1"], ["g1c0"]]
     calls: list[dict] = []
     events: list[str] = []
@@ -399,13 +405,13 @@ def test_submit_store_multigroup_pickle_sends_group_major_payload(
     assert "sync" in events[last_gather + 1 : commit_idx]
 
 
-def test_submit_retrieve_multigroup_pickle_scatters_group_major(
+def test_submit_retrieve_multigroup_inline_scatters_group_major(
     monkeypatch,
 ) -> None:
-    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
     ctx._engine_type = "sentinel-engine"
     payload = [[torch.ones(1)], [torch.ones(1) * 2]]
-    monkeypatch.setattr(pctx, "prepare_retrieve_multigroup", lambda _k, _i: payload)
+    monkeypatch.setattr(pctx, "prepare_retrieve_multigroup", lambda _k, _i, _e: payload)
     order: list[str] = []
     scattered: list[dict] = []
 
@@ -436,13 +442,13 @@ def test_submit_retrieve_multigroup_pickle_scatters_group_major(
     assert all(s["engine_type"] == "sentinel-engine" for s in scattered)
 
 
-def test_submit_retrieve_multigroup_pickle_group_count_mismatch(
+def test_submit_retrieve_multigroup_inline_group_count_mismatch(
     monkeypatch,
 ) -> None:
     """A payload whose group count differs from the registration is a miss."""
-    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
     monkeypatch.setattr(
-        pctx, "prepare_retrieve_multigroup", lambda _k, _i: [[torch.ones(1)]]
+        pctx, "prepare_retrieve_multigroup", lambda _k, _i, _e: [[torch.ones(1)]]
     )
     kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
     future = ctx.submit_retrieve("req", MagicMock(), kv, [[1, 2], [3]], MagicMock(), 2)
@@ -459,7 +465,7 @@ class _FakeMemoryObj:
 
 
 class _FakeStorageManager:
-    """In-memory reserve/read double for the pickle strategy.
+    """In-memory reserve/read double for the inline strategy.
 
     Each object group is placed in its own L1 manager, so writes must be
     completed by owner: ``finish_write(keys)`` refuses a multi-L1 setup.
@@ -513,21 +519,21 @@ class _FakeStorageManager:
         self.finished_reads.extend(keys)
 
 
-def test_pickle_strategy_multigroup_store_retrieve_roundtrip() -> None:
-    """Group-major pickle commit writes each group against its own layout;
+def test_inline_strategy_multigroup_store_retrieve_roundtrip() -> None:
+    """Group-major inline commit writes each group against its own layout;
     retrieve returns a group-major payload and is all-or-nothing. With the
     groups in different L1 managers, writes complete by owner and reads carry
     the request's L1 owners."""
     shapes: dict[int, tuple[int, ...]] = {0: (2, 2, 8, 16), 1: (2, 1, 8, 4)}
     sm = _FakeStorageManager(shapes)
     owners = {_obj_key(1, 0): 0, _obj_key(1, 1): 1}
-    strategy = PickleTransferStrategy(
+    strategy = InlineTransferStrategy(
         sm,  # type: ignore[arg-type]
         read_owner_resolver=lambda _request_id: owners,
     )
     metadata = _group_metadata()
     key = IPCCacheServerKey.from_token_ids(
-        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req-pkl"
+        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req-inline"
     )
     group_keys = [
         [_obj_key(1, 0), _obj_key(2, 0)],
@@ -542,7 +548,7 @@ def test_pickle_strategy_multigroup_store_retrieve_roundtrip() -> None:
         strategy.commit_store(
             key=key,
             instance_id=7,
-            cpu_data=_pickle.dumps(payload),
+            cpu_data=encode_grouped_tensors(payload),
             context=metadata,
             resolve_obj_keys=lambda _k: group_keys[0],
             group_keys=group_keys,
@@ -560,7 +566,13 @@ def test_pickle_strategy_multigroup_store_retrieve_roundtrip() -> None:
         group_keys=group_keys,
     )
     assert ret.success is True
-    retrieved = _pickle.loads(ret.data)
+    retrieved = decode_grouped_tensors(
+        ret.data,
+        expected=[
+            (torch.Size(shapes[0]), torch.float32, 2),
+            (torch.Size(shapes[1]), torch.float32, 2),
+        ],
+    )
     assert len(retrieved) == 2
     assert torch.equal(retrieved[0][1], payload[0][1])
     assert len(sm.finished_reads) == 4
@@ -577,16 +589,16 @@ def test_pickle_strategy_multigroup_store_retrieve_roundtrip() -> None:
     assert ret_miss.success is False
 
 
-def test_pickle_strategy_store_shape_mismatch_releases_reservations() -> None:
-    """A chunk whose shape disagrees with the reserved layout fails the store,
+def test_inline_strategy_store_shape_mismatch_releases_reservations() -> None:
+    """A chunk whose shape disagrees with the reserved object fails the store,
     and the unwritten reservations are released and deleted -- they must not
     wedge later writes or surface as garbage cache hits."""
     shapes: dict[int, tuple[int, ...]] = {0: (2, 2, 8, 16), 1: (2, 1, 4, 4)}
     sm = _FakeStorageManager(shapes)
-    strategy = PickleTransferStrategy(sm)  # type: ignore[arg-type]
+    strategy = InlineTransferStrategy(sm)  # type: ignore[arg-type]
     metadata = _group_metadata()
     key = IPCCacheServerKey.from_token_ids(
-        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req-pkl-mismatch"
+        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req-inline-mismatch"
     )
     group_keys = [
         [_obj_key(1, 0), _obj_key(2, 0)],
@@ -603,7 +615,7 @@ def test_pickle_strategy_store_shape_mismatch_releases_reservations() -> None:
         strategy.commit_store(
             key=key,
             instance_id=7,
-            cpu_data=_pickle.dumps(payload),
+            cpu_data=encode_grouped_tensors(payload),
             context=metadata,
             resolve_obj_keys=lambda _k: group_keys[0],
             group_keys=group_keys,
@@ -704,7 +716,7 @@ def test_register_payload_carries_per_group_kv_size() -> None:
     """A two-plane K/V group beside a one-plane (index-cache style) group must
     report each group's own plane count. The top-level ``use_mla`` describes
     only the first layer, so a server sizing every group from it reserves the
-    one-plane group with two planes and pickle store fails on the shape."""
+    one-plane group with two planes and inline store fails on the shape."""
     kv = {
         "layer_0": torch.zeros(2, 4, 4, 2, 8),  # separate K/V planes
         "layer_1": torch.zeros(4, 4, 16),  # single plane
@@ -741,3 +753,63 @@ def test_register_rejects_compressed_group() -> None:
                 ),
             ],
         )
+
+
+@pytest.mark.parametrize(
+    "make_payload",
+    [
+        pytest.param(
+            lambda shapes: encode_grouped_tensors(
+                [
+                    [torch.zeros(shapes[0]) for _ in range(2)],
+                    # One tensor in group 1 does not match its registered layout.
+                    [torch.zeros(shapes[1]), torch.zeros((2, 1, 4, 4))],
+                ]
+            ),
+            id="group-shape-mismatch",
+        ),
+        pytest.param(
+            lambda shapes: encode_grouped_tensors(
+                [[torch.zeros(shapes[0]) for _ in range(2)]]
+            ),
+            id="group-count-mismatch",
+        ),
+        pytest.param(
+            lambda shapes: encode_tensors([torch.zeros(shapes[0]) for _ in range(2)]),
+            id="flat-envelope",
+        ),
+        pytest.param(
+            lambda shapes: pickle.dumps([[torch.zeros(shapes[0])]]),
+            id="pickle",
+        ),
+    ],
+)
+def test_inline_strategy_multigroup_rejects_payload_before_storage(
+    make_payload,
+) -> None:
+    """A multi-group payload that does not match every group's registered
+    layout -- wrong shape in one group, wrong group count, a single-group
+    envelope, or a legacy pickle -- is refused while decoding, before any
+    object is reserved."""
+    shapes: dict[int, tuple[int, ...]] = {0: (2, 2, 8, 16), 1: (2, 1, 8, 4)}
+    sm = _FakeStorageManager(shapes)
+    strategy = InlineTransferStrategy(sm)  # type: ignore[arg-type]
+    key = IPCCacheServerKey.from_token_ids(
+        "m", 1, 0, [1] * 16, start=0, end=16, request_id="req-inline-reject"
+    )
+    group_keys = [
+        [_obj_key(1, 0), _obj_key(2, 0)],
+        [_obj_key(1, 1), _obj_key(2, 1)],
+    ]
+
+    with pytest.raises((ValueError, msgspec.DecodeError)):
+        strategy.commit_store(
+            key=key,
+            instance_id=7,
+            cpu_data=make_payload(shapes),
+            context=_group_metadata(),
+            resolve_obj_keys=lambda _k: group_keys[0],
+            group_keys=group_keys,
+        )
+    assert sm.objs == {}
+    assert sm.finished_writes == []

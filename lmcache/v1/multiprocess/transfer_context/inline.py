@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inline EngineDrivenContext implementation for multiprocess mode."""
 
+# Standard
+from typing import cast
+
 # Third Party
 import torch
 
@@ -11,7 +14,9 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
 )
 from lmcache.v1.multiprocess.transfer_context.tensor_wire import (
+    decode_grouped_tensors,
     decode_tensors,
+    encode_grouped_tensors,
     encode_tensors,
 )
 from lmcache.v1.multiprocess.transport.base import RequestClient
@@ -56,14 +61,20 @@ class EngineDrivenContextInline(EngineDrivenContext):
     ) -> bool:
         """Serialize chunks and send via COMMIT_STORE.
 
-        Single-group callers pass a flat chunk list; multi-group callers pass
-        a group-major ``chunks[group][chunk]`` list (the server side picks the
-        shape from its registered group count).
+        Single-group callers pass a flat chunk list, sent as a tensor
+        envelope; multi-group callers pass a group-major
+        ``chunks[group][chunk]`` list, sent as a grouped envelope that the
+        server validates against each group's registered layout.
 
         Returns:
             ``True`` on success, ``False`` on failure or timeout.
         """
-        serialised = encode_tensors(chunks)
+        if chunks and isinstance(chunks[0], list):
+            serialised = encode_grouped_tensors(
+                cast("list[list[torch.Tensor]]", chunks)
+            )
+        else:
+            serialised = encode_tensors(cast("list[torch.Tensor]", chunks))
         future = self.req_client.commit_store(key, instance_id, serialised)
         try:
             return bool(future.result(timeout=self.mq_timeout))
@@ -99,14 +110,23 @@ class EngineDrivenContextInline(EngineDrivenContext):
         )
 
     def prepare_retrieve_multigroup(
-        self, key: IPCCacheServerKey, instance_id: int
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        expected: list[tuple[torch.Size, torch.dtype, int]],
     ) -> list[list[torch.Tensor]] | None:
-        """Send PREPARE_RETRIEVE and deserialize a group-major payload.
+        """Send PREPARE_RETRIEVE and decode a group-major payload.
 
         The server responds with ``chunks[group][chunk]`` covering every chunk
         of every group (all-or-nothing), or a miss. Named apart from the SHM
         ``prepare_retrieve_grouped`` because the result is the chunk data
         itself, not slot views.
+
+        Args:
+            key: Cache key to retrieve.
+            instance_id: Worker instance identifier.
+            expected: One ``(shape, dtype, chunk_count)`` per group, from the
+                worker's registered group layouts and block geometry.
 
         Returns:
             Group-major chunk lists on hit, or None on miss/timeout.
@@ -118,8 +138,7 @@ class EngineDrivenContextInline(EngineDrivenContext):
             return None
         if not response.success or not response.data:
             return None
-        group_chunks: list[list[torch.Tensor]] = pickle.loads(response.data)
-        return group_chunks
+        return decode_grouped_tensors(response.data, expected=expected)
 
     def commit_retrieve(self, key: IPCCacheServerKey, instance_id: int) -> bool:
         """Send COMMIT_RETRIEVE (no-op for inline path)."""

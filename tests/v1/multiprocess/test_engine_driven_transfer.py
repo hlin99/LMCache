@@ -1092,9 +1092,9 @@ def test_scatter_unpinned_chunks_survive_back_to_back_groups() -> None:
     stream tracking cannot see. Without completing the launches before the
     temporaries are released, the caching host allocator hands their memory
     to the next group's pin_memory() while the previous group's copies are
-    still in flight -- the engine-driven pickle retrieve path scatters one
+    still in flight -- the engine-driven inline retrieve path scatters one
     group after another and hit exactly this. Unpinned inputs are the
-    contract here: the pickle payload arrives unpickled and unpinned.
+    contract here: the inline payload arrives decoded and unpinned.
     """
     # Third Party
     import pytest as _pytest
@@ -1136,7 +1136,7 @@ def test_scatter_unpinned_chunks_survive_back_to_back_groups() -> None:
                 )
                 for i in range(num_layers)
             ]
-            # Plain (unpinned) CPU tensors, as an unpickled payload would be.
+            # Plain (unpinned) CPU tensors, as a decoded inline payload would be.
             chunks.append(
                 torch.stack(per_layer, dim=1)
                 .reshape(2, num_layers, bpc * block_size, heads * hs)
@@ -1165,7 +1165,7 @@ def test_gather_sliding_window_allocates_window_sized_chunks(
     """out=None gather for a sliding-window group must allocate window-sized
     chunks: that is the shape the server reserves for the group
     (``GroupLayout.window_tokens``), so a chunk-sized buffer makes the
-    pickle-path commit_store reject every chunk. The chunk content is the
+    inline-path commit_store reject every chunk. The chunk content is the
     trailing window blocks, and scatter writes it back to the trailing
     blocks of each destination chunk."""
     # First Party
@@ -1699,7 +1699,7 @@ def test_register_multigroup_sizes_each_group_by_its_kv_size(
 ) -> None:
     """The server must size each group from its own ``kv_size``, not from the
     top-level ``use_mla``, or a mixed-plane model reserves one group with the
-    wrong shape and every pickle store for it fails on the shape check."""
+    wrong shape and every inline store for it fails on the shape check."""
     # First Party
     from lmcache.v1.multiprocess.custom_types import (
         GroupLayout,
