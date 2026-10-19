@@ -102,9 +102,9 @@ ENGINE_DRIVEN_TRANSPORT="${ENGINE_DRIVEN_TRANSPORT:-}"
 L1_LAZY_ARG=""
 
 case "$ENGINE_DRIVEN_TRANSPORT" in
-    ""|pickle|shm) ;;
+    ""|inline|shm) ;;
     *)
-        echo "ERROR: ENGINE_DRIVEN_TRANSPORT must be 'pickle' or 'shm', got '$ENGINE_DRIVEN_TRANSPORT'"
+        echo "ERROR: ENGINE_DRIVEN_TRANSPORT must be 'inline' or 'shm', got '$ENGINE_DRIVEN_TRANSPORT'"
         exit 1
         ;;
 esac
@@ -112,7 +112,7 @@ esac
 # The SHM-backed L1 pool needs BOTH a non-lazy allocation and an explicit
 # --shm-name: the default name "" disables the pool (and lazy allocation
 # disables it regardless), in which case engine_driven silently falls back to
-# the pickle transport. Mirrors launch-processes.sh.
+# the inline transport. Mirrors launch-processes.sh.
 SHM_NAME_ARG=""
 if [ "${L1_USE_LAZY:-true}" = "false" ]; then
     L1_LAZY_ARG="--no-l1-use-lazy"
@@ -281,7 +281,7 @@ assert_engine_driven_transport_active() {
 
     local marker
     case "$ENGINE_DRIVEN_TRANSPORT" in
-        pickle) marker="Using pickle non-GPU transfer strategy" ;;
+        inline) marker="Using safe inline non-GPU transfer strategy" ;;
         shm) marker="Using shm non-GPU transfer strategy" ;;
     esac
     local max_wait=30

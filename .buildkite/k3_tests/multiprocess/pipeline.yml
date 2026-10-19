@@ -242,7 +242,7 @@ steps:
         artifact_paths: ["*.log"]
 
       # Engine-driven coverage for the same cross-TP-rank restore. Both
-      # transports are exercised: pickle keeps L1 allocation lazy, while SHM
+      # transports are exercised: inline keeps L1 allocation lazy, while SHM
       # disables it so the test's 80Gi L1 pool is actually mapped, which needs
       # the dedicated /dev/shm pod below.
       - label: ":electric_plug: kimi_linear_tp_engine_driven / {{matrix.transport}}"
@@ -250,14 +250,14 @@ steps:
           export LMCACHE_MP_TRANSFER_MODE="engine_driven"
           export ENGINE_DRIVEN_TRANSPORT="{{matrix.transport}}"
           case "{{matrix.transport}}" in
-            pickle) export L1_USE_LAZY="true" ;;
+            inline) export L1_USE_LAZY="true" ;;
             shm) export L1_USE_LAZY="false" ;;
           esac
           .buildkite/k3_tests/multiprocess/run.sh kimi_linear_tp
         matrix:
           setup:
             transport:
-              - "pickle"
+              - "inline"
               - "shm"
         env:
           INFERENCE_ENGINE: "vllm"
