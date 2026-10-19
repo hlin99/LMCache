@@ -320,7 +320,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     payload.instance_id,
                 )
                 return RegisterEngineDrivenContextResponse(
-                    shm_name=shm_name, pool_size=pool_size
+                    shm_name=shm_name,
+                    pool_size=pool_size,
+                    null_block_id=self._ctx.null_block_id,
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -377,11 +379,22 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 group_layouts.append(
                     MemoryLayoutDesc(shapes=[g_shape], dtypes=[g_dtype])
                 )
+        group_windows: list[int] | None = None
+        if payload.group_layouts:
+            group_windows = []
+            for gl in payload.group_layouts:
+                if gl.window_chunks < 0:
+                    raise ValueError(
+                        f"Invalid group window_chunks {gl.window_chunks} in "
+                        "engine-driven registration"
+                    )
+                group_windows.append(gl.window_chunks or -1)
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
             block_size=payload.block_size,
             use_mla=payload.use_mla,
             group_layouts=group_layouts,
+            group_windows=group_windows,
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
@@ -421,12 +434,19 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             # default single-group desc makes lookup prefetch only group 0 --
             # every later group then misses at retrieve (unsafe_read finds no
             # read-locked objects) and vLLM consumes the unloaded blocks. Match
-            # the desc's group count to the worker's. Engine-driven storage is
-            # uniform-coverage (every chunk of every group is stored), so each
-            # group is registered full-attention.
+            # the desc's group count to the worker's, with each group's own
+            # window and kind: sliding-window and recurrent-state groups need
+            # only their trailing chunks for a hit, and the worker never stores
+            # their all-null earlier chunks, so a full-prefix window would make
+            # every lookup on such a model miss.
+            assert group_windows is not None
             attn_desc = AttnWindowDesc(
-                num_chunks_in_sw=[-1] * len(group_layouts),
+                num_chunks_in_sw=group_windows,
                 world_size=payload.world_size,
+                group_kinds=tuple(
+                    "recurrent" if gl.recurrent else "attention"
+                    for gl in payload.group_layouts
+                ),
             )
             self._ctx.layout_desc_registry.register(
                 payload.model_name,
@@ -440,7 +460,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 payload.model_name, payload.world_size, layout_desc
             )
         return RegisterEngineDrivenContextResponse(
-            shm_name=shm_name, pool_size=pool_size
+            shm_name=shm_name,
+            pool_size=pool_size,
+            null_block_id=self._ctx.null_block_id,
         )
 
     @request_handler(operation="unregister_kv_cache_engine_driven_context")

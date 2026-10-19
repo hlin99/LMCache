@@ -172,6 +172,12 @@ class GroupLayout(msgspec.Struct):
             of one model can differ, so the server must not size them from the
             top-level ``use_mla``. ``0`` means "unreported" (legacy workers)
             and falls back to the top-level ``use_mla``.
+        window_chunks: Trailing LMCache chunks this group needs for a cache
+            hit (its attention window, rounded up to whole chunks). ``0``
+            means full attention, the whole prefix, which is also what
+            workers that predate windows send.
+        recurrent: Whether the group's pages hold recurrent state snapshots
+            (Mamba/GDN/linear attention) rather than per-token attention KV.
     """
 
     num_layers: int
@@ -180,6 +186,8 @@ class GroupLayout(msgspec.Struct):
     tokens_per_block: int
     window_tokens: int = 0
     kv_size: int = 0
+    window_chunks: int = 0
+    recurrent: bool = False
 
 
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
@@ -217,10 +225,18 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
 
 @dataclass
 class RegisterEngineDrivenContextResponse:
-    """Shared response for engine-driven context registration."""
+    """Shared response for engine-driven context registration.
+
+    Attributes:
+        shm_name: Name of the server's SHM-backed L1 pool, or ``""``.
+        pool_size: Size of that pool in bytes.
+        null_block_id: Engine block ID the server treats as absent KV data.
+            Workers skip storing chunks whose blocks are all this ID.
+    """
 
     shm_name: str = ""
     pool_size: int = 0
+    null_block_id: int = 0
 
 
 @dataclass

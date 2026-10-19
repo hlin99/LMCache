@@ -872,3 +872,31 @@ def test_register_uses_adapter_chunk_size_over_local_group_lcm() -> None:
 
     with pytest.raises(ValueError, match="not a positive multiple"):
         _register_with(lmcache_chunk_tokens=bs + 1)
+
+
+def test_register_payload_carries_group_windows_and_kinds() -> None:
+    """Each group reports the trailing chunks it needs for a hit: full
+    attention sends 0 (whole prefix), a sliding window rounds up to whole
+    chunks, and a recurrent-state group keeps its one-chunk window."""
+    kv = {f"layer_{i}": torch.zeros(2, 8, 4, 2, 8) for i in range(3)}
+    bs = _detected_block_size(kv)
+    payload, ctx = _register_capturing_payload(
+        kv,
+        [
+            EngineGroupInfo(engine_group_id=0, layer_indices=(0,)),
+            EngineGroupInfo(
+                engine_group_id=1, layer_indices=(1,), sw_size_tokens=3 * bs
+            ),
+            EngineGroupInfo(
+                engine_group_id=2,
+                layer_indices=(2,),
+                sw_size_tokens=bs,
+                recurrent_state=True,
+            ),
+        ],
+    )
+
+    # blocks_in_chunk=2, so a chunk is 2 * bs tokens: 3 * bs needs 2 chunks.
+    assert [gl.window_chunks for gl in payload.group_layouts] == [0, 2, 1]
+    assert [gl.recurrent for gl in payload.group_layouts] == [False, False, True]
+    assert [s.window_chunks for s in ctx._group_states] == [-1, 2, 1]

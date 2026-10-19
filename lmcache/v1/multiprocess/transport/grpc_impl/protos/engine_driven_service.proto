@@ -17,6 +17,8 @@ message GroupLayout {
   int64 tokens_per_block = 4;
   int64 window_tokens = 5;
   int64 kv_size = 6;
+  int64 window_chunks = 7;
+  bool recurrent = 8;
 }
 
 message RegisterKvCacheEngineDrivenContextRequest {
@@ -35,6 +37,7 @@ message RegisterKvCacheEngineDrivenContextRequest {
 message RegisterKvCacheEngineDrivenContextResponse {
   string shm_name = 1;
   int64 pool_size = 2;
+  int64 null_block_id = 3;
 }
 
 message UnregisterKvCacheEngineDrivenContextRequest {

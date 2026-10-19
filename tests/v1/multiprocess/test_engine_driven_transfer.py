@@ -1678,6 +1678,52 @@ def test_register_multigroup_sizes_object_group_count(
     assert set(group_descs) == {0, 1}
 
 
+def test_register_multigroup_registers_group_windows_and_kinds(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """The server registers each group's own window and kind, so lookup and
+    prefetch need only a sliding-window or recurrent group's trailing chunks,
+    and it tells the worker which block ID it treats as absent."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        GroupLayout,
+        RegisterEngineDrivenContextPayload,
+    )
+
+    module, _, _, ctx = server_module_factory(chunk_size=16)
+    ctx._null_block_id = 7
+
+    def _group(window_chunks: int, recurrent: bool) -> GroupLayout:
+        return GroupLayout(
+            num_layers=1,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            tokens_per_block=4,
+            window_chunks=window_chunks,
+            recurrent=recurrent,
+        )
+
+    response = module.register_kv_cache_engine_driven_context(
+        RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=3,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            group_layouts=[_group(0, False), _group(2, False), _group(1, True)],
+        )
+    )
+
+    attn_desc = ctx.layout_desc_registry.find_attn_desc("m", 1)
+    assert attn_desc.num_chunks_in_sw == [-1, 2, 1]
+    assert attn_desc.group_kinds == ("attention", "attention", "recurrent")
+    assert response.null_block_id == 7
+
+
 @pytest.mark.parametrize(
     ("use_mla", "kv_sizes", "expected_planes"),
     [

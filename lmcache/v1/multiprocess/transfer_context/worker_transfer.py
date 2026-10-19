@@ -193,6 +193,9 @@ class _GroupState:
             only the trailing ``blocks_per_window`` blocks of each chunk are
             gathered / scattered.
         layout_desc: Chunk layout for this group's objects.
+        window_chunks: Trailing chunks this group needs for a cache hit
+            (``-1`` = full attention). A retrieve returns only these chunks
+            for the group, mirroring the server's prefetch window.
     """
 
     layer_names: list[str]
@@ -200,6 +203,7 @@ class _GroupState:
     blocks_in_chunk: int
     blocks_per_window: int
     layout_desc: MemoryLayoutDesc
+    window_chunks: int = -1
 
 
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
@@ -811,6 +815,8 @@ class EngineDrivenTransferContext(TransferContext):
         # Multi-group worker state; empty means single-group (stage: filled
         # by register() for hybrid-KV models).
         self._group_states: list = []
+        # Engine block ID the server treats as absent KV (from registration).
+        self._null_block_id = 0
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -933,6 +939,9 @@ class EngineDrivenTransferContext(TransferContext):
                 # chunk; for full attention the window is the whole chunk and
                 # everything below collapses to full-coverage behaviour.
                 window_tokens = manager.get_subchunk_sw_size_tokens(gid)
+                # Trailing chunks this group needs for a hit; the server sizes
+                # lookup/prefetch and the retrieve by it (-1 = full prefix).
+                window_chunks = manager.get_kernel_group_window_chunks(gid)
                 group_dtype_str = str(kernel_group.dtype).removeprefix("torch.")
                 group_shape = (
                     torch.Size(
@@ -960,6 +969,8 @@ class EngineDrivenTransferContext(TransferContext):
                         tokens_per_block=tokens_per_block,
                         window_tokens=window_tokens,
                         kv_size=kernel_group.shape_desc.kv_size,
+                        window_chunks=max(window_chunks, 0),
+                        recurrent=kernel_group.recurrent_state,
                     )
                 )
                 group_states.append(
@@ -973,6 +984,7 @@ class EngineDrivenTransferContext(TransferContext):
                         layout_desc=MemoryLayoutDesc(
                             shapes=[group_shape], dtypes=[kernel_group.dtype]
                         ),
+                        window_chunks=window_chunks,
                     )
                 )
             # Group 0's layout doubles as the legacy top-level layout so
@@ -1013,9 +1025,12 @@ class EngineDrivenTransferContext(TransferContext):
             return
         shm_name = ""
         pool_size = 0
+        null_block_id = 0
         if isinstance(response, RegisterEngineDrivenContextResponse):
             shm_name = response.shm_name
             pool_size = response.pool_size
+            null_block_id = response.null_block_id
+        self._null_block_id = null_block_id
 
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,

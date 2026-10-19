@@ -82,12 +82,17 @@ class EngineDrivenContextMetadata:
         use_mla: Whether the worker KV format is MLA.
         group_layouts: Per-LMCache-group layouts for multi-group (hybrid-KV)
             workers, in protocol group order. ``None`` means single-group.
+        group_windows: Per-group trailing-chunk windows parallel to
+            ``group_layouts`` (``-1`` = full attention). A retrieve serves
+            only each group's in-window suffix. ``None`` means every group is
+            full attention.
     """
 
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
     group_layouts: "list[MemoryLayoutDesc] | None" = None
+    group_windows: "list[int] | None" = None
 
 
 class EngineDrivenContext(ABC):
