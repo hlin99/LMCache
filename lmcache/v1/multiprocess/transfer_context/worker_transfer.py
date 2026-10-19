@@ -817,6 +817,8 @@ class EngineDrivenTransferContext(TransferContext):
         self._group_states: list = []
         # Engine block ID the server treats as absent KV (from registration).
         self._null_block_id = 0
+        # Tokens in one LMCache chunk (multi-group registration).
+        self._chunk_tokens = 0
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -903,6 +905,7 @@ class EngineDrivenTransferContext(TransferContext):
                         f"sizes (lcm {local_lcm})"
                     )
                 chunk_tokens = lmcache_chunk_tokens
+            self._chunk_tokens = chunk_tokens
             layer_names = list(kv_caches)
             normalized_kv, per_layer_formats = normalize_and_discover_per_layer_formats(
                 list(kv_caches.values()),
@@ -1206,33 +1209,63 @@ class EngineDrivenTransferContext(TransferContext):
             return picked, None
         return picked, [chunk_indices[i] for i in idxs]
 
-    def _submit_store_multigroup(
-        self,
-        key: Any,
-        kv_caches: dict[str, torch.Tensor],
-        block_ids: list[list[int]],
-    ) -> MessagingFuture:
-        """Uniform-coverage store: gather every group's chunks into its slots."""
-        ctx = self._engine_driven_context
-        assert ctx is not None
-        future: MessagingFuture[bool] = MessagingFuture()
+    def _null_chunk_indices(self, block_ids: list[list[int]]) -> list[list[int]]:
+        """Per group, the chunks whose engine blocks are all the null block.
+
+        Sliding-window groups lose their out-of-window blocks and align-mode
+        recurrent (Mamba/linear-attention) groups keep only the block holding
+        the last state, so their earlier chunks are entirely the null block.
+        Those chunks carry no valid KV and must never be stored: object keys
+        are prefix hashes, so a later shorter-prefix hit would restore them.
+        Mirrors ``all_null_chunk_masks`` on the lmcache-driven path.
+        """
+        null_id = self._null_block_id
+        skipped: list[list[int]] = []
+        for gid, state in enumerate(self._group_states):
+            bpc = state.blocks_in_chunk
+            ids = block_ids[gid]
+            skipped.append(
+                [
+                    c
+                    for c in range(len(ids) // bpc)
+                    if all(b == null_id for b in ids[c * bpc : (c + 1) * bpc])
+                ]
+            )
+        return skipped
+
+    def _check_group_block_ids(self, block_ids: list[list[int]]) -> None:
+        """Require one block-id list per registered group."""
         if len(block_ids) != len(self._group_states):
             raise RuntimeError(
                 f"got {len(block_ids)} block-id lists for "
                 f"{len(self._group_states)} registered groups"
             )
-        if isinstance(ctx, EngineDrivenContextInline):
-            return self._submit_store_multigroup_inline(ctx, key, kv_caches, block_ids)
+
+    def _store_multigroup_shm(
+        self,
+        ctx: "EngineDrivenContext",
+        key: Any,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> bool:
+        """Store every group's non-null chunks through server-reserved slots.
+
+        The server reserves no slot for a skipped (all-null) chunk, so its
+        returned ``chunk_indices`` already exclude them.
+        """
         device = _get_kv_device(kv_caches)
+        skipped = self._null_chunk_indices(block_ids)
         synchronize_device(device)
-        result = ctx.prepare_store_grouped(key, self._instance_id)
+        result = ctx.prepare_store_grouped(
+            key,
+            self._instance_id,
+            tuple(tuple(g) for g in skipped) if any(skipped) else (),
+        )
         if result is None:
-            future.set_result(False)
-            return future
+            return False
         tensors, chunk_indices, group_ids = result
         if not tensors:
-            future.set_result(True)
-            return future
+            return True
         for gid, state in enumerate(self._group_states):
             out_g, chunks_g = self._group_slots(tensors, group_ids, gid, chunk_indices)
             if not out_g:
@@ -1250,47 +1283,129 @@ class EngineDrivenTransferContext(TransferContext):
             )
         # SHM writes are async device->CPU copies; complete them before commit.
         synchronize_device(device)
-        ok = ctx.commit_store(key, self._instance_id, [])
-        future.set_result(ok)
-        return future
+        return ctx.commit_store(key, self._instance_id, [])
 
-    def _submit_store_multigroup_inline(
+    def _store_multigroup_inline(
         self,
         ctx: "EngineDrivenContextInline",
         key: Any,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
-    ) -> MessagingFuture:
-        """Uniform-coverage store over inline: one group-major envelope.
+    ) -> bool:
+        """Store every group's non-null chunks in one typed grouped envelope.
 
         There are no server-reserved slots in inline mode, so each group's
-        chunks are gathered into fresh CPU tensors and the whole
-        ``chunks[group][chunk]`` list is sent as one typed COMMIT_STORE envelope.
+        stored chunks are gathered into fresh CPU tensors and sent with their
+        chunk positions; all-null chunks are left out.
         """
-        future: MessagingFuture[bool] = MessagingFuture()
         device = _get_kv_device(kv_caches)
+        skipped = self._null_chunk_indices(block_ids)
+        groups: list[tuple[list[int], int]] = []
+        for gid, state in enumerate(self._group_states):
+            skip = set(skipped[gid])
+            num_chunks = len(block_ids[gid]) // state.blocks_in_chunk
+            groups.append(([c for c in range(num_chunks) if c not in skip], gid))
+        if not any(indices for indices, _ in groups):
+            return True
         synchronize_device(device)
         # Handshake only: the inline strategy reserves nothing at prepare.
         ctx.prepare_store(key, self._instance_id)
-        group_chunks: list[list[torch.Tensor]] = []
-        for gid, state in enumerate(self._group_states):
-            group_chunks.append(
+        payload: list[tuple[list[int], list[torch.Tensor]]] = []
+        for indices, gid in groups:
+            state = self._group_states[gid]
+            chunks = (
                 gather_paged_kv_to_cpu(
                     {name: kv_caches[name] for name in state.layer_names},
                     block_ids[gid],
                     state.blocks_in_chunk,
                     layout_hints=self._layout_hints,
                     engine_kv_format=state.engine_kv_format,
+                    chunk_indices=indices,
                     blocks_per_window=state.blocks_per_window,
                     engine_type=self._engine_type,
                 )
+                if indices
+                else []
             )
+            payload.append((indices, chunks))
         # Gather issues async device->CPU copies; commit_store serializes the
         # buffers immediately, so the copies must be complete first.
         synchronize_device(device)
-        ok = ctx.commit_store(key, self._instance_id, group_chunks)
-        future.set_result(ok)
+        return ctx.commit_store(key, self._instance_id, payload)
+
+    def _store_multigroup(
+        self,
+        key: Any,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> bool:
+        """Run a multi-group store to completion on the calling thread."""
+        ctx = self._engine_driven_context
+        assert ctx is not None
+        self._check_group_block_ids(block_ids)
+        if isinstance(ctx, EngineDrivenContextInline):
+            return self._store_multigroup_inline(ctx, key, kv_caches, block_ids)
+        return self._store_multigroup_shm(ctx, key, kv_caches, block_ids)
+
+    def _submit_store_multigroup(
+        self,
+        key: Any,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> MessagingFuture:
+        """Synchronous multi-group store; resolves before returning."""
+        future: MessagingFuture[bool] = MessagingFuture()
+        future.set_result(self._store_multigroup(key, kv_caches, block_ids))
         return future
+
+    def _group_windows(self, block_ids: list[list[int]]) -> list[tuple[int, int]]:
+        """Per group ``(first_chunk, num_chunks)`` a retrieve serves.
+
+        A group with a window of ``w`` chunks gets only its last ``w`` chunks,
+        matching the server's prefetch window; full-attention groups get all.
+        """
+        windows: list[tuple[int, int]] = []
+        for gid, state in enumerate(self._group_states):
+            if len(block_ids[gid]) % state.blocks_in_chunk != 0:
+                raise ValueError(
+                    "Engine block count must be divisible by blocks_in_chunk: "
+                    f"group={gid}, blocks={len(block_ids[gid])}, "
+                    f"blocks_in_chunk={state.blocks_in_chunk}"
+                )
+            num_chunks = len(block_ids[gid]) // state.blocks_in_chunk
+            window = state.window_chunks
+            first = 0 if window < 0 else max(0, num_chunks - window)
+            windows.append((first, num_chunks))
+        return windows
+
+    def _scatter_group(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        gid: int,
+        group_block_ids: list[int],
+        chunks: list[torch.Tensor],
+        first_chunk: int,
+        skip_first_n_tokens: int,
+    ) -> None:
+        """Scatter one group's chunks starting at chunk ``first_chunk``.
+
+        The block ids are cut at that chunk boundary, and the already-computed
+        token prefix is shifted by the dropped chunks.
+        """
+        state = self._group_states[gid]
+        scatter_cpu_to_paged_kv(
+            {name: kv_caches[name] for name in state.layer_names},
+            group_block_ids[first_chunk * state.blocks_in_chunk :],
+            chunks,
+            state.blocks_in_chunk,
+            skip_first_n_tokens=max(
+                0, skip_first_n_tokens - first_chunk * self._chunk_tokens
+            ),
+            layout_hints=self._layout_hints,
+            engine_kv_format=state.engine_kv_format,
+            blocks_per_window=state.blocks_per_window,
+            engine_type=self._engine_type,
+        )
 
     def _submit_retrieve_multigroup_inline(
         self,
@@ -1301,52 +1416,49 @@ class EngineDrivenTransferContext(TransferContext):
         event: IPCEvent | None,
         skip_first_n_tokens: int,
     ) -> MessagingFuture:
-        """Uniform-coverage retrieve over inline: scatter a group-major payload.
+        """Retrieve over inline: scatter each group's in-window chunks.
 
         Each group's payload is validated against that group's registered
-        layout and the chunk count its block ids cover.
+        layout, and its chunk positions must be exactly the group's window.
         """
         future: MessagingFuture[bool] = MessagingFuture()
         device = _get_kv_device(kv_caches)
-        expected: list[tuple[torch.Size, torch.dtype, int]] = []
-        for gid, state in enumerate(self._group_states):
-            if len(block_ids[gid]) % state.blocks_in_chunk != 0:
-                raise ValueError(
-                    "Engine block count must be divisible by blocks_in_chunk: "
-                    f"group={gid}, blocks={len(block_ids[gid])}, "
-                    f"blocks_in_chunk={state.blocks_in_chunk}"
-                )
-            expected.append(
-                (
-                    state.layout_desc.shapes[0],
-                    state.layout_desc.dtypes[0],
-                    len(block_ids[gid]) // state.blocks_in_chunk,
+        windows = self._group_windows(block_ids)
+        expected = [
+            (state.layout_desc.shapes[0], state.layout_desc.dtypes[0], num_chunks)
+            for state, (_, num_chunks) in zip(self._group_states, windows, strict=True)
+        ]
+        groups = ctx.prepare_retrieve_multigroup(key, self._instance_id, expected)
+        if groups is not None and (
+            len(groups) != len(self._group_states)
+            or any(
+                indices != list(range(first, num_chunks))
+                for (indices, _), (first, num_chunks) in zip(
+                    groups, windows, strict=True
                 )
             )
-        group_chunks = ctx.prepare_retrieve_multigroup(key, self._instance_id, expected)
-        if group_chunks is not None and len(group_chunks) != len(self._group_states):
+        ):
             logger.error(
-                "inline retrieve returned %d groups for %d registered groups",
-                len(group_chunks),
-                len(self._group_states),
+                "inline retrieve returned chunks that do not match the "
+                "registered group windows (groups=%d)",
+                len(groups),
             )
-            group_chunks = None
-        ok = group_chunks is not None
-        if group_chunks is not None:
+            groups = None
+        ok = groups is not None
+        if groups is not None:
             try:
                 if event is not None:
                     event.wait()
-                for gid, state in enumerate(self._group_states):
-                    scatter_cpu_to_paged_kv(
-                        {name: kv_caches[name] for name in state.layer_names},
+                for gid, ((_, chunks), (first, _)) in enumerate(
+                    zip(groups, windows, strict=True)
+                ):
+                    self._scatter_group(
+                        kv_caches,
+                        gid,
                         block_ids[gid],
-                        group_chunks[gid],
-                        state.blocks_in_chunk,
-                        skip_first_n_tokens=skip_first_n_tokens,
-                        layout_hints=self._layout_hints,
-                        engine_kv_format=state.engine_kv_format,
-                        blocks_per_window=state.blocks_per_window,
-                        engine_type=self._engine_type,
+                        chunks,
+                        first,
+                        skip_first_n_tokens,
                     )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
@@ -1364,39 +1476,47 @@ class EngineDrivenTransferContext(TransferContext):
         event: IPCEvent | None,
         skip_first_n_tokens: int,
     ) -> MessagingFuture:
-        """Uniform-coverage retrieve: scatter every group's chunks from its slots."""
+        """Retrieve: scatter each group's in-window chunks from its slots."""
         ctx = self._engine_driven_context
         assert ctx is not None
         future: MessagingFuture[bool] = MessagingFuture()
-        if len(block_ids) != len(self._group_states):
-            raise RuntimeError(
-                f"got {len(block_ids)} block-id lists for "
-                f"{len(self._group_states)} registered groups"
-            )
+        self._check_group_block_ids(block_ids)
         if isinstance(ctx, EngineDrivenContextInline):
             return self._submit_retrieve_multigroup_inline(
                 ctx, key, kv_caches, block_ids, event, skip_first_n_tokens
             )
         device = _get_kv_device(kv_caches)
+        windows = self._group_windows(block_ids)
         result = ctx.prepare_retrieve_grouped(key, self._instance_id)
         ok = result is not None
         if result is not None:
-            tensors, group_ids = result
+            tensors, group_ids, chunk_indices = result
             try:
+                per_group = [
+                    self._group_slots(tensors, group_ids, gid, chunk_indices)
+                    for gid in range(len(self._group_states))
+                ]
+                for (_, got), (first, num_chunks) in zip(
+                    per_group, windows, strict=True
+                ):
+                    if got != list(range(first, num_chunks)):
+                        raise ValueError(
+                            "SHM retrieve chunks do not match the registered "
+                            f"group window: expected {first}..{num_chunks - 1}, "
+                            f"got {got}"
+                        )
                 if event is not None:
                     event.wait()
-                for gid, state in enumerate(self._group_states):
-                    src_g, _ = self._group_slots(tensors, group_ids, gid)
-                    scatter_cpu_to_paged_kv(
-                        {name: kv_caches[name] for name in state.layer_names},
+                for gid, ((src_g, _), (first, _)) in enumerate(
+                    zip(per_group, windows, strict=True)
+                ):
+                    self._scatter_group(
+                        kv_caches,
+                        gid,
                         block_ids[gid],
                         src_g,
-                        state.blocks_in_chunk,
-                        skip_first_n_tokens=skip_first_n_tokens,
-                        layout_hints=self._layout_hints,
-                        engine_kv_format=state.engine_kv_format,
-                        blocks_per_window=state.blocks_per_window,
-                        engine_type=self._engine_type,
+                        first,
+                        skip_first_n_tokens,
                     )
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")

@@ -46,9 +46,16 @@ message UnregisterKvCacheEngineDrivenContextRequest {
 
 message UnregisterKvCacheEngineDrivenContextResponse {}
 
+// Chunk positions of one LMCache group (e.g. the all-null chunks a worker
+// will not store).
+message ChunkIndexList {
+  repeated int64 indices = 1;
+}
+
 message PrepareStoreRequest {
   IpcCacheServerKey key = 1;
   int64 instance_id = 2;
+  repeated ChunkIndexList skipped_chunks = 3;
 }
 
 message PrepareStoreResponse {

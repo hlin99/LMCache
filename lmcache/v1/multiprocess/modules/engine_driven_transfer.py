@@ -495,23 +495,49 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
+        skipped_chunks: tuple[tuple[int, ...], ...] = (),
     ) -> PrepareStoreResponse:
         """Prepare a store operation.
 
         Args:
             key: Cache key for the token range to store.
             instance_id: Worker instance identifier.
+            skipped_chunks: Per LMCache group, the chunk positions the worker
+                will not store because every engine block in them is the null
+                block. Empty means none; otherwise one entry per registered
+                group. Only multi-group workers send it.
 
         Returns:
             PrepareStoreResponse with empty slots for inline mode.
+
+        Raises:
+            ValueError: If ``skipped_chunks`` does not have one entry per
+                registered group or names a chunk outside the key's range.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
+        group_keys = self._group_keys_for(entry, key)
+        if skipped_chunks:
+            if group_keys is None or len(skipped_chunks) != len(group_keys):
+                raise ValueError(
+                    f"skipped_chunks has {len(skipped_chunks)} groups for "
+                    f"{0 if group_keys is None else len(group_keys)} registered "
+                    f"groups (instance_id={instance_id})"
+                )
+            for gid, (skips, g_keys) in enumerate(
+                zip(skipped_chunks, group_keys, strict=True)
+            ):
+                if any(not 0 <= idx < len(g_keys) for idx in skips):
+                    raise ValueError(
+                        f"skipped_chunks for group {gid} is outside its "
+                        f"{len(g_keys)} chunks (instance_id={instance_id})"
+                    )
         response = strategy.prepare_store(
             key=key,
             instance_id=instance_id,
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
-            group_keys=self._group_keys_for(entry, key),
+            group_keys=group_keys,
+            skipped_chunks=skipped_chunks,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
@@ -588,11 +614,25 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 instance ID.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
+        group_keys = self._group_keys_for(entry, key)
+        group_first_chunk: list[int] = []
+        windows = entry.metadata.group_windows
+        if group_keys is not None and windows is not None:
+            # Serve each group's in-window suffix only, as prefetch locked it:
+            # a sliding-window or recurrent group's earlier chunks are not
+            # needed and were never stored.
+            narrowed: list[list[ObjectKey]] = []
+            for g_keys, window in zip(group_keys, windows, strict=True):
+                first = 0 if window < 0 else max(0, len(g_keys) - window)
+                group_first_chunk.append(first)
+                narrowed.append(g_keys[first:])
+            group_keys = narrowed
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
-            group_keys=self._group_keys_for(entry, key),
+            group_keys=group_keys,
+            group_first_chunk=group_first_chunk,
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["retrieve_start_time"] = time.perf_counter()

@@ -169,9 +169,19 @@ class EngineDrivenContext(ABC):
         ...
 
     def prepare_store_grouped(
-        self, key: IPCCacheServerKey, instance_id: int
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        skipped_chunks: tuple[tuple[int, ...], ...] = (),
     ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
         """Multi-group store prepare (SHM transport only).
+
+        Args:
+            key: Cache key for the token range to store.
+            instance_id: Worker instance identifier.
+            skipped_chunks: Per group, the chunk positions the worker will not
+                store (all-null engine blocks); the server reserves no slot for
+                them. Empty means none.
 
         Returns:
             Parallel per-slot ``(tensors, chunk_indices, group_ids)`` lists,
@@ -184,12 +194,12 @@ class EngineDrivenContext(ABC):
 
     def prepare_retrieve_grouped(
         self, key: IPCCacheServerKey, instance_id: int
-    ) -> tuple[list[torch.Tensor], list[int]] | None:
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
         """Multi-group retrieve prepare (SHM transport only).
 
         Returns:
-            Parallel per-slot ``(tensors, group_ids)`` lists, or ``None`` on
-            a miss.
+            Parallel per-slot ``(tensors, group_ids, chunk_indices)`` lists
+            covering each group's in-window chunks, or ``None`` on a miss.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support multi-group transfers"

@@ -1678,6 +1678,98 @@ def test_register_multigroup_sizes_object_group_count(
     assert set(group_descs) == {0, 1}
 
 
+def _group_obj_key(group: int, chunk: int) -> Any:
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    return ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(chunk),
+        model_name="m",
+        kv_rank=0,
+        object_group_id=group,
+    )
+
+
+def _register_windowed_three_group_instance(module: Any) -> None:
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        GroupLayout,
+        RegisterEngineDrivenContextPayload,
+    )
+
+    def _group(window_chunks: int) -> GroupLayout:
+        return GroupLayout(
+            num_layers=1,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            tokens_per_block=4,
+            window_chunks=window_chunks,
+        )
+
+    module.register_kv_cache_engine_driven_context(
+        RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=3,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            group_layouts=[_group(0), _group(2), _group(1)],
+        )
+    )
+
+
+def test_prepare_retrieve_serves_each_group_window(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server hands the strategy only each group's in-window suffix, the
+    chunks prefetch locked, with each group's first chunk position."""
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    _register_windowed_three_group_instance(module)
+    keys = [[_group_obj_key(g, c) for c in range(4)] for g in range(3)]
+    monkeypatch.setattr(
+        module, "_group_keys_for", lambda entry, key: [list(k) for k in keys]
+    )
+    strategy = MagicMock()
+    module._strategies[1] = strategy
+
+    module.prepare_retrieve(_default_key(), 1)
+
+    kwargs = strategy.prepare_retrieve.call_args.kwargs
+    assert kwargs["group_keys"] == [keys[0], keys[1][2:], keys[2][3:]]
+    assert kwargs["group_first_chunk"] == [0, 2, 3]
+
+
+def test_prepare_store_validates_skipped_chunks(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    _register_windowed_three_group_instance(module)
+    keys = [[_group_obj_key(g, c) for c in range(4)] for g in range(3)]
+    monkeypatch.setattr(
+        module, "_group_keys_for", lambda entry, key: [list(k) for k in keys]
+    )
+    strategy = MagicMock()
+    module._strategies[1] = strategy
+
+    module.prepare_store(_default_key(), 1, ((), (0, 1), (0, 1, 2)))
+    assert strategy.prepare_store.call_args.kwargs["skipped_chunks"] == (
+        (),
+        (0, 1),
+        (0, 1, 2),
+    )
+    with pytest.raises(ValueError, match="2 groups for 3 registered"):
+        module.prepare_store(_default_key(), 1, ((), (0,)))
+    with pytest.raises(ValueError, match="outside its 4 chunks"):
+        module.prepare_store(_default_key(), 1, ((), (4,), ()))
+
+
 def test_register_multigroup_registers_group_windows_and_kinds(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,

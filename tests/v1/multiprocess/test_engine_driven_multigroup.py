@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock
 import pickle
+import threading
 
 # Third Party
 import msgspec
@@ -22,7 +23,10 @@ from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-from lmcache.v1.multiprocess.modules.server_transfer import InlineTransferStrategy
+from lmcache.v1.multiprocess.modules.server_transfer import (
+    InlineTransferStrategy,
+    ShmTransferStrategy,
+)
 from lmcache.v1.multiprocess.transfer_context import worker_transfer
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
@@ -197,13 +201,15 @@ class _FakeGroupedContext:
     def __init__(self, tensors, chunk_indices, group_ids):
         self._prep = (tensors, chunk_indices, group_ids)
         self.committed = False
+        self.skipped: Any = None
 
-    def prepare_store_grouped(self, _key, _iid):
+    def prepare_store_grouped(self, _key, _iid, skipped_chunks=()):
+        self.skipped = skipped_chunks
         return self._prep
 
     def prepare_retrieve_grouped(self, _key, _iid):
-        tensors, _, group_ids = self._prep
-        return tensors, group_ids
+        tensors, chunk_indices, group_ids = self._prep
+        return tensors, group_ids, chunk_indices
 
     def commit_store(self, _key, _iid, _chunks):
         self.committed = True
@@ -364,7 +370,7 @@ def test_submit_store_multigroup_inline_sends_group_major_payload(
     """Inline store gathers each group into fresh CPU chunks (no slots) and
     commits one group-major payload."""
     ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
-    gathered = [["g0c0", "g0c1"], ["g1c0"]]
+    gathered = [["g0c0", "g0c1"], ["g1c0", "g1c1"]]
     calls: list[dict] = []
     events: list[str] = []
 
@@ -394,9 +400,10 @@ def test_submit_store_multigroup_inline_sends_group_major_payload(
     )
 
     assert future.result(timeout=1) is True
-    assert committed["chunks"] == gathered
-    # Fresh CPU gathers: no slot tensors, no chunk-index filtering.
-    assert all(c.get("out") is None and c.get("chunk_indices") is None for c in calls)
+    assert committed["chunks"] == [([0, 1], gathered[0]), ([0, 1], gathered[1])]
+    # Fresh CPU gathers (no slot tensors) of every non-null chunk.
+    assert all(c.get("out") is None for c in calls)
+    assert [c.get("chunk_indices") for c in calls] == [[0, 1], [0, 1]]
     # Gather issues async device->CPU copies and commit serializes the
     # buffers, so a device synchronize must sit between the last gather and
     # the commit.
@@ -410,7 +417,7 @@ def test_submit_retrieve_multigroup_inline_scatters_group_major(
 ) -> None:
     ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
     ctx._engine_type = "sentinel-engine"
-    payload = [[torch.ones(1)], [torch.ones(1) * 2]]
+    payload = [([0], [torch.ones(1)]), ([0], [torch.ones(1) * 2])]
     monkeypatch.setattr(pctx, "prepare_retrieve_multigroup", lambda _k, _i, _e: payload)
     order: list[str] = []
     scattered: list[dict] = []
@@ -434,8 +441,8 @@ def test_submit_retrieve_multigroup_inline_scatters_group_major(
 
     assert future.result(timeout=1) is True
     assert [s["layers"] for s in scattered] == [["layer_0", "layer_1"], ["layer_2"]]
-    assert scattered[0]["chunks"] is payload[0]
-    assert scattered[1]["chunks"] is payload[1]
+    assert scattered[0]["chunks"] is payload[0][1]
+    assert scattered[1]["chunks"] is payload[1][1]
     # The engine's event gates every group's scatter, as on the single-group
     # path, and each group is scattered with the registered engine type.
     assert order == ["wait", "scatter", "scatter"]
@@ -448,7 +455,9 @@ def test_submit_retrieve_multigroup_inline_group_count_mismatch(
     """A payload whose group count differs from the registration is a miss."""
     ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
     monkeypatch.setattr(
-        pctx, "prepare_retrieve_multigroup", lambda _k, _i, _e: [[torch.ones(1)]]
+        pctx,
+        "prepare_retrieve_multigroup",
+        lambda _k, _i, _e: [([0], [torch.ones(1)])],
     )
     kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
     future = ctx.submit_retrieve("req", MagicMock(), kv, [[1, 2], [3]], MagicMock(), 2)
@@ -548,7 +557,7 @@ def test_inline_strategy_multigroup_store_retrieve_roundtrip() -> None:
         strategy.commit_store(
             key=key,
             instance_id=7,
-            cpu_data=encode_grouped_tensors(payload),
+            cpu_data=encode_grouped_tensors([([0, 1], g) for g in payload]),
             context=metadata,
             resolve_obj_keys=lambda _k: group_keys[0],
             group_keys=group_keys,
@@ -574,7 +583,8 @@ def test_inline_strategy_multigroup_store_retrieve_roundtrip() -> None:
         ],
     )
     assert len(retrieved) == 2
-    assert torch.equal(retrieved[0][1], payload[0][1])
+    assert [indices for indices, _ in retrieved] == [[0, 1], [0, 1]]
+    assert torch.equal(retrieved[0][1][1], payload[0][1])
     assert len(sm.finished_reads) == 4
     assert sm.read_owners == [owners, owners]
 
@@ -615,7 +625,7 @@ def test_inline_strategy_store_shape_mismatch_releases_reservations() -> None:
         strategy.commit_store(
             key=key,
             instance_id=7,
-            cpu_data=encode_grouped_tensors(payload),
+            cpu_data=encode_grouped_tensors([([0, 1], g) for g in payload]),
             context=metadata,
             resolve_obj_keys=lambda _k: group_keys[0],
             group_keys=group_keys,
@@ -761,16 +771,16 @@ def test_register_rejects_compressed_group() -> None:
         pytest.param(
             lambda shapes: encode_grouped_tensors(
                 [
-                    [torch.zeros(shapes[0]) for _ in range(2)],
+                    ([0, 1], [torch.zeros(shapes[0]) for _ in range(2)]),
                     # One tensor in group 1 does not match its registered layout.
-                    [torch.zeros(shapes[1]), torch.zeros((2, 1, 4, 4))],
+                    ([0, 1], [torch.zeros(shapes[1]), torch.zeros((2, 1, 4, 4))]),
                 ]
             ),
             id="group-shape-mismatch",
         ),
         pytest.param(
             lambda shapes: encode_grouped_tensors(
-                [[torch.zeros(shapes[0]) for _ in range(2)]]
+                [([0, 1], [torch.zeros(shapes[0]) for _ in range(2)])]
             ),
             id="group-count-mismatch",
         ),
@@ -900,3 +910,294 @@ def test_register_payload_carries_group_windows_and_kinds() -> None:
     assert [gl.window_chunks for gl in payload.group_layouts] == [0, 2, 1]
     assert [gl.recurrent for gl in payload.group_layouts] == [False, False, True]
     assert [s.window_chunks for s in ctx._group_states] == [-1, 2, 1]
+
+
+def test_store_multigroup_inline_leaves_out_all_null_chunks(monkeypatch) -> None:
+    """A chunk whose engine blocks are all the null block carries no KV: it is
+    neither gathered nor sent, and its key is never written."""
+    ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
+    gathered: list[dict] = []
+
+    def _fake_gather(*_a: Any, **kwargs: Any):
+        gathered.append(kwargs)
+        return [f"chunk{c}" for c in kwargs["chunk_indices"]]
+
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", _fake_gather)
+    prepared: list[Any] = []
+    monkeypatch.setattr(pctx, "prepare_store", lambda k, i: prepared.append(k))
+    committed: list[Any] = []
+
+    def _commit(_k: Any, _i: int, chunks: Any) -> bool:
+        committed.append(chunks)
+        return True
+
+    monkeypatch.setattr(pctx, "commit_store", _commit)
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+
+    # Group 0 (2 blocks/chunk): chunk 0 is all null. Group 1 (1 block/chunk):
+    # chunk 0 is null. A partly-null chunk is still stored.
+    future = ctx.submit_store(
+        "req", MagicMock(), kv, [[0, 0, 0, 4], [0, 6]], MagicMock(), 2
+    )
+    assert future.result(timeout=1) is True
+    assert [g["chunk_indices"] for g in gathered] == [[1], [1]]
+    assert committed == [[([1], ["chunk1"]), ([1], ["chunk1"])]]
+
+    # Everything null: nothing to store, and no round trip at all.
+    gathered.clear()
+    committed.clear()
+    prepared.clear()
+    future = ctx.submit_store(
+        "req", MagicMock(), kv, [[0, 0, 0, 0], [0, 0]], MagicMock(), 2
+    )
+    assert future.result(timeout=1) is True
+    assert gathered == [] and committed == [] and prepared == []
+
+
+def test_store_multigroup_shm_asks_server_to_skip_all_null_chunks(
+    monkeypatch,
+) -> None:
+    ctx, _ = _fanout_ctx(monkeypatch)
+    t = [torch.zeros(1) for _ in range(2)]
+    fake = _FakeGroupedContext(t, [1, 1], [0, 1])
+    ctx._engine_driven_context = fake  # type: ignore[assignment]
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+
+    future = ctx.submit_store(
+        "req", MagicMock(), kv, [[0, 0, 3, 4], [0, 6]], MagicMock(), 2
+    )
+    assert future.result(timeout=1) is True
+    assert fake.skipped == ((0,), (0,))
+
+    # No null chunks: the RPC carries no skip list at all.
+    future = ctx.submit_store(
+        "req", MagicMock(), kv, [[1, 2, 3, 4], [5, 6]], MagicMock(), 2
+    )
+    assert future.result(timeout=1) is True
+    assert fake.skipped == ()
+
+
+def _windowed_inline_ctx(monkeypatch):
+    """Inline worker context whose group 1 needs only its last chunk."""
+    ctx, pctx, _ = _inline_worker_ctx(monkeypatch)
+    ctx._group_states[1].window_chunks = 1
+    ctx._chunk_tokens = 2
+    scattered: list[dict] = []
+
+    def _fake_scatter(kv_caches, block_ids, chunks, *a, **k):
+        scattered.append(
+            {
+                "block_ids": block_ids,
+                "chunks": chunks,
+                "skip_first_n_tokens": k.get("skip_first_n_tokens"),
+            }
+        )
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", _fake_scatter)
+    return ctx, pctx, scattered
+
+
+def test_retrieve_multigroup_inline_serves_each_group_window(monkeypatch) -> None:
+    """A windowed group gets only its trailing chunks: they are scattered from
+    that chunk's first block, with the computed-prefix skip shifted past the
+    dropped chunks."""
+    ctx, pctx, scattered = _windowed_inline_ctx(monkeypatch)
+    requested: list[Any] = []
+    a, b, c = torch.ones(1), torch.ones(1) * 2, torch.ones(1) * 3
+
+    def _prepare(_k, _i, expected):
+        requested.append([count for _, _, count in expected])
+        return [([0, 1], [a, b]), ([2], [c])]
+
+    monkeypatch.setattr(pctx, "prepare_retrieve_multigroup", _prepare)
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), kv, [[1, 2, 3, 4], [5, 6, 7]], None, 2, 1
+    )
+    assert future.result(timeout=1) is True
+    assert requested == [[2, 3]]
+    assert scattered[0]["block_ids"] == [1, 2, 3, 4]
+    assert scattered[0]["skip_first_n_tokens"] == 1
+    assert scattered[1]["block_ids"] == [7]
+    assert scattered[1]["chunks"] == [c]
+    assert scattered[1]["skip_first_n_tokens"] == 0
+
+
+def test_retrieve_multigroup_inline_rejects_chunks_outside_the_window(
+    monkeypatch,
+) -> None:
+    ctx, pctx, scattered = _windowed_inline_ctx(monkeypatch)
+    monkeypatch.setattr(
+        pctx,
+        "prepare_retrieve_multigroup",
+        lambda _k, _i, _e: [
+            ([0, 1], [torch.ones(1), torch.ones(1)]),
+            ([1, 2], [torch.ones(1), torch.ones(1)]),
+        ],
+    )
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), kv, [[1, 2, 3, 4], [5, 6, 7]], None, 2
+    )
+    assert future.result(timeout=1) is False
+    assert scattered == []
+
+
+def test_retrieve_multigroup_shm_serves_each_group_window(monkeypatch) -> None:
+    ctx, _ = _fanout_ctx(monkeypatch)
+    ctx._group_states[1].window_chunks = 1
+    ctx._chunk_tokens = 2
+    t = [torch.zeros(1) for _ in range(3)]
+    scattered: list[Any] = []
+    monkeypatch.setattr(
+        worker_transfer,
+        "scatter_cpu_to_paged_kv",
+        lambda kv, block_ids, chunks, *a, **k: scattered.append((block_ids, chunks)),
+    )
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+
+    ctx._engine_driven_context = _FakeGroupedContext(t, [0, 1, 2], [0, 0, 1])  # type: ignore[assignment]
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), kv, [[1, 2, 3, 4], [5, 6, 7]], None, 2
+    )
+    assert future.result(timeout=1) is True
+    assert scattered == [([1, 2, 3, 4], [t[0], t[1]]), ([7], [t[2]])]
+
+    # Slots that are not the group's window are refused before any scatter.
+    scattered.clear()
+    ctx._engine_driven_context = _FakeGroupedContext(t, [0, 1, 1], [0, 0, 1])  # type: ignore[assignment]
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), kv, [[1, 2, 3, 4], [5, 6, 7]], None, 2
+    )
+    assert future.result(timeout=1) is False
+    assert scattered == []
+
+
+class _FakeShmMemoryObj(_FakeMemoryObj):
+    shm_offset = 0
+
+    @property
+    def shm_byte_length(self) -> int:
+        return self.tensor.numel() * self.tensor.element_size()
+
+
+class _FakeShmStorageManager(_FakeStorageManager):
+    """Single-L1 double for the SHM strategy, which completes by key."""
+
+    def __init__(self, shapes_by_group):
+        super().__init__(shapes_by_group)
+        self.reserved: list[ObjectKey] = []
+
+    def reserve_write(self, obj_keys, _layout):
+        reserved = {}
+        for obj_key in obj_keys:
+            obj = _FakeShmMemoryObj(self._shapes[obj_key.object_group_id])
+            self.objs[obj_key] = obj
+            reserved[obj_key] = obj
+        self.reserved.extend(obj_keys)
+        return reserved
+
+    def finish_write(self, keys):
+        self.finished_writes.extend(keys)
+
+    def unsafe_read(self, keys, l1_owners=None):
+        found = [k for k in keys if k in self.objs]
+        return found, [self.objs[k] for k in found]
+
+
+def _shm_strategy(sm) -> ShmTransferStrategy:
+    return ShmTransferStrategy(
+        storage_manager=sm,
+        pending_writes={},
+        pending_reads={},
+        pending_lock=threading.Lock(),
+        transfer_key_factory=lambda key, iid: (iid, key),
+        fallback_strategy=InlineTransferStrategy(sm),
+    )
+
+
+_SHAPES: dict[int, tuple[int, ...]] = {0: (2, 2, 8, 16), 1: (2, 1, 8, 4)}
+_GROUP_KEYS = [
+    [_obj_key(c, 0) for c in range(3)],
+    [_obj_key(c, 1) for c in range(3)],
+]
+_KEY = IPCCacheServerKey.from_token_ids(
+    "m", 1, 0, [1] * 24, start=0, end=24, request_id="req-skip"
+)
+
+
+def test_inline_strategy_writes_only_the_chunks_the_payload_names() -> None:
+    sm = _FakeStorageManager(_SHAPES)
+    strategy = InlineTransferStrategy(sm)  # type: ignore[arg-type]
+    payload = encode_grouped_tensors(
+        [
+            ([0, 1, 2], [torch.zeros(_SHAPES[0]) for _ in range(3)]),
+            # Group 1's first two chunks were all-null and are not sent.
+            ([2], [torch.ones(_SHAPES[1])]),
+        ]
+    )
+
+    assert strategy.commit_store(
+        key=_KEY,
+        instance_id=7,
+        cpu_data=payload,
+        context=_group_metadata(),
+        resolve_obj_keys=lambda _k: _GROUP_KEYS[0],
+        group_keys=_GROUP_KEYS,
+    )
+    assert set(sm.objs) == set(_GROUP_KEYS[0]) | {_GROUP_KEYS[1][2]}
+    assert torch.equal(sm.objs[_GROUP_KEYS[1][2]].tensor, torch.ones(_SHAPES[1]))
+
+
+def test_shm_strategy_reserves_no_slot_for_skipped_chunks() -> None:
+    sm = _FakeShmStorageManager(_SHAPES)
+    response = _shm_strategy(sm).prepare_store(
+        key=_KEY,
+        instance_id=7,
+        context=_group_metadata(),
+        resolve_obj_keys=lambda _k: _GROUP_KEYS[0],
+        group_keys=_GROUP_KEYS,
+        skipped_chunks=((), (0, 1)),
+    )
+
+    assert sm.reserved == _GROUP_KEYS[0] + [_GROUP_KEYS[1][2]]
+    assert response.context["group_ids"] == [0, 0, 0, 1]
+    assert response.context["chunk_indices"] == [0, 1, 2, 2]
+
+
+@pytest.mark.parametrize("transport", ["inline", "shm"])
+def test_strategies_report_windowed_retrieve_chunk_positions(transport) -> None:
+    """Given each group's in-window suffix, both transports report the
+    absolute chunk positions the worker checks against its own window."""
+    sm = _FakeShmStorageManager(_SHAPES)
+    for keys in _GROUP_KEYS:
+        sm.reserve_write(keys, None)
+    narrowed = [_GROUP_KEYS[0], _GROUP_KEYS[1][2:]]
+    strategy = (
+        InlineTransferStrategy(sm)  # type: ignore[arg-type]
+        if transport == "inline"
+        else _shm_strategy(sm)
+    )
+
+    response = strategy.prepare_retrieve(
+        key=_KEY,
+        instance_id=7,
+        resolve_obj_keys=lambda _k: _GROUP_KEYS[0],
+        group_keys=narrowed,
+        group_first_chunk=[0, 2],
+    )
+
+    assert response.success
+    if transport == "inline":
+        decoded = decode_grouped_tensors(
+            response.data,
+            expected=[
+                (torch.Size(_SHAPES[0]), torch.float32, 3),
+                (torch.Size(_SHAPES[1]), torch.float32, 3),
+            ],
+        )
+        assert [indices for indices, _ in decoded] == [[0, 1, 2], [2]]
+    else:
+        assert response.context["group_ids"] == [0, 0, 0, 1]
+        assert response.context["chunk_indices"] == [0, 1, 2, 2]

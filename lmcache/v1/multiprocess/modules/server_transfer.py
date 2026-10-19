@@ -3,7 +3,7 @@
 
 # Standard
 from _thread import LockType
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 import abc
 
@@ -101,6 +101,7 @@ class TransferStrategy(abc.ABC):
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
         group_keys: "list[list[ObjectKey]] | None" = None,
+        skipped_chunks: "Sequence[Sequence[int]]" = (),
     ) -> PrepareStoreResponse:
         """Prepare destination resources for a store request.
 
@@ -111,6 +112,8 @@ class TransferStrategy(abc.ABC):
             resolve_obj_keys: Callable that resolves object keys from ``key``.
             group_keys: Group-major object keys for multi-group workers;
                 ``None`` for single-group.
+            skipped_chunks: Per group, chunk positions the worker will not
+                store (all-null engine blocks); empty means none.
 
         Returns:
             Transport-specific store preparation response.
@@ -148,6 +151,7 @@ class TransferStrategy(abc.ABC):
         instance_id: int,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
         group_keys: "list[list[ObjectKey]] | None" = None,
+        group_first_chunk: "Sequence[int]" = (),
     ) -> PrepareRetrieveResponse:
         """Prepare source resources for a retrieve request.
 
@@ -155,8 +159,12 @@ class TransferStrategy(abc.ABC):
             key: Cache key identifying the requested token range.
             instance_id: Worker instance identifier.
             resolve_obj_keys: Callable that resolves object keys from ``key``.
-            group_keys: Group-major object keys for multi-group workers;
-                ``None`` for single-group.
+            group_keys: Group-major object keys for multi-group workers,
+                already narrowed to each group's in-window suffix; ``None``
+                for single-group.
+            group_first_chunk: Per group, the chunk position of
+                ``group_keys[g][0]`` within the request (non-zero when a
+                window drops leading chunks); empty means all zero.
 
         Returns:
             Transport-specific retrieve preparation response.
@@ -210,11 +218,14 @@ class InlineTransferStrategy(TransferStrategy):
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
         group_keys: "list[list[ObjectKey]] | None" = None,
+        skipped_chunks: "Sequence[Sequence[int]]" = (),
     ) -> PrepareStoreResponse:
         """Return empty store context for inline mode.
 
         Inline transport does not pre-allocate SHM slots during prepare; the
         whole (single- or multi-group) payload arrives with ``commit_store``.
+        ``skipped_chunks`` is not needed here: a multi-group payload names
+        the chunks it carries.
         """
         return PrepareStoreResponse(context={})
 
@@ -334,18 +345,25 @@ class InlineTransferStrategy(TransferStrategy):
                     instance_id,
                 )
                 return False
-            group_chunks = decode_grouped_tensors(
+            decoded = decode_grouped_tensors(
                 cpu_data,
                 expected=[
                     (layout.shapes[0], layout.dtypes[0], len(g_keys))
                     for layout, g_keys in zip(group_layouts, group_keys, strict=True)
                 ],
             )
+            # Each group carries only the chunks the worker stores; all-null
+            # chunks are absent and their keys are never reserved.
             ok = True
-            for g_keys, g_chunks, g_layout in zip(
-                group_keys, group_chunks, group_layouts, strict=True
+            for g_keys, (g_indices, g_chunks), g_layout in zip(
+                group_keys, decoded, group_layouts, strict=True
             ):
-                ok = self._write_chunks(instance_id, g_keys, g_chunks, g_layout) and ok
+                ok = (
+                    self._write_chunks(
+                        instance_id, [g_keys[i] for i in g_indices], g_chunks, g_layout
+                    )
+                    and ok
+                )
             return ok
 
         obj_keys = resolve_obj_keys(key)
@@ -363,12 +381,14 @@ class InlineTransferStrategy(TransferStrategy):
         instance_id: int,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
         group_keys: "list[list[ObjectKey]] | None" = None,
+        group_first_chunk: "Sequence[int]" = (),
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return a typed inline tensor payload.
 
         Single-group responses carry a flat tensor envelope. Multi-group
-        responses carry a group-major envelope and are all-or-nothing: a
-        retrieve is a miss unless EVERY group has every chunk.
+        responses carry a group-major envelope with each group's absolute
+        chunk positions, and are all-or-nothing: a retrieve is a miss unless
+        EVERY group has every chunk of its in-window suffix.
         """
         multi_group = group_keys is not None and len(group_keys) > 1
         if group_keys is None:
@@ -406,11 +426,16 @@ class InlineTransferStrategy(TransferStrategy):
                         prefetched_keys, l1_owners=owners
                     )
 
-        data = (
-            encode_grouped_tensors(group_chunks)
-            if multi_group
-            else encode_tensors(group_chunks[0])
-        )
+        if multi_group:
+            firsts = list(group_first_chunk) or [0] * len(group_keys)
+            data = encode_grouped_tensors(
+                [
+                    (list(range(first, first + len(chunks))), chunks)
+                    for first, chunks in zip(firsts, group_chunks, strict=True)
+                ]
+            )
+        else:
+            data = encode_tensors(group_chunks[0])
         return PrepareRetrieveResponse(success=True, data=data, context={})
 
     def commit_retrieve(
@@ -467,6 +492,7 @@ class ShmTransferStrategy(TransferStrategy):
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
         group_keys: "list[list[ObjectKey]] | None" = None,
+        skipped_chunks: "Sequence[Sequence[int]]" = (),
     ) -> PrepareStoreResponse:
         """Reserve SHM-backed objects and return slot descriptors.
 
@@ -474,6 +500,8 @@ class ShmTransferStrategy(TransferStrategy):
             group_keys: Group-major object keys for multi-group workers
                 (``group_keys[g][c]`` is chunk ``c``'s key in group ``g``).
                 ``None`` means single-group via ``resolve_obj_keys``.
+            skipped_chunks: Per group, chunk positions the worker will not
+                store; they are never reserved and get no slot.
 
         Returns:
             Context with ``slots`` and ``chunk_indices``. Multi-group
@@ -494,10 +522,17 @@ class ShmTransferStrategy(TransferStrategy):
         for gid, (g_keys, g_layout) in enumerate(
             zip(group_keys, group_layouts, strict=True)
         ):
-            reserved = self._storage_manager.reserve_write(g_keys, g_layout)
+            # Never reserve chunks the worker will not store (all-null engine
+            # blocks): an unwritten slot would be committed as garbage.
+            skip = set(skipped_chunks[gid]) if skipped_chunks else set()
+            reserved = self._storage_manager.reserve_write(
+                [k for idx, k in enumerate(g_keys) if idx not in skip], g_layout
+            )
             g_reserved: list[ObjectKey] = []
             try:
                 for idx, obj_key in enumerate(g_keys):
+                    if idx in skip:
+                        continue
                     memory_obj = reserved.get(obj_key)
                     if memory_obj is None or memory_obj.tensor is None:
                         continue
@@ -572,13 +607,18 @@ class ShmTransferStrategy(TransferStrategy):
         instance_id: int,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
         group_keys: "list[list[ObjectKey]] | None" = None,
+        group_first_chunk: "Sequence[int]" = (),
     ) -> PrepareRetrieveResponse:
         """Read SHM objects and return slot descriptors for worker access.
 
         Args:
-            group_keys: Group-major object keys for multi-group workers.
-                A retrieve is a miss unless EVERY group has every chunk
-                (uniform coverage). ``None`` means single-group.
+            group_keys: Group-major object keys for multi-group workers,
+                narrowed to each group's in-window suffix. A retrieve is a
+                miss unless EVERY group has every one of them. ``None`` means
+                single-group.
+            group_first_chunk: Per group, the chunk position of its first
+                key; multi-group responses report absolute ``chunk_indices``
+                parallel to ``slots``.
         """
         if group_keys is None:
             group_keys = [resolve_obj_keys(key)]
@@ -587,6 +627,8 @@ class ShmTransferStrategy(TransferStrategy):
         all_prefetched: list[ObjectKey] = []
         slots: list[dict[str, Any]] = []
         group_ids: list[int] = []
+        chunk_indices: list[int] = []
+        firsts = list(group_first_chunk) or [0] * len(group_keys)
 
         def _miss() -> PrepareRetrieveResponse:
             if all_prefetched:
@@ -602,7 +644,7 @@ class ShmTransferStrategy(TransferStrategy):
                 or len(memory_objs) != len(g_keys)
             ):
                 return _miss()
-            for memory_obj in memory_objs:
+            for pos, memory_obj in enumerate(memory_objs):
                 if memory_obj.tensor is None:
                     return _miss()
                 slots.append(
@@ -614,6 +656,7 @@ class ShmTransferStrategy(TransferStrategy):
                     ).to_dict()
                 )
                 group_ids.append(gid)
+                chunk_indices.append(firsts[gid] + pos)
 
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
@@ -621,6 +664,7 @@ class ShmTransferStrategy(TransferStrategy):
         ctx: dict[str, Any] = {"slots": slots}
         if multi_group:
             ctx["group_ids"] = group_ids
+            ctx["chunk_indices"] = chunk_indices
         return PrepareRetrieveResponse(success=True, data=b"", context=ctx)
 
     def commit_retrieve(

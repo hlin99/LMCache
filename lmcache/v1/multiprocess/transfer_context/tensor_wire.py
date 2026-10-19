@@ -42,16 +42,28 @@ class TensorEnvelope(msgspec.Struct, forbid_unknown_fields=True):
     tensors: TensorFrames
 
 
-TensorGroups: TypeAlias = Annotated[list[TensorFrames], msgspec.Meta(max_length=64)]
+ChunkIndices: TypeAlias = Annotated[list[NonNegative], msgspec.Meta(max_length=65536)]
+
+
+class TensorGroup(msgspec.Struct, forbid_unknown_fields=True):
+    """One KV group's tensors and the chunk position each one fills."""
+
+    chunk_indices: ChunkIndices
+    tensors: TensorFrames
+
+
+TensorGroups: TypeAlias = Annotated[list[TensorGroup], msgspec.Meta(max_length=64)]
 
 
 class GroupedTensorEnvelope(msgspec.Struct, forbid_unknown_fields=True):
     """Versioned group-major collection of inline CPU tensors.
 
     Used by multi-group (hybrid-KV) transfers, where each KV group has its own
-    tensor layout. Every group is validated against its own expected layout,
-    under the same per-tensor and total limits as :class:`TensorEnvelope`. The
-    two envelopes have disjoint field names, so neither decodes as the other.
+    tensor layout and may carry only some of the request's chunks (all-null
+    chunks are never stored, and a retrieve returns a group's in-window
+    suffix). Every group is validated against its own expected layout, under
+    the same per-tensor and total limits as :class:`TensorEnvelope`. The two
+    envelopes have disjoint field names, so neither decodes as the other.
     """
 
     version: Literal[1]
@@ -197,52 +209,81 @@ def _decode_frames(
     return tensors, total_bytes
 
 
-def encode_grouped_tensors(groups: list[list[torch.Tensor]]) -> bytes:
+def encode_grouped_tensors(
+    groups: list[tuple[list[int], list[torch.Tensor]]],
+) -> bytes:
     """Encode group-major CPU tensors without Python object serialization.
 
     Args:
-        groups: ``groups[group][chunk]`` CPU tensors; each group may have its
-            own dtype and shape.
+        groups: Per group, ``(chunk_indices, tensors)``: the chunk position
+            each tensor fills, strictly increasing, and the CPU tensors. Each
+            group may have its own dtype and shape.
 
     Returns:
         A versioned MessagePack :class:`GroupedTensorEnvelope`.
 
     Raises:
         ValueError: If there are more than 64 groups, more than 65536 tensors
-            in total, or any tensor or the cumulative payload is invalid as for
-            :func:`encode_tensors`.
+            in total, a group's indices are not strictly increasing or do not
+            match its tensor count, or any tensor or the cumulative payload is
+            invalid as for :func:`encode_tensors`.
     """
     if len(groups) > _MAX_GROUP_COUNT:
         raise ValueError("Inline tensor group count exceeds 64")
-    if sum(len(group) for group in groups) > _MAX_TENSOR_COUNT:
+    if sum(len(tensors) for _, tensors in groups) > _MAX_TENSOR_COUNT:
         raise ValueError("Inline tensor count exceeds 65536")
     total_bytes = 0
-    encoded: list[list[TensorFrame]] = []
-    for group in groups:
-        frames, total_bytes = _encode_frames(group, total_bytes)
-        encoded.append(frames)
+    encoded: list[TensorGroup] = []
+    for gid, (indices, tensors) in enumerate(groups):
+        _check_chunk_indices(gid, indices, len(tensors), None)
+        frames, total_bytes = _encode_frames(tensors, total_bytes)
+        encoded.append(TensorGroup(chunk_indices=list(indices), tensors=frames))
     return msgspec.msgpack.encode(GroupedTensorEnvelope(version=1, groups=encoded))
+
+
+def _check_chunk_indices(
+    gid: int, indices: list[int], num_tensors: int, num_chunks: int | None
+) -> None:
+    """Require strictly increasing indices, one per tensor, below ``num_chunks``."""
+    if len(indices) != num_tensors:
+        raise ValueError(
+            f"Inline tensor group {gid} has {len(indices)} chunk indices for "
+            f"{num_tensors} tensors"
+        )
+    if any(b <= a for a, b in zip(indices, indices[1:], strict=False)):
+        raise ValueError(
+            f"Inline tensor group {gid} chunk indices are not strictly increasing"
+        )
+    if indices and (
+        indices[0] < 0 or (num_chunks is not None and indices[-1] >= num_chunks)
+    ):
+        raise ValueError(
+            f"Inline tensor group {gid} chunk index out of range (chunks={num_chunks})"
+        )
 
 
 def decode_grouped_tensors(
     payload: bytes,
     *,
     expected: list[tuple[torch.Size, torch.dtype, int]],
-) -> list[list[torch.Tensor]]:
+) -> list[tuple[list[int], list[torch.Tensor]]]:
     """Decode and validate a group-major inline tensor envelope.
 
     Args:
         payload: MessagePack bytes produced by :func:`encode_grouped_tensors`.
-        expected: One ``(shape, dtype, count)`` per group, in group order. Every
-            tensor of a group must match that group's shape and dtype, and the
-            group must hold exactly ``count`` tensors.
+        expected: One ``(shape, dtype, num_chunks)`` per group, in group order.
+            Every tensor of a group must match that group's shape and dtype,
+            and its chunk indices must be strictly increasing and below
+            ``num_chunks``. Callers that expect an exact set of chunks check
+            the returned indices themselves.
 
     Returns:
-        ``tensors[group][chunk]`` backed directly by the immutable input
-        payload. Callers must treat the returned tensors as read-only.
+        Per group, ``(chunk_indices, tensors)``. The tensors are backed
+        directly by the immutable input payload; callers must treat them as
+        read-only.
 
     Raises:
-        ValueError: If the group count, any per-group tensor count, or any
+        ValueError: If the group count, any group's chunk indices, or any
             tensor metadata or byte length does not match ``expected``.
         msgspec.DecodeError: If ``payload`` is not a valid grouped envelope.
     """
@@ -265,15 +306,11 @@ def decode_grouped_tensors(
             f"expected {len(expected)}, got {len(envelope.groups)}"
         )
     total_bytes = 0
-    groups: list[list[torch.Tensor]] = []
-    for gid, (frames, (shape, dtype, count)) in enumerate(
+    groups: list[tuple[list[int], list[torch.Tensor]]] = []
+    for gid, (group, (shape, dtype, num_chunks)) in enumerate(
         zip(envelope.groups, expected, strict=True)
     ):
-        if len(frames) != count:
-            raise ValueError(
-                f"Inline tensor count mismatch in group {gid}: "
-                f"expected {count}, got {len(frames)}"
-            )
-        tensors, total_bytes = _decode_frames(frames, shape, dtype, total_bytes)
-        groups.append(tensors)
+        _check_chunk_indices(gid, group.chunk_indices, len(group.tensors), num_chunks)
+        tensors, total_bytes = _decode_frames(group.tensors, shape, dtype, total_bytes)
+        groups.append((list(group.chunk_indices), tensors))
     return groups

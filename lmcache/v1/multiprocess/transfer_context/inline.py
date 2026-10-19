@@ -57,21 +57,22 @@ class EngineDrivenContextInline(EngineDrivenContext):
         self,
         key: IPCCacheServerKey,
         instance_id: int,
-        chunks: "list[torch.Tensor] | list[list[torch.Tensor]]",
+        chunks: "list[torch.Tensor] | list[tuple[list[int], list[torch.Tensor]]]",
     ) -> bool:
         """Serialize chunks and send via COMMIT_STORE.
 
         Single-group callers pass a flat chunk list, sent as a tensor
-        envelope; multi-group callers pass a group-major
-        ``chunks[group][chunk]`` list, sent as a grouped envelope that the
-        server validates against each group's registered layout.
+        envelope. Multi-group callers pass, per group, ``(chunk_indices,
+        tensors)`` -- the chunks that group stores, which omit all-null
+        chunks -- sent as a grouped envelope that the server validates
+        against each group's registered layout.
 
         Returns:
             ``True`` on success, ``False`` on failure or timeout.
         """
-        if chunks and isinstance(chunks[0], list):
+        if chunks and isinstance(chunks[0], tuple):
             serialised = encode_grouped_tensors(
-                cast("list[list[torch.Tensor]]", chunks)
+                cast("list[tuple[list[int], list[torch.Tensor]]]", chunks)
             )
         else:
             serialised = encode_tensors(cast("list[torch.Tensor]", chunks))
@@ -114,22 +115,23 @@ class EngineDrivenContextInline(EngineDrivenContext):
         key: IPCCacheServerKey,
         instance_id: int,
         expected: list[tuple[torch.Size, torch.dtype, int]],
-    ) -> list[list[torch.Tensor]] | None:
+    ) -> list[tuple[list[int], list[torch.Tensor]]] | None:
         """Send PREPARE_RETRIEVE and decode a group-major payload.
 
-        The server responds with ``chunks[group][chunk]`` covering every chunk
-        of every group (all-or-nothing), or a miss. Named apart from the SHM
+        The server responds with each group's in-window chunks and their
+        chunk positions (all-or-nothing), or a miss. Named apart from the SHM
         ``prepare_retrieve_grouped`` because the result is the chunk data
         itself, not slot views.
 
         Args:
             key: Cache key to retrieve.
             instance_id: Worker instance identifier.
-            expected: One ``(shape, dtype, chunk_count)`` per group, from the
+            expected: One ``(shape, dtype, num_chunks)`` per group, from the
                 worker's registered group layouts and block geometry.
 
         Returns:
-            Group-major chunk lists on hit, or None on miss/timeout.
+            Per group ``(chunk_indices, tensors)`` on hit, or None on
+            miss/timeout.
         """
         future = self.req_client.prepare_retrieve(key, instance_id)
         try:
