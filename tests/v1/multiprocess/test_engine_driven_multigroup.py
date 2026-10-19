@@ -813,3 +813,62 @@ def test_inline_strategy_multigroup_rejects_payload_before_storage(
         )
     assert sm.objs == {}
     assert sm.finished_writes == []
+
+
+def test_register_uses_adapter_chunk_size_over_local_group_lcm() -> None:
+    """A pipeline stage may hold only the groups with the smaller block size.
+    ``blocks_in_chunk`` is counted in the engine's global (larger) block, so
+    rebuilding the chunk from this stage's own groups would register half of
+    it. The adapter's LMCache chunk size must win."""
+    kv = {f"layer_{i}": torch.zeros(2, 8, 4, 2, 8) for i in range(2)}
+    bs = _detected_block_size(kv)
+    chunk_tokens = 4 * bs
+    # Global block = 2 * bs (a group this stage does not hold), so the
+    # adapter's blocks_in_chunk is chunk_tokens // (2 * bs) == 2.
+    blocks_in_chunk = chunk_tokens // (2 * bs)
+    infos = [
+        EngineGroupInfo(engine_group_id=0, layer_indices=(0,), tokens_per_block=bs),
+        EngineGroupInfo(engine_group_id=1, layer_indices=(1,), tokens_per_block=bs),
+    ]
+
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        RegisterEngineDrivenContextResponse,
+    )
+
+    def _register_with(**extra: Any) -> tuple[Any, EngineDrivenTransferContext]:
+        sent: list[Any] = []
+
+        def _register(payload):
+            sent.append(payload)
+            future = MagicMock()
+            future.result.return_value = RegisterEngineDrivenContextResponse(
+                shm_name="lmcache_l1_pool_x", pool_size=4096
+            )
+            return future
+
+        req_client = MagicMock()
+        req_client.register_kv_cache_engine_driven_context.side_effect = _register
+        ctx = EngineDrivenTransferContext(1, req_client)
+        ctx.register(
+            kv_caches=kv,
+            model_name="m",
+            world_size=1,
+            blocks_in_chunk=blocks_in_chunk,
+            mq_timeout=1.0,
+            engine_group_infos=infos,
+            **extra,
+        )
+        return sent[0], ctx
+
+    payload, ctx = _register_with(lmcache_chunk_tokens=chunk_tokens)
+    assert [gl.window_tokens for gl in payload.group_layouts] == [chunk_tokens] * 2
+    assert [s.blocks_in_chunk for s in ctx._group_states] == [4, 4]
+
+    # Without the adapter's chunk size, the stage-local reconstruction is the
+    # half-chunk this guards against.
+    legacy, _ = _register_with()
+    assert [gl.window_tokens for gl in legacy.group_layouts] == [2 * bs] * 2
+
+    with pytest.raises(ValueError, match="not a positive multiple"):
+        _register_with(lmcache_chunk_tokens=bs + 1)

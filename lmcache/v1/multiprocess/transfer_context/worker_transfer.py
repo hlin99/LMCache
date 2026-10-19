@@ -297,6 +297,7 @@ class TransferContext(ABC):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        lmcache_chunk_tokens: int | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -312,6 +313,12 @@ class TransferContext(ABC):
                 contexts use it to normalize engine-specific KV layouts.
                 Adapters should pass their own :class:`EngineType`; the
                 default is :attr:`EngineType.VLLM` for backwards compatibility.
+            lmcache_chunk_tokens: Tokens in one LMCache chunk. Engine-driven
+                multi-group registration sizes every group from it; without
+                it the chunk is derived from ``blocks_in_chunk`` and this
+                worker's own groups, which is wrong when a pipeline stage does
+                not hold the group with the largest block. Adapters that know
+                the chunk size should pass it.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -539,6 +546,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        lmcache_chunk_tokens: int | None = None,
     ) -> None:
         """Register the worker KV cache with the LMCache server.
 
@@ -827,6 +835,7 @@ class EngineDrivenTransferContext(TransferContext):
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
+        lmcache_chunk_tokens: int | None = None,
     ) -> None:
         """Register KV caches with the engine-driven context server.
 
@@ -869,14 +878,25 @@ class EngineDrivenTransferContext(TransferContext):
         group_layouts: list[GroupLayout] = []
         group_states: list[_GroupState] = []
         if len(engine_group_infos) > 1:
-            # The engine schedules block ids in units of every group's block
-            # size at once, so one LMCache chunk must cover a whole number of
-            # blocks of EVERY group: chunk tokens are ``blocks_in_chunk``
-            # multiples of the lcm of the group block sizes (0 = unreported,
-            # treated as the detected engine block size).
-            chunk_tokens = blocks_in_chunk * lcm(
+            # One LMCache chunk must cover a whole number of blocks of EVERY
+            # group. Prefer the chunk size the adapter knows: blocks_in_chunk
+            # is counted in the engine's global block size, and a pipeline
+            # stage that does not hold the group with the largest block would
+            # otherwise reconstruct a smaller chunk from its own groups' lcm
+            # (0 = unreported, treated as the detected engine block size).
+            local_lcm = lcm(
                 *(group.tokens_per_block or block_size for group in engine_group_infos)
             )
+            if lmcache_chunk_tokens is None:
+                chunk_tokens = blocks_in_chunk * local_lcm
+            else:
+                if lmcache_chunk_tokens <= 0 or lmcache_chunk_tokens % local_lcm:
+                    raise ValueError(
+                        f"LMCache chunk of {lmcache_chunk_tokens} tokens is not "
+                        "a positive multiple of this worker's group block "
+                        f"sizes (lcm {local_lcm})"
+                    )
+                chunk_tokens = lmcache_chunk_tokens
             layer_names = list(kv_caches)
             normalized_kv, per_layer_formats = normalize_and_discover_per_layer_formats(
                 list(kv_caches.values()),
