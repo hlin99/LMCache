@@ -206,6 +206,27 @@ class _GroupState:
     window_chunks: int = -1
 
 
+# Allocates ``count`` CPU gather targets of one shape and dtype.
+_StagingAlloc = Callable[[torch.Size, torch.dtype, int], list[torch.Tensor]]
+
+
+@dataclass
+class _GroupStorePlan:
+    """One group's part of a multi-group store.
+
+    Attributes:
+        gid: LMCache group index.
+        chunk_indices: Chunk positions this group stores (all-null chunks left
+            out), in increasing order.
+        out: Gather targets parallel to ``chunk_indices`` (SHM slots or pinned
+            staging), or ``None`` to let gather allocate fresh CPU tensors.
+    """
+
+    gid: int
+    chunk_indices: list[int]
+    out: "list[torch.Tensor] | None"
+
+
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
     """Return the flat block-id list for transports without HMA support."""
     if len(block_ids) != 1:
@@ -1241,97 +1262,112 @@ class EngineDrivenTransferContext(TransferContext):
                 f"{len(self._group_states)} registered groups"
             )
 
-    def _store_multigroup_shm(
+    def _prepare_multigroup_store(
         self,
         ctx: "EngineDrivenContext",
         key: Any,
-        kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
-    ) -> bool:
-        """Store every group's non-null chunks through server-reserved slots.
+        alloc: "_StagingAlloc | None" = None,
+    ) -> "list[_GroupStorePlan] | None":
+        """Decide what each group stores and where it gathers to.
 
-        The server reserves no slot for a skipped (all-null) chunk, so its
-        returned ``chunk_indices`` already exclude them.
+        All-null chunks are left out on both transports. Over SHM the server
+        reserves slots for the rest (and none for skipped chunks) and they are
+        the gather targets. Inline has no slots: ``alloc``, when given,
+        provides each group's gather targets (the async path's pinned
+        staging), otherwise gather allocates fresh CPU tensors.
+
+        Returns:
+            One plan per group with chunks to store (an empty list when
+            nothing needs storing), or ``None`` on a malformed SHM response.
         """
-        device = _get_kv_device(kv_caches)
         skipped = self._null_chunk_indices(block_ids)
-        synchronize_device(device)
-        result = ctx.prepare_store_grouped(
-            key,
-            self._instance_id,
-            tuple(tuple(g) for g in skipped) if any(skipped) else (),
-        )
-        if result is None:
-            return False
-        tensors, chunk_indices, group_ids = result
-        if not tensors:
-            return True
-        for gid, state in enumerate(self._group_states):
-            out_g, chunks_g = self._group_slots(tensors, group_ids, gid, chunk_indices)
-            if not out_g:
-                continue
-            gather_paged_kv_to_cpu(
-                {name: kv_caches[name] for name in state.layer_names},
-                block_ids[gid],
-                state.blocks_in_chunk,
-                layout_hints=self._layout_hints,
-                engine_kv_format=state.engine_kv_format,
-                out=out_g,
-                chunk_indices=chunks_g,
-                blocks_per_window=state.blocks_per_window,
-                engine_type=self._engine_type,
+        if not isinstance(ctx, EngineDrivenContextInline):
+            result = ctx.prepare_store_grouped(
+                key,
+                self._instance_id,
+                tuple(tuple(g) for g in skipped) if any(skipped) else (),
             )
-        # SHM writes are async device->CPU copies; complete them before commit.
-        synchronize_device(device)
-        return ctx.commit_store(key, self._instance_id, [])
+            if result is None:
+                return None
+            tensors, chunk_indices, group_ids = result
+            plans: list[_GroupStorePlan] = []
+            for gid in range(len(self._group_states)):
+                out_g, chunks_g = self._group_slots(
+                    tensors, group_ids, gid, chunk_indices
+                )
+                if out_g:
+                    assert chunks_g is not None
+                    plans.append(_GroupStorePlan(gid, chunks_g, out_g))
+            return plans
 
-    def _store_multigroup_inline(
-        self,
-        ctx: "EngineDrivenContextInline",
-        key: Any,
-        kv_caches: dict[str, torch.Tensor],
-        block_ids: list[list[int]],
-    ) -> bool:
-        """Store every group's non-null chunks in one typed grouped envelope.
-
-        There are no server-reserved slots in inline mode, so each group's
-        stored chunks are gathered into fresh CPU tensors and sent with their
-        chunk positions; all-null chunks are left out.
-        """
-        device = _get_kv_device(kv_caches)
-        skipped = self._null_chunk_indices(block_ids)
-        groups: list[tuple[list[int], int]] = []
+        plans = []
         for gid, state in enumerate(self._group_states):
             skip = set(skipped[gid])
             num_chunks = len(block_ids[gid]) // state.blocks_in_chunk
-            groups.append(([c for c in range(num_chunks) if c not in skip], gid))
-        if not any(indices for indices, _ in groups):
-            return True
-        synchronize_device(device)
+            indices = [c for c in range(num_chunks) if c not in skip]
+            out = (
+                alloc(
+                    state.layout_desc.shapes[0],
+                    state.layout_desc.dtypes[0],
+                    len(indices),
+                )
+                if alloc is not None and indices
+                else None
+            )
+            plans.append(_GroupStorePlan(gid, indices, out))
+        if not any(plan.chunk_indices for plan in plans):
+            return []
         # Handshake only: the inline strategy reserves nothing at prepare.
         ctx.prepare_store(key, self._instance_id)
-        payload: list[tuple[list[int], list[torch.Tensor]]] = []
-        for indices, gid in groups:
-            state = self._group_states[gid]
-            chunks = (
+        return plans
+
+    def _gather_multigroup(
+        self,
+        plans: "list[_GroupStorePlan]",
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> list[list[torch.Tensor]]:
+        """Enqueue each planned group's device->CPU copies; one list per plan."""
+        gathered: list[list[torch.Tensor]] = []
+        for plan in plans:
+            state = self._group_states[plan.gid]
+            if not plan.chunk_indices:
+                gathered.append([])
+                continue
+            gathered.append(
                 gather_paged_kv_to_cpu(
                     {name: kv_caches[name] for name in state.layer_names},
-                    block_ids[gid],
+                    block_ids[plan.gid],
                     state.blocks_in_chunk,
                     layout_hints=self._layout_hints,
                     engine_kv_format=state.engine_kv_format,
-                    chunk_indices=indices,
+                    out=plan.out,
+                    chunk_indices=plan.chunk_indices,
                     blocks_per_window=state.blocks_per_window,
                     engine_type=self._engine_type,
                 )
-                if indices
-                else []
             )
-            payload.append((indices, chunks))
-        # Gather issues async device->CPU copies; commit_store serializes the
-        # buffers immediately, so the copies must be complete first.
-        synchronize_device(device)
-        return ctx.commit_store(key, self._instance_id, payload)
+        return gathered
+
+    def _commit_multigroup(
+        self,
+        ctx: "EngineDrivenContext",
+        key: Any,
+        plans: "list[_GroupStorePlan]",
+        gathered: list[list[torch.Tensor]],
+    ) -> bool:
+        """Commit a gathered multi-group store; the copies must be complete."""
+        if not isinstance(ctx, EngineDrivenContextInline):
+            return ctx.commit_store(key, self._instance_id, [])
+        return ctx.commit_store(
+            key,
+            self._instance_id,
+            [
+                (plan.chunk_indices, chunks)
+                for plan, chunks in zip(plans, gathered, strict=True)
+            ],
+        )
 
     def _store_multigroup(
         self,
@@ -1343,9 +1379,18 @@ class EngineDrivenTransferContext(TransferContext):
         ctx = self._engine_driven_context
         assert ctx is not None
         self._check_group_block_ids(block_ids)
-        if isinstance(ctx, EngineDrivenContextInline):
-            return self._store_multigroup_inline(ctx, key, kv_caches, block_ids)
-        return self._store_multigroup_shm(ctx, key, kv_caches, block_ids)
+        device = _get_kv_device(kv_caches)
+        synchronize_device(device)
+        plans = self._prepare_multigroup_store(ctx, key, block_ids)
+        if plans is None:
+            return False
+        if not plans:
+            return True
+        gathered = self._gather_multigroup(plans, kv_caches, block_ids)
+        # Gather issues async device->CPU copies (into SHM slots, or into
+        # buffers inline commit serializes at once): complete them first.
+        synchronize_device(device)
+        return self._commit_multigroup(ctx, key, plans, gathered)
 
     def _submit_store_multigroup(
         self,
