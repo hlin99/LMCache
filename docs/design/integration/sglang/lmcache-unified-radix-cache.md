@@ -41,13 +41,54 @@ conv state, FP32 recurrent state, equal key/value head counts, ascending layer
 IDs, and unpadded n:1 GDN/FULL layer grouping. It registers
 recurrent objects before FULL objects, uses vLLM's round-robin layer order,
 and packs conv followed by recurrent bytes into zero-padded rows matching
-the writer's 16-byte-aligned transfer width.
+the writer's 16-byte-aligned transfer width. SGLang keeps its own checkpoint
+grid and slot IDs; the shared LMCache chunk must align to both engines'
+grids (1088 tokens for the tested 544/64 configuration).
+
+The BF16 TP1 Qwen3.5-0.8B experiment restored 2176 of 2273 prompt tokens,
+including all 18 GDN layers and 6 FULL layers. Its generated token IDs matched
+the SGLang cold control; log probabilities were not bit-exact. SGLang-originated
+objects were also retrieved by a fresh vLLM process and preserved the needle
+answer, but did not reproduce vLLM's entire cold completion. This is not a
+general hybrid-model, heterogeneous-TP, or FP8 compatibility guarantee.
 
 The default remains the independent-component representation. The prototype
 duplicates the GPU KV pool and synchronously waits for load-side unpacking;
 it is a correctness experiment, not a performance optimization. Use an empty
 LMCache instance or an isolated namespace: previously stored native SGLang
 objects are incompatible, and cache keys still do not encode the format.
+
+#### Shared hybrid checkpoint boundaries
+
+For the tested Qwen3.5-0.8B BF16 TP1 setup, use this SGLang LMCache YAML:
+
+```yaml
+mp_host: 127.0.0.1
+mp_port: 15655
+extra_config:
+  sglang.vllm_fused_kv: true
+  sglang.vllm_mamba_block_size: 544
+```
+
+Start the LMCache MP server with `--chunk-size 1088 --separate-object-groups`.
+The vLLM writer must use `VLLM_SSM_CONV_STATE_LAYOUT=DS` and BF16 KV; the
+SGLang reader must use FP32 recurrent state (`--mamba-ssm-dtype float32`).
+Both engines must use the same weights and token IDs. The value 544 must match
+the writer's resolved Mamba block size; it is not universal across models,
+TP sizes, or attention backends.
+
+The shared chunk is `lcm(544, 64) = 1088`: vLLM's resolved cache block covers
+544 tokens, while SGLang's checkpoint grid covers 64. Full-attention KV and
+the GDN snapshot must refer to exactly the same prefix boundary. A state at
+2240 tokens cannot stand in for a state at 2176 tokens or be cropped back to it.
+Grid alignment does not mean every eligible historical checkpoint remains
+resident; STORE still needs a real checkpoint at the requested boundary.
+
+The existing MP connector validates component/chunk divisibility and truncates
+LOOKUP/STORE ranges to complete chunks. Thus the 2273-token experiment restored
+2176 tokens and computed the remaining 97. This configuration does not add
+arbitrary-boundary checkpoints or partial-chunk support; padding actual model
+input with dummy tokens would change the recurrent state.
 
 ### Goals
 
