@@ -53,6 +53,7 @@ class LMCacheLoadOperation:
     future: Any
     lookup: LMCacheLookupOperation
     result: Optional[bool] = None
+    group_device_indices: tuple[torch.Tensor, ...] = ()
 
     def query(self) -> bool:
         return self.result is not None or bool(self.future.query())

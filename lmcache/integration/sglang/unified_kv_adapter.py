@@ -49,6 +49,7 @@ class SGLangUnifiedKVAdapter:
         if vllm_fused_kv and tree_components != (ComponentType.FULL,):
             raise ValueError("Experimental vLLM fused KV requires FULL attention only")
         self.vllm_fused_kv = vllm_fused_kv
+        self.vllm_mamba_block_size = 0
         self._fused_kv_pairs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     def is_mla_enabled(self, model_config: Any) -> bool:
@@ -164,6 +165,9 @@ class SGLangUnifiedKVAdapter:
                 )
             else:
                 raise AssertionError(f"Unexpected LMCache component {component_type}")
+        if self.vllm_mamba_block_size:
+            # Qwen3.5's vLLM registration puts recurrent objects before FULL KV.
+            groups.reverse()
         return groups
 
     def pack_for_store(self, indices: torch.Tensor) -> None:
@@ -252,6 +256,8 @@ class SGLangUnifiedKVAdapter:
                 result.append(checkpoint_slots)
             else:
                 raise AssertionError(f"Unexpected LMCache component {component_type}")
+        if self.vllm_mamba_block_size:
+            result.reverse()
         return result
 
     def _resolve_pool_tensors(self, kv_pool) -> tuple[torch.Tensor, ...]:

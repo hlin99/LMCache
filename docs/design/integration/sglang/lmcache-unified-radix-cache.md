@@ -39,6 +39,11 @@ it is a correctness experiment, not a performance optimization. Use an empty
 LMCache instance or an isolated namespace: previously stored native SGLang
 objects are incompatible, and cache keys still do not encode the format.
 
+Load operations retain each component's physical slot indices and
+identify FULL ownership by component name rather than group position.
+Recurrent-first wire registration and its matching index order are
+prepared for the GDN extension; FULL-only behavior is unchanged.
+
 ### Goals
 
 The design has the following goals:

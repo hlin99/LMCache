@@ -932,12 +932,19 @@ class UnifiedLMCacheMPConnector:
             end=total_hit,
             local_hit_tokens=local_hit_tokens,
             device_indices=(
-                group_indices[0]
+                next(
+                    indices
+                    for group, indices in zip(
+                        self._kv_groups, group_indices, strict=True
+                    )
+                    if group.name == "full"
+                )
                 if owned_device_indices is None
                 else owned_device_indices
             ),
             future=future,
             lookup=operation,
+            group_device_indices=tuple(group_indices),
         )
 
     def prepare_load_on_stream(

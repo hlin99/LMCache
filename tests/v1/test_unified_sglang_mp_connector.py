@@ -922,6 +922,24 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(operation.start, 0)
         self.assertEqual(operation.end, 8)
 
+        connector._kv_groups = tuple(reversed(connector._kv_groups))
+        full_indices = torch.arange(4, 9)
+        mamba_indices = torch.tensor([0, 7])
+        with patch.object(torch, "get_device_module"):
+            reversed_operation = connector.submit_load(
+                lookup,
+                [mamba_indices, full_indices],
+                local_hit_tokens=3,
+                producer_stream=producer_stream,
+            )
+
+        self.assertEqual(
+            connector._transfer_ctx.retrieve_args[0][3],
+            [[0, 7], [0, 0, 0, 4, 5, 6, 7, 8]],
+        )
+        self.assertIs(reversed_operation.device_indices, full_indices)
+        self.assertIs(reversed_operation.group_device_indices[0], mamba_indices)
+
     def test_prepare_load_orders_forward_stream_without_completing_future(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)
         connector._mq_timeout = 10
