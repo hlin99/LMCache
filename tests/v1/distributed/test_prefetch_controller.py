@@ -13,7 +13,7 @@ the full integration without mocking internals.
 # Standard
 from collections.abc import Sequence
 from threading import Event
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import time
 
 # Third Party
@@ -60,6 +60,8 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     L2AdapterDescriptor,
 )
 from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
+from lmcache.v1.multiprocess.config import CoordinatorConfig, P2PConfig
+from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
 from lmcache.v1.storage_backend.raw_block import RawBlockCore, encode_object_key
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
@@ -1187,6 +1189,37 @@ class TestL1AndL2:
 
 
 class TestSlidingWindowRows:
+    def test_p2p_keeps_full_history_without_historical_recurrent_states(
+        self, l1_manager
+    ):
+        recurrent_keys = [
+            make_object_key(chunk, gid=0, kv_rank=rank)
+            for rank in range(2)
+            for chunk in range(2)
+        ]
+        full_keys = [
+            make_object_key(chunk, gid=1, kv_rank=rank)
+            for rank in range(2)
+            for chunk in range(2)
+        ]
+        resident = recurrent_keys[1::2] + full_keys
+        layout = make_layout()
+        write_keys_to_l1(l1_manager, resident, layout)
+        ctx = MagicMock()
+        peer = P2PController(
+            ctx, P2PConfig(), CoordinatorConfig(), instance_id="source"
+        )
+        peer.p2p_lookup_and_lock(recurrent_keys + full_keys, {0: layout, 1: layout})
+        (spec,), kwargs = ctx.storage_manager.submit_prefetch_task.call_args
+        ctrl = make_controller(l1_manager, [])
+        request_id = ctrl.submit_prefetch_request(spec, skip_l2=kwargs["skip_l2"])
+        result = ctrl.query_prefetch_result(request_id)
+
+        assert row_bits(result, 0) == [1, 3]
+        assert row_bits(result, 1) == [0, 1, 2, 3]
+        assert_read_locked(l1_manager, resident)
+        l1_manager.finish_read(resident)
+
     def test_windowed_row_keeps_only_its_window(self, l1_manager):
         """Rows [full, window 2] over 4 chunks all in L1: the full row keeps
         every chunk, the windowed row keeps chunks 2-3 and releases 0-1."""

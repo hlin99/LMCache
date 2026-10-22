@@ -24,13 +24,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-FetchingPolicy = Literal["prefix", "full"]
+FetchingPolicy = Literal["prefix", "full", "sparse"]
 """Which found objects a prefetch loads and reports.
 
 ``"prefix"`` -- only fetch the prefix hit and discard all non-prefix hits.
 
-``"full"`` -- fetch all of the hit chunks, no matter whether they are in the
-prefix or not.
+``"full"`` -- fetch all hit chunks, including gaps in the prefix, but report
+only columns for which every object group is present.
+
+``"sparse"`` -- fetch and report every found object independently, even when
+another object group is missing at the same chunk.
 """
 
 FULL_ATTENTION_WINDOW_CHUNKS = -1

@@ -1569,6 +1569,7 @@ class PrefetchController(StorageControllerInterface):
 
         For `prefix` loading, it will do fold-unfold. It will also touch the
         L1 keys so that the eviction module can be updated.
+        Sparse loading retains each found object without requiring its column.
 
         Args:
             request: The request to finish. Its L2 locked map and reserved

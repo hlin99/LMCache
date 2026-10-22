@@ -164,7 +164,7 @@ def _make_controller(
 
 
 def test_lookup_and_lock_submits_skip_l2_and_returns_task_id():
-    """p2p_lookup_and_lock submits a "full" (gap-tolerant) skip_l2 prefetch
+    """p2p_lookup_and_lock submits a "sparse" skip_l2 prefetch
     with all keys in one object-group row, and returns a fresh id."""
     controller, ctx = _make_controller()
     handle = MagicMock(total_requested_keys=2)
@@ -181,7 +181,7 @@ def test_lookup_and_lock_submits_skip_l2_and_returns_task_id():
     assert [row.object_group_id for row in spec.key_groups] == [0]
     assert spec.key_groups[0].layout_desc is layout
     assert kwargs["skip_l2"] is True
-    assert spec.fetching_policy == "full"
+    assert spec.fetching_policy == "sparse"
     # A second call gets a distinct id.
     assert controller.p2p_lookup_and_lock(keys, group_layout_descs) == 1
 
@@ -209,7 +209,7 @@ def test_lookup_and_lock_groups_keys_per_object_group():
     assert spec.key_groups[1].keys == [keys[1], keys[3]]
     assert spec.key_groups[0].layout_desc is layouts[1]
     assert spec.key_groups[1].layout_desc is layouts[0]
-    assert spec.fetching_policy == "full"
+    assert spec.fetching_policy == "sparse"
 
 
 def test_lookup_and_lock_uneven_object_groups_report_misses():

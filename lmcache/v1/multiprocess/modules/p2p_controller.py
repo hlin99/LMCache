@@ -73,7 +73,7 @@ def _group_keys_by_object_group(
         in ``group_layout_descs``.
 
     Note:
-        Now we only do ``"full"`` fetching.
+        P2P serves individual objects with ``"sparse"`` fetching.
     """
     by_group: dict[int, list[ObjectKey]] = {}
     for key in keys:
@@ -315,9 +315,9 @@ class P2PController(DiscoverableModule):
         key_groups = _group_keys_by_object_group(keys, group_layout_descs)
         if key_groups:
             # NOTE: skip_l2=True -- only objects already resident in L1 are
-            # locked; "full" keeps every resident key, gaps allowed.
+            # locked, independently of other groups' historical checkpoints.
             handle = self._ctx.storage_manager.submit_prefetch_task(
-                PrefetchTaskSpec(key_groups=key_groups, fetching_policy="full"),
+                PrefetchTaskSpec(key_groups=key_groups, fetching_policy="sparse"),
                 external_request_id=f"p2p-{task_id}",
                 skip_l2=True,
             )
