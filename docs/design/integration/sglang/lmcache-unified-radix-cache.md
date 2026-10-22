@@ -30,19 +30,24 @@ The opt-in LMCache YAML setting
 FULL-attention layer with per-head content `[K, V]`, matching the current vLLM
 fused-content representation. STORE packs only its selected token slots;
 RETRIEVE unpacks into SGLang's unchanged K/V pools before publishing the prefix.
-This prototype requires TP1/PP1, FULL-only attention, and matching BF16/FP16
-K/V shapes. It does not support MLA or recurrent state.
+This prototype requires TP1/PP1 and matching BF16/FP16 K/V shapes.
+It does not support MLA.
+
+The experimental GDN extension additionally accepts
+`extra_config: {"sglang.vllm_fused_kv": true, "sglang.vllm_mamba_block_size": 544}`.
+It requires contiguous BF16 dimension-first QKV conv state and FP32
+recurrent state with equal key/value head counts. Each layer is packed
+as conv bytes followed by recurrent bytes and zero padding, using the
+writer's 16-byte-aligned transfer width. STORE/RETRIEVE use the real
+checkpoint slot and ignore absent zero slots. Recurrent object groups
+precede FULL groups. Cross-engine GDN layer ordering is completed in
+the next change; byte packing alone is not complete interoperability.
 
 The default remains the independent-component representation. The prototype
 duplicates the GPU KV pool and synchronously waits for load-side unpacking;
 it is a correctness experiment, not a performance optimization. Use an empty
 LMCache instance or an isolated namespace: previously stored native SGLang
 objects are incompatible, and cache keys still do not encode the format.
-
-Load operations retain each component's physical slot indices and
-identify FULL ownership by component name rather than group position.
-Recurrent-first wire registration and its matching index order are
-prepared for the GDN extension; FULL-only behavior is unchanged.
 
 ### Goals
 

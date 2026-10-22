@@ -122,6 +122,9 @@ class UnifiedLMCacheMPConnector:
             page_size=page_size,
             sliding_window_size=sliding_window_size,
             vllm_fused_kv=self.vllm_fused_kv,
+            vllm_mamba_block_size=int(
+                config.get_extra_config_value("sglang.vllm_mamba_block_size", 0)
+            ),
         )
         kv_groups = self._sglang_kv_adapter.resolve_registered_groups()
         mla_enabled = self._sglang_kv_adapter.is_mla_enabled(model_config)
@@ -983,7 +986,13 @@ class UnifiedLMCacheMPConnector:
         if success:
             if self.vllm_fused_kv:
                 with torch.cuda.stream(stream):
-                    self._sglang_kv_adapter.unpack_after_load(operation.device_indices)
+                    for group, indices in zip(
+                        self._kv_groups, operation.group_device_indices, strict=True
+                    ):
+                        if group.recurrent_state:
+                            self._sglang_kv_adapter.unpack_recurrent_after_load(indices)
+                        else:
+                            self._sglang_kv_adapter.unpack_after_load(indices)
                 # The prototype must finish unpacking before cache ownership changes.
                 stream.synchronize()
             return True
@@ -1149,7 +1158,13 @@ class UnifiedLMCacheMPConnector:
                     lookup, start=start, end=aligned_end, worker_id=self.kv_worker_id
                 )
                 if self.vllm_fused_kv:
-                    self._sglang_kv_adapter.pack_for_store(store_group_indices[0])
+                    for group, indices in zip(
+                        self._kv_groups, store_group_indices, strict=True
+                    ):
+                        if group.recurrent_state:
+                            self._sglang_kv_adapter.pack_recurrent_for_store(indices)
+                        else:
+                            self._sglang_kv_adapter.pack_for_store(indices)
                 event = transfer_ctx.create_recorded_event()
                 future = transfer_ctx.submit_store(
                     request_id,

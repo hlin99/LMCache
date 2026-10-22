@@ -31,6 +31,7 @@ class SGLangUnifiedKVAdapter:
         page_size: int,
         sliding_window_size: Optional[int],
         vllm_fused_kv: bool = False,
+        vllm_mamba_block_size: int = 0,
     ) -> None:
         # check tree components
         if len(tree_components) <= 0:
@@ -46,11 +47,23 @@ class SGLangUnifiedKVAdapter:
         self.mamba_component = mamba_component
         self.page_size = page_size
         self.sliding_window_size = sliding_window_size
-        if vllm_fused_kv and tree_components != (ComponentType.FULL,):
+        if vllm_mamba_block_size < 0:
+            raise ValueError("vllm_mamba_block_size must be nonnegative")
+        if vllm_mamba_block_size and (
+            not vllm_fused_kv
+            or tree_components != (ComponentType.FULL, ComponentType.MAMBA)
+        ):
+            raise ValueError("Experimental GDN packing requires fused FULL plus MAMBA")
+        if (
+            vllm_fused_kv
+            and tree_components != (ComponentType.FULL,)
+            and not vllm_mamba_block_size
+        ):
             raise ValueError("Experimental vLLM fused KV requires FULL attention only")
         self.vllm_fused_kv = vllm_fused_kv
-        self.vllm_mamba_block_size = 0
+        self.vllm_mamba_block_size = vllm_mamba_block_size
         self._fused_kv_pairs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._gdn_state_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     def is_mla_enabled(self, model_config: Any) -> bool:
         """Return whether KV is TP-replicated for the MLA optimization."""
@@ -150,12 +163,17 @@ class SGLangUnifiedKVAdapter:
             elif component_type is ComponentType.MAMBA:
                 mamba_pool = self.req_to_token_pool.mamba_pool
                 checkpoint_grid = self.mamba_component.mamba_checkpoint_grid
+                state_tensors = (
+                    self._resolve_vllm_gdn_rows(mamba_pool)
+                    if self.vllm_mamba_block_size
+                    else self._resolve_mamba_pool_tensors(mamba_pool)
+                )
                 groups.append(
                     SGLangKVComponentGroup(
                         name=component_type.name.lower(),
                         kv_tensors=tuple(
                             tensor.view(tensor.shape[0], 1, -1)
-                            for tensor in self._resolve_mamba_pool_tensors(mamba_pool)
+                            for tensor in state_tensors
                         ),
                         sliding_window_size=checkpoint_grid,
                         tokens_per_block=checkpoint_grid,
@@ -203,6 +221,64 @@ class SGLangUnifiedKVAdapter:
             width = key.shape[-1]
             key.index_copy_(0, slots, packed[..., :width])
             value.index_copy_(0, slots, packed[..., width:])
+
+    def pack_recurrent_for_store(self, indices: torch.Tensor) -> None:
+        """Pack GDN conv then recurrent bytes into vLLM-compatible opaque rows.
+
+        Args:
+            indices: Checkpoint-slot vector; zero entries are absent history.
+
+        Raises:
+            ValueError: No real checkpoint is present.
+        """
+        slots = indices[indices != 0].unique().to(dtype=torch.int64)
+        if not slots.numel():
+            raise ValueError("GDN STORE requires a resident nonzero checkpoint slot")
+        for conv, temporal, packed in self._gdn_state_rows:
+            slots = slots.to(device=conv.device)
+            conv_bytes = conv[0].numel() * conv.element_size()
+            temporal_bytes = temporal[0].numel() * temporal.element_size()
+            raw = packed.view(torch.uint8).flatten(1)
+            raw[:, :conv_bytes].index_copy_(
+                0, slots, conv.index_select(0, slots).view(torch.uint8).flatten(1)
+            )
+            raw[:, conv_bytes : conv_bytes + temporal_bytes].index_copy_(
+                0, slots, temporal.index_select(0, slots).view(torch.uint8).flatten(1)
+            )
+
+    def unpack_recurrent_after_load(self, indices: torch.Tensor) -> None:
+        """Restore opaque GDN rows into the selected SGLang checkpoint slots.
+
+        Args:
+            indices: Checkpoint-slot vector, ignoring absent zero history.
+
+        Raises:
+            ValueError: No destination checkpoint is present.
+        """
+        slots = indices[indices != 0].unique().to(dtype=torch.int64)
+        if not slots.numel():
+            raise ValueError("GDN RETRIEVE requires a nonzero checkpoint slot")
+        for conv, temporal, packed in self._gdn_state_rows:
+            slots = slots.to(device=conv.device)
+            raw = packed.index_select(0, slots).view(torch.uint8).flatten(1)
+            conv_bytes = conv[0].numel() * conv.element_size()
+            temporal_bytes = temporal[0].numel() * temporal.element_size()
+            conv.index_copy_(
+                0,
+                slots,
+                raw[:, :conv_bytes]
+                .contiguous()
+                .view(conv.dtype)
+                .reshape(-1, *conv.shape[1:]),
+            )
+            temporal.index_copy_(
+                0,
+                slots,
+                raw[:, conv_bytes : conv_bytes + temporal_bytes]
+                .contiguous()
+                .view(temporal.dtype)
+                .reshape(-1, *temporal.shape[1:]),
+            )
 
     def aligned_swa_window_size(self) -> int:
         assert self.sliding_window_size is not None
@@ -259,6 +335,55 @@ class SGLangUnifiedKVAdapter:
         if self.vllm_mamba_block_size:
             result.reverse()
         return result
+
+    def _resolve_vllm_gdn_rows(self, mamba_pool: Any) -> tuple[torch.Tensor, ...]:
+        """Reproduce Qwen3.5 vLLM's grouped, padded conv/recurrent byte rows."""
+        state = mamba_pool.mamba_cache
+        if len(state.conv) != 1:
+            raise ValueError("Experimental GDN packing requires one QKV conv tensor")
+        conv = state.conv[0]
+        temporal = state.temporal
+        layer_ids = mamba_pool.mamba_layer_ids
+        if (
+            conv.ndim != 4
+            or temporal.ndim != 5
+            or conv.shape[:2] != temporal.shape[:2]
+            or conv.shape[0] != len(layer_ids)
+            or conv.dtype != torch.bfloat16
+            or temporal.dtype != torch.float32
+            or not conv.is_contiguous()
+            or not temporal.is_contiguous()
+            or list(layer_ids) != sorted(set(layer_ids))
+        ):
+            raise ValueError(
+                "Experimental GDN packing requires BF16 DS conv/FP32 state"
+            )
+        if conv.shape[2] != temporal.shape[2] * (
+            2 * temporal.shape[4] + temporal.shape[3]
+        ):
+            raise ValueError(
+                "Experimental GDN packing requires DS QKV conv state "
+                "with equal key/value head counts"
+            )
+        block_size = self.vllm_mamba_block_size
+        self._gdn_state_rows = []
+        for index in range(len(layer_ids)):
+            conv_layer, temporal_layer = conv[index], temporal[index]
+            payload_bytes = (
+                conv_layer[0].numel() * conv_layer.element_size()
+                + temporal_layer[0].numel() * temporal_layer.element_size()
+            )
+            # Match _MambaUnifiedViewEdit's 16-byte aligned per-token width.
+            token_bytes = (
+                (payload_bytes + block_size * 16 - 1) // (block_size * 16) * 16
+            )
+            packed = torch.zeros(
+                (conv.shape[1], 1, block_size * token_bytes),
+                dtype=torch.int8,
+                device=conv.device,
+            )
+            self._gdn_state_rows.append((conv_layer, temporal_layer, packed))
+        return tuple(packed for _, _, packed in self._gdn_state_rows)
 
     def _resolve_pool_tensors(self, kv_pool) -> tuple[torch.Tensor, ...]:
         kv_buffer = getattr(kv_pool, "kv_buffer", None)

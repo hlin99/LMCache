@@ -109,3 +109,81 @@ def test_fused_registration_rejects_recurrent_hybrid() -> None:
             sliding_window_size=None,
             vllm_fused_kv=True,
         )
+
+
+def test_hybrid_packs_grouped_conv_and_recurrent_rows_and_restores_slots() -> None:
+    components = pytest.importorskip("sglang.srt.mem_cache.unified_cache.components")
+    # First Party
+    from lmcache.integration.sglang.unified_kv_adapter import SGLangUnifiedKVAdapter
+
+    conv = torch.arange(6 * 4 * 6 * 3, dtype=torch.bfloat16).reshape(6, 4, 6, 3)
+    temporal = torch.arange(6 * 4 * 1 * 2 * 2, dtype=torch.float32).reshape(
+        6, 4, 1, 2, 2
+    )
+    original_conv, original_temporal = conv.clone(), temporal.clone()
+    pool = SimpleNamespace(
+        k_buffer=[torch.zeros(16, 1, 2, dtype=torch.bfloat16) for _ in range(2)],
+        v_buffer=[torch.zeros(16, 1, 2, dtype=torch.bfloat16) for _ in range(2)],
+    )
+    allocator = SimpleNamespace(
+        get_kvcache=lambda: pool,
+        translate_kv_indices_for_transfer=lambda indices: indices,
+    )
+    state_pool = SimpleNamespace(
+        mamba_cache=SimpleNamespace(conv=[conv], temporal=temporal),
+        mamba_layer_ids=[0, 1, 2, 4, 5, 6],
+    )
+    adapter = SGLangUnifiedKVAdapter(
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=SimpleNamespace(
+            mamba_pool=state_pool, translate_mamba_indices=lambda indices: indices
+        ),
+        tree_components=(components.ComponentType.FULL, components.ComponentType.MAMBA),
+        mamba_component=SimpleNamespace(mamba_checkpoint_grid=4),
+        page_size=1,
+        sliding_window_size=None,
+        vllm_fused_kv=True,
+        vllm_mamba_block_size=4,
+    )
+    groups = adapter.resolve_registered_groups()
+    assert [group.name for group in groups] == ["mamba", "full"]
+    assert groups[0].tokens_per_block == 4
+    assert groups[0].slots_per_block == 1
+    assert all(tensor.shape == (4, 1, 64) for tensor in groups[0].kv_tensors)
+    indices = adapter.device_indices_by_group(
+        torch.arange(8), mamba_value=torch.tensor([2])
+    )
+    assert indices[0].tolist() == [0, 2]
+    assert indices[1].tolist() == list(range(8))
+
+    adapter.pack_recurrent_for_store(indices[0])
+
+    for packed, source_layer in zip(
+        groups[0].kv_tensors, [0, 1, 2, 3, 4, 5], strict=True
+    ):
+        raw = packed[2].view(torch.uint8).flatten()
+        expected = torch.cat(
+            (
+                original_conv[source_layer, 2].view(torch.uint8).flatten(),
+                original_temporal[source_layer, 2].view(torch.uint8).flatten(),
+            )
+        )
+        assert torch.equal(raw[:52], expected)
+        assert torch.count_nonzero(raw[52:]) == 0
+    conv[:, 2] = 0
+    temporal[:, 2] = 0
+
+    adapter.unpack_recurrent_after_load(indices[0])
+
+    assert torch.equal(conv, original_conv)
+    assert torch.equal(temporal, original_temporal)
+    for transfer in (
+        adapter.pack_recurrent_for_store,
+        adapter.unpack_recurrent_after_load,
+    ):
+        with pytest.raises(ValueError, match="nonzero checkpoint"):
+            transfer(torch.zeros(2, dtype=torch.int64))
+
+    state_pool.mamba_cache.conv[0] = conv.transpose(-1, -2).contiguous()
+    with pytest.raises(ValueError, match="DS QKV conv state"):
+        adapter.resolve_registered_groups()
