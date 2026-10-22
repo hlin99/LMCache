@@ -1604,6 +1604,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         Update KVConnector state from worker-side connectors output.
 
+        Eager writers end their sessions after aggregated send completion,
+        so a late worker STORE cannot recreate an already-ended session.
+
         Args:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
@@ -1617,6 +1620,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             self._kv_cache_events.extend(kv_cache_events.aggregate().get_all_events())
 
         if not self.lazy_offload:
+            if self._can_store:
+                for request_id in connector_output.finished_sending or ():
+                    self.scheduler_adapter.end_session(request_id)
             return
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, LMCacheMPWorkerMetadata):
@@ -1682,8 +1688,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 self.scheduler_adapter.end_session(request_id)
             return False, (return_params or None)
 
-        # Notify LMCache to end the session for this request
-        self.scheduler_adapter.end_session(request.request_id)
+        # Writers still have stores in flight; finished_sending ends their session.
+        if not self._can_store:
+            self.scheduler_adapter.end_session(request.request_id)
         return self._can_store, (return_params or None)
 
     def request_finished_all_groups(

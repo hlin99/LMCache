@@ -51,6 +51,8 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
 )
 from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
 from lmcache.utils import CacheStoreEvent  # noqa: E402
+from lmcache.v1.multiprocess.session import SessionManager
+from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 pytestmark = pytest.mark.no_shared_allocator
 
@@ -376,7 +378,10 @@ def test_chunked_prefill_stores_and_completion(
     )
     assert not receiving
     scheduler.update_connector_output(
-        KVConnectorOutput(kv_connector_worker_meta=worker.build_connector_worker_meta())
+        KVConnectorOutput(
+            finished_sending=sending,
+            kv_connector_worker_meta=worker.build_connector_worker_meta(),
+        )
     )
     assert not scheduler.has_pending_push_work()
     mock_io.scheduler.end_session.assert_called_once_with("request")
@@ -393,6 +398,54 @@ def test_chunked_prefill_stores_and_completion(
     else:
         mock_io.telemetry.on_request_store_finished.assert_not_called()
     assert not any(worker.get_finished({"request"}))
+
+
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_both"])
+@pytest.mark.parametrize("lazy_offload", [False])
+def test_session_cleanup_waits_for_late_worker_store(
+    connectors: tuple[LMCacheMPConnector, LMCacheMPConnector],
+    mock_io: SimpleNamespace,
+) -> None:
+    """A STORE submitted after generation ends must not leave a new session."""
+    scheduler, worker = connectors
+    request = _request()
+    sessions = SessionManager(TokenHasher(chunk_size=4), cleanup_interval=None)
+    future = mock_io.transfer.submit_store.return_value
+
+    def submit_store(*args: object, **kwargs: object) -> MagicMock:
+        sessions.get_or_create(request.request_id)
+        return future
+
+    mock_io.transfer.submit_store.side_effect = submit_store
+    mock_io.scheduler.end_session.side_effect = sessions.remove
+    try:
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        sessions.get_or_create(request.request_id)
+        scheduler.update_state_after_alloc(
+            request, MagicMock(get_block_ids=lambda: ([1],)), 0
+        )
+        metadata = scheduler.build_connector_meta(
+            _schedule(num_tokens=4, block_ids=([1],), new=True)
+        )
+        assert scheduler.request_finished(request, [1]) == (True, None)
+
+        worker.bind_connector_metadata(metadata)
+        future.query.return_value = False
+        worker.wait_for_save()
+        sending, receiving = worker.get_finished({request.request_id})
+        assert not sending and not receiving
+        scheduler.update_connector_output(KVConnectorOutput())
+        assert sessions.active_count() == 1
+
+        future.query.return_value = True
+        sending, receiving = worker.get_finished(set())
+        assert sending == {request.request_id} and not receiving
+        scheduler.update_connector_output(KVConnectorOutput(finished_sending=sending))
+
+        assert sessions.active_count() == 0
+        mock_io.scheduler.end_session.assert_called_once_with(request.request_id)
+    finally:
+        sessions.close()
 
 
 @pytest.mark.parametrize("retrieve_success", [False, True])
@@ -455,10 +508,11 @@ def test_lookup_retrieve_and_cleanup(
     }
     assert scheduler.request_trackers == {}
     mock_io.scheduler.cleanup_lookup_result.assert_called_once_with("request")
-    mock_io.scheduler.end_session.assert_called_once_with("request")
     sending, receiving = worker.get_finished({"request"})
     assert (sending or set()) == ({"request"} if delay_free else set())
     assert not receiving
+    scheduler.update_connector_output(KVConnectorOutput(finished_sending=sending))
+    mock_io.scheduler.end_session.assert_called_once_with("request")
 
 
 @pytest.mark.parametrize("num_groups,legacy_api", [(1, False), (2, False), (2, True)])
@@ -614,9 +668,11 @@ def test_multi_connector_child_role_and_completion(
         {"request"} if can_store and not peer_delays_free else set()
     )
     assert not receiving
+    scheduler.update_connector_output(KVConnectorOutput(finished_sending=sending))
     sending, receiving = worker.get_finished(set())
     assert (sending or set()) == ({"request"} if peer_delays_free else set())
     assert not receiving
+    scheduler.update_connector_output(KVConnectorOutput(finished_sending=sending))
     mock_io.scheduler.end_session.assert_called_once_with("request")
     worker.shutdown()
     scheduler.shutdown()
