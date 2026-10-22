@@ -1,0 +1,5 @@
+mp_host: 127.0.0.1
+mp_port: 15656
+extra_config:
+  sglang.vllm_fused_kv: true
+  sglang.vllm_mamba_block_size: 544

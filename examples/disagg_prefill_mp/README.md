@@ -63,3 +63,133 @@ vllm bench serve \
     --model Qwen/Qwen3-14B \
     --port 8000
 ```
+
+## Experimental aligned vLLM-to-SGLang handoff
+
+`vllm_to_sglang.py` is a separate, non-streaming TP1 example. It uses two
+LMCache MP servers and the existing NIXL P2P CPU transfer:
+
+```text
+vLLM GPU -> prefill LMCache CPU L1
+         -> NIXL READ -> decode LMCache CPU L1 -> SGLang GPU
+```
+
+The prompt must contain an exact multiple of the LMCache chunk size. The
+example does not implement partial chunks or change either engine's scheduler.
+It requests exactly one output token from vLLM, takes its **token ID** without
+detokenizing/re-tokenizing, and submits `prompt_ids + [first_token_id]` to
+SGLang. SGLang can then restore the entire aligned prompt and compute just the
+new input token. For hybrid models this restores `state(N)` and advances it
+with that token; it never attempts to rewind a recurrent state.
+
+Before submitting to SGLang, the example looks up and locks the full prefix on
+the prefill daemon, waiting for STORE completion, then on the decode daemon,
+waiting for P2P prefetch completion. It releases both sets of locks and sessions
+on completion or failure. A fresh salt isolates each handoff from earlier runs.
+The result is rejected unless SGLang reports the entire original prompt as an
+LMCache storage hit. This is a functional prototype, not a production PD proxy:
+it supports greedy generation only, no streaming, custom stop sequences,
+penalties, prompt logprobs, heterogeneous TP, or multimodal inputs. Requests
+must complete within the daemons' read-lock TTL.
+
+### Start the services
+
+Use separate compatible engine environments, both loading this LMCache source.
+Set `P_PYTHON` to the vLLM/LMCache Python and `D_PYTHON` to the SGLang Python.
+The daemon environment also needs the NIXL Python package for its CUDA version
+and a working UCX backend. Keep the engines' existing Torch versions when
+installing optional dependencies.
+
+The following configuration is for Qwen3.5-0.8B, BF16, DS convolution state,
+FP32 recurrent state, and a resolved vLLM Mamba block size of 544. Both engines
+must use identical weights, model name, token IDs, and hash configuration.
+See the [adapter interoperability documentation](../../docs/design/integration/sglang/lmcache-unified-radix-cache.md)
+for the experimental wire-format restrictions. The shared chunk size is
+`1088 = lcm(544, 64)`.
+
+Run each long-lived command in a separate terminal, exporting the same
+environment variables:
+
+```bash
+export MODEL=/absolute/path/to/Qwen3.5-0.8B
+export P_PYTHON=/path/to/vllm-env/bin/python
+export D_PYTHON=/path/to/sglang-env/bin/python
+
+# Coordinator.
+"$P_PYTHON" -m lmcache.cli.main coordinator --host 127.0.0.1 --port 19300
+
+# Prefill-side CPU cache.
+"$P_PYTHON" -m lmcache.cli.main server \
+  --host 127.0.0.1 --port 15655 --http-port 19000 \
+  --chunk-size 1088 --separate-object-groups \
+  --l1-size-gb 1 --l1-align-bytes 65536 --eviction-policy LRU \
+  --instance-id aligned-prefill \
+  --coordinator-url http://127.0.0.1:19300 \
+  --coordinator-advertise-ip 127.0.0.1 \
+  --p2p-advertise-url 127.0.0.1:18555
+
+# Decode-side CPU cache: a distinct L1 allocation and distinct ports.
+"$P_PYTHON" -m lmcache.cli.main server \
+  --host 127.0.0.1 --port 15656 --http-port 19001 \
+  --chunk-size 1088 --separate-object-groups \
+  --l1-size-gb 1 --l1-align-bytes 65536 --eviction-policy LRU \
+  --instance-id aligned-decode \
+  --coordinator-url http://127.0.0.1:19300 \
+  --coordinator-advertise-ip 127.0.0.1 \
+  --p2p-advertise-url 127.0.0.1:18556
+
+# Prefill engine.
+CUDA_VISIBLE_DEVICES=0 VLLM_SSM_CONV_STATE_LAYOUT=DS \
+"$P_PYTHON" -m vllm.entrypoints.openai.api_server \
+  --model "$MODEL" --host 127.0.0.1 --port 18000 \
+  --tensor-parallel-size 1 --dtype bfloat16 \
+  --max-model-len 4096 --max-num-seqs 2 \
+  --max-num-batched-tokens 544 --gpu-memory-utilization 0.25 \
+  --enforce-eager --enable-prefix-caching \
+  --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.port":15655}}'
+
+# Decode engine; run from this example directory for the YAML path.
+CUDA_VISIBLE_DEVICES=1 "$D_PYTHON" -m sglang.launch_server \
+  --model-path "$MODEL" --host 127.0.0.1 --port 18002 \
+  --tp-size 1 --dtype bfloat16 --context-length 4096 \
+  --mem-fraction-static 0.25 --max-running-requests 2 \
+  --disable-cuda-graph --attention-backend triton \
+  --mamba-ssm-dtype float32 \
+  --enable-lmcache --lmcache-config-file vllm_to_sglang.yaml
+```
+
+Wait for both engines' `/health` endpoints and verify both daemons report a
+connected P2P peer at `/status`. For multiple hosts, replace the advertised
+addresses, engine URLs, and cache URLs with routable addresses; the SGLang YAML
+must point to its own local daemon.
+
+### Submit an aligned prompt
+
+Create `input_ids.json` as a JSON array of exactly 2176 prompt token IDs,
+including the question at its end. Use the model's tokenizer, not dummy padding
+tokens added just to align an existing prompt. Then run:
+
+```bash
+"$P_PYTHON" vllm_to_sglang.py \
+  --model "$MODEL" --input-ids input_ids.json \
+  --chunk-size 1088 --max-tokens 32 --output handoff.json
+```
+
+`handoff.json` contains the exact combined `output_ids`, the first token ID,
+both engine responses, and the request salt. Decode the combined IDs with the
+model tokenizer for display; the SGLang response text alone omits the first
+token, which was produced by vLLM. The total output budget includes that first
+token. A terminal first token or a one-token budget skips decode altogether.
+
+For transport evidence, inspect the decode daemon's `/metrics`:
+`lmcache_mp_l2_load_completed_requests_total{l2_name="p2p"}` must increase, and
+its only L2 adapter should be the prefill peer. The transport logs must identify
+the NIXL UCX backend. Localhost exercises NIXL CPU-to-CPU functionality, not
+cross-node RDMA performance.
+
+The functional validation used a 2176-token Qwen3.5-0.8B prompt and a 32-token
+output budget. SGLang reported 2176 LMCache storage-hit tokens and computed one
+new input token. P2P loaded three objects: two Full KV chunks and the final GDN
+checkpoint. All 31 continuation token IDs matched a separate cold SGLang run
+given the identical `prompt_ids + [vLLM_first_token_id]`. This does not assert
+equality to an independently sampled, uninterrupted vLLM completion.
