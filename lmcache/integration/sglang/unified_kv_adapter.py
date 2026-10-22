@@ -365,9 +365,20 @@ class SGLangUnifiedKVAdapter:
                 "Experimental GDN packing requires DS QKV conv state "
                 "with equal key/value head counts"
             )
+        full_layers = len(self._fused_kv_pairs)
+        if not full_layers or len(layer_ids) % full_layers:
+            raise ValueError(
+                "GDN/FULL layer counts must match vLLM's unpadded grouping"
+            )
+        num_groups = len(layer_ids) // full_layers
+        grouped_indices = [
+            i
+            for group in range(num_groups)
+            for i in range(group, len(layer_ids), num_groups)
+        ]
         block_size = self.vllm_mamba_block_size
         self._gdn_state_rows = []
-        for index in range(len(layer_ids)):
+        for index in grouped_indices:
             conv_layer, temporal_layer = conv[index], temporal[index]
             payload_bytes = (
                 conv_layer[0].numel() * conv_layer.element_size()

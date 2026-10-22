@@ -33,15 +33,15 @@ RETRIEVE unpacks into SGLang's unchanged K/V pools before publishing the prefix.
 This prototype requires TP1/PP1 and matching BF16/FP16 K/V shapes.
 It does not support MLA.
 
-The experimental GDN extension additionally accepts
+For the Qwen3.5 GDN experiment, additionally set
 `extra_config: {"sglang.vllm_fused_kv": true, "sglang.vllm_mamba_block_size": 544}`.
-It requires contiguous BF16 dimension-first QKV conv state and FP32
-recurrent state with equal key/value head counts. Each layer is packed
-as conv bytes followed by recurrent bytes and zero padding, using the
-writer's 16-byte-aligned transfer width. STORE/RETRIEVE use the real
-checkpoint slot and ignore absent zero slots. Recurrent object groups
-precede FULL groups. Cross-engine GDN layer ordering is completed in
-the next change; byte packing alone is not complete interoperability.
+The block size must match the vLLM writer's logical Mamba block size. This
+mode requires FULL plus MAMBA components, contiguous BF16 dimension-first QKV
+conv state, FP32 recurrent state, equal key/value head counts, ascending layer
+IDs, and unpadded n:1 GDN/FULL layer grouping. It registers
+recurrent objects before FULL objects, uses vLLM's round-robin layer order,
+and packs conv followed by recurrent bytes into zero-padded rows matching
+the writer's 16-byte-aligned transfer width.
 
 The default remains the independent-component representation. The prototype
 duplicates the GPU KV pool and synchronously waits for load-side unpacking;

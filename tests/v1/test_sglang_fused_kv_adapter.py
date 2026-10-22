@@ -159,7 +159,7 @@ def test_hybrid_packs_grouped_conv_and_recurrent_rows_and_restores_slots() -> No
     adapter.pack_recurrent_for_store(indices[0])
 
     for packed, source_layer in zip(
-        groups[0].kv_tensors, [0, 1, 2, 3, 4, 5], strict=True
+        groups[0].kv_tensors, [0, 3, 1, 4, 2, 5], strict=True
     ):
         raw = packed[2].view(torch.uint8).flatten()
         expected = torch.cat(
