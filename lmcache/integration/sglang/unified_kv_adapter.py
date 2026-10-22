@@ -30,6 +30,7 @@ class SGLangUnifiedKVAdapter:
         mamba_component: Any,
         page_size: int,
         sliding_window_size: Optional[int],
+        vllm_fused_kv: bool = False,
     ) -> None:
         # check tree components
         if len(tree_components) <= 0:
@@ -45,6 +46,10 @@ class SGLangUnifiedKVAdapter:
         self.mamba_component = mamba_component
         self.page_size = page_size
         self.sliding_window_size = sliding_window_size
+        if vllm_fused_kv and tree_components != (ComponentType.FULL,):
+            raise ValueError("Experimental vLLM fused KV requires FULL attention only")
+        self.vllm_fused_kv = vllm_fused_kv
+        self._fused_kv_pairs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     def is_mla_enabled(self, model_config: Any) -> bool:
         """Return whether KV is TP-replicated for the MLA optimization."""
@@ -81,6 +86,31 @@ class SGLangUnifiedKVAdapter:
             if component_type is ComponentType.FULL:
                 component_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
                 tensors = self._resolve_pool_tensors(component_pool)
+                if self.vllm_fused_kv:
+                    if getattr(component_pool, "kv_buffer", None) is not None:
+                        raise ValueError(
+                            "Experimental vLLM fused KV does not support MLA"
+                        )
+                    half = len(tensors) // 2
+                    self._fused_kv_pairs = []
+                    for key, value in zip(tensors[:half], tensors[half:], strict=True):
+                        if (
+                            key.ndim != 3
+                            or key.shape != value.shape
+                            or key.dtype != value.dtype
+                            or key.dtype not in (torch.bfloat16, torch.float16)
+                        ):
+                            raise ValueError(
+                                "Experimental vLLM fused KV requires matching "
+                                "3D BF16/FP16 K and V tensors"
+                            )
+                        fused = torch.empty(
+                            (*key.shape[:-1], 2 * key.shape[-1]),
+                            dtype=key.dtype,
+                            device=key.device,
+                        )
+                        self._fused_kv_pairs.append((key, value, fused))
+                    tensors = tuple(fused for _, _, fused in self._fused_kv_pairs)
                 tensor_rows_per_block = (self.page_size,) * len(tensors)
                 dsa_tensors = self._resolve_dsa_indexer_tensors(component_pool)
                 if dsa_tensors:
@@ -135,6 +165,40 @@ class SGLangUnifiedKVAdapter:
             else:
                 raise AssertionError(f"Unexpected LMCache component {component_type}")
         return groups
+
+    def pack_for_store(self, indices: torch.Tensor) -> None:
+        """Pack selected SGLang slots into per-head ``[K, V]`` transfer buffers.
+
+        Args:
+            indices: Token-slot indices in the FULL pool's address space.
+
+        Notes:
+            Only the experimental fused mode owns these additional buffers.
+            Call on the producer stream before recording the STORE event.
+        """
+        for key, value, fused in self._fused_kv_pairs:
+            slots = indices.to(device=key.device, dtype=torch.int64)
+            packed = torch.cat(
+                (key.index_select(0, slots), value.index_select(0, slots)), dim=-1
+            )
+            fused.index_copy_(0, slots, packed)
+
+    def unpack_after_load(self, indices: torch.Tensor) -> None:
+        """Restore selected fused transfer slots into SGLang's K/V buffers.
+
+        Args:
+            indices: Fresh FULL token slots populated by RETRIEVE.
+
+        Notes:
+            The caller must order this stream after RETRIEVE and wait for
+            unpacking before publishing or releasing the destination slots.
+        """
+        for key, value, fused in self._fused_kv_pairs:
+            slots = indices.to(device=key.device, dtype=torch.int64)
+            packed = fused.index_select(0, slots)
+            width = key.shape[-1]
+            key.index_copy_(0, slots, packed[..., :width])
+            value.index_copy_(0, slots, packed[..., width:])
 
     def aligned_swa_window_size(self) -> int:
         assert self.sliding_window_size is not None

@@ -64,6 +64,9 @@ class _ImmediateFuture:
 class UnifiedLMCacheMPConnector:
     """Asynchronous device-IPC connector to a standalone LMCache server."""
 
+    vllm_fused_kv: bool = False
+    """Opt-in TP1 FULL-attention experiment; duplicates GPU KV transfer storage."""
+
     def __init__(
         self,
         *,
@@ -99,6 +102,18 @@ class UnifiedLMCacheMPConnector:
             SGLangUnifiedKVAdapter,
         )
 
+        config = load_engine_config_with_overrides(config_file_path=config_file)
+        self.vllm_fused_kv = bool(
+            config.get_extra_config_value("sglang.vllm_fused_kv", False)
+        )
+        if self.vllm_fused_kv and (tp_size != 1 or pp_size != 1):
+            raise ValueError("Experimental vLLM fused KV currently requires TP1/PP1")
+        if self.vllm_fused_kv:
+            logger.warning(
+                "Experimental vLLM fused KV duplicates GPU KV storage and "
+                "synchronizes load-side unpacking; use an empty cache or "
+                "a compatible isolated namespace."
+            )
         self._sglang_kv_adapter = SGLangUnifiedKVAdapter(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             req_to_token_pool=req_to_token_pool,
@@ -106,6 +121,7 @@ class UnifiedLMCacheMPConnector:
             mamba_component=mamba_component,
             page_size=page_size,
             sliding_window_size=sliding_window_size,
+            vllm_fused_kv=self.vllm_fused_kv,
         )
         kv_groups = self._sglang_kv_adapter.resolve_registered_groups()
         mla_enabled = self._sglang_kv_adapter.is_mla_enabled(model_config)
@@ -217,7 +233,6 @@ class UnifiedLMCacheMPConnector:
             )
         kv_tensors = [tensor for group in wire_groups for tensor in group.kv_tensors]
 
-        config = load_engine_config_with_overrides(config_file_path=config_file)
         if not config.mp_host:  # type: ignore[attr-defined]
             raise ValueError(
                 "LMCache MP config must define mp_host; pass "
@@ -944,6 +959,8 @@ class UnifiedLMCacheMPConnector:
             Engine-driven retrieval completes its worker-side scatter before
             returning its plain future. On a cross-rank failure, successful
             ranks synchronize local work before destination slots are released.
+            The experimental fused-KV mode unpacks on the consumer stream
+            and synchronizes it before returning.
         """
         local_success = False
         try:
@@ -957,6 +974,11 @@ class UnifiedLMCacheMPConnector:
 
         success = self._sync_success(local_success)
         if success:
+            if self.vllm_fused_kv:
+                with torch.cuda.stream(stream):
+                    self._sglang_kv_adapter.unpack_after_load(operation.device_indices)
+                # The prototype must finish unpacking before cache ownership changes.
+                stream.synchronize()
             return True
 
         # Another rank may have failed after this rank successfully enqueued
@@ -1119,6 +1141,8 @@ class UnifiedLMCacheMPConnector:
                 key = self._create_key(
                     lookup, start=start, end=aligned_end, worker_id=self.kv_worker_id
                 )
+                if self.vllm_fused_kv:
+                    self._sglang_kv_adapter.pack_for_store(store_group_indices[0])
                 event = transfer_ctx.create_recorded_event()
                 future = transfer_ctx.submit_store(
                     request_id,
