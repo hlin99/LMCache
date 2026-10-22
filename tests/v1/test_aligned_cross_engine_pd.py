@@ -59,7 +59,8 @@ def run_handoff(prefill: Mock, decode: Mock, **kwargs) -> dict:
     )
 
 
-def test_handoff_preserves_token_ids_salt_budget_and_prefix_locks():
+@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 8])
+def test_handoff_preserves_token_ids_salt_budget_and_prefix_locks(tp_size):
     prefill, decode = cache_client(), cache_client()
 
     def respond(url, payload, timeout):
@@ -73,21 +74,29 @@ def test_handoff_preserves_token_ids_salt_budget_and_prefix_locks():
         for client in (prefill, decode):
             key = client.lookup.call_args.args[0]
             assert key.end == 8 and key.token_ids == tuple(range(8))
-            assert key.world_size == 1
+            assert key.world_size == tp_size
             assert key.num_kv_readers == 1
-            assert client.lookup.call_args.args[1] == 1
+            assert client.lookup.call_args.args[1] == tp_size
             assert key.cache_salt == payload["cache_salt"]
             assert client.wait_prefetch_status.called
             client.free_lookup_locks.assert_not_called()
         return decode_response()
 
     with patch.object(pd, "request_json", side_effect=respond):
-        result = run_handoff(prefill, decode)
+        result = run_handoff(prefill, decode, tp_size=tp_size)
     assert result["output_ids"] == [99, 100, 101]
     for client in (prefill, decode):
         client.free_lookup_locks.assert_called_once()
-        assert client.free_lookup_locks.call_args.args[1] == 1
+        assert client.free_lookup_locks.call_args.args[1] == tp_size
         client.end_session.assert_called_once()
+
+
+@pytest.mark.parametrize("tp_size", [0, -1, -4])
+def test_nonpositive_tp_rejected_before_requests(tp_size):
+    with patch.object(pd, "request_json") as request:
+        with pytest.raises(ValueError, match="tp_size must be positive"):
+            run_handoff(cache_client(), cache_client(), tp_size=tp_size)
+    request.assert_not_called()
 
 
 @pytest.mark.parametrize("input_ids", [[], [1, 2, 3]])

@@ -149,6 +149,33 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
                 sliding_window_size=None,
             )
 
+            config.get_extra_config_value = lambda key, default: {
+                "sglang.vllm_fused_kv": True
+            }.get(key, default)
+            for tp_size in (2, 4):
+                with patch("torch.distributed.get_world_size", return_value=tp_size):
+                    for rank in range(tp_size):
+                        with self.subTest(tp_size=tp_size, tp_rank=rank):
+                            sharded = UnifiedLMCacheMPConnector(
+                                config_file=None,
+                                model_config=SimpleNamespace(model_path="test-model"),
+                                tp_size=tp_size,
+                                tp_rank=rank,
+                                tp_group=object(),
+                                page_size=4,
+                                token_to_kv_pool_allocator=object(),
+                                req_to_token_pool=object(),
+                                tree_components=(object(),),
+                                mamba_component=None,
+                                sliding_window_size=None,
+                            )
+                            self.assertEqual(sharded.kv_world_size, tp_size)
+                            self.assertEqual(sharded.kv_worker_id, rank)
+                            self.assertEqual(sharded.num_kv_readers, 1)
+                            self.assertTrue(sharded.is_kv_writer)
+                            self.assertEqual(sharded.is_lookup_leader, rank == 0)
+                            self.assertEqual(sharded.blocks_in_chunk, 2)
+
         self.assertEqual(connector.blocks_in_chunk, 2)
 
     def test_slots_to_blocks_accepts_noncontiguous_pages(self):

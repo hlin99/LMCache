@@ -65,7 +65,7 @@ class UnifiedLMCacheMPConnector:
     """Asynchronous device-IPC connector to a standalone LMCache server."""
 
     vllm_fused_kv: bool = False
-    """Opt-in TP1 FULL-attention experiment; duplicates GPU KV transfer storage."""
+    """Opt-in vLLM-compatible transfer; duplicates GPU KV transfer storage."""
 
     def __init__(
         self,
@@ -106,8 +106,8 @@ class UnifiedLMCacheMPConnector:
         self.vllm_fused_kv = bool(
             config.get_extra_config_value("sglang.vllm_fused_kv", False)
         )
-        if self.vllm_fused_kv and (tp_size != 1 or pp_size != 1):
-            raise ValueError("Experimental vLLM fused KV currently requires TP1/PP1")
+        if self.vllm_fused_kv and pp_size != 1:
+            raise ValueError("Experimental vLLM fused KV requires matching TP with PP1")
         if self.vllm_fused_kv:
             logger.warning(
                 "Experimental vLLM fused KV duplicates GPU KV storage and "

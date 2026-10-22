@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental greedy, chunk-aligned TP1 handoff through LMCache MP P2P."""
+"""Experimental greedy, chunk-aligned equal-TP handoff through LMCache MP P2P."""
 
 # Standard
 from contextlib import contextmanager
@@ -40,7 +40,7 @@ def hold_prefix(
     while time.monotonic() < deadline:
         attempt = replace(key, request_id=f"aligned-pd-{uuid.uuid4().hex}")
         try:
-            client.lookup(attempt, 1).result(timeout=timeout)
+            client.lookup(attempt, key.world_size).result(timeout=timeout)
             hit_chunks = None
             while hit_chunks is None:
                 remaining = deadline - time.monotonic()
@@ -55,7 +55,9 @@ def hold_prefix(
                 return
         finally:
             try:
-                client.free_lookup_locks(attempt, 1).result(timeout=timeout)
+                client.free_lookup_locks(attempt, key.world_size).result(
+                    timeout=timeout
+                )
             finally:
                 client.end_session(attempt.request_id).result(timeout=timeout)
         time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
@@ -72,6 +74,7 @@ def handoff(
     decode_url: str,
     prefill_cache: RequestClient,
     decode_cache: RequestClient,
+    tp_size: int = 1,
     timeout: float = 120,
 ) -> dict[str, Any]:
     """Prefill once, transfer the aligned prefix, and continue from its first token."""
@@ -81,6 +84,8 @@ def handoff(
         raise ValueError("max_tokens must be positive")
     if timeout <= 0:
         raise ValueError("timeout must be positive")
+    if tp_size <= 0:
+        raise ValueError("tp_size must be positive")
     for client in (prefill_cache, decode_cache):
         actual = client.get_chunk_size().result(timeout=timeout)
         if actual != chunk_size:
@@ -108,6 +113,7 @@ def handoff(
         "input_ids": input_ids,
         "cache_salt": salt,
         "first_token_ids": first_ids,
+        "tp_size": tp_size,
         "prefill": prefill,
     }
     if choice["finish_reason"] == "stop":
@@ -120,7 +126,7 @@ def handoff(
         return result
     key = IPCCacheServerKey(
         model_name=model,
-        world_size=1,
+        world_size=tp_size,
         worker_id=None,
         num_kv_readers=1,
         token_ids=tuple(input_ids),
@@ -170,6 +176,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chunk-size", type=int, required=True)
     parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--prefill-url", default="http://127.0.0.1:18000")
     parser.add_argument("--decode-url", default="http://127.0.0.1:18002")
     parser.add_argument("--prefill-cache", default="tcp://127.0.0.1:15655")
@@ -194,6 +201,7 @@ def main() -> None:
                 decode_url=args.decode_url,
                 prefill_cache=prefill_cache,
                 decode_cache=decode_cache,
+                tp_size=args.tp_size,
                 timeout=args.timeout,
             )
             args.output.write_text(json.dumps(result, indent=2) + "\n")

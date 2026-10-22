@@ -30,7 +30,11 @@ The opt-in LMCache YAML setting
 FULL-attention layer with per-head content `[K, V]`, matching the current vLLM
 fused-content representation. STORE packs only its selected token slots;
 RETRIEVE unpacks into SGLang's unchanged K/V pools before publishing the prefix.
-This prototype requires TP1/PP1 and matching BF16/FP16 K/V shapes.
+This prototype requires matching TP with PP1 and compatible per-rank BF16/FP16
+K/V shapes and head-sharding/replication rules. Each TP rank transfers its own
+local shard under its `kv_rank`; there is no redistribution between different
+TP sizes. Any positive TP size supported by both engines and the model is
+accepted, but only TP1 and TP2 have been validated with real engines.
 It does not support MLA.
 
 For the Qwen3.5 GDN experiment, additionally set
@@ -51,6 +55,13 @@ the SGLang cold control; log probabilities were not bit-exact. SGLang-originated
 objects were also retrieved by a fresh vLLM process and preserved the needle
 answer, but did not reproduce vLLM's entire cold completion. This is not a
 general hybrid-model, heterogeneous-TP, or FP8 compatibility guarantee.
+
+An additional chunk-aligned TP2-to-TP2 PD run restored all 2176 prompt tokens
+through two independent LMCache CPU pools and NIXL UCX. Each rank transferred
+two FULL objects and its final GDN checkpoint. SGLang consumed the vLLM first
+output token as its one new input token; all 31 continuation IDs matched a
+cold TP2 SGLang control with that same input. This was a localhost functional
+check, not a cross-node RDMA or performance measurement.
 
 The default remains the independent-component representation. The prototype
 duplicates the GPU KV pool and synchronously waits for load-side unpacking;

@@ -66,8 +66,8 @@ vllm bench serve \
 
 ## Experimental aligned vLLM-to-SGLang handoff
 
-`vllm_to_sglang.py` is a separate, non-streaming TP1 example. It uses two
-LMCache MP servers and the existing NIXL P2P CPU transfer:
+`vllm_to_sglang.py` is a separate, non-streaming matching-TP example.
+It uses two LMCache MP servers and the existing NIXL P2P CPU transfer:
 
 ```text
 vLLM GPU -> prefill LMCache CPU L1
@@ -91,6 +91,12 @@ LMCache storage hit. This is a functional prototype, not a production PD proxy:
 it supports greedy generation only, no streaming, custom stop sequences,
 penalties, prompt logprobs, heterogeneous TP, or multimodal inputs. Requests
 must complete within the daemons' read-lock TTL.
+
+`--tp-size` accepts any positive common TP size supported by the model and
+both engines, with PP1. Both engines must use compatible per-rank head
+sharding/replication and wire layouts; matching the TP count alone does not
+establish that compatibility. Real-engine validation currently covers TP1
+and TP2 only.
 
 ### Start the services
 
@@ -193,3 +199,35 @@ new input token. P2P loaded three objects: two Full KV chunks and the final GDN
 checkpoint. All 31 continuation token IDs matched a separate cold SGLang run
 given the identical `prompt_ids + [vLLM_first_token_id]`. This does not assert
 equality to an independently sampled, uninterrupted vLLM completion.
+
+### Matching TP2 on both sides
+
+Keep both CPU daemons and the hybrid YAML unchanged. Start vLLM with
+`CUDA_VISIBLE_DEVICES=0,1 --tensor-parallel-size 2` (the environment assignment
+precedes the Python command), and SGLang with `CUDA_VISIBLE_DEVICES=2,3` and
+`--tp-size 2`. Pass `--tp-size 2` to `vllm_to_sglang.py` as well:
+
+```bash
+"$P_PYTHON" vllm_to_sglang.py \
+  --model "$MODEL" --input-ids input_ids.json \
+  --chunk-size 1088 --tp-size 2 --max-tokens 32 --output handoff-tp2.json
+```
+
+The readiness lookups cover both KV ranks. Every rank has its own Full KV
+and GDN objects, with one lookup reader per object, not two readers of a
+replicated object. For Qwen3.5-0.8B each rank owns one Full KV head and eight
+GDN heads. Rank 0 transfers to rank 0, and rank 1 to rank 1; this does not
+implement TP2-to-TP1 or TP4-to-TP2 resharding. The vLLM block-size setting must
+still match the actual writer configuration.
+
+The TP2-to-TP2 functional run used GPUs 0/1 for vLLM and GPUs 2/3 for
+SGLang. NIXL loaded six objects (two Full KV chunks and one final GDN
+checkpoint per rank). SGLang restored all 2176 prompt tokens and computed
+one new input token. All 31 continuation IDs matched an independent cold
+TP2 SGLang run with the same first-token input.
+
+On the validation host, vLLM's local GPU-P2P collective initialization stalled.
+The functional run used `NCCL_P2P_DISABLE=1 NCCL_CUMEM_ENABLE=0` in the vLLM
+environment and added `--disable-custom-all-reduce` to its launch command.
+These are host-specific collective workarounds, not requirements of the
+LMCache NIXL CPU transfer, and the run makes no performance claim.
