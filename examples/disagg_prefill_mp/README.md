@@ -69,6 +69,50 @@ vllm bench serve \
 `vllm_to_sglang.py` is a separate, non-streaming matching-TP example.
 It uses two LMCache MP servers and the existing NIXL P2P CPU transfer:
 
+For a one-command Qwen3.5-0.8B functional check, run:
+
+```bash
+MODEL=/absolute/path/to/Qwen3.5-0.8B \
+P_PYTHON=/path/to/vllm-env/bin/python \
+D_PYTHON=/path/to/sglang-env/bin/python \
+TP=2 bash verify_vllm_to_sglang.sh
+```
+
+With the existing `/workspace` experiment layout, simply run
+`bash examples/disagg_prefill_mp/verify_vllm_to_sglang.sh` from the repository
+root. Defaults are the sibling `kv-interop/.venv/bin/python` for prefill,
+`kv-interop/sglang/.venv/bin/python` for decode, and the sibling
+`models/Qwen3.5-0.8B` if present (otherwise `Qwen/Qwen3.5-0.8B`).
+The environment variables above override these defaults.
+
+The script prepares a two-chunk needle prompt, starts the coordinator, both CPU
+daemons and engines, and checks the complete storage restore and NIXL P2P
+counter, with no remaining read/write locks or active sessions after the
+handoff. It then stops the engines and starts a fresh cache-disabled SGLang
+control, comparing continuation token IDs with the same first-token input.
+It prints `PASS` only if all checks succeed, keeps logs and JSON results in
+the printed temporary directory, and cleans up its own process groups on exit.
+Service stdout and stderr are shown live in the terminal and saved both in
+per-service logs and the combined `run.log`. Python output is unbuffered.
+It refuses to run if any of its ports are already in use.
+
+The default is TP2 on GPUs 0/1 and 2/3; `TP=1` uses GPUs 0 and 1. Override
+`PREFILL_GPUS` and `DECODE_GPUS` for different disjoint GPU sets.
+`DISABLE_GPU_P2P=1` is the default functional-test workaround for local engine
+collective initialization; set it to `0` on hosts that do not need it.
+It disables NCCL P2P/CUMEM and custom all-reduce in both engines, not NIXL CPU
+transfers.
+Set `LMCACHE_MP_TRANSFER_MODE=engine_driven` to force worker-side GPU/CPU
+copies on both engines; CPU-to-CPU transfer still uses NIXL. The default is
+`auto` (LMCache-driven on the tested CUDA setup).
+`CHUNK_SIZE=1088` and `MAMBA_BLOCK_SIZE=544` are the validated TP1/TP2 defaults.
+For attention-only models such as Llama, set `MAMBA_BLOCK_SIZE=0` to disable
+GDN packing; for example, use `CHUNK_SIZE=256`.
+For other TP sizes, set these to match the actual writer block size and both
+engines' checkpoint grids. Both Python environments must load this repository's
+LMCache, with compatible engine dependencies and NIXL/UCX in the daemon
+environment. This script is not an installer or a performance benchmark.
+
 ```text
 vLLM GPU -> prefill LMCache CPU L1
          -> NIXL READ -> decode LMCache CPU L1 -> SGLang GPU
